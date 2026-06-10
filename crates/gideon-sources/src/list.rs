@@ -33,6 +33,9 @@ pub struct SourceInformation {
     pub file: Option<String>,
     #[serde(default)]
     pub lang: Option<String>,
+    /// Icon file name, resolved relative to the list's `icons/` directory.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// Domain of the source list this entry came from (filled in by us).
     #[serde(skip)]
     pub origin: Option<String>,
@@ -149,6 +152,21 @@ pub fn resolve_package_url(list_url: &Url, source: &SourceInformation) -> Result
     Ok(list_url.join(&relative)?)
 }
 
+/// Resolve a source's icon URL, following the `icons/` directory convention
+/// used by Aidoku-style repositories.
+pub fn resolve_icon_url(list_url: &Url, source: &SourceInformation) -> Option<Url> {
+    let icon = source.icon.as_deref()?;
+    if let Ok(absolute) = Url::parse(icon) {
+        return Some(absolute);
+    }
+    let relative = if icon.starts_with("icons/") {
+        icon.to_string()
+    } else {
+        format!("icons/{icon}")
+    };
+    list_url.join(&relative).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +256,7 @@ mod tests {
             version: 1,
             file: Some("en.x-v1.aix".into()),
             lang: None,
+            icon: None,
             origin: None,
         };
         let url = resolve_package_url(&list_url, &source).unwrap();
@@ -257,6 +276,7 @@ mod tests {
             version: 1,
             file: Some("sources/a.aix".into()),
             lang: None,
+            icon: None,
             origin: None,
         };
         assert_eq!(
@@ -291,5 +311,38 @@ mod tests {
             lists.find_source(&fetcher, "en.missing"),
             Err(Error::SourceNotFound(_))
         ));
+    }
+
+    #[test]
+    fn resolve_icon_url_follows_icons_convention() {
+        let list_url = Url::parse(LIST_URL).unwrap();
+        let source = SourceInformation {
+            id: "a".into(),
+            name: "A".into(),
+            version: 1,
+            file: None,
+            lang: None,
+            icon: Some("a-v1.png".into()),
+            origin: None,
+        };
+        assert_eq!(
+            resolve_icon_url(&list_url, &source).unwrap().as_str(),
+            "https://raw.githubusercontent.com/example/sources/gh-pages/icons/a-v1.png"
+        );
+
+        let no_icon = SourceInformation {
+            icon: None,
+            ..source.clone()
+        };
+        assert!(resolve_icon_url(&list_url, &no_icon).is_none());
+
+        let absolute = SourceInformation {
+            icon: Some("https://cdn.example.com/i.png".into()),
+            ..source
+        };
+        assert_eq!(
+            resolve_icon_url(&list_url, &absolute).unwrap().as_str(),
+            "https://cdn.example.com/i.png"
+        );
     }
 }

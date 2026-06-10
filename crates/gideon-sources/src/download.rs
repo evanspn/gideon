@@ -15,22 +15,35 @@ use crate::Result;
 /// Write pages (already-encoded image bytes) into a CBZ at `out_path`.
 ///
 /// Page names are zero-padded so the resulting archive sorts correctly in
-/// any reader, not just gideon.
+/// any reader, not just gideon. The archive is written to a temporary file
+/// and renamed into place, so an interrupted download can never leave a
+/// half-written CBZ where the library would find it.
 pub fn pages_to_cbz(out_path: &Path, pages: &[(String, Vec<u8>)]) -> Result<()> {
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let tmp_path = out_path.with_extension("cbz.part");
 
-    let file = std::fs::File::create(out_path)?;
-    let mut zip = ZipWriter::new(file);
-    // Pages are already compressed images; store them instead of deflating.
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let result = (|| {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut zip = ZipWriter::new(file);
+        // Pages are already compressed images; store them instead of deflating.
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
-    for (name, bytes) in pages {
-        zip.start_file(name.as_str(), options)?;
-        zip.write_all(bytes)?;
+        for (name, bytes) in pages {
+            zip.start_file(name.as_str(), options)?;
+            zip.write_all(bytes)?;
+        }
+        zip.finish()?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return result;
     }
-    zip.finish()?;
+    std::fs::rename(&tmp_path, out_path)?;
     Ok(())
 }
 

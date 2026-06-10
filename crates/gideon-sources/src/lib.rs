@@ -14,7 +14,8 @@ pub mod list;
 pub use download::pages_to_cbz;
 pub use fetch::{Fetcher, UreqFetcher};
 pub use list::{
-    parse_source_list, resolve_package_url, SourceInformation, SourceLists, DEFAULT_SOURCE_LISTS,
+    parse_source_list, resolve_icon_url, resolve_package_url, SourceInformation, SourceLists,
+    DEFAULT_SOURCE_LISTS,
 };
 
 #[derive(Debug, thiserror::Error)]

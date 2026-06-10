@@ -14,7 +14,11 @@
 ## v1 — read manga on the device
 
 - [ ] Touch input via evdev (tap zones: next/prev/menu)
-- [ ] On-device library browser UI (cover grid, progress badges)
+- [ ] On-device library browser UI (cover grid, progress badges) — pure
+      Rust, drawn through the `Display` trait; every text API takes explicit
+      bounds and clips/ellipsizes, with headless pixel tests asserting no
+      widget ever draws outside its box (see docs/LESSONS.md §1 — bobo's Lua
+      UI overflow bugs must not come back)
 - [ ] FitWidth scrolling within a page (the render/blit plumbing exists)
 - [ ] Page pre-decoding (decode page N+1 while reading page N)
 - [x] Install bundle: armv7 binary + data-preserving installer with backups

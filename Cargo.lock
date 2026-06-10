@@ -327,6 +327,7 @@ dependencies = [
  "gideon-render",
  "gideon-sources",
  "image",
+ "serde_json",
  "tempfile",
  "url",
  "zip",

@@ -59,27 +59,24 @@ jobs:
           retention-days: 30
 
   live-sources:
-    name: Live source list fetch
+    name: Live GitHub source integration tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --workspace
-      - name: Fetch the preinstalled GitHub source list (3 attempts)
+      - name: Run online integration tests (3 attempts)
+        # Fetches the live source list, downloads a real source package
+        # (validating its WASM payload), and runs the full
+        # download -> CBZ -> decode -> render pipeline on real images
+        # hosted in the GitHub source repository.
         run: |
           for attempt in 1 2 3; do
-            if out=$(./target/debug/gideon sources); then
-              echo "$out" | head -20
-              count=$(echo "$out" | grep -oE '^[0-9]+ source' | grep -oE '^[0-9]+' || echo 0)
-              if [ "${count:-0}" -ge 1 ]; then
-                echo "OK: $count sources available"
-                exit 0
-              fi
+            if cargo test -p gideon-app --test online -- --ignored; then
+              exit 0
             fi
-            echo "attempt $attempt failed, retrying in 10s..."
-            sleep 10
+            echo "attempt $attempt failed, retrying in 15s..."
+            sleep 15
           done
-          echo "live source list fetch failed after 3 attempts" >&2
+          echo "online integration tests failed after 3 attempts" >&2
           exit 1

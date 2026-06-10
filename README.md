@@ -102,4 +102,6 @@ user-mode emulation (`ci/qemu_integration.sh`), verifies the preinstalled
 GitHub source list still resolves live, and uploads the Kobo binary as a
 build artifact.
 
-See [ROADMAP.md](ROADMAP.md) for where this is going.
+See [ROADMAP.md](ROADMAP.md) for where this is going, and
+[docs/LESSONS.md](docs/LESSONS.md) for the mistakes from bobo's history that
+gideon is designed not to repeat.

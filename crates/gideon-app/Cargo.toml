@@ -27,3 +27,4 @@ gideon-device = { path = "../gideon-device" }
 [dev-dependencies]
 tempfile.workspace = true
 zip.workspace = true
+serde_json.workspace = true
