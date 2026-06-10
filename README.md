@@ -115,19 +115,25 @@ smoke test against a generated CBZ, and a cross-check for the Kobo target.
 
 ### Releases
 
-Releases are semantically versioned and tag-driven:
+Releases are fully automatic: **every merge to main publishes a
+semantically versioned GitHub Release** with the installable
+`gideon-kobo-vX.Y.Z.zip` bundle attached — nothing to run, works from a
+phone.
 
-```sh
-scripts/release.sh patch        # or minor / major / an explicit X.Y.Z
-git push origin HEAD --follow-tags
-```
+- Default: the patch version is bumped (0.1.0 → 0.1.1 → 0.1.2 …)
+- Put `[minor]` or `[major]` in the merge commit message for bigger bumps,
+  or trigger the Release workflow manually from the Actions tab with a
+  bump choice
+- Put `[skip release]` in the merge commit message to merge without
+  releasing
+- To pick an exact version, bump `Cargo.toml` in the PR (or run
+  `scripts/release.sh X.Y.Z`) — an untagged version in `Cargo.toml` is
+  released as-is
 
-The script bumps the workspace version (binary `--version` inherits it),
-refreshes `Cargo.lock`, commits and tags `vX.Y.Z`. Pushing the tag triggers
-the release workflow, which refuses to publish unless the tag matches
-`Cargo.toml`, re-runs the full quality gate plus the QEMU integration tests
-against the release binaries, and then publishes a GitHub Release with
-`gideon-kobo-vX.Y.Z.zip` and auto-generated notes.
+The release is only published after the full quality gate (fmt, clippy,
+tests, installer tests) and the QEMU integration suite pass against the
+exact armv7 binaries being shipped. The version-bump commit and `vX.Y.Z`
+tag are pushed back to main by the workflow.
 
 After merges to main, a post-merge workflow goes further: it builds the real
 armv7 Kobo binaries and runs integration tests against them under QEMU

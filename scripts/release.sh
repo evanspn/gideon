@@ -7,15 +7,11 @@
 #   scripts/release.sh minor          # 0.1.1 -> 0.2.0
 #   scripts/release.sh major          # 0.2.0 -> 1.0.0
 #
-# Bumps the workspace version in Cargo.toml (which every crate and the
-# binary's --version inherit), refreshes Cargo.lock, commits and creates
-# the matching tag. Then:
-#
-#   git push origin main --follow-tags
-#
-# The tag triggers .github/workflows/release.yml, which gates on the full
-# test suite + QEMU integration before publishing the GitHub Release with
-# the versioned Kobo bundle attached.
+# Releases are normally fully automatic: every merge to main publishes a
+# patch release (see .github/workflows/release.yml). Use this script only
+# when you want to pick the version deliberately: it bumps Cargo.toml and
+# commits — when that commit reaches main, the release workflow publishes
+# exactly that version.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -63,9 +59,8 @@ rm -f Cargo.toml.bak
 cargo update --workspace --quiet
 
 git add Cargo.toml Cargo.lock
-git commit -m "release: v$new"
-git tag -a "v$new" -m "gideon v$new"
+git commit -m "version: $new"
 
 echo
-echo "Created commit and tag v$new. To publish:"
-echo "  git push origin HEAD --follow-tags"
+echo "Version set to $new. Merge/push this to main and the release"
+echo "workflow will build, test and publish v$new automatically."
