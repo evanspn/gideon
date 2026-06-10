@@ -1,0 +1,6 @@
+# Configuration for cross-rs builds (the ARM/Kobo toolchain).
+# The cross images ship a proper musl gcc, avoiding the glibc-headers vs
+# musl-libc symbol mismatches (__longjmp_chk, __isoc23_strtol) that broke
+# linking freetype with the Ubuntu gnueabihf compiler.
+[build.env]
+passthrough = ["RUST_FONTCONFIG_DLOPEN", "FONTCONFIG_NO_PKG_CONFIG"]
