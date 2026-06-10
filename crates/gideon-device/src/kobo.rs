@@ -43,6 +43,8 @@ unsafe fn ioctl<T>(fd: libc::c_int, request: u32, arg: *mut T) -> libc::c_int {
 }
 
 const WAVEFORM_MODE_AUTO: u32 = 0x101;
+/// NTX GC16: the full-quality 16-gray waveform KOReader uses for flashes.
+const WAVEFORM_MODE_GC16: u32 = 2;
 const UPDATE_MODE_PARTIAL: u32 = 0x0;
 const UPDATE_MODE_FULL: u32 = 0x1;
 const TEMP_USE_AMBIENT: i32 = 0x1000;
@@ -198,12 +200,22 @@ impl KoboDisplay {
         // passing properly sized zero-initialized out-structs.
         unsafe {
             if ioctl(file.as_raw_fd(), FBIOGET_VSCREENINFO, &mut var) != 0 {
-                return Err(Error::Io(std::io::Error::last_os_error()));
+                return Err(Error::Display(format!(
+                    "FBIOGET_VSCREENINFO failed on {path}: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
             if ioctl(file.as_raw_fd(), FBIOGET_FSCREENINFO, &mut fix) != 0 {
-                return Err(Error::Io(std::io::Error::last_os_error()));
+                return Err(Error::Display(format!(
+                    "FBIOGET_FSCREENINFO failed on {path}: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
+        eprintln!(
+            "gideon fb: {}x{} {}bpp rotate={} line_length={} smem_len={}",
+            var.xres, var.yres, var.bits_per_pixel, var.rotate, fix.line_length, fix.smem_len
+        );
 
         // Stock Nickel leaves the panel at 16 or 32bpp; we convert grayscale
         // to whatever depth the framebuffer reports instead of requiring a
@@ -218,11 +230,19 @@ impl KoboDisplay {
         // /dev/fb0 is a character device with file length 0 — the mapping
         // length must come from the driver's advertised memory size, not
         // the file metadata.
-        let map_len = (fix.smem_len as usize).max(fix.line_length as usize * var.yres as usize);
-        if map_len == 0 {
-            return Err(Error::Display(
-                "framebuffer reports zero memory size".to_string(),
-            ));
+        let needed = fix.line_length as usize * var.yres as usize;
+        let map_len = fix.smem_len as usize;
+        if map_len == 0 || needed == 0 {
+            return Err(Error::Display(format!(
+                "framebuffer reports zero memory size (smem_len={} line_length={} yres={})",
+                fix.smem_len, fix.line_length, var.yres
+            )));
+        }
+        if needed > map_len {
+            return Err(Error::Display(format!(
+                "framebuffer memory too small: need {needed} bytes (line_length={} x yres={}), driver advertises {map_len}",
+                fix.line_length, var.yres
+            )));
         }
         // SAFETY: mapping exactly the framebuffer memory the kernel
         // advertised via FBIOGET_FSCREENINFO.
@@ -276,9 +296,11 @@ impl Display for KoboDisplay {
             width: self.width,
             height: self.height,
         };
-        let update_mode = match mode {
-            RefreshMode::Full => UPDATE_MODE_FULL,
-            RefreshMode::Partial => UPDATE_MODE_PARTIAL,
+        // KOReader's Kobo configuration: GC16 for flashing refreshes, AUTO
+        // for partials.
+        let (update_mode, waveform) = match mode {
+            RefreshMode::Full => (UPDATE_MODE_FULL, WAVEFORM_MODE_GC16),
+            RefreshMode::Partial => (UPDATE_MODE_PARTIAL, WAVEFORM_MODE_AUTO),
         };
 
         // Kernel generations disagree on the update struct (KOReader
@@ -296,7 +318,7 @@ impl Display for KoboDisplay {
                 UpdateApi::V2 => {
                     let mut update = mxcfb_update_data_v2 {
                         update_region: region,
-                        waveform_mode: WAVEFORM_MODE_AUTO,
+                        waveform_mode: waveform,
                         update_mode,
                         update_marker: self.update_marker,
                         temp: TEMP_USE_AMBIENT,
@@ -310,7 +332,7 @@ impl Display for KoboDisplay {
                 UpdateApi::V1 => {
                     let mut update = mxcfb_update_data_v1 {
                         update_region: region,
-                        waveform_mode: WAVEFORM_MODE_AUTO,
+                        waveform_mode: waveform,
                         update_mode,
                         update_marker: self.update_marker,
                         temp: TEMP_USE_AMBIENT,
@@ -326,9 +348,14 @@ impl Display for KoboDisplay {
             }
             last_err = Some(std::io::Error::last_os_error());
         }
-        Err(Error::Io(last_err.unwrap_or_else(|| {
-            std::io::Error::other("no MXCFB update variant accepted")
-        })))
+        Err(Error::Display(format!(
+            "MXCFB_SEND_UPDATE rejected (tried v2+v1, {}x{}, mode={update_mode}): {}",
+            self.width,
+            self.height,
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )))
     }
 }
 
