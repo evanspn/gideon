@@ -118,10 +118,8 @@ impl TouchTracker {
                 }
                 self.touching = true;
             }
-            (EV_SYN, SYN_REPORT) => {
-                if self.release_seen {
-                    return self.finish_tap();
-                }
+            (EV_SYN, SYN_REPORT) if self.release_seen => {
+                return self.finish_tap();
             }
             _ => {}
         }
