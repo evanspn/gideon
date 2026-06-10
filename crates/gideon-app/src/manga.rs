@@ -224,6 +224,11 @@ pub fn cmd_manga_download(
 /// ComicInfo.xml), reporting `(pages_done, pages_total)` through `progress`
 /// (called once with `(0, total)` before the first page). Returns the path
 /// of the written CBZ.
+///
+/// Individual failed pages do not abort the chapter: each one becomes a
+/// self-describing placeholder image (like bobo's downloader) so the CBZ
+/// stays complete and readable; only a chapter where *every* page failed
+/// is an error.
 pub async fn download_chapter(
     source: &Source,
     manga_id: &str,
@@ -267,8 +272,15 @@ pub async fn download_chapter(
     }
     progress(0, pages.len());
 
+    // Client configuration mirrors bobo's proven downloader: redirects are
+    // followed manually (so the source-set Referer survives every hop, see
+    // `execute_with_forced_referer`) and broken CDN certificates are
+    // tolerated — manga mirrors routinely have invalid TLS. The user-agent
+    // here is only a fallback: `get_image_request` always sets a browser UA.
     let client = reqwest::Client::builder()
         .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(true)
         .build()?;
     let width = pages.len().to_string().len().max(3);
     let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(pages.len() + 1);
@@ -284,51 +296,55 @@ pub async fn download_chapter(
     );
     cbz_pages.push(("ComicInfo.xml".to_string(), comic_info.into_bytes()));
 
+    // A failed page must not abort the chapter (bobo's downloader inserts
+    // an error placeholder and keeps going); a 40-page chapter with one
+    // dead page must still be readable.
+    let mut failed: Vec<String> = Vec::new();
+    let mut downloaded = 0usize;
     for (i, page) in pages.iter().enumerate() {
         let Some(image_url) = page.image_url.clone() else {
             continue;
         };
-        // The source may add auth headers / referers to the request.
-        let request = source
-            .get_image_request(image_url.clone(), page.ctx.clone())
-            .await?;
-        let (req_url, req_headers) = (request.url().clone(), request.headers().clone());
-        let response = client.execute(request).await?;
-        let status = response.status();
-        if !status.is_success() {
-            bail!("page {} failed: HTTP {status} from {req_url}", i + 1);
+        match fetch_page_bytes(source, &client, &token, page, &image_url).await {
+            Ok(bytes) => {
+                let ext = image_url
+                    .path()
+                    .rsplit('.')
+                    .next()
+                    .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .unwrap_or("jpg")
+                    .to_ascii_lowercase();
+                cbz_pages.push((format!("{:0width$}.{ext}", i + 1, width = width), bytes));
+                downloaded += 1;
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                eprintln!("gideon download: page {} failed: {reason}", i + 1);
+                failed.push(format!("page {}: {reason}", i + 1));
+                cbz_pages.push((
+                    format!("{:0width$}.png", i + 1, width = width),
+                    error_page_png(i + 1, pages.len(), &reason),
+                ));
+            }
         }
-        let resp_headers = response.headers().clone();
-        let bytes = response.bytes().await?;
-
-        // Sources with scrambled images post-process the raw bytes.
-        let bytes = if source.1.process_page_image {
-            source
-                .process_page_image(
-                    token.clone(),
-                    (req_url, req_headers),
-                    (status, resp_headers),
-                    bytes,
-                    page.ctx.clone(),
-                )
-                .await?
-        } else {
-            bytes.to_vec()
-        };
-
-        let ext = image_url
-            .path()
-            .rsplit('.')
-            .next()
-            .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-            .unwrap_or("jpg")
-            .to_ascii_lowercase();
-        cbz_pages.push((format!("{:0width$}.{ext}", i + 1, width = width), bytes));
         progress(i + 1, pages.len());
     }
 
-    if cbz_pages.len() <= 1 {
-        bail!("no pages were downloaded");
+    if downloaded == 0 {
+        match failed.first() {
+            Some(first) => bail!(
+                "all {} page(s) failed to download (first error: {first})",
+                failed.len()
+            ),
+            None => bail!("no pages were downloaded"),
+        }
+    }
+    if !failed.is_empty() {
+        eprintln!(
+            "gideon download: {}/{} page(s) failed; placeholders inserted",
+            failed.len(),
+            pages.len()
+        );
     }
 
     let out_path = library
@@ -336,6 +352,199 @@ pub async fn download_chapter(
         .join(format!("{}.cbz", sanitize(&chapter_label)));
     pages_to_cbz(&out_path, &cbz_pages)?;
     Ok(out_path)
+}
+
+/// Fetch one page image through the source's request hook, with the
+/// forced-referer redirect handling and connection retries bobo uses.
+async fn fetch_page_bytes(
+    source: &Source,
+    client: &reqwest::Client,
+    token: &CancellationToken,
+    page: &gideon_aidoku::source::model::Page,
+    image_url: &Url,
+) -> Result<Vec<u8>> {
+    // The source may add auth headers / referers to the request.
+    let request = source
+        .get_image_request(image_url.clone(), page.ctx.clone())
+        .await?;
+    let (req_url, req_headers) = (request.url().clone(), request.headers().clone());
+    let response = execute_with_forced_referer(client, request).await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("HTTP {status} from {req_url}");
+    }
+    let resp_headers = response.headers().clone();
+    let bytes = response.bytes().await?;
+
+    // Sources with scrambled images post-process the raw bytes.
+    if source.1.process_page_image {
+        Ok(source
+            .process_page_image(
+                token.clone(),
+                (req_url, req_headers),
+                (status, resp_headers),
+                bytes,
+                page.ctx.clone(),
+            )
+            .await?)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+/// Maximum redirect hops followed manually.
+const MAX_REDIRECTS: usize = 10;
+/// Connection-level attempts per hop (bobo: 3, linear 200ms backoff).
+const CONNECT_ATTEMPTS: u32 = 3;
+
+/// Execute `request`, following redirects by hand so the Referer the
+/// source set survives every hop — image CDNs commonly 403 requests whose
+/// Referer was dropped or rewritten, which is exactly what reqwest's
+/// automatic redirect policy does. Connection-level errors are retried
+/// (HTTP error statuses are returned to the caller, not retried). Ported
+/// from bobo's `request_with_forced_referer_from_request`.
+async fn execute_with_forced_referer(
+    client: &reqwest::Client,
+    mut request: reqwest::Request,
+) -> Result<reqwest::Response> {
+    use reqwest::header::{LOCATION, REFERER};
+
+    let referer = request.headers().get(REFERER).cloned();
+
+    for _ in 0..MAX_REDIRECTS {
+        let method = request.method().clone();
+        let headers = request.headers().clone();
+
+        let mut response = None;
+        let mut last_err = None;
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            let cloned = request
+                .try_clone()
+                .context("request cannot be retried (streaming body)")?;
+            match client.execute(cloned).await {
+                Ok(resp) => {
+                    response = Some(resp);
+                    break;
+                }
+                Err(error) => {
+                    last_err = Some(error);
+                    if attempt < CONNECT_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
+                            .await;
+                    }
+                }
+            }
+        }
+        let response = match (response, last_err) {
+            (Some(resp), _) => resp,
+            (None, Some(error)) => return Err(error.into()),
+            (None, None) => bail!("request produced neither response nor error"),
+        };
+
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .context("redirect without Location header")?
+            .to_str()
+            .context("invalid Location header")?;
+        let next_url = response.url().join(location)?;
+
+        let mut next = client.request(method, next_url).build()?;
+        let next_headers = next.headers_mut();
+        for (key, value) in headers.iter() {
+            if key != REFERER {
+                next_headers.insert(key, value.clone());
+            }
+        }
+        // Keep the *original* Referer across the hop.
+        if let Some(ref referer) = referer {
+            next_headers.insert(REFERER, referer.clone());
+        }
+        request = next;
+    }
+    bail!("too many redirects")
+}
+
+/// A self-describing placeholder page for a failed download, so the
+/// chapter stays complete and the error renders on-screen in the reader
+/// (mirrors bobo's `generate_error_image`).
+fn error_page_png(page_no: usize, total: usize, reason: &str) -> Vec<u8> {
+    use gideon_render::text::draw_text;
+    use gideon_render::GrayPage;
+
+    let (w, h) = (600u32, 800u32);
+    let mut page = GrayPage::new_white(w, h);
+
+    // 2px black border so the placeholder reads as deliberate.
+    for x in 0..w {
+        for y in [0, 1, h - 2, h - 1] {
+            page.pixels[(y * w + x) as usize] = 0;
+        }
+    }
+    for y in 0..h {
+        for x in [0, 1, w - 2, w - 1] {
+            page.pixels[(y * w + x) as usize] = 0;
+        }
+    }
+
+    let margin = 40u32;
+    draw_text(
+        &mut page,
+        margin,
+        80,
+        40.0,
+        &format!("Page {page_no}/{total}"),
+        w - 2 * margin,
+        true,
+    );
+    draw_text(
+        &mut page,
+        margin,
+        140,
+        30.0,
+        "failed to download",
+        w - 2 * margin,
+        false,
+    );
+    let mut y = 220;
+    for line in wrap_text(reason, 40) {
+        draw_text(&mut page, margin, y, 24.0, &line, w - 2 * margin, false);
+        y += 32;
+        if y > h - margin {
+            break;
+        }
+    }
+
+    let image = image::GrayImage::from_raw(w, h, page.pixels)
+        .expect("placeholder buffer matches its dimensions");
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encoding an in-memory PNG cannot fail");
+    bytes.into_inner()
+}
+
+/// Greedy word wrap at `max_chars` per line.
+fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + word.chars().count() + 1 > max_chars {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn xml_escape(raw: &str) -> String {
@@ -399,6 +608,95 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 #[cfg(not(unix))]
 fn write_executable(path: &Path, content: &str) -> Result<()> {
     atomic_write(path, content)
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn error_page_is_a_decodable_image() {
+        let bytes = error_page_png(
+            3,
+            40,
+            "HTTP 403 Forbidden from https://cdn.example.com/x.jpg",
+        );
+        let image = image::load_from_memory(&bytes).expect("placeholder must decode");
+        assert_eq!((image.width(), image.height()), (600, 800));
+    }
+
+    #[test]
+    fn wrap_text_splits_long_reasons() {
+        let lines = wrap_text("one two three four", 9);
+        assert_eq!(lines, vec!["one two", "three", "four"]);
+        assert!(wrap_text("", 10).is_empty());
+        // A single oversized word still lands on its own line.
+        assert_eq!(
+            wrap_text("supercalifragilistic", 5),
+            vec!["supercalifragilistic"]
+        );
+    }
+
+    /// Minimal blocking HTTP server: answers each connection with the next
+    /// canned response and records request heads.
+    fn one_shot_server(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn forced_referer_survives_redirects() {
+        let (addr, heads) = one_shot_server(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /image.jpg\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let request = client
+                .get(format!("http://{addr}/start"))
+                .header("Referer", "https://manga.example.com/reader")
+                .build()
+                .unwrap();
+            let response = execute_with_forced_referer(&client, request).await.unwrap();
+            assert!(response.status().is_success());
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+        });
+
+        let first = heads.recv().unwrap();
+        let second = heads.recv().unwrap();
+        assert!(first.contains("GET /start"));
+        assert!(second.contains("GET /image.jpg"));
+        // The load-bearing assertion: the original Referer survived the hop.
+        assert!(
+            second
+                .to_ascii_lowercase()
+                .contains("referer: https://manga.example.com/reader"),
+            "redirected request lost the Referer:\n{second}"
+        );
+    }
 }
 
 #[cfg(test)]

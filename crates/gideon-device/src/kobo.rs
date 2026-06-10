@@ -262,12 +262,16 @@ impl KoboDisplay {
             }
         }
         // KOReader normalizes the framebuffer rotation to upright at startup
-        // (fbdepth -r); device touch tables assume that orientation. Best
-        // effort: a kernel that refuses keeps its rotation and we adapt to
-        // whatever geometry it reports.
-        if var.rotate != 0 {
+        // (fbdepth -R UR); device touch tables assume that orientation.
+        // Crucially "upright" is NOT rotate=0 on every device — the native
+        // rotate value that scans out a linear buffer upright is
+        // per-device (see [`upright_rotate_for_product`]). Best effort: a
+        // kernel that refuses keeps its rotation and we adapt to whatever
+        // geometry it reports.
+        let wanted_rotate = upright_rotate_from_env();
+        if var.rotate != wanted_rotate {
             let mut wanted = var;
-            wanted.rotate = 0;
+            wanted.rotate = wanted_rotate;
             // SAFETY: FBIOPUT_VSCREENINFO with a struct obtained from the
             // matching GET, only the rotate field changed.
             let ret = unsafe { ioctl(file.as_raw_fd(), FBIOPUT_VSCREENINFO, &mut wanted) };
@@ -278,8 +282,12 @@ impl KoboDisplay {
                 let _ = ioctl(file.as_raw_fd(), FBIOGET_FSCREENINFO, &mut fix);
             }
             eprintln!(
-                "gideon fb: rotation normalize {} (was rotate!=0, now rotate={})",
-                if ret == 0 { "ok" } else { "refused" },
+                "gideon fb: rotation normalize to {wanted_rotate} {} (now rotate={})",
+                if ret == 0 && var.rotate == wanted_rotate {
+                    "ok"
+                } else {
+                    "refused"
+                },
                 var.rotate
             );
         }
@@ -330,6 +338,42 @@ impl KoboDisplay {
             update_api: None,
         })
     }
+}
+
+/// The native `rotate` value that scans a linear framebuffer out *upright*
+/// (canonical portrait, what the UI and the touch tables assume).
+///
+/// This is NOT 0 on every device: each Kobo panel is mounted with its own
+/// scanout origin. The values mirror FBInk's empirically verified
+/// per-device rotation maps (`fbink_device_id.c`), which is exactly what
+/// KOReader's `fbdepth -R UR` startup normalization resolves through:
+///
+/// * Libra Colour (`monza*`) and Elipsa 2E (`condor`): canonical UR is
+///   native rotate=1 (map {UR:1, CW:0, UD:3, CCW:2}). Under Nickel the
+///   Libra Colour sits at rotate=3 — upside-down for a linear renderer.
+/// * Clara BW/Colour (`spa*`): canonical UR is native rotate=3
+///   (map {UR:3, CW:2, UD:1, CCW:0}).
+/// * Unknown devices keep the historical best-effort rotate=0.
+fn upright_rotate_for_product(product: Option<&str>) -> u32 {
+    match product.map(|p| p.trim().to_ascii_lowercase()).as_deref() {
+        Some("monza") | Some("monzakobo") | Some("monzatolino") | Some("condor") => 1,
+        Some(p) if p.starts_with("spa") => 3,
+        _ => 0,
+    }
+}
+
+/// Resolve the upright rotation: `GIDEON_FB_ROTATE` (0..=3) overrides,
+/// otherwise the per-device default for the Kobo `PRODUCT` codename (set
+/// by the stock system and re-derived by our launcher when missing).
+fn upright_rotate_from_env() -> u32 {
+    if let Some(rotate) = std::env::var("GIDEON_FB_ROTATE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|r| *r <= 3)
+    {
+        return rotate;
+    }
+    upright_rotate_for_product(std::env::var("PRODUCT").ok().as_deref())
 }
 
 impl Display for KoboDisplay {
@@ -550,6 +594,34 @@ mod pixel_format_tests {
         let mut out = [0u8; 6];
         write_gray_row(&[0x10, 0xF0], &mut out, 3);
         assert_eq!(out, [0x10, 0x10, 0x10, 0xF0, 0xF0, 0xF0]);
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::upright_rotate_for_product;
+
+    #[test]
+    fn libra_colour_family_is_upright_at_rotate_1() {
+        // FBInk rotationMap for monza/condor: canonical UR == native 1.
+        assert_eq!(upright_rotate_for_product(Some("monza")), 1);
+        assert_eq!(upright_rotate_for_product(Some(" MonzaKobo ")), 1);
+        assert_eq!(upright_rotate_for_product(Some("monzaTolino")), 1);
+        assert_eq!(upright_rotate_for_product(Some("condor")), 1);
+    }
+
+    #[test]
+    fn clara_family_is_upright_at_rotate_3() {
+        // FBInk rotationMap for spa*: canonical UR == native 3.
+        assert_eq!(upright_rotate_for_product(Some("spaBW")), 3);
+        assert_eq!(upright_rotate_for_product(Some("spaColour")), 3);
+        assert_eq!(upright_rotate_for_product(Some("spaTolinoBW")), 3);
+    }
+
+    #[test]
+    fn unknown_devices_keep_the_historical_zero() {
+        assert_eq!(upright_rotate_for_product(Some("frost")), 0);
+        assert_eq!(upright_rotate_for_product(None), 0);
     }
 }
 
