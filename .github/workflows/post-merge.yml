@@ -1,0 +1,71 @@
+name: Post-merge integration
+
+# Heavier checks that run after merges to main (and on demand): execute the
+# real armv7 Kobo binary under QEMU user-mode emulation, and verify the
+# preinstalled GitHub source list still works end to end.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qemu-integration:
+    name: QEMU armv7 integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ARM cross toolchain and QEMU
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user-static
+      - name: Build Kobo binary (armv7, kobo feature)
+        env:
+          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: |
+          cargo build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
+          cp target/armv7-unknown-linux-musleabihf/release/gideon /tmp/gideon-kobo
+      - name: Build plain binary (armv7, default features)
+        env:
+          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: cargo build --release --target armv7-unknown-linux-musleabihf
+      - name: Run integration tests under QEMU
+        run: ./ci/qemu_integration.sh /tmp/gideon-kobo target/armv7-unknown-linux-musleabihf/release/gideon
+      - name: Upload Kobo binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gideon-kobo-armv7
+          path: /tmp/gideon-kobo
+          retention-days: 30
+
+  live-sources:
+    name: Live source list fetch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace
+      - name: Fetch the preinstalled GitHub source list (3 attempts)
+        run: |
+          for attempt in 1 2 3; do
+            if out=$(./target/debug/gideon sources); then
+              echo "$out" | head -20
+              count=$(echo "$out" | grep -oE '^[0-9]+ source' | grep -oE '^[0-9]+' || echo 0)
+              if [ "${count:-0}" -ge 1 ]; then
+                echo "OK: $count sources available"
+                exit 0
+              fi
+            fi
+            echo "attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "live source list fetch failed after 3 attempts" >&2
+          exit 1

@@ -87,4 +87,10 @@ cargo fmt --all
 CI runs formatting, clippy (both feature sets), the full test suite, a CLI
 smoke test against a generated CBZ, and a cross-check for the Kobo target.
 
+After merges to main, a post-merge workflow goes further: it builds the real
+armv7 Kobo binaries and runs integration tests against them under QEMU
+user-mode emulation (`ci/qemu_integration.sh`), verifies the preinstalled
+GitHub source list still resolves live, and uploads the Kobo binary as a
+build artifact.
+
 See [ROADMAP.md](ROADMAP.md) for where this is going.
