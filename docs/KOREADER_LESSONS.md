@@ -28,7 +28,7 @@ Status legend: ✅ implemented · 📋 documented/deferred · ⚠️ known risk.
 
 | KOReader behavior | gideon status |
 | --- | --- |
-| Per-device mirroring from the device table (`PRODUCT` codename); Libra Colour (`monza`) is `touch_mirrored_y` | ✅ codename-based transform defaults (monza → swap+mirror-Y; Clara BW/Colour mapped); `GIDEON_TOUCH_TRANSFORM` overrides |
+| Per-device mirroring from the device table (`PRODUCT` codename); Libra Colour (`monza`) is `touch_mirrored_y` | ✅ codename-based transform defaults (monza → SwapXYMirrorX in our raw-axis convention — KOReader mirrors after the swap; Clara BW/Colour mapped); `GIDEON_TOUCH_TRANSFORM` overrides |
 | `pressure_event = ABS_MT_PRESSURE` on monza: contact tracked via pressure | ✅ zero pressure registers a release |
 | "snow" protocol quirks on some models (Clara BW) | 📋 tracker handles MT tracking-id + BTN_TOUCH + pressure; snow-specific quirks unverified on hardware |
 | Multi-touch gestures (pinch etc.) | 📋 taps only for now |

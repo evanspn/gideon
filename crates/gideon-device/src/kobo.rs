@@ -24,12 +24,13 @@ use crate::{blit_into, Display, Error, RefreshMode, Result};
 
 const FBIOGET_VSCREENINFO: u32 = 0x4600;
 const FBIOGET_FSCREENINFO: u32 = 0x4602;
-// _IOW('F', 0x2E, struct mxcfb_update_data_v1) — pre-Mark 7 kernels.
-const MXCFB_SEND_UPDATE_V1: u32 = 0x4048462E;
-// _IOW('F', 0x2E, struct mxcfb_update_data_v2) — Mark 7+ (Clara HD and
-// newer): same request, but the struct gained dither_mode/quant_bit, so
-// the encoded size (and therefore the ioctl number) differs.
-const MXCFB_SEND_UPDATE_V2: u32 = 0x4050462E;
+// _IOW('F', 0x2E, struct mxcfb_update_data_v1_ntx) — pre-Mark 7 kernels
+// (the NTX alt-buffer layout includes virt_addr): 0x44 bytes on the
+// 32-bit device ABI. Value matches KOReader's generated bindings.
+const MXCFB_SEND_UPDATE_V1: u32 = 0x4044462E;
+// _IOW('F', 0x2E, struct mxcfb_update_data_v2) — Mark 7+: dither fields
+// added and the alt-buffer DROPS virt_addr: 0x48 bytes on the device ABI.
+const MXCFB_SEND_UPDATE_V2: u32 = 0x4048462E;
 // _IOW('F', 0x2E, struct hwtcon_update_data) — MTK devices (Libra Colour,
 // Clara BW/Colour, Elipsa 2E): a different driver (HWTCON) with a compact
 // 36-byte update struct.
@@ -142,10 +143,21 @@ struct mxcfb_rect {
     height: u32,
 }
 
+/// Pre-Mark 7 (NTX) alt-buffer layout: includes virt_addr.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct mxcfb_alt_buffer_data_ntx {
+    virt_addr: libc::c_ulong,
+    phys_addr: u32,
+    width: u32,
+    height: u32,
+    alt_update_region: mxcfb_rect,
+}
+
+/// Mark 7+ alt-buffer layout: virt_addr was dropped.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct mxcfb_alt_buffer_data {
-    virt_addr: libc::c_ulong,
     phys_addr: u32,
     width: u32,
     height: u32,
@@ -161,7 +173,7 @@ struct mxcfb_update_data_v1 {
     update_marker: u32,
     temp: i32,
     flags: u32,
-    alt_buffer_data: mxcfb_alt_buffer_data,
+    alt_buffer_data: mxcfb_alt_buffer_data_ntx,
 }
 
 /// Mark 7+ layout (KOReader's `mxcfb_update_data_v2`): v1 plus the
@@ -379,8 +391,10 @@ impl Display for KoboDisplay {
         for &api in candidates {
             let ret = match api {
                 UpdateApi::Mtk => {
-                    // KOReader's HWTCON waveforms: GC16 flashes, REAGL
-                    // (GLR16) partials.
+                    // KOReader's HWTCON config: GC16 flashes, REAGL (GLR16)
+                    // partials — and REAGL must ALWAYS be paired with
+                    // UPDATE_MODE_FULL on these kernels (it doesn't flash;
+                    // see mtk-kobo.h and KOReader's hard promotion).
                     let mtk_waveform = match mode {
                         RefreshMode::Full => WAVEFORM_MODE_GC16,
                         RefreshMode::Partial => HWTCON_WAVEFORM_MODE_GLR16,
@@ -388,7 +402,7 @@ impl Display for KoboDisplay {
                     let mut update = hwtcon_update_data {
                         update_region: region,
                         waveform_mode: mtk_waveform,
-                        update_mode,
+                        update_mode: UPDATE_MODE_FULL,
                         update_marker: self.update_marker,
                         flags: 0,
                         dither_mode: 0,
@@ -439,8 +453,10 @@ impl Display for KoboDisplay {
                             &mut submitted,
                         )
                     };
-                    // …and for full completion before/around flashes.
-                    if mode == RefreshMode::Full {
+                    // …and for completion: every MTK send above is
+                    // UPDATE_MODE_FULL (REAGL requirement), and KOReader
+                    // waits for completion after FULL updates.
+                    {
                         let mut marker = hwtcon_update_marker_data {
                             update_marker: self.update_marker,
                             collision_test: 0,
@@ -548,16 +564,18 @@ mod ioctl_encoding_tests {
 
     #[test]
     fn update_ioctl_numbers_encode_the_32bit_struct_sizes() {
-        // The structs contain c_ulong, so their size matches the device
-        // (32-bit ARM) layout only there; the constants are fixed to the
-        // device ABI: 0x48 and 0x50 bytes.
-        assert_eq!(iow_f_2e(0x48), MXCFB_SEND_UPDATE_V1);
-        assert_eq!(iow_f_2e(0x50), MXCFB_SEND_UPDATE_V2);
+        // v1 (NTX layout, includes virt_addr) is 0x44 bytes on the 32-bit
+        // device ABI; v2 (dither fields, no virt_addr) is 0x48. Values
+        // match KOReader's generated bindings.
+        assert_eq!(iow_f_2e(0x44), MXCFB_SEND_UPDATE_V1);
+        assert_eq!(iow_f_2e(0x48), MXCFB_SEND_UPDATE_V2);
         #[cfg(target_pointer_width = "32")]
         {
-            assert_eq!(std::mem::size_of::<mxcfb_update_data_v1>(), 0x48);
-            assert_eq!(std::mem::size_of::<mxcfb_update_data_v2>(), 0x50);
+            assert_eq!(std::mem::size_of::<mxcfb_update_data_v1>(), 0x44);
+            assert_eq!(std::mem::size_of::<mxcfb_update_data_v2>(), 0x48);
         }
+        // v2's struct has no pointer-width fields anymore: pin it here too.
+        assert_eq!(std::mem::size_of::<mxcfb_update_data_v2>(), 0x48);
     }
 
     #[test]
@@ -576,10 +594,17 @@ mod ioctl_encoding_tests {
     }
 
     #[test]
-    fn v2_is_v1_plus_dither_fields() {
+    fn alt_buffer_layouts_differ_by_virt_addr() {
+        // NTX adds virt_addr; the exact +4 relationship holds on the
+        // device's 32-bit ABI (64-bit hosts add alignment padding).
+        assert!(
+            std::mem::size_of::<mxcfb_alt_buffer_data_ntx>()
+                > std::mem::size_of::<mxcfb_alt_buffer_data>()
+        );
+        #[cfg(target_pointer_width = "32")]
         assert_eq!(
-            std::mem::size_of::<mxcfb_update_data_v2>(),
-            std::mem::size_of::<mxcfb_update_data_v1>() + 8
+            std::mem::size_of::<mxcfb_alt_buffer_data_ntx>(),
+            std::mem::size_of::<mxcfb_alt_buffer_data>() + 4
         );
     }
 }
