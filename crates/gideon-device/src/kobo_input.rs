@@ -52,6 +52,10 @@ const KEY_POWER: u16 = 116;
 const KEY_SLEEP_COVER: u16 = 59;
 /// Elipsa-style power cover (KOReader: `[35] = "SleepCover"`; 35 is KEY_H).
 const KEY_POWER_COVER: u16 = 35;
+/// Physical page-back button (KOReader: `[193] = "RPgBack"`).
+const KEY_PAGE_BACK: u16 = 193;
+/// Physical page-forward button (KOReader: `[194] = "RPgFwd"`).
+const KEY_PAGE_FWD: u16 = 194;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -187,6 +191,8 @@ impl ButtonTracker {
         }
         match ev.code {
             KEY_POWER | KEY_SLEEP_COVER | KEY_POWER_COVER => Some(UiEvent::Sleep),
+            KEY_PAGE_FWD => Some(UiEvent::PageForward),
+            KEY_PAGE_BACK => Some(UiEvent::PageBack),
             _ => None,
         }
     }
@@ -228,96 +234,49 @@ impl KoboTouch {
         screen_h: u32,
         transform: TouchTransform,
     ) -> Result<Self> {
-        let mut devices: Vec<File> = Vec::new();
-        let mut touch_idx: Option<usize> = None;
-        let mut axes: Option<(u32, u32)> = None;
-
-        for n in 0..=9 {
-            let path = format!("/dev/input/event{n}");
-            // Non-blocking: next_event poll(2)s before reading, and
-            // discard_queued drains without fcntl gymnastics.
-            let Ok(file) = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-            else {
-                continue;
-            };
-            let fd = file.as_raw_fd();
-
-            let mut abs_bits = [0u8; 8];
-            // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
-            let abs_ok =
-                unsafe { ioctl(fd, eviocgbit(EV_ABS, abs_bits.len()), abs_bits.as_mut_ptr()) } >= 0;
-            let mt = abs_ok && bit_set(&abs_bits, ABS_MT_POSITION_X);
-            let is_touch = touch_idx.is_none() && abs_ok && (mt || bit_set(&abs_bits, ABS_X));
-
-            // Key capabilities: 16 bytes cover codes 0..=127, enough for
-            // the power button (116) and the cover codes (59/35).
-            let mut key_bits = [0u8; 16];
-            // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
-            let key_ok =
-                unsafe { ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr()) } >= 0;
-            let has_power = key_ok && bit_set(&key_bits, KEY_POWER);
-            let has_cover = key_ok
-                && (bit_set(&key_bits, KEY_SLEEP_COVER) || bit_set(&key_bits, KEY_POWER_COVER));
-
-            if !is_touch && !has_power && !has_cover {
-                continue;
-            }
-
-            if is_touch {
-                let (x_axis, y_axis) = if mt {
-                    (ABS_MT_POSITION_X, ABS_MT_POSITION_Y)
-                } else {
-                    (ABS_X, ABS_Y)
-                };
-                // Some devices advertise ABS bits but reject EVIOCGABS; fall
-                // back to screen dimensions rather than aborting.
-                let (max_x, max_y) = match (read_axis_max(fd, x_axis), read_axis_max(fd, y_axis)) {
-                    (Ok(x), Ok(y)) => (x, y),
-                    (x, y) => {
-                        eprintln!(
-                            "gideon touch: {path}: EVIOCGABS failed (x: {x:?}, y: {y:?}); using screen dims"
-                        );
-                        (
-                            x.unwrap_or(screen_w.max(1) - 1),
-                            y.unwrap_or(screen_h.max(1) - 1),
-                        )
-                    }
-                };
-                eprintln!(
-                    "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={transform:?}"
-                );
-                touch_idx = Some(devices.len());
-                axes = Some((max_x, max_y));
-            } else {
-                eprintln!(
-                    "gideon input: using {path} for buttons (power={has_power} cover={has_cover})"
-                );
-            }
-            devices.push(file);
-        }
-
-        let Some(touch_idx) = touch_idx else {
-            return Err(Error::Display(
-                "no touch screen found on /dev/input/event0..9".to_string(),
-            ));
-        };
-        let (max_x, max_y) = axes.expect("axes recorded with touch_idx");
-
+        let scan = scan_devices(screen_w, screen_h, transform)?;
         Ok(Self {
-            devices,
-            touch_idx,
+            devices: scan.devices,
+            touch_idx: scan.touch_idx,
             tracker: TouchTracker::new(),
             buttons: ButtonTracker::new(),
             pending: VecDeque::new(),
             transform,
-            max_x,
-            max_y,
+            max_x: scan.max_x,
+            max_y: scan.max_y,
             screen_w,
             screen_h,
         })
+    }
+
+    /// Close and re-scan every input device. MTK kernels (Libra Colour)
+    /// can re-register the evdev nodes across a suspend/resume cycle,
+    /// leaving our fds dead — without this, the first cover-close sleep
+    /// would kill input (and with it the app) on wake. Retries briefly:
+    /// the nodes take a moment to come back after resume. Keeps the old
+    /// devices when every retry fails (they may still be alive).
+    pub fn reopen(&mut self) {
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            match scan_devices(self.screen_w, self.screen_h, self.transform) {
+                Ok(scan) => {
+                    self.devices = scan.devices;
+                    self.touch_idx = scan.touch_idx;
+                    self.max_x = scan.max_x;
+                    self.max_y = scan.max_y;
+                    self.tracker = TouchTracker::new();
+                    self.buttons = ButtonTracker::new();
+                    self.pending.clear();
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("gideon input: rescan attempt {} failed: {e}", attempt + 1);
+                }
+            }
+        }
+        eprintln!("gideon input: rescan failed; keeping the previous devices");
     }
 
     /// Drain any already-queued evdev events without blocking and reset the
@@ -331,7 +290,109 @@ impl KoboTouch {
         self.buttons = ButtonTracker::new();
         self.pending.clear();
     }
+}
 
+/// What a device scan found.
+struct Scan {
+    devices: Vec<File>,
+    touch_idx: usize,
+    max_x: u32,
+    max_y: u32,
+}
+
+/// Scan `/dev/input/event0..event9` for the touch panel and button devices
+/// (see [`KoboTouch::open_with_transform`]).
+fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Result<Scan> {
+    let mut devices: Vec<File> = Vec::new();
+    let mut touch_idx: Option<usize> = None;
+    let mut axes: Option<(u32, u32)> = None;
+
+    for n in 0..=9 {
+        let path = format!("/dev/input/event{n}");
+        // Non-blocking: next_event poll(2)s before reading, and
+        // discard_queued drains without fcntl gymnastics.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        else {
+            continue;
+        };
+        let fd = file.as_raw_fd();
+
+        let mut abs_bits = [0u8; 8];
+        // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
+        let abs_ok =
+            unsafe { ioctl(fd, eviocgbit(EV_ABS, abs_bits.len()), abs_bits.as_mut_ptr()) } >= 0;
+        let mt = abs_ok && bit_set(&abs_bits, ABS_MT_POSITION_X);
+        let is_touch = touch_idx.is_none() && abs_ok && (mt || bit_set(&abs_bits, ABS_X));
+
+        // Key capabilities: 32 bytes cover codes 0..=255 — the power
+        // button (116), the cover codes (59/35) and the physical
+        // page-turn buttons (193/194).
+        let mut key_bits = [0u8; 32];
+        // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
+        let key_ok =
+            unsafe { ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr()) } >= 0;
+        let has_power = key_ok && bit_set(&key_bits, KEY_POWER);
+        let has_cover =
+            key_ok && (bit_set(&key_bits, KEY_SLEEP_COVER) || bit_set(&key_bits, KEY_POWER_COVER));
+        let has_pages =
+            key_ok && (bit_set(&key_bits, KEY_PAGE_FWD) || bit_set(&key_bits, KEY_PAGE_BACK));
+
+        if !is_touch && !has_power && !has_cover && !has_pages {
+            continue;
+        }
+
+        if is_touch {
+            let (x_axis, y_axis) = if mt {
+                (ABS_MT_POSITION_X, ABS_MT_POSITION_Y)
+            } else {
+                (ABS_X, ABS_Y)
+            };
+            // Some devices advertise ABS bits but reject EVIOCGABS; fall
+            // back to screen dimensions rather than aborting.
+            let (max_x, max_y) = match (read_axis_max(fd, x_axis), read_axis_max(fd, y_axis)) {
+                (Ok(x), Ok(y)) => (x, y),
+                (x, y) => {
+                    eprintln!(
+                            "gideon touch: {path}: EVIOCGABS failed (x: {x:?}, y: {y:?}); using screen dims"
+                        );
+                    (
+                        x.unwrap_or(screen_w.max(1) - 1),
+                        y.unwrap_or(screen_h.max(1) - 1),
+                    )
+                }
+            };
+            eprintln!(
+                    "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={transform:?}"
+                );
+            touch_idx = Some(devices.len());
+            axes = Some((max_x, max_y));
+        } else {
+            eprintln!(
+                    "gideon input: using {path} for buttons (power={has_power} cover={has_cover} pages={has_pages})"
+                );
+        }
+        devices.push(file);
+    }
+
+    let Some(touch_idx) = touch_idx else {
+        return Err(Error::Display(
+            "no touch screen found on /dev/input/event0..9".to_string(),
+        ));
+    };
+    let (max_x, max_y) = axes.expect("axes recorded with touch_idx");
+
+    Ok(Scan {
+        devices,
+        touch_idx,
+        max_x,
+        max_y,
+    })
+}
+
+impl KoboTouch {
     /// Drain queued events but keep sleep requests: taps made while a
     /// chapter downloaded are stale, a sleep cover closed during it is not
     /// — the device must still go to sleep once the download finishes.
@@ -405,16 +466,26 @@ impl KoboTouch {
             }
         }
 
+        let mut lost_touch = false;
         for &i in dead.iter().rev() {
             eprintln!("gideon input: device {i} went away, dropping it");
             self.devices.remove(i);
             if i == self.touch_idx {
-                return Err(Error::Display(
-                    "the touch input device disappeared".to_string(),
-                ));
-            }
-            if i < self.touch_idx {
+                lost_touch = true;
+            } else if i < self.touch_idx {
                 self.touch_idx -= 1;
+            }
+        }
+        if lost_touch {
+            // Kernels re-register input nodes (e.g. across suspend/resume);
+            // rescan rather than dying — without a touch screen the app is
+            // unusable and the launcher would reboot the device.
+            eprintln!("gideon input: touch device disappeared, rescanning");
+            self.reopen();
+            if self.devices.is_empty() {
+                return Err(Error::Display(
+                    "the touch input device disappeared and did not come back".to_string(),
+                ));
             }
         }
         Ok(())
@@ -484,6 +555,10 @@ impl InputSource for KoboTouch {
 
     fn discard_taps(&mut self) {
         KoboTouch::discard_taps(self);
+    }
+
+    fn refresh_devices(&mut self) {
+        KoboTouch::reopen(self);
     }
 }
 
@@ -622,6 +697,31 @@ mod tests {
             b.push(&ev(EV_KEY, KEY_POWER_COVER, 1)),
             Some(UiEvent::Sleep)
         );
+    }
+
+    #[test]
+    fn page_buttons_emit_page_events_on_press_only() {
+        let mut b = ButtonTracker::new();
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_PAGE_FWD, 1)),
+            Some(UiEvent::PageForward)
+        );
+        assert_eq!(b.push(&ev(EV_KEY, KEY_PAGE_FWD, 0)), None, "release");
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_PAGE_BACK, 1)),
+            Some(UiEvent::PageBack)
+        );
+        assert_eq!(b.push(&ev(EV_KEY, KEY_PAGE_BACK, 2)), None, "repeat");
+    }
+
+    #[test]
+    fn key_bitmask_covers_the_page_button_codes() {
+        // 193/194 live above the old 16-byte (0..=127) probe window; the
+        // scan must use a 32-byte mask or the buttons are invisible.
+        let mut bits = [0u8; 32];
+        bits[(KEY_PAGE_FWD / 8) as usize] |= 1 << (KEY_PAGE_FWD % 8);
+        assert!(bit_set(&bits, KEY_PAGE_FWD));
+        assert!(!bit_set(&bits[..16], KEY_PAGE_FWD), "16 bytes is too small");
     }
 
     #[test]

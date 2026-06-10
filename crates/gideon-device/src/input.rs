@@ -17,6 +17,10 @@ use std::str::FromStr;
 pub enum UiEvent {
     /// A finger tapped the screen at (x, y) in screen coordinates.
     Tap { x: u32, y: u32 },
+    /// Physical page-forward button (Kobo Libra family: code 194, RPgFwd).
+    PageForward,
+    /// Physical page-back button (Kobo Libra family: code 193, RPgBack).
+    PageBack,
     /// The user asked the device to sleep: power button pressed or the
     /// magnetic sleep cover closed (KOReader: KEY_POWER=116 press, sleep
     /// cover codes 59/35 press). Waking is *not* an event: the suspend call
@@ -42,17 +46,25 @@ pub trait InputSource {
     fn discard_taps(&mut self) {
         self.discard_queued();
     }
+
+    /// Re-open the underlying devices after a suspend/resume cycle:
+    /// kernels can re-register input nodes across suspend, leaving old
+    /// fds dead. Default: no-op (fakes have nothing to reopen).
+    fn refresh_devices(&mut self) {}
 }
 
 /// Test input source: replays a fixed list of events, then errors.
 pub struct FakeInput {
     events: std::vec::IntoIter<UiEvent>,
+    /// How often `refresh_devices` ran (the post-wake reopen), for tests.
+    pub refreshes: usize,
 }
 
 impl FakeInput {
     pub fn new(events: Vec<UiEvent>) -> Self {
         Self {
             events: events.into_iter(),
+            refreshes: 0,
         }
     }
 }
@@ -62,6 +74,10 @@ impl InputSource for FakeInput {
         self.events
             .next()
             .ok_or_else(|| crate::Error::Display("fake input exhausted".to_string()))
+    }
+
+    fn refresh_devices(&mut self) {
+        self.refreshes += 1;
     }
 }
 

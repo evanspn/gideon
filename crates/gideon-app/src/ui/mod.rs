@@ -31,7 +31,7 @@ use gideon_render::{FitMode, GrayPage};
 
 use crate::reader::Reader;
 
-const HOME_ROWS: [&str; 3] = ["Library", "Browse sources", "Check for updates"];
+const HOME_ROWS: [&str; 4] = ["Library", "Search", "Browse sources", "Check for updates"];
 const SHELF_COLUMNS: u32 = 3;
 
 /// One row on the Sources screen.
@@ -68,10 +68,18 @@ enum Screen {
     Listings {
         source: SourceEntry,
     },
-    /// On-screen keyboard for a manga search within a source.
+    /// On-screen keyboard for a manga search. `source: None` searches every
+    /// installed source (the Home-screen entry point — e-ink refreshes cost
+    /// a second each, so search must not hide behind a source picker).
     Search {
-        source: SourceEntry,
+        source: Option<SourceEntry>,
         query: String,
+    },
+    /// Global search results: each row knows which source it came from.
+    SearchResults {
+        query: String,
+        results: Vec<(SourceEntry, MangaEntry)>,
+        page: usize,
     },
     MangaList {
         source: SourceEntry,
@@ -188,6 +196,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         &self.gateway
     }
 
+    #[cfg(test)]
+    pub(crate) fn input(&self) -> &I {
+        &self.input
+    }
+
     #[cfg_attr(feature = "kobo", allow(dead_code))]
     fn screen(&self) -> &Screen {
         self.stack.last().expect("screen stack is never empty")
@@ -212,6 +225,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // The UI must never die on an error: show it instead.
                     Err(e) => self.show_error(&e)?,
                 },
+                // Physical page-turn buttons page through whatever list is
+                // on screen (library shelf, sources, results…).
+                Ok(UiEvent::PageForward) => {
+                    if let Err(e) = self.flip_page(1) {
+                        self.show_error(&e)?;
+                    }
+                }
+                Ok(UiEvent::PageBack) => {
+                    if let Err(e) = self.flip_page(-1) {
+                        self.show_error(&e)?;
+                    }
+                }
                 Ok(UiEvent::Sleep) => {
                     if let Err(e) = self.sleep_now() {
                         self.show_error(&e)?;
@@ -228,6 +253,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.sleeper.is_none() || self.sleep_debounced() {
             return Ok(());
         }
+        // E-ink keeps its image with zero power: this stays on the panel
+        // for the whole nap, and doubles as feedback that the cover close
+        // / button press registered.
+        self.show_status(&["Sleeping…", "Press power or open the cover to wake."])?;
         let result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -238,6 +267,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.render_current(RefreshMode::Full)?;
             return Ok(());
         }
+        // The kernel may have re-registered the input nodes across the
+        // suspend — reopen them, then drop the key press that woke us.
+        self.input.refresh_devices();
         self.input.discard_queued();
         self.render_current(RefreshMode::Full)?;
         result.map(|_| ())
@@ -301,6 +333,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let (page, count) = match screen {
             Screen::Library { entries, page } => (page, entries.len().div_ceil(shelf_capacity)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
+            Screen::SearchResults { results, page, .. } => (page, results.len().div_ceil(per_page)),
             Screen::MangaList { mangas, page, .. } => (page, mangas.len().div_ceil(per_page)),
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
             _ => return Ok(()),
@@ -324,10 +357,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(Flow::Continue)
                 }
                 1 => {
-                    self.open_sources()?;
+                    self.open_global_search()?;
                     Ok(Flow::Continue)
                 }
                 2 => {
+                    self.open_sources()?;
+                    Ok(Flow::Continue)
+                }
+                3 => {
                     self.check_updates()?;
                     Ok(Flow::Continue)
                 }
@@ -355,7 +392,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     2 => {
                         self.keyboard_paints = 0;
                         self.push(Screen::Search {
-                            source,
+                            source: Some(source),
                             query: String::new(),
                         })?;
                         return Ok(Flow::Continue);
@@ -367,6 +404,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             Screen::Search { source, query } => {
                 self.tap_keyboard(&source, &query, x, y)?;
+                Ok(Flow::Continue)
+            }
+            Screen::SearchResults { results, page, .. } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some((source, manga)) = results.get(index).cloned() {
+                    self.open_chapter_list(&source, &manga)?;
+                }
                 Ok(Flow::Continue)
             }
             Screen::MangaList {
@@ -473,7 +517,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Handle a tap on the search keyboard: edit the query in place
     /// (partial refresh) or run the search.
-    fn tap_keyboard(&mut self, source: &SourceEntry, query: &str, x: u32, y: u32) -> Result<()> {
+    fn tap_keyboard(
+        &mut self,
+        source: &Option<SourceEntry>,
+        query: &str,
+        x: u32,
+        y: u32,
+    ) -> Result<()> {
         let edited = match self.layout.key_at(x, y) {
             Some(Key::Char(c)) => {
                 let mut q = query.to_string();
@@ -523,7 +573,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(())
     }
 
-    fn run_search(&mut self, source: &SourceEntry, query: &str) -> Result<()> {
+    /// Open the global-search keyboard from Home (every installed source).
+    fn open_global_search(&mut self) -> Result<()> {
+        if self.gateway.installed_sources()?.is_empty() {
+            return self.push(Screen::Message {
+                title: "Search".to_string(),
+                body: "No sources installed yet.\nInstall one under Browse sources first."
+                    .to_string(),
+            });
+        }
+        self.keyboard_paints = 0;
+        self.push(Screen::Search {
+            source: None,
+            query: String::new(),
+        })
+    }
+
+    fn run_search(&mut self, source: &Option<SourceEntry>, query: &str) -> Result<()> {
+        match source {
+            Some(source) => self.run_source_search(source, query),
+            None => self.run_global_search(query),
+        }
+    }
+
+    /// Search one source; results open as a normal manga list.
+    fn run_source_search(&mut self, source: &SourceEntry, query: &str) -> Result<()> {
         self.show_status(&[&format!("Searching for \"{query}\"…")])?;
         let mangas = self
             .gateway
@@ -540,6 +614,46 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             source: source.clone(),
             listing: format!("\"{query}\""),
             mangas,
+            page: 0,
+        })
+    }
+
+    /// Search every installed source and merge the results. A source that
+    /// errors is skipped (its name is noted) — one broken source must not
+    /// kill the search.
+    fn run_global_search(&mut self, query: &str) -> Result<()> {
+        let sources = self.gateway.installed_sources()?;
+        let mut results: Vec<(SourceEntry, MangaEntry)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for source in &sources {
+            self.show_status(&[
+                &format!("Searching for \"{query}\"…"),
+                &format!("{}…", source.name),
+            ])?;
+            match self.gateway.search_manga(&source.id, query) {
+                Ok(mangas) => {
+                    results.extend(mangas.into_iter().map(|m| (source.clone(), m)));
+                }
+                Err(e) => {
+                    eprintln!("gideon: search on {} failed: {e:#}", source.name);
+                    failed.push(source.name.clone());
+                }
+            }
+        }
+        if results.is_empty() {
+            let mut body = format!("No results for \"{query}\".");
+            if !failed.is_empty() {
+                body.push_str(&format!("\n(Search failed on: {}.)", failed.join(", ")));
+            }
+            // Stay on the keyboard so the user can refine the query.
+            return self.push(Screen::Message {
+                title: "Search".to_string(),
+                body,
+            });
+        }
+        self.push(Screen::SearchResults {
+            query: query.to_string(),
+            results,
             page: 0,
         })
     }
@@ -716,6 +830,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                         ReaderZone::Back => break,
                     },
+                    Ok(UiEvent::PageForward) => {
+                        reader.next_page()?;
+                    }
+                    Ok(UiEvent::PageBack) => {
+                        reader.prev_page()?;
+                    }
                     Ok(UiEvent::Sleep) => {
                         // Field accesses only: `reader` is borrowing
                         // `self.display`, so no whole-`self` method calls.
@@ -736,7 +856,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         if matches!(result, Ok(SleepResult::Skipped)) {
                             continue; // still awake, screen untouched
                         }
-                        // Drop the wake key press, repaint in full.
+                        // Reopen possibly re-registered input nodes, drop
+                        // the wake key press, repaint in full.
+                        self.input.refresh_devices();
                         self.input.discard_queued();
                         reader.repaint_full()?;
                     }
@@ -788,7 +910,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::Home => {
                 let rows: Vec<(String, bool)> =
                     HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
-                compose_list(l, "gideon", &rows, 0, 1)
+                // The version in the title answers "did the update take?"
+                // at a glance.
+                let title = concat!("gideon v", env!("CARGO_PKG_VERSION"));
+                compose_list(l, title, &rows, 0, 1)
             }
             Screen::Library { entries, page } => self.compose_library(entries, *page)?,
             Screen::Sources { rows, page } => {
@@ -806,7 +931,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ];
                 compose_list(l, &source.name, &rows, 0, 1)
             }
-            Screen::Search { source, query } => compose_search(l, &source.name, query),
+            Screen::Search { source, query } => {
+                let scope = source.as_ref().map_or("all sources", |s| s.name.as_str());
+                compose_search(l, scope, query)
+            }
+            Screen::SearchResults {
+                query,
+                results,
+                page,
+            } => {
+                let rows: Vec<(String, bool)> = paged(results, *page, per_page)
+                    .iter()
+                    .map(|(s, m)| (format!("{} — {}", m.title, s.name), true))
+                    .collect();
+                compose_list(
+                    l,
+                    &format!("\"{query}\""),
+                    &rows,
+                    *page,
+                    l.page_count(results.len()),
+                )
+            }
             Screen::MangaList {
                 source,
                 listing,

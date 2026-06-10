@@ -46,6 +46,8 @@ struct FakeGateway {
     search_results: std::result::Result<Vec<MangaEntry>, String>,
     /// Queries passed to `search_manga`, in order.
     searches: RefCell<Vec<String>>,
+    /// Source ids passed to `search_manga`, in order.
+    searched_sources: RefCell<Vec<String>>,
     chapters: Vec<ChapterEntry>,
     download: Option<DownloadFn>,
     update_message: String,
@@ -61,6 +63,7 @@ impl Default for FakeGateway {
             mangas: Ok(Vec::new()),
             search_results: Ok(Vec::new()),
             searches: RefCell::new(Vec::new()),
+            searched_sources: RefCell::new(Vec::new()),
             chapters: Vec::new(),
             download: None,
             update_message: "up to date".to_string(),
@@ -93,8 +96,11 @@ impl SourceGateway for FakeGateway {
         self.mangas.clone().map_err(|e| anyhow!(e))
     }
 
-    fn search_manga(&self, _source_id: &str, query: &str) -> Result<Vec<MangaEntry>> {
+    fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>> {
         self.searches.borrow_mut().push(query.to_string());
+        self.searched_sources
+            .borrow_mut()
+            .push(source_id.to_string());
         self.search_results.clone().map_err(|e| anyhow!(e))
     }
 
@@ -452,7 +458,7 @@ fn sources_screen_lists_installed_then_available() {
         ]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(1)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(2)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -476,7 +482,7 @@ fn source_list_fetch_error_shows_note_row_and_continues() {
         available: Err("network unreachable".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(1)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(2)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -500,7 +506,7 @@ fn tapping_available_source_installs_and_refreshes() {
         ..FakeGateway::default()
     };
     // Rows: [Separator, Available("New Source")] -> tap row 1 installs.
-    let mut app = app(dir.path(), gateway, vec![tap_row(1), tap_row(1)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(2), tap_row(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -554,7 +560,7 @@ fn full_browse_download_and_read_flow() {
     };
 
     let events = vec![
-        tap_row(1),        // Home -> Sources
+        tap_row(2),        // Home -> Sources
         tap_row(0),        // installed "Src" -> Listings
         tap_row(0),        // Popular -> MangaList
         tap_row(0),        // Manga One -> ChapterList
@@ -601,7 +607,7 @@ fn manga_list_paginates() {
     };
 
     let events = vec![
-        tap_row(1),     // Sources
+        tap_row(2),     // Sources
         tap_row(0),     // Listings
         tap_row(0),     // Popular
         tap_nav_next(), // page 2
@@ -632,7 +638,7 @@ fn listing_failure_shows_error_screen_with_back() {
     };
 
     let events = vec![
-        tap_row(1), // Sources
+        tap_row(2), // Sources
         tap_row(0), // Listings
         tap_row(0), // Popular -> fails
         tap_row(0), // tap the error screen -> back
@@ -655,7 +661,7 @@ fn error_screen_renders_the_message() {
         mangas: Err("server exploded".into()),
         ..FakeGateway::default()
     };
-    let events = vec![tap_row(1), tap_row(0), tap_row(0)];
+    let events = vec![tap_row(2), tap_row(0), tap_row(0)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -673,7 +679,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(3)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -724,7 +730,7 @@ fn update_prompt_installs_on_tap() {
         ..FakeGateway::default()
     };
     // Home row 2 = "Check for updates" -> prompt; content tap installs.
-    let mut app = app(dir.path(), gateway, vec![tap_row(2), tap_row(0)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(3), tap_row(0)]);
     app.run().unwrap();
 
     assert_eq!(
@@ -769,16 +775,132 @@ fn search_gateway() -> FakeGateway {
 }
 
 #[test]
+fn home_search_goes_straight_to_the_keyboard() {
+    // One tap from Home — e-ink refreshes cost a second each, so search
+    // must not hide behind Sources -> source -> Search.
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), search_gateway(), vec![tap_row(1)]);
+    app.run().unwrap();
+
+    let Screen::Search { source, query } = app.screen() else {
+        panic!("expected the global search keyboard");
+    };
+    assert!(source.is_none(), "home search covers all sources");
+    assert_eq!(query, "");
+}
+
+#[test]
+fn home_search_without_sources_explains_instead_of_a_dead_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![tap_row(1)]);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected install hint");
+    };
+    assert_eq!(title, "Search");
+    assert!(body.contains("Browse sources"));
+}
+
+#[test]
+fn global_search_queries_every_source_and_labels_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![
+            SourceEntry {
+                id: "src1".into(),
+                name: "First".into(),
+            },
+            SourceEntry {
+                id: "src2".into(),
+                name: "Second".into(),
+            },
+        ]),
+        search_results: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Naruto".into(),
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        ..FakeGateway::default()
+    };
+    let events = vec![
+        tap_row(1), // Home -> global search keyboard
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search),
+        tap_row(1), // second result -> ChapterList via its own source
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    assert_eq!(
+        *app.gateway().searched_sources.borrow(),
+        vec!["src1".to_string(), "src2".to_string()],
+        "every installed source must be searched"
+    );
+    // Both sources contributed a result; tapping the second opened its
+    // chapter list with the right source attached.
+    let Screen::ChapterList { source, manga, .. } = app.screen() else {
+        panic!("expected chapter list from a search result");
+    };
+    assert_eq!(source.id, "src2");
+    assert_eq!(manga.title, "Naruto");
+}
+
+#[test]
+fn global_search_with_no_hits_keeps_the_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.search_results = Ok(Vec::new());
+    let events = vec![
+        tap_row(1),
+        tap_key(Key::Char('z')),
+        tap_key(Key::Search),
+        tap_back(), // dismiss the message
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::Search { query, .. } = app.screen() else {
+        panic!("expected to land back on the keyboard");
+    };
+    assert_eq!(query, "z");
+}
+
+#[test]
+fn global_search_skips_a_broken_source_keeps_the_rest() {
+    // search_results is shared in the fake, so simulate "one broken
+    // source" with all-broken + non-empty vs the message path instead:
+    // a failing source must surface in the no-results message.
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.search_results = Err("cloudflare tantrum".into());
+    let events = vec![tap_row(1), tap_key(Key::Char('a')), tap_key(Key::Search)];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected message screen");
+    };
+    assert_eq!(title, "Search");
+    assert!(body.contains("Search failed on: Src"), "{body}");
+}
+
+#[test]
 fn listings_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_row(1), tap_row(0), tap_row(2)];
+    let events = vec![tap_row(2), tap_row(0), tap_row(2)];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
 
     let Screen::Search { source, query } = app.screen() else {
         panic!("expected search screen");
     };
-    assert_eq!(source.id, "src");
+    assert_eq!(source.as_ref().map(|s| s.id.as_str()), Some("src"));
     assert_eq!(query, "");
     assert!(
         app.display().buffer.iter().any(|&p| p < 0x80),
@@ -790,7 +912,7 @@ fn listings_search_row_opens_the_keyboard() {
 fn typing_builds_the_query_with_partial_refreshes() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -819,7 +941,7 @@ fn typing_builds_the_query_with_partial_refreshes() {
 #[test]
 fn every_eighth_keystroke_flashes_the_panel_clean() {
     let dir = tempfile::tempdir().unwrap();
-    let mut events = vec![tap_row(1), tap_row(0), tap_row(2)];
+    let mut events = vec![tap_row(2), tap_row(0), tap_row(2)];
     events.extend(std::iter::repeat_with(|| tap_key(Key::Char('a'))).take(8));
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
@@ -836,7 +958,7 @@ fn every_eighth_keystroke_flashes_the_panel_clean() {
 fn punctuation_for_manga_titles_is_typeable() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('r')),
@@ -859,7 +981,7 @@ fn punctuation_for_manga_titles_is_typeable() {
 fn space_is_not_allowed_leading_or_doubled() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Space), // leading — ignored
@@ -880,7 +1002,7 @@ fn space_is_not_allowed_leading_or_doubled() {
 fn search_key_queries_the_gateway_and_shows_results() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -913,7 +1035,7 @@ fn search_results_open_chapters_like_any_list() {
         lang: None,
     }];
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -932,7 +1054,7 @@ fn search_results_open_chapters_like_any_list() {
 #[test]
 fn empty_query_search_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_row(1), tap_row(0), tap_row(2), tap_key(Key::Search)];
+    let events = vec![tap_row(2), tap_row(0), tap_row(2), tap_key(Key::Search)];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
 
@@ -946,7 +1068,7 @@ fn empty_results_show_a_message_and_keep_the_keyboard_below() {
     let mut gateway = search_gateway();
     gateway.search_results = Ok(Vec::new());
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('z')),
@@ -968,7 +1090,7 @@ fn search_failure_shows_error_screen() {
     let mut gateway = search_gateway();
     gateway.search_results = Err("source exploded".into());
     let events = vec![
-        tap_row(1),
+        tap_row(2),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('a')),
@@ -987,10 +1109,71 @@ fn search_failure_shows_error_screen() {
 #[test]
 fn back_leaves_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_row(1), tap_row(0), tap_row(2), tap_back()];
+    let events = vec![tap_row(2), tap_row(0), tap_row(2), tap_back()];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Listings { .. }));
+}
+
+// --- physical page-turn buttons ---
+
+#[test]
+fn page_buttons_flip_library_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let l = layout();
+    let capacity = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS).capacity();
+    for i in 0..capacity + 2 {
+        make_cbz(&lib.join(format!("Series/vol{i:02}.cbz")), 1);
+    }
+
+    let events = vec![
+        tap_row(0), // Library
+        UiEvent::PageForward,
+        UiEvent::PageForward, // clamped at the last page
+        UiEvent::PageBack,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Library { page, .. } = app.screen() else {
+        panic!("expected library");
+    };
+    assert_eq!(*page, 0, "forward, clamp, back lands on page 0");
+    // Button page flips are partial refreshes, like nav-bar ones.
+    assert!(app.display().flushes.contains(&RefreshMode::Partial));
+}
+
+#[test]
+fn page_buttons_turn_reader_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        UiEvent::PageForward, // page 1
+        UiEvent::PageForward, // page 2
+        UiEvent::PageBack,    // page 1
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+}
+
+#[test]
+fn page_buttons_are_ignored_on_unpaged_screens() {
+    // Home has no pages; a button press must not crash or navigate.
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![UiEvent::PageForward, UiEvent::PageBack, tap_row(0)];
+    let lib = dir.path().join("Manga");
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Library { .. }));
 }
 
 // --- sleep (power button / sleep cover) ---
@@ -1017,12 +1200,18 @@ fn sleep_event_suspends_and_repaints_in_full() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "sleeper must run on UiEvent::Sleep");
-    // Initial paint + post-wake repaint, both full.
+    // Initial paint, the "Sleeping…" screen, the post-wake repaint.
     assert_eq!(
         app.display().flushes,
-        vec![RefreshMode::Full, RefreshMode::Full]
+        vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
     );
     assert!(matches!(app.screen(), Screen::Home));
+    assert_eq!(
+        app.input().refreshes,
+        1,
+        "input devices must be reopened after resume — the kernel can \
+         re-register the nodes and dead fds would kill input"
+    );
 }
 
 #[test]
@@ -1052,11 +1241,13 @@ fn skipped_suspend_explains_itself_and_stays_awake() {
 
     assert_eq!(count.get(), 1);
     assert!(matches!(app.screen(), Screen::Home));
-    // Initial paint, the "staying awake" notice, and the restore repaint.
-    assert_eq!(
-        app.display().flushes,
-        vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
-    );
+    // Initial paint, "Sleeping…", the "staying awake" notice, the restore.
+    assert_eq!(app.display().flushes.len(), 4);
+    assert!(app
+        .display()
+        .flushes
+        .iter()
+        .all(|m| *m == RefreshMode::Full));
 }
 
 #[test]
@@ -1091,7 +1282,7 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
 
     let (count, sleeper) = counting_sleeper();
     let events = vec![
-        tap_row(1),        // Sources
+        tap_row(2),        // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -1184,7 +1375,7 @@ fn update_prompt_back_declines() {
         update_message: "Update available.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(2), tap_back()]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(3), tap_back()]);
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
 }
