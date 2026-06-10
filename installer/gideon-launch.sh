@@ -14,9 +14,23 @@ export GIDEON_DATA_DIR
 # Flush pending writes before we take over (KOReader does the same).
 sync
 
-# Stop nickel and its watchdog/helper daemons so the screen is ours.
+# The per-device touch profile keys off the Kobo PRODUCT codename; if
+# the environment didn't carry it, re-derive it the way KOReader does.
+if [ -z "${PRODUCT:-}" ]; then
+    PRODUCT="$(/bin/kobo_config.sh 2>/dev/null)"
+    export PRODUCT
+fi
+
+# Stop nickel and its watchdog/helper daemons so the screen is ours, and
+# wait for nickel to actually exit (up to ~4s) instead of guessing — both
+# processes fighting over the framebuffer stomps gideon's first paint.
 killall -TERM nickel hindenburg sickel fickel 2>/dev/null
-sleep 1
+i=0
+while pkill -0 nickel 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -ge 16 ] && break
+    usleep 250000 2>/dev/null || sleep 1
+done
 
 # Remove Nickel's hardware-status FIFO: with nickel gone, udev/udhcpc
 # scripts can hang forever on open() against it (KOReader's koreader.sh

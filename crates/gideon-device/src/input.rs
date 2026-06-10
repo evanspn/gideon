@@ -57,8 +57,10 @@ pub enum TouchTransform {
     SwapXY,
     MirrorX,
     MirrorY,
-    #[default]
     SwapXYMirrorX,
+    /// KOReader's base Kobo mapping (touch_mirrored_x after swap):
+    /// screen_x = max - raw_y, screen_y = raw_x.
+    #[default]
     SwapXYMirrorY,
     MirrorBoth,
     SwapXYMirrorBoth,
@@ -131,12 +133,15 @@ impl TouchTransform {
     /// (`touch_mirrored_x/y` per codename; Kobo panels report swapped axes).
     pub fn default_for_product(product: Option<&str>) -> Self {
         match product.map(|p| p.trim().to_ascii_lowercase()).as_deref() {
-            // Libra Colour: touch_mirrored_x = false, touch_mirrored_y = true.
+            // KOReader mirrors AFTER the axis swap; our variants mirror the
+            // raw axes BEFORE swapping. Their monza mapping (mirrored_y):
+            // screen_x = raw_y, screen_y = max - raw_x == our SwapXYMirrorX.
             Some("monza") | Some("monzakobo") | Some("monzatolino") => {
-                TouchTransform::SwapXYMirrorY
+                TouchTransform::SwapXYMirrorX
             }
-            // Clara BW / Clara Colour: mirrored like the classic default.
-            Some("spabw") | Some("spacolour") | Some("spacolor") => TouchTransform::SwapXYMirrorX,
+            // Clara BW / Clara Colour: KOReader's base mapping (mirrored_x):
+            // screen_x = max - raw_y == our SwapXYMirrorY.
+            Some("spabw") | Some("spacolour") | Some("spacolor") => TouchTransform::SwapXYMirrorY,
             _ => TouchTransform::default(),
         }
     }
@@ -276,22 +281,22 @@ mod tests {
             TouchTransform::MirrorBoth
         );
         assert!("bogus".parse::<TouchTransform>().is_err());
-        assert_eq!(TouchTransform::default(), TouchTransform::SwapXYMirrorX);
+        assert_eq!(TouchTransform::default(), TouchTransform::SwapXYMirrorY);
     }
 
     #[test]
     fn product_codename_selects_device_transform() {
         assert_eq!(
             TouchTransform::default_for_product(Some("monza")),
-            TouchTransform::SwapXYMirrorY
+            TouchTransform::SwapXYMirrorX
         );
         assert_eq!(
             TouchTransform::default_for_product(Some(" MonzaKobo ")),
-            TouchTransform::SwapXYMirrorY
+            TouchTransform::SwapXYMirrorX
         );
         assert_eq!(
             TouchTransform::default_for_product(Some("spaBW")),
-            TouchTransform::SwapXYMirrorX
+            TouchTransform::SwapXYMirrorY
         );
         assert_eq!(
             TouchTransform::default_for_product(Some("frost")),
