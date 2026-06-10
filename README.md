@@ -51,8 +51,11 @@ cargo run -- read ~/manga/berserk-v1.cbz
 
 ## Installing on a Kobo
 
-Grab the `gideon-kobo-bundle` artifact from the latest post-merge CI run,
-unzip it, plug in your Kobo and run `./install.sh`. Upgrades are in-place and
+Download `gideon-kobo-vX.Y.Z.zip` from the
+[latest release](https://github.com/evanspn/gideon/releases/latest) (or grab
+the `gideon-kobo-bundle` artifact from the latest post-merge CI run for a
+bleeding-edge build), unzip it, plug in your Kobo and run `./install.sh`.
+Upgrades are in-place and
 **never touch your data**: settings and progress live in
 `.adds/gideon/data/`, which the installer backs up before each upgrade and
 never writes to. See [installer/INSTALL.md](installer/INSTALL.md) for
@@ -95,6 +98,22 @@ cargo fmt --all
 
 CI runs formatting, clippy (both feature sets), the full test suite, a CLI
 smoke test against a generated CBZ, and a cross-check for the Kobo target.
+
+### Releases
+
+Releases are semantically versioned and tag-driven:
+
+```sh
+scripts/release.sh patch        # or minor / major / an explicit X.Y.Z
+git push origin HEAD --follow-tags
+```
+
+The script bumps the workspace version (binary `--version` inherits it),
+refreshes `Cargo.lock`, commits and tags `vX.Y.Z`. Pushing the tag triggers
+the release workflow, which refuses to publish unless the tag matches
+`Cargo.toml`, re-runs the full quality gate plus the QEMU integration tests
+against the release binaries, and then publishes a GitHub Release with
+`gideon-kobo-vX.Y.Z.zip` and auto-generated notes.
 
 After merges to main, a post-merge workflow goes further: it builds the real
 armv7 Kobo binaries and runs integration tests against them under QEMU

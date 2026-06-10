@@ -23,7 +23,7 @@
 - [ ] Page pre-decoding (decode page N+1 while reading page N)
 - [x] Install bundle: armv7 binary + data-preserving installer with backups
       and NickelMenu launcher entry (post-merge CI artifact)
-- [ ] GitHub release publishing for install bundles
+- [x] Semantic-versioned, tag-driven GitHub releases (scripts/release.sh + release workflow)
 - [ ] Rotation support (landscape reading, two-page spreads)
 
 ## v2 — online sources, end to end
