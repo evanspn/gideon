@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # fontconfig is linked via dlopen at runtime (bobo's recipe); no dev
+  # headers needed at build time on any platform.
+  RUST_FONTCONFIG_DLOPEN: "on"
+  FONTCONFIG_NO_PKG_CONFIG: "1"
   RUSTFLAGS: -D warnings
 
 jobs:
