@@ -30,6 +30,10 @@ const MXCFB_SEND_UPDATE_V1: u32 = 0x4048462E;
 // newer): same request, but the struct gained dither_mode/quant_bit, so
 // the encoded size (and therefore the ioctl number) differs.
 const MXCFB_SEND_UPDATE_V2: u32 = 0x4050462E;
+// _IOW('F', 0x2E, struct hwtcon_update_data) — MTK devices (Libra Colour,
+// Clara BW/Colour, Elipsa 2E): a different driver (HWTCON) with a compact
+// 36-byte update struct.
+const HWTCON_SEND_UPDATE: u32 = 0x4024462E;
 // Mark 7 dithering: passthrough (off).
 const EPDC_FLAG_USE_DITHERING_PASSTHROUGH: i32 = 0x0;
 
@@ -165,10 +169,24 @@ struct mxcfb_update_data_v2 {
     alt_buffer_data: mxcfb_alt_buffer_data,
 }
 
-/// Which MXCFB_SEND_UPDATE generation the kernel speaks; probed on the
-/// first refresh and cached.
+/// MTK/HWTCON update payload (Libra Colour & friends): no temp, no
+/// alt-buffer — just region, waveform, mode, marker, flags, dither.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct hwtcon_update_data {
+    update_region: mxcfb_rect,
+    waveform_mode: u32,
+    update_mode: u32,
+    update_marker: u32,
+    flags: u32,
+    dither_mode: i32,
+}
+
+/// Which refresh ioctl dialect the kernel speaks; probed on the first
+/// refresh and cached. MTK first (newest devices), then mxcfb v2, then v1.
 #[derive(Clone, Copy, PartialEq)]
 enum UpdateApi {
+    Mtk,
     V2,
     V1,
 }
@@ -310,14 +328,27 @@ impl Display for KoboDisplay {
         // handles this per-device; we probe). Try the cached variant, or
         // V2 (Mark 7+, every Kobo since ~2018) then V1 on the first call.
         let candidates: &[UpdateApi] = match self.update_api {
+            Some(UpdateApi::Mtk) => &[UpdateApi::Mtk],
             Some(UpdateApi::V2) => &[UpdateApi::V2],
             Some(UpdateApi::V1) => &[UpdateApi::V1],
-            None => &[UpdateApi::V2, UpdateApi::V1],
+            None => &[UpdateApi::Mtk, UpdateApi::V2, UpdateApi::V1],
         };
 
         let mut last_err = None;
         for &api in candidates {
             let ret = match api {
+                UpdateApi::Mtk => {
+                    let mut update = hwtcon_update_data {
+                        update_region: region,
+                        waveform_mode: waveform,
+                        update_mode,
+                        update_marker: self.update_marker,
+                        flags: 0,
+                        dither_mode: 0,
+                    };
+                    // SAFETY: fully initialized struct matching the ioctl.
+                    unsafe { ioctl(self.file.as_raw_fd(), HWTCON_SEND_UPDATE, &mut update) }
+                }
                 UpdateApi::V2 => {
                     let mut update = mxcfb_update_data_v2 {
                         update_region: region,
@@ -352,7 +383,7 @@ impl Display for KoboDisplay {
             last_err = Some(std::io::Error::last_os_error());
         }
         Err(Error::Display(format!(
-            "MXCFB_SEND_UPDATE rejected (tried v2+v1, {}x{}, mode={update_mode}): {}",
+            "screen refresh rejected (tried MTK+v2+v1, {}x{}, mode={update_mode}): {}",
             self.width,
             self.height,
             last_err
@@ -450,6 +481,13 @@ mod ioctl_encoding_tests {
             assert_eq!(std::mem::size_of::<mxcfb_update_data_v1>(), 0x48);
             assert_eq!(std::mem::size_of::<mxcfb_update_data_v2>(), 0x50);
         }
+    }
+
+    #[test]
+    fn hwtcon_ioctl_matches_struct_size_on_all_arches() {
+        // hwtcon_update_data is all fixed-width fields: 36 bytes everywhere.
+        assert_eq!(std::mem::size_of::<hwtcon_update_data>(), 0x24);
+        assert_eq!(iow_f_2e(0x24), HWTCON_SEND_UPDATE);
     }
 
     #[test]
