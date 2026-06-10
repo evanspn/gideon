@@ -174,10 +174,12 @@ impl KoboDisplay {
             }
         }
 
-        if var.bits_per_pixel != 8 {
+        // Stock Nickel leaves the panel at 16 or 32bpp; we convert grayscale
+        // to whatever depth the framebuffer reports instead of requiring a
+        // depth switch.
+        if !matches!(var.bits_per_pixel, 8 | 16 | 24 | 32) {
             return Err(Error::Display(format!(
-                "unsupported framebuffer depth: {}bpp (gideon currently requires 8bpp grayscale; \
-                 run `fbdepth -d 8` from KOReader's tools or set the depth before launching)",
+                "unsupported framebuffer depth: {}bpp (supported: 8/16/24/32)",
                 var.bits_per_pixel
             )));
         }
@@ -207,16 +209,17 @@ impl Display for KoboDisplay {
     }
 
     fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
-        // Render into a contiguous buffer first, then copy row by row to
-        // honor the framebuffer's line stride.
+        // Render into a contiguous grayscale buffer first, then convert to
+        // the framebuffer's pixel format row by row, honoring line stride.
         let mut staging = vec![0xFFu8; (self.width * self.height) as usize];
         blit_into(&mut staging, self.width, self.height, page, offset_y);
 
-        let row_bytes = (self.width * self.bytes_per_pixel) as usize;
+        let bpp = self.bytes_per_pixel as usize;
         for y in 0..self.height as usize {
-            let src = y * self.width as usize;
+            let src_row = &staging[y * self.width as usize..(y + 1) * self.width as usize];
             let dst = y * self.line_length as usize;
-            self.map[dst..dst + row_bytes].copy_from_slice(&staging[src..src + row_bytes]);
+            let dst_row = &mut self.map[dst..dst + self.width as usize * bpp];
+            write_gray_row(src_row, dst_row, bpp);
         }
         Ok(())
     }
@@ -249,5 +252,72 @@ impl Display for KoboDisplay {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
         Ok(())
+    }
+}
+
+/// Convert one row of 8-bit grayscale into the framebuffer pixel format.
+/// Gray means R = G = B, so channel order (RGB vs BGR) doesn't matter.
+fn write_gray_row(gray: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
+    match bytes_per_pixel {
+        1 => out[..gray.len()].copy_from_slice(gray),
+        2 => {
+            // RGB565: gray -> (g>>3, g>>2, g>>3), little-endian.
+            for (i, &g) in gray.iter().enumerate() {
+                let v = ((g as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (g as u16 >> 3);
+                out[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        3 => {
+            for (i, &g) in gray.iter().enumerate() {
+                out[i * 3..i * 3 + 3].copy_from_slice(&[g, g, g]);
+            }
+        }
+        4 => {
+            // XRGB/XBGR with opaque alpha/padding byte.
+            for (i, &g) in gray.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&[g, g, g, 0xFF]);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod pixel_format_tests {
+    use super::write_gray_row;
+
+    #[test]
+    fn gray_to_8bpp_is_identity() {
+        let mut out = [0u8; 3];
+        write_gray_row(&[0x00, 0x80, 0xFF], &mut out, 1);
+        assert_eq!(out, [0x00, 0x80, 0xFF]);
+    }
+
+    #[test]
+    fn gray_to_rgb565() {
+        let mut out = [0u8; 6];
+        write_gray_row(&[0x00, 0xFF, 0x80], &mut out, 2);
+        // Black -> 0x0000, white -> 0xFFFF.
+        assert_eq!(&out[0..2], &0x0000u16.to_le_bytes());
+        assert_eq!(&out[2..4], &0xFFFFu16.to_le_bytes());
+        // Mid gray: r=0x80>>3=16, g=0x80>>2=32, b=16 -> equal-ish channels.
+        let v = u16::from_le_bytes([out[4], out[5]]);
+        assert_eq!(v >> 11, 16);
+        assert_eq!((v >> 5) & 0x3F, 32);
+        assert_eq!(v & 0x1F, 16);
+    }
+
+    #[test]
+    fn gray_to_32bpp_replicates_channels_with_opaque_alpha() {
+        let mut out = [0u8; 8];
+        write_gray_row(&[0x12, 0xAB], &mut out, 4);
+        assert_eq!(out, [0x12, 0x12, 0x12, 0xFF, 0xAB, 0xAB, 0xAB, 0xFF]);
+    }
+
+    #[test]
+    fn gray_to_24bpp() {
+        let mut out = [0u8; 6];
+        write_gray_row(&[0x10, 0xF0], &mut out, 3);
+        assert_eq!(out, [0x10, 0x10, 0x10, 0xF0, 0xF0, 0xF0]);
     }
 }

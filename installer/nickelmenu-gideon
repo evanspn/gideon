@@ -1,5 +1,1 @@
 menu_item :main :gideon :cmd_spawn :quiet:/mnt/onboard/.adds/gideon/bin/gideon-launch.sh
-menu_item :main :gideon - library :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga 2>&1
-menu_item :main :gideon - check update :cmd_output :9000:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon update --check 2>&1
-menu_item :main :gideon - install update :cmd_spawn :sh -c 'env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon update >/mnt/onboard/.adds/gideon/update.log 2>&1'
-menu_item :main :gideon - update result :cmd_output :2000:cat /mnt/onboard/.adds/gideon/update.log

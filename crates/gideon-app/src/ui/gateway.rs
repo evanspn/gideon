@@ -91,8 +91,17 @@ pub trait SourceGateway {
         progress: &mut dyn FnMut(usize, usize),
     ) -> Result<PathBuf>;
 
-    /// Check for app updates; returns a human-readable status line.
-    fn check_updates(&self) -> Result<String>;
+    /// Check for app updates.
+    fn check_updates(&self) -> Result<UpdateCheck>;
+
+    /// Download and install the available update; returns a status line.
+    fn install_update(&self) -> Result<String>;
+}
+
+/// Result of an update check.
+pub struct UpdateCheck {
+    pub message: String,
+    pub available: bool,
 }
 
 /// Production gateway: Aidoku WASM sources + GitHub-hosted source lists.
@@ -214,24 +223,59 @@ impl SourceGateway for AidokuGateway {
         ))
     }
 
-    fn check_updates(&self) -> Result<String> {
-        use gideon_sources::update;
-
-        let repo = std::env::var("GIDEON_UPDATE_REPO")
-            .unwrap_or_else(|_| update::DEFAULT_UPDATE_REPO.to_string());
+    fn check_updates(&self) -> Result<UpdateCheck> {
+        let release = latest_release()?;
         let current = env!("CARGO_PKG_VERSION");
-        let fetcher = UreqFetcher::new();
-
-        let base = update::release_base();
-        let release = update::check_update_via_assets(&fetcher, &base, &repo, current)
-            .or_else(|_| update::check_update(&fetcher, &repo, current))?;
-
         Ok(match release {
-            Some(release) => format!(
-                "Update available: {current} -> {}.\nInstall it from the gideon menu.",
-                release.version
-            ),
-            None => format!("gideon {current} is up to date."),
+            Some(release) => UpdateCheck {
+                message: format!("Update available: {current} -> {}.", release.version),
+                available: true,
+            },
+            None => UpdateCheck {
+                message: format!("gideon {current} is up to date."),
+                available: false,
+            },
         })
     }
+
+    fn install_update(&self) -> Result<String> {
+        use gideon_sources::update;
+
+        let Some(release) = latest_release()? else {
+            return Ok("Already up to date.".to_string());
+        };
+        let current = env!("CARGO_PKG_VERSION");
+        if !update::is_auto_installable(current, &release.version) {
+            return Ok(format!(
+                "{} is a major upgrade from {current}; install it over USB.",
+                release.version
+            ));
+        }
+
+        let exe = std::env::current_exe()?;
+        let bin_dir = exe
+            .parent()
+            .context("can't determine the binary's directory")?;
+        let fetcher = UreqFetcher::new();
+        update::stage_update(&fetcher, &release, bin_dir)?;
+        update::apply_staged(bin_dir)?;
+        crate::manga::ensure_device_files(bin_dir)?;
+        Ok(format!(
+            "Updated to {}.\nClose gideon and reopen it to use the new version.",
+            release.version
+        ))
+    }
+}
+
+/// The newest published release, via the VERSION asset with API fallback.
+fn latest_release() -> Result<Option<gideon_sources::update::ReleaseInfo>> {
+    use gideon_sources::update;
+    let repo = std::env::var("GIDEON_UPDATE_REPO")
+        .unwrap_or_else(|_| update::DEFAULT_UPDATE_REPO.to_string());
+    let current = env!("CARGO_PKG_VERSION");
+    let fetcher = UreqFetcher::new();
+    let base = update::release_base();
+    let release = update::check_update_via_assets(&fetcher, &base, &repo, current)
+        .or_else(|_| update::check_update(&fetcher, &repo, current))?;
+    Ok(release)
 }

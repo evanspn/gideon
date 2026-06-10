@@ -46,6 +46,8 @@ struct FakeGateway {
     chapters: Vec<ChapterEntry>,
     download: Option<DownloadFn>,
     update_message: String,
+    update_available: bool,
+    installs: std::cell::Cell<usize>,
 }
 
 impl Default for FakeGateway {
@@ -57,6 +59,8 @@ impl Default for FakeGateway {
             chapters: Vec::new(),
             download: None,
             update_message: "up to date".to_string(),
+            update_available: false,
+            installs: std::cell::Cell::new(0),
         }
     }
 }
@@ -103,8 +107,16 @@ impl SourceGateway for FakeGateway {
         download(library, progress)
     }
 
-    fn check_updates(&self) -> Result<String> {
-        Ok(self.update_message.clone())
+    fn install_update(&self) -> Result<String> {
+        self.installs.set(self.installs.get() + 1);
+        Ok("Updated to 9.9.9.".to_string())
+    }
+
+    fn check_updates(&self) -> Result<super::gateway::UpdateCheck> {
+        Ok(super::gateway::UpdateCheck {
+            message: self.update_message.clone(),
+            available: self.update_available,
+        })
     }
 }
 
@@ -691,4 +703,41 @@ fn chapter_labels_format_num_title_lang() {
         lang: None,
     };
     assert_eq!(bare.label(), "Ch ?");
+}
+
+#[test]
+fn update_prompt_installs_on_tap() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        update_available: true,
+        update_message: "Update available: 0.0.0 -> 9.9.9.".into(),
+        ..FakeGateway::default()
+    };
+    // Home row 2 = "Check for updates" -> prompt; content tap installs.
+    let mut app = app(dir.path(), gateway, vec![tap_row(2), tap_row(0)]);
+    app.run().unwrap();
+
+    assert_eq!(
+        app.gateway().installs.get(),
+        1,
+        "tap on prompt should install"
+    );
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected result message screen");
+    };
+    assert_eq!(title, "Updates");
+    assert!(body.contains("Updated to 9.9.9"));
+}
+
+#[test]
+fn update_prompt_back_declines() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        update_available: true,
+        update_message: "Update available.".into(),
+        ..FakeGateway::default()
+    };
+    let mut app = app(dir.path(), gateway, vec![tap_row(2), tap_back()]);
+    app.run().unwrap();
+    assert_eq!(app.gateway().installs.get(), 0, "back should not install");
 }
