@@ -30,9 +30,27 @@ impl UreqFetcher {
     pub fn new() -> Self {
         let agent = ureq::AgentBuilder::new()
             .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
+            .tls_config(std::sync::Arc::new(tls_config()))
             .build();
         Self { agent }
     }
+}
+
+/// TLS roots: the embedded Mozilla store (always present and current at
+/// build time — Kobo firmware ships an outdated CA bundle that can't
+/// validate modern chains) merged with whatever system certs exist (so
+/// corporate/proxy CAs keep working).
+fn tls_config() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Ok(certs) = rustls_native_certs::load_native_certs() {
+        for cert in certs {
+            let _ = roots.add(cert);
+        }
+    }
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 impl Fetcher for UreqFetcher {
