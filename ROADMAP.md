@@ -1,0 +1,37 @@
+# Roadmap
+
+## v0 — core pipeline (this PR)
+
+- [x] Workspace skeleton (`core`, `render`, `sources`, `device`, `app`)
+- [x] CBZ loading: natural page order, junk filtering, ComicInfo.xml
+- [x] E-ink render pipeline: fit modes, grayscale, 16-level dithering
+- [x] Library scan + JSON reading progress with resume
+- [x] Preinstalled GitHub source lists (Aidoku/bobo-compatible), source
+      resolution, chapter→CBZ downloads
+- [x] Kobo framebuffer backend (mxcfb ioctls, full/partial refresh policy)
+- [x] CI: fmt, clippy, tests, CLI smoke test, armv7 cross-check
+
+## v1 — read manga on the device
+
+- [ ] Touch input via evdev (tap zones: next/prev/menu)
+- [ ] On-device library browser UI (cover grid, progress badges)
+- [ ] FitWidth scrolling within a page (the render/blit plumbing exists)
+- [ ] Page pre-decoding (decode page N+1 while reading page N)
+- [ ] Release artifacts: cross-compiled armv7 binary + install instructions
+      (NickelMenu / KFMon launcher)
+- [ ] Rotation support (landscape reading, two-page spreads)
+
+## v2 — online sources, end to end
+
+- [ ] Run Aidoku WASM sources (wasmi) so installed sources can search and
+      list chapters, like bobo's backend does
+- [ ] Search + browse UI for sources
+- [ ] Chapter download queue with offline storage limits
+- [ ] In-app source install/update from the configured lists
+
+## Later
+
+- [ ] CBR (rar) support
+- [ ] OTA self-update from GitHub releases
+- [ ] Reading stats
+- [ ] Cloud sync of progress

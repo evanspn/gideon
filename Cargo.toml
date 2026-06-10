@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gideon-core",
+    "crates/gideon-render",
+    "crates/gideon-sources",
+    "crates/gideon-device",
+    "crates/gideon-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/evanspn/gideon"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = { version = "2", features = ["serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+quick-xml = "0.37"
+ureq = { version = "2", default-features = false, features = ["tls", "native-certs", "json"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+memmap2 = "0.9"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

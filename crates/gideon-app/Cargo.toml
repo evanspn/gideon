@@ -1,0 +1,29 @@
+[package]
+name = "gideon-app"
+description = "gideon: a manga e-reader for Kobo devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gideon"
+path = "src/main.rs"
+
+[features]
+# Build with the Kobo e-ink framebuffer backend.
+kobo = ["gideon-device/kobo"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+image.workspace = true
+url.workspace = true
+gideon-core = { path = "../gideon-core" }
+gideon-render = { path = "../gideon-render" }
+gideon-sources = { path = "../gideon-sources" }
+gideon-device = { path = "../gideon-device" }
+
+[dev-dependencies]
+tempfile.workspace = true
+zip.workspace = true
