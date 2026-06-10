@@ -178,8 +178,25 @@ impl KoboTouch {
             } else {
                 (ABS_X, ABS_Y)
             };
-            let max_x = read_axis_max(fd, x_axis)?;
-            let max_y = read_axis_max(fd, y_axis)?;
+            // Some devices advertise ABS bits but reject EVIOCGABS; fall
+            // back to screen dimensions rather than aborting, and keep
+            // scanning if this device is unusable.
+            let (max_x, max_y) = match (read_axis_max(fd, x_axis), read_axis_max(fd, y_axis)) {
+                (Ok(x), Ok(y)) => (x, y),
+                (x, y) => {
+                    eprintln!(
+                        "gideon touch: {path}: EVIOCGABS failed (x: {x:?}, y: {y:?}); using screen dims"
+                    );
+                    (
+                        x.unwrap_or(screen_w.max(1) - 1),
+                        y.unwrap_or(screen_h.max(1) - 1),
+                    )
+                }
+            };
+            eprintln!(
+                "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={:?}",
+                TouchTransform::from_env()
+            );
 
             return Ok(Self {
                 file,
@@ -202,7 +219,10 @@ fn read_axis_max(fd: libc::c_int, axis: u16) -> Result<u32> {
     // SAFETY: EVIOCGABS with a properly sized zero-initialized out-struct.
     let ret = unsafe { ioctl(fd, eviocgabs(axis), &mut info) };
     if ret < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+        return Err(Error::Display(format!(
+            "EVIOCGABS(axis {axis:#x}) failed: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(info.maximum.max(1) as u32)
 }
