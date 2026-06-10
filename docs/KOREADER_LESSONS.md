@@ -17,7 +17,7 @@ Status legend: ✅ implemented · 📋 documented/deferred · ⚠️ known risk.
 | Maps the fb with the driver-advertised memory size (char devices have file length 0) | ✅ exact `smem_len` mapping, validated to cover the screen |
 | Never msyncs the fb mapping (device memory; EINVAL) | ✅ removed |
 | Adapts to the panel depth; normalizes to 8bpp via `fbdepth` on NXP, keeps 32bpp on MTK/colour | ✅ converts grayscale to the reported depth (8/16/24/32bpp) instead of switching |
-| Normalizes fb rotation to upright at startup (`fbdepth -r`); touch tables assume that orientation | ✅ best-effort `FBIOPUT_VSCREENINFO rotate=0`, re-reads geometry, adapts if refused |
+| Normalizes fb rotation to upright at startup (`fbdepth -R UR`); touch tables assume that orientation. "Upright" is a per-device **native** rotate value (FBInk's rotationMap): monza/condor → 1, spa\* → 3 — NOT 0 | ✅ best-effort `FBIOPUT_VSCREENINFO` to the per-`PRODUCT` upright value (monza/condor=1, spa\*=3, else 0; `GIDEON_FB_ROTATE` overrides), re-reads geometry, adapts if refused |
 | Waveforms: GC16 flashes; partial = AUTO/REAGL per gen; MTK partial = GLR16 (REAGL always available) | ✅ GC16 full everywhere; MTK partials GLR16, mxcfb partials AUTO |
 | MTK: wait for update *submission* after every send; wait for *completion* around flashes | ✅ both, best-effort |
 | MTK driver off-by-one: refresh regions must be expanded/aligned to 16px | 📋 gideon only refreshes the full screen today (1264 and 1680 are 16-aligned); enforce alignment when partial-rect refreshes are added |

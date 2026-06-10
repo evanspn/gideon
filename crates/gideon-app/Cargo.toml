@@ -24,7 +24,7 @@ gideon-render = { path = "../gideon-render" }
 gideon-sources = { path = "../gideon-sources" }
 gideon-device = { path = "../gideon-device" }
 gideon-aidoku = { path = "../gideon-aidoku" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
 
