@@ -77,6 +77,9 @@ pub trait SourceGateway {
     /// an empty search when the source has no such listing.
     fn list_manga(&self, source_id: &str, listing: &str) -> Result<Vec<MangaEntry>>;
 
+    /// Search a source for manga matching `query`.
+    fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>>;
+
     /// Chapter list for a manga.
     fn chapters(&self, source_id: &str, manga_id: &str) -> Result<Vec<ChapterEntry>>;
 
@@ -183,6 +186,20 @@ impl SourceGateway for AidokuGateway {
                     .block_on(source.search_mangas(CancellationToken::new(), String::new()))?,
             };
 
+        Ok(mangas
+            .into_iter()
+            .map(|m| MangaEntry {
+                title: m.title.unwrap_or_else(|| m.id.clone()),
+                id: m.id,
+            })
+            .collect())
+    }
+
+    fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>> {
+        let source = self.source(source_id)?;
+        let runtime = self.runtime()?;
+        let mangas =
+            runtime.block_on(source.search_mangas(CancellationToken::new(), query.to_string()))?;
         Ok(mangas
             .into_iter()
             .map(|m| MangaEntry {

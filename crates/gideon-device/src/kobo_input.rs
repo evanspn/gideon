@@ -1,22 +1,30 @@
-//! Kobo touch screen input (Linux evdev).
+//! Kobo input (Linux evdev): touch screen + power button + sleep cover.
 //!
-//! Kobo devices expose the touch panel as `/dev/input/eventN`. We pick the
-//! first device that advertises an absolute X axis (multitouch
-//! `ABS_MT_POSITION_X` or single-touch `ABS_X`), read its axis ranges, and
-//! turn the raw event stream into [`UiEvent::Tap`]s: track the latest
-//! position and emit on finger release. Raw panel coordinates are mapped to
-//! screen coordinates with a [`TouchTransform`] (configurable through
-//! `GIDEON_TOUCH_TRANSFORM`; the default fits most Kobo models).
+//! Kobo devices expose input as several `/dev/input/eventN` nodes. The
+//! touch panel advertises absolute axes (multitouch `ABS_MT_POSITION_X` or
+//! single-touch `ABS_X`); the power button and the magnetic sleep cover
+//! live on *different* nodes (on NTX boards usually `event0`, on MTK boards
+//! like the Libra Colour they may be split across nodes) that advertise
+//! `EV_KEY` with `KEY_POWER` (116) and/or the sleep-cover codes (59 =
+//! `KEY_F1`, 35 = `KEY_H` on the Elipsa power cover) — the same capability
+//! probe FBInk's `fbink_input_scan` uses for KOReader.
+//!
+//! [`KoboTouch`] opens every matching node, `poll(2)`s across them, and
+//! merges the streams into [`UiEvent`]s: taps from the touch tracker
+//! (emit raw position on finger release, mapped to screen coordinates with
+//! a [`TouchTransform`]), [`UiEvent::Sleep`] from the button tracker (power
+//! button press or cover closed).
 //!
 //! Only compiled with the `kobo` feature on Linux. The event-stream state
-//! machine ([`TouchTracker`]) is pure and unit-tested with synthetic
-//! `libc::input_event` values.
+//! machines ([`TouchTracker`], [`ButtonTracker`]) are pure and unit-tested
+//! with synthetic `libc::input_event` values.
 
 #![cfg(target_os = "linux")]
 
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::input::{InputSource, TouchTransform, UiEvent};
 use crate::{Error, Result};
@@ -38,6 +46,13 @@ const ABS_MT_PRESSURE: u16 = 0x3a;
 
 const BTN_TOUCH: u16 = 0x14a;
 
+/// Power button (KOReader's Kobo event_map: `[116] = "Power"`).
+const KEY_POWER: u16 = 116;
+/// Magnetic sleep cover (KOReader: `[59] = "SleepCover"`; 59 is KEY_F1).
+const KEY_SLEEP_COVER: u16 = 59;
+/// Elipsa-style power cover (KOReader: `[35] = "SleepCover"`; 35 is KEY_H).
+const KEY_POWER_COVER: u16 = 35;
+
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct input_absinfo {
@@ -49,10 +64,10 @@ struct input_absinfo {
     resolution: i32,
 }
 
-/// `EVIOCGBIT(EV_ABS, len)`: read the absolute-axis capability bitmask.
-/// _IOC(_IOC_READ, 'E', 0x20 + EV_ABS, len)
-fn eviocgbit_abs(len: usize) -> u32 {
-    (2u32 << 30) | ((len as u32) << 16) | (b'E' as u32) << 8 | (0x20 + EV_ABS as u32)
+/// `EVIOCGBIT(ev, len)`: read a capability bitmask for event type `ev`.
+/// _IOC(_IOC_READ, 'E', 0x20 + ev, len)
+fn eviocgbit(ev: u16, len: usize) -> u32 {
+    (2u32 << 30) | ((len as u32) << 16) | (b'E' as u32) << 8 | (0x20 + ev as u32)
 }
 
 /// `EVIOCGABS(abs)`: read an axis's `input_absinfo`.
@@ -71,7 +86,7 @@ unsafe fn ioctl<T>(fd: libc::c_int, request: u32, arg: *mut T) -> libc::c_int {
     libc::ioctl(fd, request as _, arg)
 }
 
-fn abs_bit_set(bits: &[u8], code: u16) -> bool {
+fn bit_set(bits: &[u8], code: u16) -> bool {
     let byte = (code / 8) as usize;
     byte < bits.len() && bits[byte] & (1 << (code % 8)) != 0
 }
@@ -150,10 +165,44 @@ impl TouchTracker {
     }
 }
 
-/// Touch screen input on Kobo hardware.
+/// Pure state machine for the power button and the magnetic sleep cover.
+///
+/// KOReader's Kobo event map: code 116 (`KEY_POWER`) is the power button,
+/// codes 59/35 are the sleep cover — value 1 = press / cover closed,
+/// value 0 = release / cover opened, value 2 = key repeat. We sleep on
+/// power *press* and cover *close*; releases and cover-open are ignored
+/// (waking is the kernel's job — the suspend write blocks until then).
+#[derive(Debug, Default)]
+pub struct ButtonTracker;
+
+impl ButtonTracker {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Process one event; returns a [`UiEvent`] when one completes.
+    pub fn push(&mut self, ev: &libc::input_event) -> Option<UiEvent> {
+        if ev.type_ != EV_KEY || ev.value != 1 {
+            return None;
+        }
+        match ev.code {
+            KEY_POWER | KEY_SLEEP_COVER | KEY_POWER_COVER => Some(UiEvent::Sleep),
+            _ => None,
+        }
+    }
+}
+
+/// Merged evdev input on Kobo hardware: the touch panel plus any nodes
+/// carrying the power button / sleep cover.
 pub struct KoboTouch {
-    file: File,
+    /// All opened devices, polled together. Index `touch_idx` feeds the
+    /// touch tracker; every device feeds the button tracker (touch nodes
+    /// never emit the power/cover codes, so this is harmless).
+    devices: Vec<File>,
+    touch_idx: usize,
     tracker: TouchTracker,
+    buttons: ButtonTracker,
+    pending: VecDeque<UiEvent>,
     transform: TouchTransform,
     max_x: u32,
     max_y: u32,
@@ -162,10 +211,11 @@ pub struct KoboTouch {
 }
 
 impl KoboTouch {
-    /// Scan `/dev/input/event0..event5` for the first device advertising an
-    /// absolute X axis, and configure raw-to-screen mapping for a
-    /// `screen_w x screen_h` display, with the transform taken from the
-    /// environment (`GIDEON_TOUCH_TRANSFORM` / `PRODUCT`).
+    /// Scan `/dev/input/event0..event9` for the touch panel (first device
+    /// advertising an absolute X axis) and any button devices (`EV_KEY`
+    /// with `KEY_POWER` or a sleep-cover code), and configure raw-to-screen
+    /// mapping for a `screen_w x screen_h` display, with the transform
+    /// taken from the environment (`GIDEON_TOUCH_TRANSFORM` / `PRODUCT`).
     pub fn open(screen_w: u32, screen_h: u32) -> Result<Self> {
         Self::open_with_transform(screen_w, screen_h, TouchTransform::from_env())
     }
@@ -178,89 +228,182 @@ impl KoboTouch {
         screen_h: u32,
         transform: TouchTransform,
     ) -> Result<Self> {
-        for n in 0..=5 {
+        let mut devices: Vec<File> = Vec::new();
+        let mut touch_idx: Option<usize> = None;
+        let mut axes: Option<(u32, u32)> = None;
+
+        for n in 0..=9 {
             let path = format!("/dev/input/event{n}");
-            let Ok(file) = File::open(&path) else {
+            // Non-blocking: next_event poll(2)s before reading, and
+            // discard_queued drains without fcntl gymnastics.
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+            else {
                 continue;
             };
             let fd = file.as_raw_fd();
 
-            let mut bits = [0u8; 8];
+            let mut abs_bits = [0u8; 8];
             // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
-            let ret = unsafe { ioctl(fd, eviocgbit_abs(bits.len()), bits.as_mut_ptr()) };
-            if ret < 0 {
-                continue;
-            }
-            let mt = abs_bit_set(&bits, ABS_MT_POSITION_X);
-            if !mt && !abs_bit_set(&bits, ABS_X) {
+            let abs_ok =
+                unsafe { ioctl(fd, eviocgbit(EV_ABS, abs_bits.len()), abs_bits.as_mut_ptr()) } >= 0;
+            let mt = abs_ok && bit_set(&abs_bits, ABS_MT_POSITION_X);
+            let is_touch = touch_idx.is_none() && abs_ok && (mt || bit_set(&abs_bits, ABS_X));
+
+            // Key capabilities: 16 bytes cover codes 0..=127, enough for
+            // the power button (116) and the cover codes (59/35).
+            let mut key_bits = [0u8; 16];
+            // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
+            let key_ok =
+                unsafe { ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr()) } >= 0;
+            let has_power = key_ok && bit_set(&key_bits, KEY_POWER);
+            let has_cover = key_ok
+                && (bit_set(&key_bits, KEY_SLEEP_COVER) || bit_set(&key_bits, KEY_POWER_COVER));
+
+            if !is_touch && !has_power && !has_cover {
                 continue;
             }
 
-            let (x_axis, y_axis) = if mt {
-                (ABS_MT_POSITION_X, ABS_MT_POSITION_Y)
+            if is_touch {
+                let (x_axis, y_axis) = if mt {
+                    (ABS_MT_POSITION_X, ABS_MT_POSITION_Y)
+                } else {
+                    (ABS_X, ABS_Y)
+                };
+                // Some devices advertise ABS bits but reject EVIOCGABS; fall
+                // back to screen dimensions rather than aborting.
+                let (max_x, max_y) = match (read_axis_max(fd, x_axis), read_axis_max(fd, y_axis)) {
+                    (Ok(x), Ok(y)) => (x, y),
+                    (x, y) => {
+                        eprintln!(
+                            "gideon touch: {path}: EVIOCGABS failed (x: {x:?}, y: {y:?}); using screen dims"
+                        );
+                        (
+                            x.unwrap_or(screen_w.max(1) - 1),
+                            y.unwrap_or(screen_h.max(1) - 1),
+                        )
+                    }
+                };
+                eprintln!(
+                    "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={transform:?}"
+                );
+                touch_idx = Some(devices.len());
+                axes = Some((max_x, max_y));
             } else {
-                (ABS_X, ABS_Y)
-            };
-            // Some devices advertise ABS bits but reject EVIOCGABS; fall
-            // back to screen dimensions rather than aborting, and keep
-            // scanning if this device is unusable.
-            let (max_x, max_y) = match (read_axis_max(fd, x_axis), read_axis_max(fd, y_axis)) {
-                (Ok(x), Ok(y)) => (x, y),
-                (x, y) => {
-                    eprintln!(
-                        "gideon touch: {path}: EVIOCGABS failed (x: {x:?}, y: {y:?}); using screen dims"
-                    );
-                    (
-                        x.unwrap_or(screen_w.max(1) - 1),
-                        y.unwrap_or(screen_h.max(1) - 1),
-                    )
-                }
-            };
-            eprintln!(
-                "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={transform:?}"
-            );
-
-            return Ok(Self {
-                file,
-                tracker: TouchTracker::new(),
-                transform,
-                max_x,
-                max_y,
-                screen_w,
-                screen_h,
-            });
+                eprintln!(
+                    "gideon input: using {path} for buttons (power={has_power} cover={has_cover})"
+                );
+            }
+            devices.push(file);
         }
-        Err(Error::Display(
-            "no touch screen found on /dev/input/event0..5".to_string(),
-        ))
+
+        let Some(touch_idx) = touch_idx else {
+            return Err(Error::Display(
+                "no touch screen found on /dev/input/event0..9".to_string(),
+            ));
+        };
+        let (max_x, max_y) = axes.expect("axes recorded with touch_idx");
+
+        Ok(Self {
+            devices,
+            touch_idx,
+            tracker: TouchTracker::new(),
+            buttons: ButtonTracker::new(),
+            pending: VecDeque::new(),
+            transform,
+            max_x,
+            max_y,
+            screen_w,
+            screen_h,
+        })
     }
 
     /// Drain any already-queued evdev events without blocking and reset the
-    /// tap tracker: taps made while the UI was busy (e.g. during a chapter
-    /// download) must not fire stale actions in whatever screen comes next.
+    /// trackers: taps made while the UI was busy (e.g. during a chapter
+    /// download), or the key press that woke the device from suspend, must
+    /// not fire stale actions in whatever screen comes next.
     pub fn discard_queued(&mut self) {
-        let fd = self.file.as_raw_fd();
-        // SAFETY: fcntl F_GETFL/F_SETFL and read(2) on a fd we own; the
-        // buffer pointer/length pair describes a valid local buffer.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags < 0 {
-                return;
-            }
-            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return;
-            }
-            let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 4096];
+        for file in &self.devices {
+            let fd = file.as_raw_fd();
             loop {
-                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                // SAFETY: read(2) into a valid local buffer on a
+                // non-blocking fd we own.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n <= 0 {
                     break;
                 }
             }
-            // Restore blocking mode for next_event's read_exact.
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags);
         }
         self.tracker = TouchTracker::new();
+        self.buttons = ButtonTracker::new();
+        self.pending.clear();
+    }
+
+    /// Block in `poll(2)` until any device is readable, then drain it
+    /// through the trackers into `pending`.
+    fn poll_and_read(&mut self) -> Result<()> {
+        let mut fds: Vec<libc::pollfd> = self
+            .devices
+            .iter()
+            .map(|f| libc::pollfd {
+                fd: f.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: fds points at a valid pollfd array of the given length.
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        const EVENT_SIZE: usize = std::mem::size_of::<libc::input_event>();
+        for (i, pfd) in fds.iter().enumerate() {
+            if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+                continue;
+            }
+            loop {
+                let mut events: [libc::input_event; 64] = unsafe { std::mem::zeroed() };
+                // SAFETY: reading whole input_event structs (plain old
+                // data) into a correctly sized local buffer.
+                let n = unsafe {
+                    libc::read(
+                        pfd.fd,
+                        events.as_mut_ptr().cast(),
+                        EVENT_SIZE * events.len(),
+                    )
+                };
+                if n <= 0 {
+                    break; // EAGAIN (drained), EOF, or a transient error
+                }
+                for ev in &events[..(n as usize / EVENT_SIZE)] {
+                    if i == self.touch_idx {
+                        if let Some((raw_x, raw_y)) = self.tracker.push(ev) {
+                            let (x, y) = self.transform.apply(
+                                raw_x,
+                                raw_y,
+                                self.max_x,
+                                self.max_y,
+                                self.screen_w,
+                                self.screen_h,
+                            );
+                            self.pending.push_back(UiEvent::Tap { x, y });
+                        }
+                    }
+                    if let Some(event) = self.buttons.push(ev) {
+                        self.pending.push_back(event);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -280,24 +423,10 @@ fn read_axis_max(fd: libc::c_int, axis: u16) -> Result<u32> {
 impl InputSource for KoboTouch {
     fn next_event(&mut self) -> Result<UiEvent> {
         loop {
-            let mut ev: libc::input_event = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::input_event>();
-            // SAFETY: input_event is plain-old-data; reading exactly one
-            // struct's worth of bytes into it is sound.
-            let buf = unsafe { std::slice::from_raw_parts_mut(&mut ev as *mut _ as *mut u8, size) };
-            self.file.read_exact(buf)?;
-
-            if let Some((raw_x, raw_y)) = self.tracker.push(&ev) {
-                let (x, y) = self.transform.apply(
-                    raw_x,
-                    raw_y,
-                    self.max_x,
-                    self.max_y,
-                    self.screen_w,
-                    self.screen_h,
-                );
-                return Ok(UiEvent::Tap { x, y });
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(event);
             }
+            self.poll_and_read()?;
         }
     }
 
@@ -390,7 +519,9 @@ mod tests {
     #[test]
     fn ioctl_request_constants_match_kernel_encoding() {
         // EVIOCGBIT(EV_ABS, 8) == _IOC(read, 'E', 0x23, 8)
-        assert_eq!(eviocgbit_abs(8), 0x8008_4523);
+        assert_eq!(eviocgbit(EV_ABS, 8), 0x8008_4523);
+        // EVIOCGBIT(EV_KEY, 16) == _IOC(read, 'E', 0x21, 16)
+        assert_eq!(eviocgbit(EV_KEY, 16), 0x8010_4521);
         // EVIOCGABS(ABS_MT_POSITION_X) == _IOC(read, 'E', 0x75, 24)
         assert_eq!(eviocgabs(ABS_MT_POSITION_X), 0x8018_4575);
     }
@@ -408,5 +539,71 @@ mod tests {
             Some((100, 200)),
             "pressure 0 + SYN should tap"
         );
+    }
+
+    // --- ButtonTracker (power button / sleep cover) ---
+
+    #[test]
+    fn power_button_press_sleeps_release_does_not() {
+        let mut b = ButtonTracker::new();
+        assert_eq!(b.push(&ev(EV_KEY, KEY_POWER, 1)), Some(UiEvent::Sleep));
+        assert_eq!(b.push(&ev(EV_KEY, KEY_POWER, 0)), None, "release ignored");
+        assert_eq!(b.push(&ev(EV_KEY, KEY_POWER, 2)), None, "repeat ignored");
+    }
+
+    #[test]
+    fn sleep_cover_close_sleeps_open_does_not() {
+        let mut b = ButtonTracker::new();
+        // 59 (KEY_F1): the classic Kobo sleep cover, incl. the Libra Colour.
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_SLEEP_COVER, 1)),
+            Some(UiEvent::Sleep),
+            "cover closed must sleep"
+        );
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_SLEEP_COVER, 0)),
+            None,
+            "cover opened is consumed by wakeup, not an event"
+        );
+        // 35 (KEY_H): the Elipsa-style power cover code.
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_POWER_COVER, 1)),
+            Some(UiEvent::Sleep)
+        );
+    }
+
+    #[test]
+    fn unrelated_keys_and_touch_events_do_not_sleep() {
+        let mut b = ButtonTracker::new();
+        assert_eq!(b.push(&ev(EV_KEY, BTN_TOUCH, 1)), None);
+        assert_eq!(b.push(&ev(EV_KEY, 102, 1)), None, "Home key is not sleep");
+        assert_eq!(b.push(&ev(EV_ABS, ABS_MT_POSITION_X, 116)), None);
+        assert_eq!(b.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
+    }
+
+    #[test]
+    fn merged_stream_interleaves_taps_and_sleep() {
+        // The poll loop feeds every event through both trackers; a power
+        // press in the middle of a touch sequence must not corrupt the tap.
+        let mut touch = TouchTracker::new();
+        let mut buttons = ButtonTracker::new();
+        let mut out: Vec<UiEvent> = Vec::new();
+        let stream = [
+            ev(EV_ABS, ABS_MT_POSITION_X, 100),
+            ev(EV_ABS, ABS_MT_POSITION_Y, 200),
+            ev(EV_KEY, KEY_POWER, 1), // power pressed mid-touch (other fd)
+            ev(EV_KEY, KEY_POWER, 0),
+            ev(EV_ABS, ABS_MT_TRACKING_ID, -1),
+            ev(EV_SYN, SYN_REPORT, 0),
+        ];
+        for e in &stream {
+            if let Some((x, y)) = touch.push(e) {
+                out.push(UiEvent::Tap { x, y });
+            }
+            if let Some(event) = buttons.push(e) {
+                out.push(event);
+            }
+        }
+        assert_eq!(out, vec![UiEvent::Sleep, UiEvent::Tap { x: 100, y: 200 }]);
     }
 }
