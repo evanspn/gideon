@@ -183,6 +183,30 @@ fn reader_tap_back() -> UiEvent {
     UiEvent::Tap { x: W / 2, y: 100 }
 }
 
+/// Like [`make_cbz`] but with one very tall page per entry, so FitWidth
+/// rendering produces a scrollable page (300x1600 → 600x3200 on a 600-wide
+/// display: max_scroll 2400, scroll step 800 - 60 = 740).
+fn make_tall_cbz(path: &Path, pages: usize) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    for i in 0..pages {
+        let gray = (i * 40) as u8;
+        let img = image::RgbImage::from_pixel(300, 1600, image::Rgb([gray, gray, gray]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.start_file(
+            format!("{:03}.png", i + 1),
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
 // --- tests ---
 
 #[test]
