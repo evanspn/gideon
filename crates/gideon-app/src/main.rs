@@ -219,7 +219,7 @@ fn cmd_sources(add_lists: Vec<Url>, no_defaults: bool) -> Result<()> {
 
     println!("{} source(s) available:\n", sources.len());
     for source in sources {
-        let lang = source.lang.as_deref().unwrap_or("?");
+        let lang = source.primary_language().unwrap_or("?");
         let origin = source.origin.as_deref().unwrap_or("?");
         println!(
             "  {:<30} [{}] v{} — {} (from {})",

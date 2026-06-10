@@ -16,11 +16,12 @@ use url::Url;
 use crate::fetch::Fetcher;
 use crate::{Error, Result};
 
-/// Source lists preinstalled in gideon. Users can add their own GitHub-hosted
-/// lists on top of these; any Aidoku-compatible list works.
-pub const DEFAULT_SOURCE_LISTS: &[&str] = &[
-    "https://raw.githubusercontent.com/Skittyblock/aidoku-community-sources/gh-pages/index.json",
-];
+/// Source lists preinstalled in gideon — the same default bobo ships in its
+/// `default-settings.json` (the Aidoku community source list, hosted on
+/// GitHub Pages). Users can add their own lists on top; any
+/// Aidoku-compatible list works.
+pub const DEFAULT_SOURCE_LISTS: &[&str] =
+    &["https://aidoku-community.github.io/sources/index.min.json"];
 
 /// One installable source as described by a source list.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -33,12 +34,25 @@ pub struct SourceInformation {
     pub file: Option<String>,
     #[serde(default)]
     pub lang: Option<String>,
-    /// Icon file name, resolved relative to the list's `icons/` directory.
+    /// Newer lists (like the Aidoku community list) use a `languages` array
+    /// instead of a single `lang` string.
     #[serde(default)]
+    pub languages: Vec<String>,
+    /// Icon file name, resolved relative to the list's `icons/` directory.
+    #[serde(default, alias = "iconURL")]
     pub icon: Option<String>,
     /// Domain of the source list this entry came from (filled in by us).
     #[serde(skip)]
     pub origin: Option<String>,
+}
+
+impl SourceInformation {
+    /// The source's primary language, whichever format the list used.
+    pub fn primary_language(&self) -> Option<&str> {
+        self.lang
+            .as_deref()
+            .or_else(|| self.languages.first().map(String::as_str))
+    }
 }
 
 /// The set of configured source lists (defaults + user additions).
@@ -256,6 +270,7 @@ mod tests {
             version: 1,
             file: Some("en.x-v1.aix".into()),
             lang: None,
+            languages: Vec::new(),
             icon: None,
             origin: None,
         };
@@ -276,6 +291,7 @@ mod tests {
             version: 1,
             file: Some("sources/a.aix".into()),
             lang: None,
+            languages: Vec::new(),
             icon: None,
             origin: None,
         };
@@ -314,6 +330,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_aidoku_community_format() {
+        // Entry shape from https://aidoku-community.github.io/sources/index.min.json,
+        // the same default source list bobo ships.
+        let body = br#"[{
+            "id": "en.aquamanga",
+            "name": "Aqua Manga",
+            "version": 1,
+            "iconURL": "icons/en.aquamanga-v1.png",
+            "downloadURL": "sources/en.aquamanga-v1.aix",
+            "languages": ["en"],
+            "contentRating": 1,
+            "baseURL": "https://aquareader.net"
+        }]"#;
+        let sources = parse_source_list(body).unwrap();
+        assert_eq!(sources.len(), 1);
+        let s = &sources[0];
+        assert_eq!(s.file.as_deref(), Some("sources/en.aquamanga-v1.aix"));
+        assert_eq!(s.icon.as_deref(), Some("icons/en.aquamanga-v1.png"));
+        assert_eq!(s.primary_language(), Some("en"));
+
+        let list_url =
+            Url::parse("https://aidoku-community.github.io/sources/index.min.json").unwrap();
+        assert_eq!(
+            resolve_package_url(&list_url, s).unwrap().as_str(),
+            "https://aidoku-community.github.io/sources/sources/en.aquamanga-v1.aix"
+        );
+        assert_eq!(
+            resolve_icon_url(&list_url, s).unwrap().as_str(),
+            "https://aidoku-community.github.io/sources/icons/en.aquamanga-v1.png"
+        );
+    }
+
+    #[test]
     fn resolve_icon_url_follows_icons_convention() {
         let list_url = Url::parse(LIST_URL).unwrap();
         let source = SourceInformation {
@@ -322,6 +371,7 @@ mod tests {
             version: 1,
             file: None,
             lang: None,
+            languages: Vec::new(),
             icon: Some("a-v1.png".into()),
             origin: None,
         };
