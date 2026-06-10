@@ -25,7 +25,14 @@ The core pipeline works end to end:
 - **Kobo display backend** — Linux framebuffer with mxcfb e-ink refresh
   ioctls (full/partial refresh policy), behind the `kobo` feature
 - **Chapter downloads** — fetched pages are packed into `.cbz` for offline
-  reading
+  reading, with atomic writes, a configurable storage budget and
+  least-recently-read eviction, plus a pre-download engine
+- **Settings** — `settings.json` (source lists, languages, storage limit,
+  pre-download count, auto-update), parsed leniently
+- **OTA updates** — `gideon update` checks GitHub releases, downloads the
+  bundle and swaps the binary atomically with a rollback copy
+- **Library cover view** — `gideon shelf` renders a cover grid with
+  progress bars, pixel-tested so nothing can overflow its cell
 
 ## Try it
 
@@ -41,9 +48,16 @@ cargo run -- render ~/manga/berserk-v1.cbz -p 12 -o page.png
 # Scan a library and see reading progress
 cargo run -- library ~/manga
 
-# List manga sources from the preinstalled GitHub source list
+# List manga sources from the preinstalled GitHub source list (same default as bobo)
 cargo run -- sources
 cargo run -- sources --add-list https://example.com/index.json
+
+# Render the library cover view (cover grid with progress bars)
+cargo run -- shelf ~/manga -o shelf.png
+
+# Check for / install updates from GitHub releases
+cargo run -- update --check
+cargo run -- update
 
 # Read interactively (n = next, p = prev, q = quit); progress is saved
 cargo run -- read ~/manga/berserk-v1.cbz

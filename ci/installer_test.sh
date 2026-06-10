@@ -34,6 +34,14 @@ grep -q "binary-v1" "$ROOT/.adds/gideon/bin/gideon" || fail "wrong binary instal
 [ -d "$ROOT/.adds/gideon/data" ] || fail "data dir not created"
 [ -f "$ROOT/.adds/nm/gideon" ] || fail "NickelMenu entry not installed"
 
+echo "==> install without NickelMenu warns but still succeeds"
+ROOT_NO_NM="$WORKDIR/KoboNoNM"
+mkdir -p "$ROOT_NO_NM/.kobo"
+OUT=$(sh "$INSTALLER" --binary "$WORKDIR/gideon-v1" --root "$ROOT_NO_NM")
+[ -x "$ROOT_NO_NM/.adds/gideon/bin/gideon" ] || fail "install without NickelMenu should still install the app"
+echo "$OUT" | grep -q "NickelMenu is not installed" || fail "missing NickelMenu warning not shown"
+echo "$OUT" | grep -q "pgaskin.net/NickelMenu" || fail "warning should link to NickelMenu"
+
 echo "==> simulate user data accumulating between installs"
 mkdir -p "$ROOT/.adds/gideon/data"
 echo '{"progress":{"Berserk/vol1.cbz":{"current_page":42}}}' > "$ROOT/.adds/gideon/data/progress.json"

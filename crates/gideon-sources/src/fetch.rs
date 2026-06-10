@@ -37,14 +37,18 @@ impl UreqFetcher {
 
 impl Fetcher for UreqFetcher {
     fn get(&self, url: &Url) -> Result<Vec<u8>> {
-        let response = self
-            .agent
-            .get(url.as_str())
-            .call()
-            .map_err(|e| Error::Fetch {
-                url: url.to_string(),
-                message: e.to_string(),
-            })?;
+        let mut request = self.agent.get(url.as_str());
+        // Authenticate GitHub API requests when a token is provided —
+        // required for OTA update checks against private repositories.
+        if url.domain() == Some("api.github.com") {
+            if let Ok(token) = std::env::var("GIDEON_GITHUB_TOKEN") {
+                request = request.set("Authorization", &format!("Bearer {token}"));
+            }
+        }
+        let response = request.call().map_err(|e| Error::Fetch {
+            url: url.to_string(),
+            message: e.to_string(),
+        })?;
 
         let mut buf = Vec::new();
         response

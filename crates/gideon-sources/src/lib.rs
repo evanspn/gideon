@@ -10,6 +10,8 @@
 pub mod download;
 pub mod fetch;
 pub mod list;
+pub mod storage;
+pub mod update;
 
 pub use download::pages_to_cbz;
 pub use fetch::{Fetcher, UreqFetcher};
@@ -17,6 +19,8 @@ pub use list::{
     parse_source_list, resolve_icon_url, resolve_package_url, SourceInformation, SourceLists,
     DEFAULT_SOURCE_LISTS,
 };
+pub use storage::ChapterStorage;
+pub use update::{apply_staged, check_update, stage_update, ReleaseInfo, DEFAULT_UPDATE_REPO};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -21,6 +21,15 @@
       UI overflow bugs must not come back)
 - [ ] FitWidth scrolling within a page (the render/blit plumbing exists)
 - [ ] Page pre-decoding (decode page N+1 while reading page N)
+- [x] Settings (settings.json: source lists, languages, storage limit,
+      pre-download count, auto-update) with lenient parsing
+- [x] Chapter storage with size-budget eviction + pre-download engine
+      (gideon-sources::storage; sources WASM runtime in v2 plugs into it)
+- [x] OTA updates from GitHub releases (`gideon update`, staged atomic
+      binary swap with rollback; requires the repo to be public or a
+      GIDEON_GITHUB_TOKEN)
+- [x] Library cover view foundation (`gideon shelf`: cover grid + progress
+      bars, headless pixel-tested so nothing draws outside its cell)
 - [x] Install bundle: armv7 binary + data-preserving installer with backups
       and NickelMenu launcher entry (post-merge CI artifact)
 - [x] Semantic-versioned, tag-driven GitHub releases (scripts/release.sh + release workflow)

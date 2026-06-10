@@ -6,6 +6,8 @@
 //! (what most Kobo e-ink panels can actually show) → centered composite
 //! onto a white canvas matching the screen size.
 
+pub mod shelf;
+
 use image::imageops::FilterType;
 use image::DynamicImage;
 
