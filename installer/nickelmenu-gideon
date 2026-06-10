@@ -1,1 +1,1 @@
-menu_item :main :gideon :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga
+menu_item :main :gideon :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga 2>&1

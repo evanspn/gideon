@@ -47,6 +47,14 @@ set -e
 echo "$READ_OUT" | grep -F "failed to open the e-ink framebuffer" >/dev/null \
     || fail "unexpected error message: $READ_OUT"
 
+echo "==> [kobo binary] first boot: missing library dir is created, exit 0"
+FIRSTBOOT="$WORKDIR/fresh-device/Manga"
+$RUN "$KOBO_BIN" library "$FIRSTBOOT" | grep -q "Library initialized" \
+    || fail "first boot should initialize the library directory"
+[ -d "$FIRSTBOOT" ] || fail "library directory was not created"
+$RUN "$KOBO_BIN" library "$FIRSTBOOT" | grep -q "No CBZ files found" \
+    || fail "second boot with empty library should report no CBZ files"
+
 echo "==> [plain binary] full read loop with progress persistence"
 $RUN "$PLAIN_BIN" library "$WORKDIR/manga" >/dev/null
 printf 'n\nq\n' | $RUN "$PLAIN_BIN" read "$CBZ" >/dev/null
