@@ -38,6 +38,13 @@ const HWTCON_SEND_UPDATE: u32 = 0x4024462E;
 // update to complete; KOReader waits on flashing refreshes so MTK updates
 // don't stack and glitch the panel.
 const HWTCON_WAIT_FOR_UPDATE_COMPLETE: u32 = 0xC008462F;
+// _IOW('F', 0x37, uint32_t) — KOReader waits for submission of the marker
+// it just sent on Kobo MTK ("wait_for_submission_after = true").
+const HWTCON_WAIT_FOR_UPDATE_SUBMISSION: u32 = 0x40044637;
+// MTK REAGL: KOReader's partial-refresh waveform on HWTCON devices
+// ("REAGL is *always* available" there).
+const HWTCON_WAVEFORM_MODE_GLR16: u32 = 4;
+const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 // Mark 7 dithering: passthrough (off).
 const EPDC_FLAG_USE_DITHERING_PASSTHROUGH: i32 = 0x0;
 
@@ -242,6 +249,28 @@ impl KoboDisplay {
                 )));
             }
         }
+        // KOReader normalizes the framebuffer rotation to upright at startup
+        // (fbdepth -r); device touch tables assume that orientation. Best
+        // effort: a kernel that refuses keeps its rotation and we adapt to
+        // whatever geometry it reports.
+        if var.rotate != 0 {
+            let mut wanted = var;
+            wanted.rotate = 0;
+            // SAFETY: FBIOPUT_VSCREENINFO with a struct obtained from the
+            // matching GET, only the rotate field changed.
+            let ret = unsafe { ioctl(file.as_raw_fd(), FBIOPUT_VSCREENINFO, &mut wanted) };
+            // Re-read whatever the kernel settled on (geometry may have
+            // changed even on partial success).
+            unsafe {
+                let _ = ioctl(file.as_raw_fd(), FBIOGET_VSCREENINFO, &mut var);
+                let _ = ioctl(file.as_raw_fd(), FBIOGET_FSCREENINFO, &mut fix);
+            }
+            eprintln!(
+                "gideon fb: rotation normalize {} (was rotate!=0, now rotate={})",
+                if ret == 0 { "ok" } else { "refused" },
+                var.rotate
+            );
+        }
         eprintln!(
             "gideon fb: {}x{} {}bpp rotate={} line_length={} smem_len={}",
             var.xres, var.yres, var.bits_per_pixel, var.rotate, fix.line_length, fix.smem_len
@@ -350,9 +379,15 @@ impl Display for KoboDisplay {
         for &api in candidates {
             let ret = match api {
                 UpdateApi::Mtk => {
+                    // KOReader's HWTCON waveforms: GC16 flashes, REAGL
+                    // (GLR16) partials.
+                    let mtk_waveform = match mode {
+                        RefreshMode::Full => WAVEFORM_MODE_GC16,
+                        RefreshMode::Partial => HWTCON_WAVEFORM_MODE_GLR16,
+                    };
                     let mut update = hwtcon_update_data {
                         update_region: region,
-                        waveform_mode: waveform,
+                        waveform_mode: mtk_waveform,
                         update_mode,
                         update_marker: self.update_marker,
                         flags: 0,
@@ -392,19 +427,33 @@ impl Display for KoboDisplay {
                 self.update_api = Some(api);
                 // MTK: wait for flashing refreshes to finish (KOReader does)
                 // so back-to-back updates can't stack; best-effort.
-                if api == UpdateApi::Mtk && mode == RefreshMode::Full {
-                    let mut marker = hwtcon_update_marker_data {
-                        update_marker: self.update_marker,
-                        collision_test: 0,
-                    };
-                    // SAFETY: fully initialized marker struct for the ioctl.
+                if api == UpdateApi::Mtk {
+                    // KOReader on Kobo MTK waits for submission of the
+                    // just-sent marker after every update…
+                    let mut submitted: u32 = self.update_marker;
+                    // SAFETY: uint32 payload per the ioctl definition.
                     let _ = unsafe {
                         ioctl(
                             self.file.as_raw_fd(),
-                            HWTCON_WAIT_FOR_UPDATE_COMPLETE,
-                            &mut marker,
+                            HWTCON_WAIT_FOR_UPDATE_SUBMISSION,
+                            &mut submitted,
                         )
                     };
+                    // …and for full completion before/around flashes.
+                    if mode == RefreshMode::Full {
+                        let mut marker = hwtcon_update_marker_data {
+                            update_marker: self.update_marker,
+                            collision_test: 0,
+                        };
+                        // SAFETY: fully initialized marker struct.
+                        let _ = unsafe {
+                            ioctl(
+                                self.file.as_raw_fd(),
+                                HWTCON_WAIT_FOR_UPDATE_COMPLETE,
+                                &mut marker,
+                            )
+                        };
+                    }
                 }
                 return Ok(());
             }
