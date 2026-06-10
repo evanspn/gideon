@@ -1,0 +1,237 @@
+//! The [`SourceGateway`] trait: everything the browse UI needs from the
+//! manga-source backend, behind one object so the UI is unit-testable with
+//! a fake (no network, no WASM runtime).
+//!
+//! [`AidokuGateway`] is the production implementation, built on the Aidoku
+//! WASM runtime (`gideon-aidoku`) and the source-list machinery
+//! (`gideon-sources`), reusing the same functions the CLI commands use.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
+
+use gideon_aidoku::source::Source;
+use gideon_sources::UreqFetcher;
+
+use crate::manga;
+
+/// A source as shown in the Sources screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEntry {
+    pub id: String,
+    pub name: String,
+}
+
+/// A manga as shown in list screens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MangaEntry {
+    pub id: String,
+    pub title: String,
+}
+
+/// A chapter as shown in the chapter list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChapterEntry {
+    pub id: String,
+    pub num: Option<f32>,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+}
+
+impl ChapterEntry {
+    /// Row label: `Ch {num} — {title} [{lang}]`, omitting missing pieces.
+    pub fn label(&self) -> String {
+        let mut out = match self.num {
+            Some(n) => format!("Ch {n}"),
+            None => "Ch ?".to_string(),
+        };
+        if let Some(title) = self.title.as_deref().filter(|t| !t.is_empty()) {
+            out.push_str(" — ");
+            out.push_str(title);
+        }
+        if let Some(lang) = self.lang.as_deref().filter(|l| !l.is_empty()) {
+            out.push_str(&format!(" [{lang}]"));
+        }
+        out
+    }
+}
+
+/// What the browse UI needs from the source backend. All methods are
+/// blocking; errors are surfaced to the user on an error screen, never
+/// panicked on.
+pub trait SourceGateway {
+    /// Installed sources, in stable order.
+    fn installed_sources(&self) -> Result<Vec<SourceEntry>>;
+
+    /// Sources available from the configured source lists (may include ones
+    /// that are already installed; the UI filters).
+    fn available_sources(&self) -> Result<Vec<SourceEntry>>;
+
+    /// Download and install a source by id.
+    fn install_source(&self, source_id: &str) -> Result<()>;
+
+    /// Fetch a listing ("Popular", "Latest") from a source, falling back to
+    /// an empty search when the source has no such listing.
+    fn list_manga(&self, source_id: &str, listing: &str) -> Result<Vec<MangaEntry>>;
+
+    /// Chapter list for a manga.
+    fn chapters(&self, source_id: &str, manga_id: &str) -> Result<Vec<ChapterEntry>>;
+
+    /// Download a chapter into `library` as a CBZ, reporting
+    /// `(pages_done, pages_total)`. Returns the written CBZ path.
+    fn download_chapter(
+        &self,
+        source_id: &str,
+        manga_id: &str,
+        chapter_id: &str,
+        library: &Path,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PathBuf>;
+
+    /// Check for app updates; returns a human-readable status line.
+    fn check_updates(&self) -> Result<String>;
+}
+
+/// Production gateway: Aidoku WASM sources + GitHub-hosted source lists.
+pub struct AidokuGateway {
+    data_dir: PathBuf,
+    /// Loaded WASM sources, cached per id — instantiating a source is slow.
+    cache: RefCell<HashMap<String, Source>>,
+}
+
+impl AidokuGateway {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn source(&self, source_id: &str) -> Result<Source> {
+        if let Some(source) = self.cache.borrow().get(source_id) {
+            return Ok(source.clone());
+        }
+        let source = manga::load_source(&self.data_dir, source_id)?;
+        self.cache
+            .borrow_mut()
+            .insert(source_id.to_string(), source.clone());
+        Ok(source)
+    }
+
+    fn runtime(&self) -> Result<tokio::runtime::Runtime> {
+        tokio::runtime::Runtime::new().context("failed to start async runtime")
+    }
+}
+
+impl SourceGateway for AidokuGateway {
+    fn installed_sources(&self) -> Result<Vec<SourceEntry>> {
+        Ok(manga::installed_sources(&self.data_dir)?
+            .into_iter()
+            .map(|s| SourceEntry {
+                id: s.id,
+                name: s.name,
+            })
+            .collect())
+    }
+
+    fn available_sources(&self) -> Result<Vec<SourceEntry>> {
+        let lists = manga::configured_lists(&self.data_dir)?;
+        let fetcher = UreqFetcher::new();
+        let sources = lists.available_sources(&fetcher)?;
+        Ok(sources
+            .into_iter()
+            .map(|s| SourceEntry {
+                id: s.id,
+                name: s.name,
+            })
+            .collect())
+    }
+
+    fn install_source(&self, source_id: &str) -> Result<()> {
+        manga::install_source(&self.data_dir, source_id)?;
+        Ok(())
+    }
+
+    fn list_manga(&self, source_id: &str, listing: &str) -> Result<Vec<MangaEntry>> {
+        let source = self.source(source_id)?;
+        let runtime = self.runtime()?;
+
+        let aidoku_listing = gideon_aidoku::aidoku::Listing {
+            id: listing.to_lowercase(),
+            name: listing.to_string(),
+            kind: gideon_aidoku::aidoku::ListingKind::default(),
+        };
+        let mangas =
+            match runtime.block_on(source.get_manga_list(CancellationToken::new(), aidoku_listing))
+            {
+                Ok(mangas) => mangas,
+                // The source may not implement this listing — fall back to an
+                // empty search, which most sources answer with a default list.
+                Err(_) => runtime
+                    .block_on(source.search_mangas(CancellationToken::new(), String::new()))?,
+            };
+
+        Ok(mangas
+            .into_iter()
+            .map(|m| MangaEntry {
+                title: m.title.unwrap_or_else(|| m.id.clone()),
+                id: m.id,
+            })
+            .collect())
+    }
+
+    fn chapters(&self, source_id: &str, manga_id: &str) -> Result<Vec<ChapterEntry>> {
+        let source = self.source(source_id)?;
+        let runtime = self.runtime()?;
+        let chapters = runtime
+            .block_on(source.get_chapter_list(CancellationToken::new(), manga_id.to_string()))?;
+        Ok(chapters
+            .into_iter()
+            .map(|c| ChapterEntry {
+                id: c.id,
+                num: c.chapter_num,
+                title: c.title,
+                lang: c.lang,
+            })
+            .collect())
+    }
+
+    fn download_chapter(
+        &self,
+        source_id: &str,
+        manga_id: &str,
+        chapter_id: &str,
+        library: &Path,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PathBuf> {
+        let source = self.source(source_id)?;
+        let runtime = self.runtime()?;
+        runtime.block_on(manga::download_chapter(
+            &source, manga_id, chapter_id, library, progress,
+        ))
+    }
+
+    fn check_updates(&self) -> Result<String> {
+        use gideon_sources::update;
+
+        let repo = std::env::var("GIDEON_UPDATE_REPO")
+            .unwrap_or_else(|_| update::DEFAULT_UPDATE_REPO.to_string());
+        let current = env!("CARGO_PKG_VERSION");
+        let fetcher = UreqFetcher::new();
+
+        let base = update::release_base();
+        let release = update::check_update_via_assets(&fetcher, &base, &repo, current)
+            .or_else(|_| update::check_update(&fetcher, &repo, current))?;
+
+        Ok(match release {
+            Some(release) => format!(
+                "Update available: {current} -> {}.\nInstall it from the gideon menu.",
+                release.version
+            ),
+            None => format!("gideon {current} is up to date."),
+        })
+    }
+}

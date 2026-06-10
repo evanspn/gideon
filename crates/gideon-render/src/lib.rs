@@ -7,6 +7,7 @@
 //! onto a white canvas matching the screen size.
 
 pub mod shelf;
+pub mod text;
 
 use image::imageops::FilterType;
 use image::DynamicImage;

@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 image.workspace = true
+ab_glyph = "0.2"

@@ -10,6 +10,10 @@
 //! have been removed or replaced with minimal standalone equivalents (see
 //! [`settings`]).
 
+// Re-export the Aidoku SDK so downstream crates can construct its types
+// (e.g. `aidoku::Listing`) without depending on the git crate directly.
+pub use aidoku;
+
 pub mod settings;
 pub mod source;
 pub(crate) mod util;
