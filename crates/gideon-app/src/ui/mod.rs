@@ -463,6 +463,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &mut progress,
         )?;
 
+        // Taps queued while the download ran were aimed at the (now gone)
+        // chapter list — drop them so they don't flip pages in the reader.
+        self.input.discard_queued();
+
         let key = progress_key(&self.library_dir, &cbz_path);
         if self.run_reader(&cbz_path, &key)? {
             Ok(Flow::Continue)

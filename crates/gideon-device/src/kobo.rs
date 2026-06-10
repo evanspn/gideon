@@ -232,6 +232,13 @@ pub struct KoboDisplay {
     bytes_per_pixel: u32,
     update_marker: u32,
     update_api: Option<UpdateApi>,
+    /// The rotation the kernel actually settled on (0..=3) — kernels may
+    /// refuse the normalization, and the touch transform must follow the
+    /// settled value, not the requested one.
+    rotate: u32,
+    /// The upright rotation we asked for (`upright_rotate_for_product`,
+    /// or the `GIDEON_FB_ROTATE` override).
+    upright_rotate: u32,
 }
 
 impl KoboDisplay {
@@ -336,7 +343,24 @@ impl KoboDisplay {
             bytes_per_pixel: var.bits_per_pixel / 8,
             update_marker: 0,
             update_api: None,
+            rotate: var.rotate,
+            upright_rotate: wanted_rotate,
         })
+    }
+
+    /// The rotation the framebuffer actually settled on (0..=3). When the
+    /// kernel refused our normalization this differs from
+    /// [`Self::upright_rotation`], and the touch transform must be rotated
+    /// by the difference.
+    pub fn rotation(&self) -> u32 {
+        self.rotate
+    }
+
+    /// The upright rotation this device's touch tables assume (the
+    /// `upright_rotate_for_product` value used, or the `GIDEON_FB_ROTATE`
+    /// override).
+    pub fn upright_rotation(&self) -> u32 {
+        self.upright_rotate
     }
 }
 

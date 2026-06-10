@@ -540,20 +540,47 @@ fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
 fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     use gideon_device::kobo::KoboDisplay;
     use gideon_device::kobo_input::KoboTouch;
-    use gideon_device::Display as _;
+    use gideon_device::{Display as _, TouchTransform};
 
     if let Some(out) = screenshot {
         return browse_screenshot(library, out);
+    }
+
+    // OTA updates only replace the binary: self-heal the launcher script
+    // and NickelMenu entries on every browse startup, best-effort — the UI
+    // must come up regardless.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            if let Err(e) = manga::ensure_device_files(bin_dir) {
+                eprintln!("gideon: couldn't refresh device files: {e:#}");
+            }
+        }
     }
 
     let mut display = KoboDisplay::open()
         .context("failed to open the e-ink framebuffer — are you running on a Kobo device?")?;
     let (width, height) = (display.width(), display.height());
 
+    // The touch transform must follow the rotation the framebuffer actually
+    // SETTLED on: a kernel that refuses our upright normalization leaves
+    // the panel rotated, and taps must rotate with it. An explicit
+    // GIDEON_TOUCH_TRANSFORM stays absolute (no delta applied).
+    let transform = match std::env::var("GIDEON_TOUCH_TRANSFORM")
+        .ok()
+        .and_then(|raw| raw.parse::<TouchTransform>().ok())
+    {
+        Some(absolute) => absolute,
+        None => {
+            let delta = (display.rotation() + 4 - display.upright_rotation()) % 4;
+            TouchTransform::default_for_product(std::env::var("PRODUCT").ok().as_deref())
+                .rotated_quarter_turns(delta)
+        }
+    };
+
     // From here on the screen is ours — if anything fails during startup
     // or while running, draw the error ON the panel and hold it long
     // enough to photograph before the launcher reboots back into Nickel.
-    let input = match KoboTouch::open(width, height) {
+    let input = match KoboTouch::open_with_transform(width, height, transform) {
         Ok(input) => input,
         Err(e) => {
             show_fatal_on_display(&mut display, &format!("touch screen init failed:\n{e}"));

@@ -277,10 +277,14 @@ pub async fn download_chapter(
     // `execute_with_forced_referer`) and broken CDN certificates are
     // tolerated — manga mirrors routinely have invalid TLS. The user-agent
     // here is only a fallback: `get_image_request` always sets a browser UA.
+    // Timeouts are mandatory: a stalled TCP connection must surface as an
+    // error page, never freeze the device forever.
     let client = reqwest::Client::builder()
         .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
     let width = pages.len().to_string().len().max(3);
     let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(pages.len() + 1);
@@ -303,18 +307,14 @@ pub async fn download_chapter(
     let mut downloaded = 0usize;
     for (i, page) in pages.iter().enumerate() {
         let Some(image_url) = page.image_url.clone() else {
+            // Skipped pages still advance the progress display.
+            progress(i + 1, pages.len());
             continue;
         };
         match fetch_page_bytes(source, &client, &token, page, &image_url).await {
             Ok(bytes) => {
-                let ext = image_url
-                    .path()
-                    .rsplit('.')
-                    .next()
-                    .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-                    .unwrap_or("jpg")
-                    .to_ascii_lowercase();
-                cbz_pages.push((format!("{:0width$}.{ext}", i + 1, width = width), bytes));
+                let name = page_file_name(i, pages.len(), &image_url, &bytes);
+                cbz_pages.push((name, bytes));
                 downloaded += 1;
             }
             Err(error) => {
@@ -352,6 +352,38 @@ pub async fn download_chapter(
         .join(format!("{}.cbz", sanitize(&chapter_label)));
     pages_to_cbz(&out_path, &cbz_pages)?;
     Ok(out_path)
+}
+
+/// Image extensions the CBZ reader recognizes as pages (must mirror
+/// gideon-core's `PAGE_EXTENSIONS`): any other extension would make the
+/// reader silently drop the page.
+const PAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+
+/// Pick the file extension for a downloaded page: the URL path's extension
+/// when it's a recognized image extension, otherwise sniff the actual bytes
+/// (CDNs serve images from `.php` & friends), falling back to "jpg".
+fn page_extension(image_url: &Url, bytes: &[u8]) -> String {
+    if let Some(ext) = image_url
+        .path()
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .filter(|e| PAGE_EXTENSIONS.contains(&e.as_str()))
+    {
+        return ext;
+    }
+    image::guess_format(bytes)
+        .ok()
+        .and_then(|format| format.extensions_str().first().copied())
+        .unwrap_or("jpg")
+        .to_string()
+}
+
+/// Archive entry name for page `index` (0-based) out of `total`.
+fn page_file_name(index: usize, total: usize, image_url: &Url, bytes: &[u8]) -> String {
+    let width = total.to_string().len().max(3);
+    let ext = page_extension(image_url, bytes);
+    format!("{:0width$}.{ext}", index + 1, width = width)
 }
 
 /// Fetch one page image through the source's request hook, with the
@@ -636,6 +668,30 @@ mod download_tests {
             wrap_text("supercalifragilistic", 5),
             vec!["supercalifragilistic"]
         );
+    }
+
+    #[test]
+    fn php_url_with_png_bytes_is_named_png() {
+        // CDNs commonly serve pages from script URLs; the reader only
+        // accepts known image extensions, so the bytes decide the name.
+        let png_bytes = error_page_png(1, 1, "fixture: a real PNG");
+        let url = Url::parse("https://cdn.example.com/image.php?id=3").unwrap();
+        assert_eq!(page_file_name(0, 40, &url, &png_bytes), "001.png");
+    }
+
+    #[test]
+    fn known_url_extension_is_kept_without_sniffing() {
+        let url = Url::parse("https://cdn.example.com/p/0042.JPG").unwrap();
+        // Garbage bytes: the URL extension wins, lowercased.
+        assert_eq!(page_file_name(11, 250, &url, b"not an image"), "012.jpg");
+        let webp = Url::parse("https://cdn.example.com/p/1.webp").unwrap();
+        assert_eq!(page_file_name(0, 9, &webp, b""), "001.webp");
+    }
+
+    #[test]
+    fn unsniffable_bytes_fall_back_to_jpg() {
+        let url = Url::parse("https://cdn.example.com/serve?page=1").unwrap();
+        assert_eq!(page_file_name(2, 10, &url, b"\x00\x01\x02"), "003.jpg");
     }
 
     /// Minimal blocking HTTP server: answers each connection with the next

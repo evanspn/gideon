@@ -164,8 +164,20 @@ pub struct KoboTouch {
 impl KoboTouch {
     /// Scan `/dev/input/event0..event5` for the first device advertising an
     /// absolute X axis, and configure raw-to-screen mapping for a
-    /// `screen_w x screen_h` display.
+    /// `screen_w x screen_h` display, with the transform taken from the
+    /// environment (`GIDEON_TOUCH_TRANSFORM` / `PRODUCT`).
     pub fn open(screen_w: u32, screen_h: u32) -> Result<Self> {
+        Self::open_with_transform(screen_w, screen_h, TouchTransform::from_env())
+    }
+
+    /// Like [`Self::open`], but with an explicit raw-to-screen transform
+    /// (e.g. the env default composed with the framebuffer's settled
+    /// rotation delta).
+    pub fn open_with_transform(
+        screen_w: u32,
+        screen_h: u32,
+        transform: TouchTransform,
+    ) -> Result<Self> {
         for n in 0..=5 {
             let path = format!("/dev/input/event{n}");
             let Ok(file) = File::open(&path) else {
@@ -205,14 +217,13 @@ impl KoboTouch {
                 }
             };
             eprintln!(
-                "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={:?}",
-                TouchTransform::from_env()
+                "gideon touch: using {path} (mt={mt}) max_x={max_x} max_y={max_y} transform={transform:?}"
             );
 
             return Ok(Self {
                 file,
                 tracker: TouchTracker::new(),
-                transform: TouchTransform::from_env(),
+                transform,
                 max_x,
                 max_y,
                 screen_w,
@@ -222,6 +233,34 @@ impl KoboTouch {
         Err(Error::Display(
             "no touch screen found on /dev/input/event0..5".to_string(),
         ))
+    }
+
+    /// Drain any already-queued evdev events without blocking and reset the
+    /// tap tracker: taps made while the UI was busy (e.g. during a chapter
+    /// download) must not fire stale actions in whatever screen comes next.
+    pub fn discard_queued(&mut self) {
+        let fd = self.file.as_raw_fd();
+        // SAFETY: fcntl F_GETFL/F_SETFL and read(2) on a fd we own; the
+        // buffer pointer/length pair describes a valid local buffer.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return;
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return;
+            }
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+            }
+            // Restore blocking mode for next_event's read_exact.
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags);
+        }
+        self.tracker = TouchTracker::new();
     }
 }
 
@@ -260,6 +299,10 @@ impl InputSource for KoboTouch {
                 return Ok(UiEvent::Tap { x, y });
             }
         }
+    }
+
+    fn discard_queued(&mut self) {
+        KoboTouch::discard_queued(self);
     }
 }
 

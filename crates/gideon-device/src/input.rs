@@ -23,6 +23,11 @@ pub enum UiEvent {
 pub trait InputSource {
     /// Block until the next event arrives.
     fn next_event(&mut self) -> crate::Result<UiEvent>;
+
+    /// Drop any events that queued up while the UI was busy (e.g. taps made
+    /// during a long download) so they don't fire stale actions. Default:
+    /// no-op — test inputs replay their script unaffected.
+    fn discard_queued(&mut self) {}
 }
 
 /// Test input source: replays a fixed list of events, then errors.
@@ -115,6 +120,60 @@ impl TouchTransform {
         )
     }
 
+    /// Decompose into the (swap, mirror_x, mirror_y) algebra: mirrors apply
+    /// to the raw axes first, then `swap` exchanges them (see [`Self::apply`]).
+    fn decompose(self) -> (bool, bool, bool) {
+        use TouchTransform::*;
+        match self {
+            Identity => (false, false, false),
+            SwapXY => (true, false, false),
+            MirrorX => (false, true, false),
+            MirrorY => (false, false, true),
+            SwapXYMirrorX => (true, true, false),
+            SwapXYMirrorY => (true, false, true),
+            MirrorBoth => (false, true, true),
+            SwapXYMirrorBoth => (true, true, true),
+        }
+    }
+
+    fn compose(swap: bool, mirror_x: bool, mirror_y: bool) -> Self {
+        use TouchTransform::*;
+        match (swap, mirror_x, mirror_y) {
+            (false, false, false) => Identity,
+            (true, false, false) => SwapXY,
+            (false, true, false) => MirrorX,
+            (false, false, true) => MirrorY,
+            (true, true, false) => SwapXYMirrorX,
+            (true, false, true) => SwapXYMirrorY,
+            (false, true, true) => MirrorBoth,
+            (true, true, true) => SwapXYMirrorBoth,
+        }
+    }
+
+    /// Compose `quarter_turns` extra *clockwise* quarter-turn rotations onto
+    /// this transform: the result maps raw panel coordinates to a screen
+    /// whose content is rotated `quarter_turns × 90°` CW relative to what
+    /// `self` targets (e.g. when the kernel refused the upright rotation
+    /// and the framebuffer settled elsewhere).
+    ///
+    /// A CW quarter turn sends screen `(x, y)` to `(max_y - y, x)`; in the
+    /// (swap, mirror) algebra that is "mirror the new screen-x source, then
+    /// swap": a swapped transform un-swaps with mirror_x flipped, an
+    /// un-swapped one swaps with mirror_y flipped.
+    pub fn rotated_quarter_turns(self, quarter_turns: u32) -> TouchTransform {
+        let (mut swap, mut mirror_x, mut mirror_y) = self.decompose();
+        for _ in 0..(quarter_turns % 4) {
+            if swap {
+                swap = false;
+                mirror_x = !mirror_x;
+            } else {
+                swap = true;
+                mirror_y = !mirror_y;
+            }
+        }
+        Self::compose(swap, mirror_x, mirror_y)
+    }
+
     /// Read the transform from `GIDEON_TOUCH_TRANSFORM`, falling back to
     /// the per-device default for the Kobo `PRODUCT` codename (set by the
     /// stock system and inherited by our launcher), then the generic
@@ -139,9 +198,10 @@ impl TouchTransform {
             Some("monza") | Some("monzakobo") | Some("monzatolino") => {
                 TouchTransform::SwapXYMirrorX
             }
-            // Clara BW / Clara Colour: KOReader's base mapping (mirrored_x):
+            // Clara BW / Clara Colour and the rest of the spa* family
+            // (incl. Tolino variants): KOReader's base mapping (mirrored_x):
             // screen_x = max - raw_y == our SwapXYMirrorY.
-            Some("spabw") | Some("spacolour") | Some("spacolor") => TouchTransform::SwapXYMirrorY,
+            Some(p) if p.starts_with("spa") => TouchTransform::SwapXYMirrorY,
             _ => TouchTransform::default(),
         }
     }
@@ -294,8 +354,17 @@ mod tests {
             TouchTransform::default_for_product(Some(" MonzaKobo ")),
             TouchTransform::SwapXYMirrorX
         );
+        // Any spa* codename (Clara family, incl. Tolino variants).
         assert_eq!(
             TouchTransform::default_for_product(Some("spaBW")),
+            TouchTransform::SwapXYMirrorY
+        );
+        assert_eq!(
+            TouchTransform::default_for_product(Some("spaColour")),
+            TouchTransform::SwapXYMirrorY
+        );
+        assert_eq!(
+            TouchTransform::default_for_product(Some(" spaTolinoBW ")),
             TouchTransform::SwapXYMirrorY
         );
         assert_eq!(
@@ -306,5 +375,116 @@ mod tests {
             TouchTransform::default_for_product(None),
             TouchTransform::default()
         );
+    }
+
+    /// Rotate a screen point one quarter turn clockwise on a square screen
+    /// of side `side`: (x, y) -> (side - 1 - y, x).
+    fn rotate_point_cw(p: (u32, u32), side: u32) -> (u32, u32) {
+        (side - 1 - p.1, p.0)
+    }
+
+    // Square geometry so screen dimensions survive rotation unchanged and
+    // the scaled mapping is exact (raw 0..=1000 onto 101 px = raw/10).
+    const SQ: u32 = 101;
+
+    fn apply_sq(t: TouchTransform, x: u32, y: u32) -> (u32, u32) {
+        t.apply(x, y, MAX, MAX, SQ, SQ)
+    }
+
+    #[test]
+    fn rotated_quarter_turns_composes_with_apply() {
+        // For every transform, every delta and a few sample points:
+        // rotated transform == rotate the output of the original.
+        let all = [
+            TouchTransform::Identity,
+            TouchTransform::SwapXY,
+            TouchTransform::MirrorX,
+            TouchTransform::MirrorY,
+            TouchTransform::SwapXYMirrorX,
+            TouchTransform::SwapXYMirrorY,
+            TouchTransform::MirrorBoth,
+            TouchTransform::SwapXYMirrorBoth,
+        ];
+        let samples = [(0, 0), (1000, 0), (0, 1000), (250, 500), (730, 90)];
+        for t in all {
+            for delta in 0..4u32 {
+                for (rx, ry) in samples {
+                    let mut expected = apply_sq(t, rx, ry);
+                    for _ in 0..delta {
+                        expected = rotate_point_cw(expected, SQ);
+                    }
+                    assert_eq!(
+                        apply_sq(t.rotated_quarter_turns(delta), rx, ry),
+                        expected,
+                        "{t:?} rotated by {delta} quarter turns at raw ({rx}, {ry})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delta_zero_is_identity_composition() {
+        assert_eq!(
+            TouchTransform::SwapXYMirrorX.rotated_quarter_turns(0),
+            TouchTransform::SwapXYMirrorX
+        );
+        // raw (250, 500) on monza: screen (50, 75) on the square screen.
+        assert_eq!(apply_sq(TouchTransform::SwapXYMirrorX, 250, 500), (50, 75));
+    }
+
+    #[test]
+    fn delta_one_maps_one_quarter_turn_clockwise() {
+        // Identity + 1 CW turn: (x, y) -> (max_y - y, x) == SwapXYMirrorY.
+        assert_eq!(
+            TouchTransform::Identity.rotated_quarter_turns(1),
+            TouchTransform::SwapXYMirrorY
+        );
+        let t = TouchTransform::Identity.rotated_quarter_turns(1);
+        assert_eq!(apply_sq(t, 0, 0), (100, 0));
+        assert_eq!(apply_sq(t, 1000, 0), (100, 100));
+        assert_eq!(apply_sq(t, 250, 500), (50, 25));
+    }
+
+    #[test]
+    fn delta_two_maps_a_half_turn() {
+        // Identity + 180°: (x, y) -> (max - x, max - y) == MirrorBoth.
+        assert_eq!(
+            TouchTransform::Identity.rotated_quarter_turns(2),
+            TouchTransform::MirrorBoth
+        );
+        let t = TouchTransform::Identity.rotated_quarter_turns(2);
+        assert_eq!(apply_sq(t, 0, 0), (100, 100));
+        assert_eq!(apply_sq(t, 1000, 0), (0, 100));
+        assert_eq!(apply_sq(t, 250, 500), (75, 50));
+    }
+
+    #[test]
+    fn delta_three_maps_one_quarter_turn_counterclockwise() {
+        // Identity + 270° CW (= 90° CCW): (x, y) -> (y, max_x - x).
+        assert_eq!(
+            TouchTransform::Identity.rotated_quarter_turns(3),
+            TouchTransform::SwapXYMirrorX
+        );
+        let t = TouchTransform::Identity.rotated_quarter_turns(3);
+        assert_eq!(apply_sq(t, 0, 0), (0, 100));
+        assert_eq!(apply_sq(t, 1000, 0), (0, 0));
+        assert_eq!(apply_sq(t, 250, 500), (50, 75));
+    }
+
+    #[test]
+    fn four_quarter_turns_round_trip() {
+        for t in [
+            TouchTransform::Identity,
+            TouchTransform::SwapXYMirrorX,
+            TouchTransform::MirrorBoth,
+        ] {
+            assert_eq!(t.rotated_quarter_turns(4), t);
+            assert_eq!(
+                t.rotated_quarter_turns(1).rotated_quarter_turns(3),
+                t,
+                "1 + 3 quarter turns must cancel for {t:?}"
+            );
+        }
     }
 }

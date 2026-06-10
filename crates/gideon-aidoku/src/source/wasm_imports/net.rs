@@ -203,8 +203,17 @@ pub fn send(mut caller: Caller<'_, WasmStore>, request_descriptor_i32: i32) -> R
         anyhow::bail!("no internet connection available");
     }
 
+    // Timeouts are mandatory: a stalled TCP connection must surface as a
+    // source error, never hang the device forever. Invalid certificates are
+    // tolerated to match the image downloader (bobo's tolerance) — manga
+    // mirrors routinely have broken TLS.
     #[cfg(feature = "all")]
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("failed to build HTTP client")?;
     #[cfg(feature = "all")]
     let request =
         reqwest::Request::try_from(&*request_builder).context("failed to build request")?;
