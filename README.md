@@ -85,13 +85,13 @@ Kobo devices are armv7 with an e-ink framebuffer. The `kobo` feature enables
 the framebuffer backend:
 
 ```sh
-rustup target add armv7-unknown-linux-musleabihf
-sudo apt-get install gcc-arm-linux-gnueabihf
-
-export CC_armv7_unknown_linux_musleabihf=arm-linux-gnueabihf-gcc
-export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=arm-linux-gnueabihf-gcc
-cargo build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
+cargo install cross
+cross build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
 ```
+
+(`cross` uses Docker images with a proper musl toolchain — the same approach
+bobo uses; a plain gnueabihf compiler produces glibc/musl symbol mismatches
+when linking the source runtime's C dependencies.)
 
 The framebuffer must be in 8-bit grayscale mode (`fbdepth -d 8`, shipped with
 KOReader, does this).

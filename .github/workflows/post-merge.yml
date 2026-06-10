@@ -25,26 +25,18 @@ jobs:
         with:
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
-      - name: Install ARM cross toolchain and QEMU
-        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user-static
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
       - name: Build Kobo binary (armv7, kobo feature)
-        env:
-          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
-          CXX_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-g++
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
-          RUST_FONTCONFIG_DLOPEN: "on"
-          FONTCONFIG_NO_PKG_CONFIG: "1"
         run: |
-          cargo build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
+          cross build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
           cp target/armv7-unknown-linux-musleabihf/release/gideon /tmp/gideon-kobo
       - name: Build plain binary (armv7, default features)
-        env:
-          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
-          CXX_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-g++
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
-          RUST_FONTCONFIG_DLOPEN: "on"
-          FONTCONFIG_NO_PKG_CONFIG: "1"
-        run: cargo build --release --target armv7-unknown-linux-musleabihf
+        run: cross build --release --target armv7-unknown-linux-musleabihf
       - name: Run integration tests under QEMU
         run: ./ci/qemu_integration.sh /tmp/gideon-kobo target/armv7-unknown-linux-musleabihf/release/gideon
       - name: Assemble install bundle
