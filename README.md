@@ -49,6 +49,15 @@ cargo run -- sources --add-list https://example.com/index.json
 cargo run -- read ~/manga/berserk-v1.cbz
 ```
 
+## Installing on a Kobo
+
+Grab the `gideon-kobo-bundle` artifact from the latest post-merge CI run,
+unzip it, plug in your Kobo and run `./install.sh`. Upgrades are in-place and
+**never touch your data**: settings and progress live in
+`.adds/gideon/data/`, which the installer backs up before each upgrade and
+never writes to. See [installer/INSTALL.md](installer/INSTALL.md) for
+details, on-device installs and uninstalling.
+
 ## Building for Kobo
 
 Kobo devices are armv7 with an e-ink framebuffer. The `kobo` feature enables

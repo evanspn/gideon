@@ -37,11 +37,25 @@ jobs:
         run: cargo build --release --target armv7-unknown-linux-musleabihf
       - name: Run integration tests under QEMU
         run: ./ci/qemu_integration.sh /tmp/gideon-kobo target/armv7-unknown-linux-musleabihf/release/gideon
-      - name: Upload Kobo binary artifact
+      - name: Assemble install bundle
+        run: |
+          mkdir -p /tmp/bundle
+          cp /tmp/gideon-kobo /tmp/bundle/gideon
+          cp installer/install.sh installer/nickelmenu-gideon installer/INSTALL.md /tmp/bundle/
+          chmod 755 /tmp/bundle/install.sh /tmp/bundle/gideon
+          pkg_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "gideon ${pkg_version} (${GITHUB_SHA::9})" > /tmp/bundle/VERSION
+      - name: Smoke-test the bundle installer against a fake Kobo
+        run: |
+          mkdir -p /tmp/fake-kobo/.kobo /tmp/fake-kobo/.adds/nm
+          sh /tmp/bundle/install.sh --root /tmp/fake-kobo
+          test -x /tmp/fake-kobo/.adds/gideon/bin/gideon
+          cmp /tmp/bundle/gideon /tmp/fake-kobo/.adds/gideon/bin/gideon
+      - name: Upload Kobo install bundle
         uses: actions/upload-artifact@v4
         with:
-          name: gideon-kobo-armv7
-          path: /tmp/gideon-kobo
+          name: gideon-kobo-bundle
+          path: /tmp/bundle/
           retention-days: 30
 
   live-sources:

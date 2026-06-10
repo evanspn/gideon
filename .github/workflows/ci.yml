@@ -57,6 +57,18 @@ jobs:
           printf 'n\nq\n' | ./target/debug/gideon read "/tmp/manga/Sample Manga/vol1.cbz"
           ./target/debug/gideon library /tmp/manga | grep -F "(page 2/3)"
 
+  installer:
+    name: Installer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint shell scripts
+        run: shellcheck installer/install.sh ci/installer_test.sh ci/qemu_integration.sh
+      - name: Run installer test suite
+        run: ./ci/installer_test.sh
+
   kobo-cross:
     name: Cross-check (Kobo armv7)
     runs-on: ubuntu-latest

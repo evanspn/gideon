@@ -17,8 +17,9 @@
 - [ ] On-device library browser UI (cover grid, progress badges)
 - [ ] FitWidth scrolling within a page (the render/blit plumbing exists)
 - [ ] Page pre-decoding (decode page N+1 while reading page N)
-- [ ] Release artifacts: cross-compiled armv7 binary + install instructions
-      (NickelMenu / KFMon launcher)
+- [x] Install bundle: armv7 binary + data-preserving installer with backups
+      and NickelMenu launcher entry (post-merge CI artifact)
+- [ ] GitHub release publishing for install bundles
 - [ ] Rotation support (landscape reading, two-page spreads)
 
 ## v2 — online sources, end to end
