@@ -34,6 +34,7 @@ const ABS_Y: u16 = 0x01;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
+const ABS_MT_PRESSURE: u16 = 0x3a;
 
 const BTN_TOUCH: u16 = 0x14a;
 
@@ -106,6 +107,16 @@ impl TouchTracker {
             }
             (EV_ABS, ABS_MT_TRACKING_ID) => {
                 if ev.value == -1 {
+                    self.release_seen = true;
+                } else {
+                    self.touching = true;
+                }
+            }
+            (EV_ABS, ABS_MT_PRESSURE) => {
+                // Libra Colour-class panels report contact via pressure
+                // (KOReader: pressure_event = ABS_MT_PRESSURE); zero
+                // pressure means the finger lifted.
+                if ev.value == 0 {
                     self.release_seen = true;
                 } else {
                     self.touching = true;
@@ -339,5 +350,20 @@ mod tests {
         assert_eq!(eviocgbit_abs(8), 0x8008_4523);
         // EVIOCGABS(ABS_MT_POSITION_X) == _IOC(read, 'E', 0x75, 24)
         assert_eq!(eviocgabs(ABS_MT_POSITION_X), 0x8018_4575);
+    }
+
+    #[test]
+    fn pressure_zero_releases_like_libra_colour() {
+        let mut t = TouchTracker::new();
+        assert_eq!(t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 100)), None);
+        assert_eq!(t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 200)), None);
+        assert_eq!(t.push(&ev(EV_ABS, ABS_MT_PRESSURE, 30)), None);
+        assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None, "still touching");
+        assert_eq!(t.push(&ev(EV_ABS, ABS_MT_PRESSURE, 0)), None);
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some((100, 200)),
+            "pressure 0 + SYN should tap"
+        );
     }
 }

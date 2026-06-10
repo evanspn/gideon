@@ -34,6 +34,10 @@ const MXCFB_SEND_UPDATE_V2: u32 = 0x4050462E;
 // Clara BW/Colour, Elipsa 2E): a different driver (HWTCON) with a compact
 // 36-byte update struct.
 const HWTCON_SEND_UPDATE: u32 = 0x4024462E;
+// _IOWR('F', 0x2F, struct hwtcon_update_marker_data) — wait for a sent
+// update to complete; KOReader waits on flashing refreshes so MTK updates
+// don't stack and glitch the panel.
+const HWTCON_WAIT_FOR_UPDATE_COMPLETE: u32 = 0xC008462F;
 // Mark 7 dithering: passthrough (off).
 const EPDC_FLAG_USE_DITHERING_PASSTHROUGH: i32 = 0x0;
 
@@ -167,6 +171,14 @@ struct mxcfb_update_data_v2 {
     dither_mode: i32,
     quant_bit: i32,
     alt_buffer_data: mxcfb_alt_buffer_data,
+}
+
+/// MTK wait payload: marker + (unimplemented) collision test.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct hwtcon_update_marker_data {
+    update_marker: u32,
+    collision_test: u32,
 }
 
 /// MTK/HWTCON update payload (Libra Colour & friends): no temp, no
@@ -378,6 +390,22 @@ impl Display for KoboDisplay {
             };
             if ret == 0 {
                 self.update_api = Some(api);
+                // MTK: wait for flashing refreshes to finish (KOReader does)
+                // so back-to-back updates can't stack; best-effort.
+                if api == UpdateApi::Mtk && mode == RefreshMode::Full {
+                    let mut marker = hwtcon_update_marker_data {
+                        update_marker: self.update_marker,
+                        collision_test: 0,
+                    };
+                    // SAFETY: fully initialized marker struct for the ioctl.
+                    let _ = unsafe {
+                        ioctl(
+                            self.file.as_raw_fd(),
+                            HWTCON_WAIT_FOR_UPDATE_COMPLETE,
+                            &mut marker,
+                        )
+                    };
+                }
                 return Ok(());
             }
             last_err = Some(std::io::Error::last_os_error());
@@ -488,6 +516,14 @@ mod ioctl_encoding_tests {
         // hwtcon_update_data is all fixed-width fields: 36 bytes everywhere.
         assert_eq!(std::mem::size_of::<hwtcon_update_data>(), 0x24);
         assert_eq!(iow_f_2e(0x24), HWTCON_SEND_UPDATE);
+    }
+
+    #[test]
+    fn hwtcon_wait_ioctl_matches_struct_size() {
+        assert_eq!(std::mem::size_of::<hwtcon_update_marker_data>(), 8);
+        // _IOWR('F', 0x2F, 8 bytes)
+        let expected = (3u32 << 30) | (8 << 16) | (0x46 << 8) | 0x2F;
+        assert_eq!(expected, HWTCON_WAIT_FOR_UPDATE_COMPLETE);
     }
 
     #[test]

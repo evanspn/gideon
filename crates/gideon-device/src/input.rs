@@ -114,12 +114,31 @@ impl TouchTransform {
     }
 
     /// Read the transform from `GIDEON_TOUCH_TRANSFORM`, falling back to
-    /// the default on absence or parse failure.
+    /// the per-device default for the Kobo `PRODUCT` codename (set by the
+    /// stock system and inherited by our launcher), then the generic
+    /// default.
     pub fn from_env() -> Self {
-        std::env::var("GIDEON_TOUCH_TRANSFORM")
+        if let Some(transform) = std::env::var("GIDEON_TOUCH_TRANSFORM")
             .ok()
             .and_then(|raw| raw.parse().ok())
-            .unwrap_or_default()
+        {
+            return transform;
+        }
+        Self::default_for_product(std::env::var("PRODUCT").ok().as_deref())
+    }
+
+    /// Per-device defaults, taken from KOReader's Kobo device table
+    /// (`touch_mirrored_x/y` per codename; Kobo panels report swapped axes).
+    pub fn default_for_product(product: Option<&str>) -> Self {
+        match product.map(|p| p.trim().to_ascii_lowercase()).as_deref() {
+            // Libra Colour: touch_mirrored_x = false, touch_mirrored_y = true.
+            Some("monza") | Some("monzakobo") | Some("monzatolino") => {
+                TouchTransform::SwapXYMirrorY
+            }
+            // Clara BW / Clara Colour: mirrored like the classic default.
+            Some("spabw") | Some("spacolour") | Some("spacolor") => TouchTransform::SwapXYMirrorX,
+            _ => TouchTransform::default(),
+        }
     }
 }
 
@@ -258,5 +277,29 @@ mod tests {
         );
         assert!("bogus".parse::<TouchTransform>().is_err());
         assert_eq!(TouchTransform::default(), TouchTransform::SwapXYMirrorX);
+    }
+
+    #[test]
+    fn product_codename_selects_device_transform() {
+        assert_eq!(
+            TouchTransform::default_for_product(Some("monza")),
+            TouchTransform::SwapXYMirrorY
+        );
+        assert_eq!(
+            TouchTransform::default_for_product(Some(" MonzaKobo ")),
+            TouchTransform::SwapXYMirrorY
+        );
+        assert_eq!(
+            TouchTransform::default_for_product(Some("spaBW")),
+            TouchTransform::SwapXYMirrorX
+        );
+        assert_eq!(
+            TouchTransform::default_for_product(Some("frost")),
+            TouchTransform::default()
+        );
+        assert_eq!(
+            TouchTransform::default_for_product(None),
+            TouchTransform::default()
+        );
     }
 }
