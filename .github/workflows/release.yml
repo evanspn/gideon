@@ -86,7 +86,7 @@ jobs:
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
       - name: Install ARM cross toolchain and QEMU
-        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user-static
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user-static
 
       - name: Refresh Cargo.lock after bump
         if: steps.version.outputs.bump == 'yes'
@@ -102,7 +102,10 @@ jobs:
       - name: Build Kobo binaries (armv7)
         env:
           CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CXX_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-g++
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          RUST_FONTCONFIG_DLOPEN: "on"
+          FONTCONFIG_NO_PKG_CONFIG: "1"
         run: |
           cargo build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
           cp target/armv7-unknown-linux-musleabihf/release/gideon /tmp/gideon-kobo
