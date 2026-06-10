@@ -24,8 +24,14 @@ use crate::{blit_into, Display, Error, RefreshMode, Result};
 
 const FBIOGET_VSCREENINFO: u32 = 0x4600;
 const FBIOGET_FSCREENINFO: u32 = 0x4602;
-// _IOW('F', 0x2E, struct mxcfb_update_data)
-const MXCFB_SEND_UPDATE: u32 = 0x4048462E;
+// _IOW('F', 0x2E, struct mxcfb_update_data_v1) — pre-Mark 7 kernels.
+const MXCFB_SEND_UPDATE_V1: u32 = 0x4048462E;
+// _IOW('F', 0x2E, struct mxcfb_update_data_v2) — Mark 7+ (Clara HD and
+// newer): same request, but the struct gained dither_mode/quant_bit, so
+// the encoded size (and therefore the ioctl number) differs.
+const MXCFB_SEND_UPDATE_V2: u32 = 0x4050462E;
+// Mark 7 dithering: passthrough (off).
+const EPDC_FLAG_USE_DITHERING_PASSTHROUGH: i32 = 0x0;
 
 /// `libc::ioctl`'s request parameter is `c_ulong` on glibc but `c_int` on
 /// 32-bit musl (the Kobo target); this wrapper papers over the difference.
@@ -131,7 +137,7 @@ struct mxcfb_alt_buffer_data {
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
-struct mxcfb_update_data {
+struct mxcfb_update_data_v1 {
     update_region: mxcfb_rect,
     waveform_mode: u32,
     update_mode: u32,
@@ -139,6 +145,30 @@ struct mxcfb_update_data {
     temp: i32,
     flags: u32,
     alt_buffer_data: mxcfb_alt_buffer_data,
+}
+
+/// Mark 7+ layout (KOReader's `mxcfb_update_data_v2`): v1 plus the
+/// hardware-dithering fields, inserted before `alt_buffer_data`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct mxcfb_update_data_v2 {
+    update_region: mxcfb_rect,
+    waveform_mode: u32,
+    update_mode: u32,
+    update_marker: u32,
+    temp: i32,
+    flags: u32,
+    dither_mode: i32,
+    quant_bit: i32,
+    alt_buffer_data: mxcfb_alt_buffer_data,
+}
+
+/// Which MXCFB_SEND_UPDATE generation the kernel speaks; probed on the
+/// first refresh and cached.
+#[derive(Clone, Copy, PartialEq)]
+enum UpdateApi {
+    V2,
+    V1,
 }
 
 /// E-ink framebuffer display on Kobo hardware.
@@ -150,6 +180,7 @@ pub struct KoboDisplay {
     line_length: u32,
     bytes_per_pixel: u32,
     update_marker: u32,
+    update_api: Option<UpdateApi>,
 }
 
 impl KoboDisplay {
@@ -205,6 +236,7 @@ impl KoboDisplay {
             line_length: fix.line_length,
             bytes_per_pixel: var.bits_per_pixel / 8,
             update_marker: 0,
+            update_api: None,
         })
     }
 }
@@ -238,30 +270,65 @@ impl Display for KoboDisplay {
         self.map.flush()?;
 
         self.update_marker = self.update_marker.wrapping_add(1).max(1);
-        let update = mxcfb_update_data {
-            update_region: mxcfb_rect {
-                top: 0,
-                left: 0,
-                width: self.width,
-                height: self.height,
-            },
-            waveform_mode: WAVEFORM_MODE_AUTO,
-            update_mode: match mode {
-                RefreshMode::Full => UPDATE_MODE_FULL,
-                RefreshMode::Partial => UPDATE_MODE_PARTIAL,
-            },
-            update_marker: self.update_marker,
-            temp: TEMP_USE_AMBIENT,
-            ..Default::default()
+        let region = mxcfb_rect {
+            top: 0,
+            left: 0,
+            width: self.width,
+            height: self.height,
+        };
+        let update_mode = match mode {
+            RefreshMode::Full => UPDATE_MODE_FULL,
+            RefreshMode::Partial => UPDATE_MODE_PARTIAL,
         };
 
-        // SAFETY: MXCFB_SEND_UPDATE with a fully initialized update struct.
-        let mut update = update;
-        let ret = unsafe { ioctl(self.file.as_raw_fd(), MXCFB_SEND_UPDATE, &mut update) };
-        if ret != 0 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
+        // Kernel generations disagree on the update struct (KOReader
+        // handles this per-device; we probe). Try the cached variant, or
+        // V2 (Mark 7+, every Kobo since ~2018) then V1 on the first call.
+        let candidates: &[UpdateApi] = match self.update_api {
+            Some(UpdateApi::V2) => &[UpdateApi::V2],
+            Some(UpdateApi::V1) => &[UpdateApi::V1],
+            None => &[UpdateApi::V2, UpdateApi::V1],
+        };
+
+        let mut last_err = None;
+        for &api in candidates {
+            let ret = match api {
+                UpdateApi::V2 => {
+                    let mut update = mxcfb_update_data_v2 {
+                        update_region: region,
+                        waveform_mode: WAVEFORM_MODE_AUTO,
+                        update_mode,
+                        update_marker: self.update_marker,
+                        temp: TEMP_USE_AMBIENT,
+                        dither_mode: EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
+                        quant_bit: 0,
+                        ..Default::default()
+                    };
+                    // SAFETY: fully initialized struct matching the ioctl.
+                    unsafe { ioctl(self.file.as_raw_fd(), MXCFB_SEND_UPDATE_V2, &mut update) }
+                }
+                UpdateApi::V1 => {
+                    let mut update = mxcfb_update_data_v1 {
+                        update_region: region,
+                        waveform_mode: WAVEFORM_MODE_AUTO,
+                        update_mode,
+                        update_marker: self.update_marker,
+                        temp: TEMP_USE_AMBIENT,
+                        ..Default::default()
+                    };
+                    // SAFETY: fully initialized struct matching the ioctl.
+                    unsafe { ioctl(self.file.as_raw_fd(), MXCFB_SEND_UPDATE_V1, &mut update) }
+                }
+            };
+            if ret == 0 {
+                self.update_api = Some(api);
+                return Ok(());
+            }
+            last_err = Some(std::io::Error::last_os_error());
         }
-        Ok(())
+        Err(Error::Io(last_err.unwrap_or_else(|| {
+            std::io::Error::other("no MXCFB update variant accepted")
+        })))
     }
 }
 
@@ -329,5 +396,37 @@ mod pixel_format_tests {
         let mut out = [0u8; 6];
         write_gray_row(&[0x10, 0xF0], &mut out, 3);
         assert_eq!(out, [0x10, 0x10, 0x10, 0xF0, 0xF0, 0xF0]);
+    }
+}
+
+#[cfg(test)]
+mod ioctl_encoding_tests {
+    use super::*;
+
+    /// _IOW('F', 0x2E, T) per the Linux ioctl encoding.
+    fn iow_f_2e(size: usize) -> u32 {
+        (1u32 << 30) | ((size as u32) << 16) | (0x46 << 8) | 0x2E
+    }
+
+    #[test]
+    fn update_ioctl_numbers_encode_the_32bit_struct_sizes() {
+        // The structs contain c_ulong, so their size matches the device
+        // (32-bit ARM) layout only there; the constants are fixed to the
+        // device ABI: 0x48 and 0x50 bytes.
+        assert_eq!(iow_f_2e(0x48), MXCFB_SEND_UPDATE_V1);
+        assert_eq!(iow_f_2e(0x50), MXCFB_SEND_UPDATE_V2);
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert_eq!(std::mem::size_of::<mxcfb_update_data_v1>(), 0x48);
+            assert_eq!(std::mem::size_of::<mxcfb_update_data_v2>(), 0x50);
+        }
+    }
+
+    #[test]
+    fn v2_is_v1_plus_dither_fields() {
+        assert_eq!(
+            std::mem::size_of::<mxcfb_update_data_v2>(),
+            std::mem::size_of::<mxcfb_update_data_v1>() + 8
+        );
     }
 }
