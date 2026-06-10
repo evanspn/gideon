@@ -132,8 +132,9 @@ phone.
 
 The release is only published after the full quality gate (fmt, clippy,
 tests, installer tests) and the QEMU integration suite pass against the
-exact armv7 binaries being shipped. The version-bump commit and `vX.Y.Z`
-tag are pushed back to main by the workflow.
+exact armv7 binaries being shipped. Versions live in release tags — the
+workflow never pushes commits to main, so it coexists with strict branch
+protection.
 
 After merges to main, a post-merge workflow goes further: it builds the real
 armv7 Kobo binaries and runs integration tests against them under QEMU
