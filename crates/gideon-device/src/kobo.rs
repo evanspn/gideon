@@ -287,7 +287,10 @@ impl Display for KoboDisplay {
     }
 
     fn flush(&mut self, mode: RefreshMode) -> Result<()> {
-        self.map.flush()?;
+        // No msync here: framebuffer mappings are device memory — writes
+        // are immediately visible to the EPDC, and msync on a character
+        // device returns EINVAL on Kobo kernels (KOReader never syncs the
+        // fb mapping either).
 
         self.update_marker = self.update_marker.wrapping_add(1).max(1);
         let region = mxcfb_rect {
