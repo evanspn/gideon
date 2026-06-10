@@ -244,8 +244,14 @@ mod tests {
             Settings::load(dir.path()).unwrap()
         };
         // Valid values pass through (normalized).
-        assert_eq!(load(r#"{"reader_fit": "fit-width"}"#).reader_fit, "fit-width");
-        assert_eq!(load(r#"{"reader_fit": " FIT-WIDTH "}"#).reader_fit, "fit-width");
+        assert_eq!(
+            load(r#"{"reader_fit": "fit-width"}"#).reader_fit,
+            "fit-width"
+        );
+        assert_eq!(
+            load(r#"{"reader_fit": " FIT-WIDTH "}"#).reader_fit,
+            "fit-width"
+        );
         assert_eq!(load(r#"{"reader_fit": "contain"}"#).reader_fit, "contain");
         // Unknown strings are kept (the consumer treats them as contain),
         // wrong types fall back to contain instead of erroring.

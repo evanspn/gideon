@@ -554,10 +554,20 @@ mod tests {
             0,
         );
         reader.show_current_page().unwrap();
-        let top_avg: f64 = reader.display().buffer.iter().map(|&p| p as f64).sum::<f64>()
+        let top_avg: f64 = reader
+            .display()
+            .buffer
+            .iter()
+            .map(|&p| p as f64)
+            .sum::<f64>()
             / reader.display().buffer.len() as f64;
         reader.next_page().unwrap();
-        let scrolled_avg: f64 = reader.display().buffer.iter().map(|&p| p as f64).sum::<f64>()
+        let scrolled_avg: f64 = reader
+            .display()
+            .buffer
+            .iter()
+            .map(|&p| p as f64)
+            .sum::<f64>()
             / reader.display().buffer.len() as f64;
         assert!(
             scrolled_avg > top_avg + 10.0,

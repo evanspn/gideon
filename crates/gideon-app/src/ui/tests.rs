@@ -288,7 +288,8 @@ fn fit_width_setting_makes_next_scroll_within_the_page() {
         reader_tap_next(),
         reader_tap_back(),
     ];
-    let mut app = app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::FitWidth, 0);
+    let mut app =
+        app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::FitWidth, 0);
     app.run().unwrap();
 
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
@@ -309,7 +310,8 @@ fn fit_width_setting_turns_the_page_from_the_bottom() {
     let mut events = vec![tap_row(0), tap_shelf_cell0()];
     events.extend(std::iter::repeat_with(reader_tap_next).take(5));
     events.push(reader_tap_back());
-    let mut app = app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::FitWidth, 0);
+    let mut app =
+        app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::FitWidth, 0);
     app.run().unwrap();
 
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();

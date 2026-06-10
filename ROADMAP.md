@@ -19,8 +19,9 @@
       bounds and clips/ellipsizes, with headless pixel tests asserting no
       widget ever draws outside its box (see docs/LESSONS.md §1 — bobo's Lua
       UI overflow bugs must not come back)
-- [ ] FitWidth scrolling within a page (the render/blit plumbing exists)
-- [ ] Page pre-decoding (decode page N+1 while reading page N)
+- [x] FitWidth scrolling within a page (the render/blit plumbing exists;
+      `reader_fit` setting, taps scroll with a 60px overlap before turning)
+- [x] Page pre-decoding (decode page N+1 while reading page N)
 - [x] Settings (settings.json: source lists, languages, storage limit,
       pre-download count, auto-update) with lenient parsing
 - [x] Chapter storage with size-budget eviction + pre-download engine
@@ -33,7 +34,8 @@
 - [x] Install bundle: armv7 binary + data-preserving installer with backups
       and NickelMenu launcher entry (post-merge CI artifact)
 - [x] Semantic-versioned, tag-driven GitHub releases (scripts/release.sh + release workflow)
-- [ ] Rotation support (landscape reading, two-page spreads)
+- [x] Rotation support (landscape reading via `reader_rotation`
+      0/90/180/270 with rotation-aware tap zones; two-page spreads later)
 
 ## v2 — online sources, end to end
 
