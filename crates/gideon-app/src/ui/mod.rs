@@ -80,6 +80,10 @@ enum Screen {
         chapters: Vec<ChapterEntry>,
         page: usize,
     },
+    /// Update available; any content tap installs, Back declines.
+    UpdatePrompt {
+        body: String,
+    },
     /// Error/info screen; any content tap (or Back) returns.
     Message {
         title: String,
@@ -133,6 +137,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) fn gateway(&self) -> &G {
+        &self.gateway
+    }
+
+    #[cfg_attr(feature = "kobo", allow(dead_code))]
     fn screen(&self) -> &Screen {
         self.stack.last().expect("screen stack is never empty")
     }
@@ -291,6 +301,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Screen::UpdatePrompt { .. } => {
+                self.install_update()?;
+                Ok(Flow::Continue)
+            }
             Screen::Message { .. } => self.pop(),
         }
     }
@@ -381,10 +395,29 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     fn check_updates(&mut self) -> Result<()> {
         self.show_status(&["Checking for updates…"])?;
-        let body = self
+        let check = self
             .gateway
             .check_updates()
             .context("update check failed")?;
+        if check.available {
+            self.push(Screen::UpdatePrompt {
+                body: format!("{}\nTap to install, or Back to skip.", check.message),
+            })
+        } else {
+            self.push(Screen::Message {
+                title: "Updates".to_string(),
+                body: check.message,
+            })
+        }
+    }
+
+    fn install_update(&mut self) -> Result<()> {
+        self.show_status(&["Downloading update…"])?;
+        let body = self
+            .gateway
+            .install_update()
+            .context("update install failed")?;
+        self.pop()?; // leave the prompt
         self.push(Screen::Message {
             title: "Updates".to_string(),
             body,
@@ -597,6 +630,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .collect();
                 compose_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
             }
+            Screen::UpdatePrompt { body } => compose_message(l, "Update available", body),
             Screen::Message { title, body } => compose_message(l, title, body),
         })
     }

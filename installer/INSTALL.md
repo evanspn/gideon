@@ -46,17 +46,14 @@ sh install.sh --root /mnt/onboard
 
 ## Updating over the air
 
-After installation, the NickelMenu has four gideon entries:
+There is a single **gideon** entry in the NickelMenu — it opens the app.
+Everything, including updates, lives inside it:
 
-- **gideon** — open the library
-- **gideon - check update** — quick check against the latest GitHub release
-- **gideon - install update** — downloads and installs the update in the
-  background (the binary swap is atomic; a failed download can't break the
-  install). Wifi must be on.
-- **gideon - update result** — shows the log of the last update attempt
-
-After installing an update, the next launch of gideon runs the new
-version. The previous binary is kept as `gideon.old` for manual rollback.
+**Home → Check for updates** — if a release is newer, tap once more to
+install it (wifi on). The binary swap is atomic and the previous version
+is kept as `gideon.old` for manual rollback. Close and reopen gideon to
+run the new version. If anything goes wrong, the app log is at
+`.adds/gideon/browse.log`.
 
 ## Uninstall
 
