@@ -546,16 +546,68 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         return browse_screenshot(library, out);
     }
 
-    let display = KoboDisplay::open()
+    let mut display = KoboDisplay::open()
         .context("failed to open the e-ink framebuffer — are you running on a Kobo device?")?;
     let (width, height) = (display.width(), display.height());
-    let input = KoboTouch::open(width, height)
-        .context("failed to open the touch screen — are you running on a Kobo device?")?;
+
+    // From here on the screen is ours — if anything fails during startup
+    // or while running, draw the error ON the panel and hold it long
+    // enough to photograph before the launcher reboots back into Nickel.
+    let input = match KoboTouch::open(width, height) {
+        Ok(input) => input,
+        Err(e) => {
+            show_fatal_on_display(&mut display, &format!("touch screen init failed:\n{e}"));
+            return Err(e.into());
+        }
+    };
     let gateway = ui::AidokuGateway::new(data_dir());
     let (fit, rotation) = reader_settings();
-    ui::UiApp::new(display, input, gateway, library)
+    let result = ui::UiApp::new(display, input, gateway, library)
         .with_reader_settings(fit, rotation)
-        .run()
+        .run();
+    if let Err(e) = &result {
+        // The UiApp owns the display; reopen for the error screen.
+        if let Ok(mut d) = KoboDisplay::open() {
+            show_fatal_on_display(&mut d, &format!("gideon stopped:\n{e:#}"));
+        }
+    }
+    result
+}
+
+#[cfg(feature = "kobo")]
+fn show_fatal_on_display(display: &mut impl gideon_device::Display, message: &str) {
+    use gideon_render::text::draw_text;
+    use gideon_render::GrayPage;
+
+    let (w, h) = (display.width(), display.height());
+    let mut page = GrayPage::new_white(w, h);
+    draw_text(&mut page, 40, 60, 34.0, "gideon error", w - 80, true);
+    let mut y = 130;
+    for line in message.lines().flat_map(|l| {
+        // crude wrap at ~46 chars so long errors stay on screen
+        l.as_bytes()
+            .chunks(46)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+    }) {
+        draw_text(&mut page, 40, y, 26.0, &line, w - 80, false);
+        y += 38;
+        if y > h - 120 {
+            break;
+        }
+    }
+    draw_text(
+        &mut page,
+        40,
+        h - 70,
+        24.0,
+        "Also logged to .adds/gideon/browse.log — device restarts shortly.",
+        w - 80,
+        false,
+    );
+    let _ = display.blit(&page, 0);
+    let _ = display.flush(gideon_device::RefreshMode::Full);
+    std::thread::sleep(std::time::Duration::from_secs(20));
 }
 
 #[cfg(not(feature = "kobo"))]
