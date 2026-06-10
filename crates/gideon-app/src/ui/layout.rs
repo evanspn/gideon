@@ -103,12 +103,6 @@ impl UiLayout {
         }
     }
 
-    /// Resolve a tap inside the reader into a zone (thirds of the width:
-    /// left = previous page, center = back, right = next page).
-    pub fn reader_zone(&self, x: u32) -> ReaderZone {
-        reader_zone_in_width(self.width, x)
-    }
-
     /// Resolve a *rotated* reader tap: the panel coordinates are first
     /// mapped into reading orientation (see [`map_reader_tap`]), then the
     /// zone is computed against the reading-orientation width — so
@@ -201,13 +195,12 @@ mod tests {
 
     #[test]
     fn reader_zones_are_thirds() {
-        let l = UiLayout::new(900, 1200);
-        assert_eq!(l.reader_zone(0), ReaderZone::PrevPage);
-        assert_eq!(l.reader_zone(299), ReaderZone::PrevPage);
-        assert_eq!(l.reader_zone(300), ReaderZone::Back);
-        assert_eq!(l.reader_zone(599), ReaderZone::Back);
-        assert_eq!(l.reader_zone(600), ReaderZone::NextPage);
-        assert_eq!(l.reader_zone(899), ReaderZone::NextPage);
+        assert_eq!(reader_zone_in_width(900, 0), ReaderZone::PrevPage);
+        assert_eq!(reader_zone_in_width(900, 299), ReaderZone::PrevPage);
+        assert_eq!(reader_zone_in_width(900, 300), ReaderZone::Back);
+        assert_eq!(reader_zone_in_width(900, 599), ReaderZone::Back);
+        assert_eq!(reader_zone_in_width(900, 600), ReaderZone::NextPage);
+        assert_eq!(reader_zone_in_width(900, 899), ReaderZone::NextPage);
     }
 
     #[test]
