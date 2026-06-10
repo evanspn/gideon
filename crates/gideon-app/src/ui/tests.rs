@@ -271,6 +271,103 @@ fn reader_resumes_from_saved_progress() {
 }
 
 #[test]
+fn fit_width_setting_makes_next_scroll_within_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_tall_cbz(&lib.join("Tall/vol1.cbz"), 2);
+
+    // Four "next" taps only scroll within the tall page (2400px of scroll
+    // at 740px per step needs four taps to reach the bottom), so the saved
+    // progress stays on page 0.
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(),
+        reader_tap_next(),
+        reader_tap_next(),
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::FitWidth, 0);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Tall/vol1.cbz").unwrap().current_page,
+        0,
+        "next taps within a FitWidth page must scroll, not turn the page"
+    );
+}
+
+#[test]
+fn fit_width_setting_turns_the_page_from_the_bottom() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_tall_cbz(&lib.join("Tall/vol1.cbz"), 2);
+
+    // The fifth "next" tap happens at the bottom and turns to page 1.
+    let mut events = vec![tap_row(0), tap_shelf_cell0()];
+    events.extend(std::iter::repeat_with(reader_tap_next).take(5));
+    events.push(reader_tap_back());
+    let mut app = app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::FitWidth, 0);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Tall/vol1.cbz").unwrap().current_page, 1);
+}
+
+#[test]
+fn default_contain_mode_turns_pages_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_tall_cbz(&lib.join("Tall/vol1.cbz"), 3);
+
+    // Without the fit-width setting, two next taps mean two page turns
+    // even on a tall page.
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(),
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Tall/vol1.cbz").unwrap().current_page, 2);
+}
+
+#[test]
+fn rotated_reader_taps_follow_reading_orientation() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    // Rotation 90 (clockwise): reading-right is the panel bottom, so
+    // "next" is a tap at the bottom of the panel, "prev" at the top, and
+    // the middle band is still "back".
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    let tap_panel_top = UiEvent::Tap { x: W / 2, y: 0 };
+    let tap_panel_middle = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        tap_panel_bottom, // next -> page 1
+        tap_panel_bottom, // next -> page 2
+        tap_panel_top,    // prev -> page 1
+        tap_panel_middle, // back
+    ];
+    let mut app =
+        app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::Contain, 90);
+    app.run().unwrap();
+
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+}
+
+#[test]
 fn empty_library_shows_hint_not_error() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga"); // does not exist yet
