@@ -93,6 +93,9 @@ enum Command {
         /// Only check and report; don't download or install.
         #[arg(long)]
         check: bool,
+        /// Allow installing a major version bump (off by default, like bobo).
+        #[arg(long)]
+        major: bool,
     },
 
     /// Open a CBZ for reading.
@@ -128,7 +131,7 @@ fn main() -> Result<()> {
             width,
             height,
         } => cmd_shelf(dir, out, cols, width, height),
-        Command::Update { check } => cmd_update(check),
+        Command::Update { check, major } => cmd_update(check, major),
         Command::Read {
             path,
             progress_file,
@@ -323,7 +326,7 @@ fn cmd_shelf(dir: PathBuf, out: PathBuf, cols: u32, width: u32, height: u32) -> 
     Ok(())
 }
 
-fn cmd_update(check_only: bool) -> Result<()> {
+fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
     use gideon_sources::update;
 
     let repo = std::env::var("GIDEON_UPDATE_REPO")
@@ -333,38 +336,44 @@ fn cmd_update(check_only: bool) -> Result<()> {
     println!("Checking {repo} for updates...");
 
     let fetcher = UreqFetcher::new();
-    let update_check = update::check_update(&fetcher, &repo, current);
-    let release = match update_check {
-        Ok(Some(release)) => release,
-        Ok(None) => {
-            println!("Already up to date.");
-            return Ok(());
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("status code 403") || msg.contains("status code 404") {
-                bail!(
-                    "couldn't read releases for {repo} (HTTP error).\n\
-                     If the repository is private, OTA updates need either a public repo \
-                     or a token in the GIDEON_GITHUB_TOKEN environment variable.\n\
-                     Underlying error: {msg}"
-                );
-            }
-            return Err(e.into());
-        }
+
+    // Primary: the VERSION asset on the latest release (no API, no rate
+    // limits). Fallback: the GitHub API, the way bobo checks.
+    let base = update::release_base();
+    let release = match update::check_update_via_assets(&fetcher, &base, &repo, current) {
+        Ok(release) => release,
+        Err(assets_err) => match update::check_update(&fetcher, &repo, current) {
+            Ok(release) => release,
+            Err(api_err) => bail!(
+                "couldn't check releases for {repo}.\n\
+                 - asset check failed: {assets_err}\n\
+                 - API check failed: {api_err}\n\
+                 If the repository is private, OTA updates need a public repo \
+                 or a GIDEON_GITHUB_TOKEN environment variable."
+            ),
+        },
+    };
+
+    let Some(release) = release else {
+        println!("Already up to date.");
+        return Ok(());
     };
 
     println!("Update available: {} -> {}", current, release.version);
     if let Some(notes) = &release.notes {
-        println!(
-            "
-{notes}
-"
-        );
+        println!("\n{notes}\n");
     }
     if check_only {
         println!("Run `gideon update` to install it.");
         return Ok(());
+    }
+    if !update::is_auto_installable(current, &release.version) && !allow_major {
+        bail!(
+            "{} is a major version bump from {} — review the release notes and \
+             re-run with --major to install it.",
+            release.version,
+            current
+        );
     }
 
     let exe = std::env::current_exe()?;

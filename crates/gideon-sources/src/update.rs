@@ -61,6 +61,76 @@ pub fn latest_release_url(repo: &str) -> Result<Url> {
     ))?)
 }
 
+/// Base URL for release asset downloads. Defaults to github.com; tests and
+/// mirrors can point elsewhere.
+pub fn release_base() -> Url {
+    std::env::var("GIDEON_UPDATE_BASE")
+        .ok()
+        .and_then(|raw| Url::parse(&raw).ok())
+        .unwrap_or_else(|| Url::parse("https://github.com").expect("static url"))
+}
+
+/// URL of the `VERSION` asset on the latest release. GitHub serves
+/// `releases/latest/download/<asset>` without the API — no rate limits and
+/// no auth for public repos, which makes it the most reliable check from
+/// devices.
+pub fn version_asset_url(base: &Url, repo: &str) -> Result<Url> {
+    Ok(base.join(&format!("{repo}/releases/latest/download/VERSION"))?)
+}
+
+/// URL of the Kobo bundle asset for `version` on the latest release.
+pub fn bundle_asset_url(base: &Url, repo: &str, version: &str) -> Result<Url> {
+    Ok(base.join(&format!(
+        "{repo}/releases/latest/download/gideon-kobo-v{version}.zip"
+    ))?)
+}
+
+/// Extract a semver from a VERSION asset. Lenient: finds the first token
+/// that parses as `X.Y.Z` (so both "0.2.0" and "gideon 0.2.0 (abc123)"
+/// work).
+pub fn parse_version_asset(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    text.split_whitespace()
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| parse_semver(token).is_some())
+        .map(str::to_owned)
+}
+
+/// Check for updates via the latest release's `VERSION` asset (primary
+/// mechanism: no API, no rate limits, anonymous on public repos).
+pub fn check_update_via_assets(
+    fetcher: &dyn Fetcher,
+    base: &Url,
+    repo: &str,
+    current_version: &str,
+) -> Result<Option<ReleaseInfo>> {
+    let body = fetcher.get(&version_asset_url(base, repo)?)?;
+    let Some(version) = parse_version_asset(&body) else {
+        return Err(Error::Fetch {
+            url: version_asset_url(base, repo)?.to_string(),
+            message: "VERSION asset did not contain a semantic version".into(),
+        });
+    };
+    if !is_newer(current_version, &version) {
+        return Ok(None);
+    }
+    Ok(Some(ReleaseInfo {
+        tag: format!("v{version}"),
+        asset_url: bundle_asset_url(base, repo, &version)?,
+        version,
+        notes: None,
+    }))
+}
+
+/// bobo's auto-install rule: only updates within the same major version are
+/// installed automatically; major bumps need explicit consent.
+pub fn is_auto_installable(current: &str, candidate: &str) -> bool {
+    match (parse_semver(current), parse_semver(candidate)) {
+        (Some((cur_major, ..)), Some((cand_major, ..))) => cur_major == cand_major,
+        _ => false,
+    }
+}
+
 /// Parse a GitHub /releases/latest response into a [`ReleaseInfo`], looking
 /// for the Kobo bundle asset. Returns `Ok(None)` for drafts/prereleases or
 /// releases without a bundle.

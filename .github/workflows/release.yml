@@ -114,6 +114,11 @@ jobs:
           chmod 755 "/tmp/gideon-kobo-v${version}/install.sh" "/tmp/gideon-kobo-v${version}/gideon"
           echo "gideon ${version} (${GITHUB_SHA::9})" > "/tmp/gideon-kobo-v${version}/VERSION"
           (cd /tmp && zip -r "gideon-kobo-v${version}.zip" "gideon-kobo-v${version}")
+          # Standalone VERSION asset: devices check
+          # releases/latest/download/VERSION for OTA updates (no API, no
+          # rate limits).
+          mkdir -p /tmp/release-assets
+          cp "/tmp/gideon-kobo-v${version}/VERSION" /tmp/release-assets/VERSION
 
       - name: Smoke-test the bundle installer
         run: |
@@ -140,4 +145,6 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: gideon v${{ steps.version.outputs.version }}
           generate_release_notes: true
-          files: /tmp/gideon-kobo-v${{ steps.version.outputs.version }}.zip
+          files: |
+            /tmp/gideon-kobo-v${{ steps.version.outputs.version }}.zip
+            /tmp/release-assets/VERSION

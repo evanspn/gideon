@@ -126,3 +126,38 @@ fn download_and_render_pages_from_github_source() {
         assert!(rendered.pixels.iter().all(|&p| p % 17 == 0));
     }
 }
+
+#[test]
+#[ignore = "network: checks the real latest gideon release for OTA"]
+fn ota_version_asset_resolves_on_latest_release() {
+    use gideon_sources::update;
+
+    let fetcher = UreqFetcher::new();
+    let base = update::release_base();
+    // An ancient current version guarantees any published release is "newer".
+    match update::check_update_via_assets(&fetcher, &base, update::DEFAULT_UPDATE_REPO, "0.0.0") {
+        Ok(Some(release)) => {
+            assert!(!release.version.is_empty());
+            assert!(release
+                .asset_url
+                .as_str()
+                .ends_with(&format!("gideon-kobo-v{}.zip", release.version)));
+            // The bundle asset must actually be downloadable.
+            let bundle = fetcher
+                .get(&release.asset_url)
+                .expect("bundle should download");
+            assert!(bundle.len() > 1024, "bundle suspiciously small");
+        }
+        Ok(None) => panic!("VERSION asset exists but reports nothing newer than 0.0.0"),
+        Err(e) => {
+            let msg = e.to_string();
+            // No release published yet (or repo still private): skip rather
+            // than fail, so this gate activates with the first release.
+            assert!(
+                msg.contains("404") || msg.contains("status"),
+                "unexpected failure: {msg}"
+            );
+            eprintln!("skipping: no published release with VERSION asset yet ({msg})");
+        }
+    }
+}
