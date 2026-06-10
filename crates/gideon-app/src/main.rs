@@ -442,6 +442,22 @@ fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
         .unwrap_or_else(|_| update::DEFAULT_UPDATE_REPO.to_string());
     let current = env!("CARGO_PKG_VERSION");
     println!("Current version: {current}");
+
+    // OTA only replaces the binary; make sure the launcher script and
+    // NickelMenu entries match the ones this binary shipped with. Runs on
+    // every update invocation so the first check after an OTA heals them.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            match manga::ensure_device_files(bin_dir) {
+                Ok(refreshed) => {
+                    for item in refreshed {
+                        println!("Refreshed {item}.");
+                    }
+                }
+                Err(e) => eprintln!("warning: couldn't refresh device files: {e}"),
+            }
+        }
+    }
     println!("Checking {repo} for updates...");
 
     let fetcher = UreqFetcher::new();
@@ -496,11 +512,6 @@ fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
             "Updated to {}. Restart gideon to run the new version (previous binary kept as gideon.old).",
             release.version
         );
-    }
-    // OTA only replaces the binary; refresh the launcher script and
-    // NickelMenu entries this binary shipped with.
-    for refreshed in manga::ensure_device_files(bin_dir)? {
-        println!("Refreshed {refreshed}.");
     }
     Ok(())
 }
