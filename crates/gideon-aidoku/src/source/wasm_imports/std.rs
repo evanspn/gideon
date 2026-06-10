@@ -267,20 +267,8 @@ fn read_bool(caller: Caller<'_, WasmStore>, descriptor_i32: i32) -> Result<i32> 
         .get_std_value(descriptor)
         .context("failed to get value in read_bool")?;
     let result = match value.as_ref() {
-        Value::Bool(b) => {
-            if *b {
-                1i32
-            } else {
-                0i32
-            }
-        }
-        Value::Int(i) => {
-            if *i != 0 {
-                1i32
-            } else {
-                0i32
-            }
-        }
+        Value::Bool(b) => i32::from(*b),
+        Value::Int(i) => i32::from(*i != 0),
         _ => 0,
     };
     Ok(result)
