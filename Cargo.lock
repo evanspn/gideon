@@ -1255,12 +1255,15 @@ name = "gideon-sources"
 version = "0.1.0"
 dependencies = [
  "filetime",
+ "rustls",
+ "rustls-native-certs 0.7.3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "ureq",
  "url",
+ "webpki-roots 0.26.11",
  "zip 2.4.2",
 ]
 
@@ -1429,6 +1432,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -2455,6 +2459,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
