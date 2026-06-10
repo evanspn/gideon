@@ -17,6 +17,12 @@ use std::str::FromStr;
 pub enum UiEvent {
     /// A finger tapped the screen at (x, y) in screen coordinates.
     Tap { x: u32, y: u32 },
+    /// The user asked the device to sleep: power button pressed or the
+    /// magnetic sleep cover closed (KOReader: KEY_POWER=116 press, sleep
+    /// cover codes 59/35 press). Waking is *not* an event: the suspend call
+    /// blocks until wakeup, and the key that woke the device is consumed by
+    /// the input drain that follows it.
+    Sleep,
 }
 
 /// A blocking source of UI events.
@@ -28,6 +34,14 @@ pub trait InputSource {
     /// during a long download) so they don't fire stale actions. Default:
     /// no-op — test inputs replay their script unaffected.
     fn discard_queued(&mut self) {}
+
+    /// Like [`Self::discard_queued`], but sleep requests survive the drain:
+    /// taps made during a long download are stale, a sleep cover closed
+    /// during it is not — the device must still go to sleep afterwards.
+    /// Default: same as `discard_queued`.
+    fn discard_taps(&mut self) {
+        self.discard_queued();
+    }
 }
 
 /// Test input source: replays a fixed list of events, then errors.

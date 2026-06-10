@@ -27,6 +27,25 @@ pub enum ReaderZone {
     NextPage,
 }
 
+/// A key on the on-screen search keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Backspace,
+    Space,
+    /// Run the search with the current query.
+    Search,
+}
+
+/// Character rows of the keyboard, top to bottom. The bottom row
+/// (backspace / space / search) is built separately in [`keyboard_keys`].
+/// Manga titles lean on punctuation ("Re:Zero", "Dr. Stone", "Frieren -"),
+/// so the letter rows carry the common marks.
+pub const KEYBOARD_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-:."];
+
+/// A key and its screen rectangle: `(key, x, y, w, h)`.
+pub type KeyRect = (Key, u32, u32, u32, u32);
+
 #[derive(Debug, Clone, Copy)]
 pub struct UiLayout {
     pub width: u32,
@@ -121,6 +140,51 @@ impl UiLayout {
     /// Number of pages needed to show `n` rows.
     pub fn page_count(&self, n: usize) -> usize {
         n.div_ceil(self.rows_per_page()).max(1)
+    }
+
+    /// Height of one keyboard key: taller than a list row so the targets
+    /// are finger-sized on e-ink.
+    pub fn key_h(&self) -> u32 {
+        self.row_h * 3 / 2
+    }
+
+    /// First pixel row of the on-screen keyboard. The keyboard sits at the
+    /// bottom of the content area, directly above the navigation bar.
+    pub fn keyboard_top(&self) -> u32 {
+        let kb_h = self.key_h() * (KEYBOARD_ROWS.len() as u32 + 1);
+        self.nav_top().saturating_sub(kb_h).max(self.content_top())
+    }
+
+    /// Every keyboard key with its screen rectangle, for both rendering
+    /// and hit-testing (one source of truth).
+    pub fn keyboard_keys(&self) -> Vec<KeyRect> {
+        let key_h = self.key_h();
+        let mut keys = Vec::new();
+        for (i, row) in KEYBOARD_ROWS.iter().enumerate() {
+            let y = self.keyboard_top() + i as u32 * key_h;
+            let n = row.chars().count() as u32;
+            let w = (self.width / n).max(1);
+            // Center the row when keys don't fill the full width.
+            let x0 = (self.width - w * n) / 2;
+            for (j, c) in row.chars().enumerate() {
+                keys.push((Key::Char(c), x0 + j as u32 * w, y, w, key_h));
+            }
+        }
+        // Bottom row in tenths: [backspace 2][space 5][search 3].
+        let y = self.keyboard_top() + KEYBOARD_ROWS.len() as u32 * key_h;
+        let unit = (self.width / 10).max(1);
+        keys.push((Key::Backspace, 0, y, 2 * unit, key_h));
+        keys.push((Key::Space, 2 * unit, y, 5 * unit, key_h));
+        keys.push((Key::Search, 7 * unit, y, self.width - 7 * unit, key_h));
+        keys
+    }
+
+    /// The key under a tap, if any.
+    pub fn key_at(&self, x: u32, y: u32) -> Option<Key> {
+        self.keyboard_keys()
+            .into_iter()
+            .find(|&(_, kx, ky, kw, kh)| x >= kx && x < kx + kw && y >= ky && y < ky + kh)
+            .map(|(key, ..)| key)
     }
 }
 
@@ -303,5 +367,60 @@ mod tests {
         assert!(l.row_h >= 24);
         assert!(l.rows_per_page() >= 1);
         assert!(l.content_height() > 0);
+    }
+
+    #[test]
+    fn keyboard_keys_cover_all_characters_once() {
+        let l = UiLayout::new(1072, 1448);
+        let keys = l.keyboard_keys();
+        let chars: Vec<char> = keys
+            .iter()
+            .filter_map(|(k, ..)| match k {
+                Key::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<char> = KEYBOARD_ROWS.iter().flat_map(|r| r.chars()).collect();
+        assert_eq!(chars, expected);
+        assert_eq!(keys.len(), expected.len() + 3, "backspace, space, search");
+    }
+
+    #[test]
+    fn keyboard_fits_between_content_top_and_nav_bar() {
+        for (w, h) in [(1072, 1448), (1264, 1680), (600, 800), (300, 400)] {
+            let l = UiLayout::new(w, h);
+            assert!(l.keyboard_top() >= l.content_top(), "{w}x{h}");
+            for (key, _, y, _, kh) in l.keyboard_keys() {
+                assert!(y + kh <= l.nav_top(), "{key:?} overlaps nav bar at {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn key_at_hits_centers_and_misses_outside() {
+        let l = UiLayout::new(1072, 1448);
+        for (key, x, y, w, h) in l.keyboard_keys() {
+            assert_eq!(l.key_at(x + w / 2, y + h / 2), Some(key));
+        }
+        // Above the keyboard (query area) is not a key.
+        assert_eq!(l.key_at(l.width / 2, l.keyboard_top() - 1), None);
+        // The nav bar is not a key.
+        assert_eq!(l.key_at(l.width / 2, l.nav_top()), None);
+    }
+
+    #[test]
+    fn key_at_resolves_known_keys() {
+        let l = UiLayout::new(1000, 1448);
+        let top = l.keyboard_top();
+        let key_h = l.key_h();
+        // First key of the first row is '1' (10 keys of 100px each).
+        assert_eq!(l.key_at(50, top + 1), Some(Key::Char('1')));
+        // Second row starts with 'q'.
+        assert_eq!(l.key_at(50, top + key_h), Some(Key::Char('q')));
+        // Bottom row tenths: backspace 0..200, space 200..700, search 700..
+        let bottom = top + 4 * key_h;
+        assert_eq!(l.key_at(100, bottom), Some(Key::Backspace));
+        assert_eq!(l.key_at(450, bottom), Some(Key::Space));
+        assert_eq!(l.key_at(999, bottom), Some(Key::Search));
     }
 }

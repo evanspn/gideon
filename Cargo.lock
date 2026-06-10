@@ -1256,6 +1256,7 @@ dependencies = [
  "gideon-render",
  "libc",
  "memmap2",
+ "tempfile",
  "thiserror",
 ]
 

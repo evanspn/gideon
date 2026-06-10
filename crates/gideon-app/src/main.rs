@@ -589,8 +589,19 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     };
     let gateway = ui::AidokuGateway::new(data_dir());
     let (fit, rotation) = reader_settings();
+    // Power button / sleep cover: suspend to RAM via the Nickel/KOReader
+    // sysfs dance. The call blocks until the device wakes up.
+    let sleeper: ui::SleepFn = Box::new(|| {
+        use gideon_device::power::{KoboSuspend, SuspendOutcome};
+        let mut suspend = KoboSuspend::new();
+        Ok(match suspend.suspend().context("suspend to RAM failed")? {
+            SuspendOutcome::Suspended => ui::SleepResult::Slept,
+            SuspendOutcome::SkippedCharging => ui::SleepResult::Skipped,
+        })
+    });
     let result = ui::UiApp::new(display, input, gateway, library)
         .with_reader_settings(fit, rotation)
+        .with_sleeper(sleeper)
         .run();
     if let Err(e) = &result {
         // The UiApp owns the display; reopen for the error screen.

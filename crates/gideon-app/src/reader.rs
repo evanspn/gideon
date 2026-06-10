@@ -175,6 +175,13 @@ impl<D: Display> Reader<D> {
         Ok(())
     }
 
+    /// Repaint the current page with a guaranteed full refresh — for waking
+    /// from suspend, when the panel contents can't be trusted.
+    pub fn repaint_full(&mut self) -> Result<()> {
+        self.turns_since_full_refresh = 0;
+        self.show_current_page()
+    }
+
     /// Advance: scroll down within an oversized page first; turn to the
     /// next page only from the bottom. Returns `false` at the end of the
     /// document.

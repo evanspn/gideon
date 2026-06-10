@@ -17,7 +17,7 @@ mod layout;
 mod tests;
 
 pub use gateway::{AidokuGateway, ChapterEntry, MangaEntry, SourceEntry, SourceGateway};
-pub use layout::{ReaderZone, TapTarget, UiLayout};
+pub use layout::{Key, ReaderZone, TapTarget, UiLayout};
 
 use std::path::{Path, PathBuf};
 
@@ -68,6 +68,11 @@ enum Screen {
     Listings {
         source: SourceEntry,
     },
+    /// On-screen keyboard for a manga search within a source.
+    Search {
+        source: SourceEntry,
+        query: String,
+    },
     MangaList {
         source: SourceEntry,
         listing: String,
@@ -96,6 +101,31 @@ enum Flow {
     Quit,
 }
 
+/// What the suspend hook did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepResult {
+    /// The device suspended and has since woken up.
+    Slept,
+    /// Suspend was skipped (e.g. charger plugged in); still awake.
+    Skipped,
+}
+
+/// Suspend-to-RAM hook: blocks until the device wakes up again. The UI
+/// saves state before calling it and repaints in full after it returns.
+pub type SleepFn = Box<dyn FnMut() -> Result<SleepResult>>;
+
+/// Ignore sleep requests this soon after a wake: the press that woke the
+/// device can be delivered *after* the post-wake input drain (KOReader hit
+/// the same race), and must not bounce us straight back into suspend.
+const SLEEP_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long the "staying awake" notice stays up when suspend is skipped.
+const SKIP_NOTICE_HOLD: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// Force a full e-ink refresh every Nth keyboard repaint, so ghosting
+/// can't accumulate over a long editing session.
+const KEYBOARD_FULL_REFRESH_INTERVAL: u32 = 8;
+
 pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
@@ -107,6 +137,14 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     reader_fit: FitMode,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
+    /// Suspend hook for [`UiEvent::Sleep`]; `None` (tests, headless) means
+    /// sleep events are ignored.
+    sleeper: Option<SleepFn>,
+    /// When the device last woke up, for [`SLEEP_DEBOUNCE`].
+    last_wake: Option<std::time::Instant>,
+    /// Keyboard repaints since the search screen opened, for the periodic
+    /// anti-ghosting full refresh.
+    keyboard_paints: u32,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -121,6 +159,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
             reader_rotation: 0,
+            sleeper: None,
+            last_wake: None,
+            keyboard_paints: 0,
         }
     }
 
@@ -131,12 +172,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self
     }
 
+    /// Install the suspend hook (power button / sleep cover).
+    pub fn with_sleeper(mut self, sleeper: SleepFn) -> Self {
+        self.sleeper = Some(sleeper);
+        self
+    }
+
     /// The underlying display (for tests and headless screenshots).
     pub fn display(&self) -> &D {
         &self.display
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     pub(crate) fn gateway(&self) -> &G {
         &self.gateway
@@ -153,21 +199,55 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Full)
     }
 
-    /// Main loop: render, then process taps until the input source ends
+    /// Main loop: render, then process events until the input source ends
     /// (or the user backs out of the home screen).
     pub fn run(&mut self) -> Result<()> {
         self.render_current(RefreshMode::Full)?;
         loop {
-            let Ok(UiEvent::Tap { x, y }) = self.input.next_event() else {
-                return Ok(()); // input source closed
-            };
-            match self.handle_tap(x, y) {
-                Ok(Flow::Quit) => return Ok(()),
-                Ok(Flow::Continue) => {}
-                // The UI must never die on an error: show it instead.
-                Err(e) => self.show_error(&e)?,
+            match self.input.next_event() {
+                Err(_) => return Ok(()), // input source closed
+                Ok(UiEvent::Tap { x, y }) => match self.handle_tap(x, y) {
+                    Ok(Flow::Quit) => return Ok(()),
+                    Ok(Flow::Continue) => {}
+                    // The UI must never die on an error: show it instead.
+                    Err(e) => self.show_error(&e)?,
+                },
+                Ok(UiEvent::Sleep) => {
+                    if let Err(e) = self.sleep_now() {
+                        self.show_error(&e)?;
+                    }
+                }
             }
         }
+    }
+
+    /// Suspend via the sleep hook (no-op without one), then repaint: the
+    /// panel may have been dimmed or ghosted while asleep, and the key
+    /// press that woke us must not fire an action.
+    fn sleep_now(&mut self) -> Result<()> {
+        if self.sleeper.is_none() || self.sleep_debounced() {
+            return Ok(());
+        }
+        let result = self.sleeper.as_mut().expect("checked above")();
+        self.last_wake = Some(std::time::Instant::now());
+        if matches!(result, Ok(SleepResult::Skipped)) {
+            // Pressing power while plugged in does nothing visible
+            // otherwise — say why before restoring the screen.
+            self.show_status(&["Plugged in — staying awake."])?;
+            std::thread::sleep(SKIP_NOTICE_HOLD);
+            self.render_current(RefreshMode::Full)?;
+            return Ok(());
+        }
+        self.input.discard_queued();
+        self.render_current(RefreshMode::Full)?;
+        result.map(|_| ())
+    }
+
+    /// `true` while the post-wake debounce window is open: the key press
+    /// that woke the device can arrive after the input drain and must not
+    /// bounce us straight back into suspend.
+    fn sleep_debounced(&self) -> bool {
+        matches!(self.last_wake, Some(t) if t.elapsed() < SLEEP_DEBOUNCE)
     }
 
     // --- navigation ---
@@ -272,9 +352,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let listing = match row {
                     0 => "Popular",
                     1 => "Latest",
+                    2 => {
+                        self.keyboard_paints = 0;
+                        self.push(Screen::Search {
+                            source,
+                            query: String::new(),
+                        })?;
+                        return Ok(Flow::Continue);
+                    }
                     _ => return Ok(Flow::Continue),
                 };
                 self.open_manga_list(&source, listing)?;
+                Ok(Flow::Continue)
+            }
+            Screen::Search { source, query } => {
+                self.tap_keyboard(&source, &query, x, y)?;
                 Ok(Flow::Continue)
             }
             Screen::MangaList {
@@ -379,6 +471,79 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
+    /// Handle a tap on the search keyboard: edit the query in place
+    /// (partial refresh) or run the search.
+    fn tap_keyboard(&mut self, source: &SourceEntry, query: &str, x: u32, y: u32) -> Result<()> {
+        let edited = match self.layout.key_at(x, y) {
+            Some(Key::Char(c)) => {
+                let mut q = query.to_string();
+                q.push(c);
+                Some(q)
+            }
+            Some(Key::Space) => {
+                // No leading or doubled spaces — sources won't match them.
+                let q = query.to_string();
+                if q.is_empty() || q.ends_with(' ') {
+                    None
+                } else {
+                    Some(q + " ")
+                }
+            }
+            Some(Key::Backspace) => {
+                let mut q = query.to_string();
+                q.pop();
+                Some(q)
+            }
+            Some(Key::Search) => {
+                let trimmed = query.trim();
+                if !trimmed.is_empty() {
+                    self.run_search(source, trimmed)?;
+                }
+                return Ok(());
+            }
+            None => None,
+        };
+        if let Some(q) = edited {
+            if let Some(Screen::Search { query, .. }) = self.stack.last_mut() {
+                *query = q;
+            }
+            // Mostly-partial refreshes keep typing fast, but ghosting
+            // accumulates — flash the panel clean every Nth repaint.
+            self.keyboard_paints += 1;
+            let mode = if self
+                .keyboard_paints
+                .is_multiple_of(KEYBOARD_FULL_REFRESH_INTERVAL)
+            {
+                RefreshMode::Full
+            } else {
+                RefreshMode::Partial
+            };
+            self.render_current(mode)?;
+        }
+        Ok(())
+    }
+
+    fn run_search(&mut self, source: &SourceEntry, query: &str) -> Result<()> {
+        self.show_status(&[&format!("Searching for \"{query}\"…")])?;
+        let mangas = self
+            .gateway
+            .search_manga(&source.id, query)
+            .with_context(|| format!("search on {} failed", source.name))?;
+        if mangas.is_empty() {
+            // Stay on the keyboard so the user can refine the query.
+            return self.push(Screen::Message {
+                title: "Search".to_string(),
+                body: format!("No results for \"{query}\"."),
+            });
+        }
+        self.push(Screen::MangaList {
+            source: source.clone(),
+            listing: format!("\"{query}\""),
+            mangas,
+            page: 0,
+        })
+    }
+
     fn open_chapter_list(&mut self, source: &SourceEntry, manga: &MangaEntry) -> Result<()> {
         self.show_status(&[&format!("Loading chapters of {}…", manga.title)])?;
         let chapters = self
@@ -465,7 +630,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
         // Taps queued while the download ran were aimed at the (now gone)
         // chapter list — drop them so they don't flip pages in the reader.
-        self.input.discard_queued();
+        // A sleep cover closed during the download survives the drain: the
+        // device must still suspend instead of sitting awake in a bag.
+        self.input.discard_taps();
 
         let key = progress_key(&self.library_dir, &cbz_path);
         if self.run_reader(&cbz_path, &key)? {
@@ -534,19 +701,45 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             reader.resume_from(&store, key);
             reader.show_current_page()?;
             loop {
-                let Ok(UiEvent::Tap { x, y }) = self.input.next_event() else {
-                    keep_running = false;
-                    break;
-                };
-                // Tap zones follow the reading orientation, not the panel.
-                match layout.reader_zone_rotated(x, y, rotation) {
-                    ReaderZone::NextPage => {
-                        reader.next_page()?;
+                match self.input.next_event() {
+                    Err(_) => {
+                        keep_running = false;
+                        break;
                     }
-                    ReaderZone::PrevPage => {
-                        reader.prev_page()?;
+                    // Tap zones follow the reading orientation, not the panel.
+                    Ok(UiEvent::Tap { x, y }) => match layout.reader_zone_rotated(x, y, rotation) {
+                        ReaderZone::NextPage => {
+                            reader.next_page()?;
+                        }
+                        ReaderZone::PrevPage => {
+                            reader.prev_page()?;
+                        }
+                        ReaderZone::Back => break,
+                    },
+                    Ok(UiEvent::Sleep) => {
+                        // Field accesses only: `reader` is borrowing
+                        // `self.display`, so no whole-`self` method calls.
+                        let debounced =
+                            matches!(self.last_wake, Some(t) if t.elapsed() < SLEEP_DEBOUNCE);
+                        if self.sleeper.is_none() || debounced {
+                            continue;
+                        }
+                        // Save the reading position before the power goes
+                        // down — a dead battery must not lose it.
+                        reader.save_progress(&mut store, key);
+                        store.save(&progress_file)?;
+                        let result = self.sleeper.as_mut().expect("checked above")();
+                        self.last_wake = Some(std::time::Instant::now());
+                        if let Err(e) = &result {
+                            eprintln!("gideon: suspend failed: {e:#}");
+                        }
+                        if matches!(result, Ok(SleepResult::Skipped)) {
+                            continue; // still awake, screen untouched
+                        }
+                        // Drop the wake key press, repaint in full.
+                        self.input.discard_queued();
+                        reader.repaint_full()?;
                     }
-                    ReaderZone::Back => break,
                 }
             }
             reader.save_progress(&mut store, key);
@@ -606,9 +799,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Sources", &labels, *page, l.page_count(rows.len()))
             }
             Screen::Listings { source } => {
-                let rows = vec![("Popular".to_string(), true), ("Latest".to_string(), true)];
+                let rows = vec![
+                    ("Popular".to_string(), true),
+                    ("Latest".to_string(), true),
+                    ("Search…".to_string(), true),
+                ];
                 compose_list(l, &source.name, &rows, 0, 1)
             }
+            Screen::Search { source, query } => compose_search(l, &source.name, query),
             Screen::MangaList {
                 source,
                 listing,
@@ -791,6 +989,52 @@ fn compose_list(
     canvas
 }
 
+/// The search screen: chrome + the query line + the on-screen keyboard.
+fn compose_search(l: &UiLayout, source_name: &str, query: &str) -> GrayPage {
+    let mut canvas = compose_chrome(l, &format!("Search {source_name}"), 0, 1);
+
+    // Query line with a trailing caret, in the area above the keyboard.
+    // When the query outgrows the line, show its tail — the user needs to
+    // see what they are typing, not how the query started.
+    let max_w = l.width.saturating_sub(2 * l.pad);
+    let mut shown = format!("{query}_");
+    while measure_text(l.text_px, &shown, true) > max_w && shown.chars().count() > 1 {
+        shown.remove(0);
+    }
+    draw_text(
+        &mut canvas,
+        l.pad,
+        l.row_top(0) + l.row_h.saturating_sub(l.text_px as u32 + 4) / 2,
+        l.text_px,
+        &shown,
+        max_w,
+        true,
+    );
+    hline(&mut canvas, l.keyboard_top().saturating_sub(1), 0x55);
+
+    for (key, x, y, w, h) in l.keyboard_keys() {
+        rect_outline(&mut canvas, x, y, w, h, 0xAA);
+        let label = match key {
+            Key::Char(c) => c.to_string(),
+            Key::Backspace => "<del".to_string(),
+            Key::Space => "space".to_string(),
+            Key::Search => "Search".to_string(),
+        };
+        let bold = key == Key::Search;
+        let tw = measure_text(l.text_px, &label, bold).min(w);
+        draw_text(
+            &mut canvas,
+            x + (w.saturating_sub(tw)) / 2,
+            y + h.saturating_sub(l.text_px as u32 + 4) / 2,
+            l.text_px,
+            &label,
+            w,
+            bold,
+        );
+    }
+    canvas
+}
+
 /// A full-screen transient status (e.g. "Downloading… page 3/20").
 fn compose_status(l: &UiLayout, lines: &[&str]) -> GrayPage {
     let mut canvas = GrayPage::new_white(l.width, l.height);
@@ -862,6 +1106,28 @@ fn wrap_text(px: f32, text: &str, max_w: u32) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+/// 1px rectangle outline, clipped to the canvas.
+fn rect_outline(canvas: &mut GrayPage, x: u32, y: u32, w: u32, h: u32, value: u8) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    for yy in [y, y + h - 1] {
+        if yy >= canvas.height {
+            continue;
+        }
+        let start = (yy * canvas.width + x.min(canvas.width)) as usize;
+        let end = (yy * canvas.width + (x + w).min(canvas.width)) as usize;
+        canvas.pixels[start..end].fill(value);
+    }
+    for yy in y..(y + h).min(canvas.height) {
+        for xx in [x, x + w - 1] {
+            if xx < canvas.width {
+                canvas.pixels[(yy * canvas.width + xx) as usize] = value;
+            }
+        }
+    }
 }
 
 fn hline(canvas: &mut GrayPage, y: u32, value: u8) {

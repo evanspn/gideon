@@ -43,6 +43,9 @@ struct FakeGateway {
     installed: RefCell<Vec<SourceEntry>>,
     available: std::result::Result<Vec<SourceEntry>, String>,
     mangas: std::result::Result<Vec<MangaEntry>, String>,
+    search_results: std::result::Result<Vec<MangaEntry>, String>,
+    /// Queries passed to `search_manga`, in order.
+    searches: RefCell<Vec<String>>,
     chapters: Vec<ChapterEntry>,
     download: Option<DownloadFn>,
     update_message: String,
@@ -56,6 +59,8 @@ impl Default for FakeGateway {
             installed: RefCell::new(Vec::new()),
             available: Ok(Vec::new()),
             mangas: Ok(Vec::new()),
+            search_results: Ok(Vec::new()),
+            searches: RefCell::new(Vec::new()),
             chapters: Vec::new(),
             download: None,
             update_message: "up to date".to_string(),
@@ -86,6 +91,11 @@ impl SourceGateway for FakeGateway {
 
     fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
         self.mangas.clone().map_err(|e| anyhow!(e))
+    }
+
+    fn search_manga(&self, _source_id: &str, query: &str) -> Result<Vec<MangaEntry>> {
+        self.searches.borrow_mut().push(query.to_string());
+        self.search_results.clone().map_err(|e| anyhow!(e))
     }
 
     fn chapters(&self, _source_id: &str, _manga_id: &str) -> Result<Vec<ChapterEntry>> {
@@ -727,6 +737,443 @@ fn update_prompt_installs_on_tap() {
     };
     assert_eq!(title, "Updates");
     assert!(body.contains("Updated to 9.9.9"));
+}
+
+// --- search keyboard ---
+
+/// Tap the center of a keyboard key.
+fn tap_key(key: Key) -> UiEvent {
+    let (_, x, y, w, h) = layout()
+        .keyboard_keys()
+        .into_iter()
+        .find(|(k, ..)| *k == key)
+        .expect("key exists");
+    UiEvent::Tap {
+        x: x + w / 2,
+        y: y + h / 2,
+    }
+}
+
+fn search_gateway() -> FakeGateway {
+    FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        search_results: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Naruto".into(),
+        }]),
+        ..FakeGateway::default()
+    }
+}
+
+#[test]
+fn listings_search_row_opens_the_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![tap_row(1), tap_row(0), tap_row(2)];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    let Screen::Search { source, query } = app.screen() else {
+        panic!("expected search screen");
+    };
+    assert_eq!(source.id, "src");
+    assert_eq!(query, "");
+    assert!(
+        app.display().buffer.iter().any(|&p| p < 0x80),
+        "keyboard screen is blank"
+    );
+}
+
+#[test]
+fn typing_builds_the_query_with_partial_refreshes() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Char('a')),
+        tap_key(Key::Char('x')),
+        tap_key(Key::Backspace),
+        tap_key(Key::Space),
+        tap_key(Key::Char('1')),
+    ];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    let Screen::Search { query, .. } = app.screen() else {
+        panic!("expected search screen");
+    };
+    assert_eq!(query, "na 1");
+    // Key taps are partial refreshes (no full e-ink flash per letter).
+    let flushes = &app.display().flushes;
+    assert!(flushes
+        .iter()
+        .rev()
+        .take(6)
+        .all(|m| *m == RefreshMode::Partial));
+}
+
+#[test]
+fn every_eighth_keystroke_flashes_the_panel_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut events = vec![tap_row(1), tap_row(0), tap_row(2)];
+    events.extend(std::iter::repeat_with(|| tap_key(Key::Char('a'))).take(8));
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    // The last 8 flushes are the keyboard repaints: 7 partials, then the
+    // anti-ghosting full refresh on the 8th.
+    let flushes = &app.display().flushes;
+    let last8 = &flushes[flushes.len() - 8..];
+    assert_eq!(last8[7], RefreshMode::Full);
+    assert!(last8[..7].iter().all(|m| *m == RefreshMode::Partial));
+}
+
+#[test]
+fn punctuation_for_manga_titles_is_typeable() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('r')),
+        tap_key(Key::Char('e')),
+        tap_key(Key::Char(':')),
+        tap_key(Key::Char('-')),
+        tap_key(Key::Char('\'')),
+        tap_key(Key::Char('.')),
+    ];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    let Screen::Search { query, .. } = app.screen() else {
+        panic!("expected search screen");
+    };
+    assert_eq!(query, "re:-'.");
+}
+
+#[test]
+fn space_is_not_allowed_leading_or_doubled() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Space), // leading — ignored
+        tap_key(Key::Char('a')),
+        tap_key(Key::Space),
+        tap_key(Key::Space), // doubled — ignored
+    ];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    let Screen::Search { query, .. } = app.screen() else {
+        panic!("expected search screen");
+    };
+    assert_eq!(query, "a ");
+}
+
+#[test]
+fn search_key_queries_the_gateway_and_shows_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Char('a')),
+        tap_key(Key::Search),
+    ];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    assert_eq!(*app.gateway().searches.borrow(), vec!["na".to_string()]);
+    let Screen::MangaList {
+        listing, mangas, ..
+    } = app.screen()
+    else {
+        panic!("expected search results");
+    };
+    assert_eq!(listing, "\"na\"");
+    assert_eq!(mangas.len(), 1);
+    assert_eq!(mangas[0].title, "Naruto");
+}
+
+#[test]
+fn search_results_open_chapters_like_any_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.chapters = vec![ChapterEntry {
+        id: "c1".into(),
+        num: Some(1.0),
+        title: None,
+        lang: None,
+    }];
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search),
+        tap_row(0), // Naruto -> ChapterList
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::ChapterList { manga, .. } = app.screen() else {
+        panic!("expected chapter list from search result");
+    };
+    assert_eq!(manga.title, "Naruto");
+}
+
+#[test]
+fn empty_query_search_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![tap_row(1), tap_row(0), tap_row(2), tap_key(Key::Search)];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    assert!(app.gateway().searches.borrow().is_empty());
+    assert!(matches!(app.screen(), Screen::Search { .. }));
+}
+
+#[test]
+fn empty_results_show_a_message_and_keep_the_keyboard_below() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.search_results = Ok(Vec::new());
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('z')),
+        tap_key(Key::Search),
+        tap_back(), // dismiss the message -> back on the keyboard
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::Search { query, .. } = app.screen() else {
+        panic!("expected to return to the keyboard");
+    };
+    assert_eq!(query, "z");
+}
+
+#[test]
+fn search_failure_shows_error_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.search_results = Err("source exploded".into());
+    let events = vec![
+        tap_row(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('a')),
+        tap_key(Key::Search),
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected error screen");
+    };
+    assert_eq!(title, "Error");
+    assert!(body.contains("source exploded"));
+}
+
+#[test]
+fn back_leaves_the_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![tap_row(1), tap_row(0), tap_row(2), tap_back()];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Listings { .. }));
+}
+
+// --- sleep (power button / sleep cover) ---
+
+/// A counting sleeper hook.
+fn counting_sleeper() -> (std::rc::Rc<std::cell::Cell<usize>>, SleepFn) {
+    let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let c = count.clone();
+    (
+        count,
+        Box::new(move || {
+            c.set(c.get() + 1);
+            Ok(SleepResult::Slept)
+        }),
+    )
+}
+
+#[test]
+fn sleep_event_suspends_and_repaints_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let mut app =
+        app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep]).with_sleeper(sleeper);
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1, "sleeper must run on UiEvent::Sleep");
+    // Initial paint + post-wake repaint, both full.
+    assert_eq!(
+        app.display().flushes,
+        vec![RefreshMode::Full, RefreshMode::Full]
+    );
+    assert!(matches!(app.screen(), Screen::Home));
+}
+
+#[test]
+fn back_to_back_sleep_events_are_debounced() {
+    // The press that woke the device can be delivered after the post-wake
+    // drain; it must not bounce us straight back into suspend.
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let events = vec![UiEvent::Sleep, UiEvent::Sleep, UiEvent::Sleep];
+    let mut app = app(dir.path(), FakeGateway::default(), events).with_sleeper(sleeper);
+    app.run().unwrap();
+    assert_eq!(count.get(), 1, "wake-press echo must not re-suspend");
+}
+
+#[test]
+fn skipped_suspend_explains_itself_and_stays_awake() {
+    let dir = tempfile::tempdir().unwrap();
+    let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let c = count.clone();
+    let sleeper: SleepFn = Box::new(move || {
+        c.set(c.get() + 1);
+        Ok(SleepResult::Skipped)
+    });
+    let mut app =
+        app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep]).with_sleeper(sleeper);
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1);
+    assert!(matches!(app.screen(), Screen::Home));
+    // Initial paint, the "staying awake" notice, and the restore repaint.
+    assert_eq!(
+        app.display().flushes,
+        vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
+    );
+}
+
+#[test]
+fn sleep_right_after_a_download_suspends_in_the_reader() {
+    // A cover closed while a chapter downloaded surfaces as the first
+    // event the reader sees; it must suspend, not be treated as a tap.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _progress| {
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 3);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let (count, sleeper) = counting_sleeper();
+    let events = vec![
+        tap_row(1),        // Sources
+        tap_row(0),        // Listings
+        tap_row(0),        // Popular
+        tap_row(0),        // Manga One
+        tap_row(0),        // download + Reader
+        UiEvent::Sleep,    // the cover-close that queued during the download
+        reader_tap_back(), // back out after waking
+    ];
+    let mut app = app(&lib, gateway, events).with_sleeper(sleeper);
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1, "queued sleep must still suspend");
+    assert!(matches!(app.screen(), Screen::ChapterList { .. }));
+}
+
+#[test]
+fn sleep_without_a_hook_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![UiEvent::Sleep, tap_row(0)];
+    let lib = dir.path().join("Manga");
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    // No crash, no extra repaint; the tap after the ignored event worked.
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+}
+
+#[test]
+fn sleeper_failure_lands_on_the_error_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let sleeper: SleepFn = Box::new(|| Err(anyhow!("EBUSY all the way down")));
+    let mut app =
+        app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep]).with_sleeper(sleeper);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected error screen");
+    };
+    assert_eq!(title, "Error");
+    assert!(body.contains("EBUSY"));
+}
+
+#[test]
+fn sleep_in_the_reader_saves_progress_first_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let progress_at_sleep = std::rc::Rc::new(std::cell::Cell::new(None::<usize>));
+    let lib_for_hook = lib.clone();
+    let probe = progress_at_sleep.clone();
+    let sleeper: SleepFn = Box::new(move || {
+        // What's on disk while we are "suspended"?
+        let store = ProgressStore::load(&progress_path(&lib_for_hook)).unwrap_or_default();
+        probe.set(store.get("Sample/vol1.cbz").map(|p| p.current_page));
+        Ok(SleepResult::Slept)
+    });
+
+    let events = vec![
+        tap_row(0),        // Library
+        tap_shelf_cell0(), // Reader, page 0
+        reader_tap_next(), // page 1
+        UiEvent::Sleep,    // suspend mid-read
+        reader_tap_next(), // page 2 after waking
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_sleeper(sleeper);
+    app.run().unwrap();
+
+    assert_eq!(
+        progress_at_sleep.get(),
+        Some(1),
+        "progress must be on disk before the power goes down"
+    );
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        2,
+        "reading continues after waking"
+    );
+    // The post-wake repaint is a full refresh.
+    let flushes = &app.display().flushes;
+    assert!(flushes.iter().filter(|m| **m == RefreshMode::Full).count() >= 3);
 }
 
 #[test]
