@@ -375,6 +375,17 @@ fn progress_path(library_dir: &std::path::Path) -> PathBuf {
     library_dir.join(".gideon").join("progress.json")
 }
 
+/// Reader fit mode and rotation from settings.json. Lenient end to end: a
+/// missing or unreadable settings file means the defaults (Contain, 0°) —
+/// the reader must always come up.
+fn reader_settings() -> (FitMode, u32) {
+    let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
+    (
+        FitMode::from_setting(&settings.reader_fit),
+        settings.reader_rotation,
+    )
+}
+
 /// Data directory holding settings.json: $GIDEON_DATA_DIR if set (the Kobo
 /// install uses .adds/gideon/data), otherwise ~/.config/gideon.
 fn data_dir() -> PathBuf {
@@ -525,7 +536,10 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     let input = KoboTouch::open(width, height)
         .context("failed to open the touch screen — are you running on a Kobo device?")?;
     let gateway = ui::AidokuGateway::new(data_dir());
-    ui::UiApp::new(display, input, gateway, library).run()
+    let (fit, rotation) = reader_settings();
+    ui::UiApp::new(display, input, gateway, library)
+        .with_reader_settings(fit, rotation)
+        .run()
 }
 
 #[cfg(not(feature = "kobo"))]
@@ -586,7 +600,8 @@ fn run_reader<D: gideon_device::Display>(
 
     let doc = CbzDocument::open(&path)?;
     let mut store = ProgressStore::load(&progress_file)?;
-    let mut reader = Reader::new(doc, display, FitMode::Contain);
+    let (fit, rotation) = reader_settings();
+    let mut reader = Reader::new(doc, display, fit, rotation);
     reader.resume_from(&store, &progress_key);
     reader.show_current_page()?;
 

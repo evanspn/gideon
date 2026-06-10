@@ -24,6 +24,18 @@ pub enum FitMode {
     FitHeight,
 }
 
+impl FitMode {
+    /// Parse a settings string leniently: "fit-width" selects
+    /// [`FitMode::FitWidth`]; anything else (including unknown values)
+    /// means [`FitMode::Contain`].
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fit-width" => FitMode::FitWidth,
+            _ => FitMode::Contain,
+        }
+    }
+}
+
 /// A rendered page: 8-bit grayscale pixels, row-major, `width * height` long.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrayPage {
@@ -127,6 +139,47 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
     }
 
     canvas
+}
+
+/// Rotate a rendered page clockwise by `degrees` (0, 90, 180 or 270).
+///
+/// 0 — and any value that isn't a multiple of 90 — returns the page
+/// unchanged. 90 and 270 swap the page's width and height.
+pub fn rotate_page(page: &GrayPage, degrees: u32) -> GrayPage {
+    let (w, h) = (page.width, page.height);
+    match degrees % 360 {
+        // Clockwise 90: (x, y) → (h - 1 - y, x).
+        90 => {
+            let mut out = GrayPage::new_white(h, w);
+            for y in 0..h {
+                for x in 0..w {
+                    out.pixels[(x * h + (h - 1 - y)) as usize] = page.pixel(x, y);
+                }
+            }
+            out
+        }
+        // 180: (x, y) → (w - 1 - x, h - 1 - y).
+        180 => {
+            let mut out = GrayPage::new_white(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    out.pixels[((h - 1 - y) * w + (w - 1 - x)) as usize] = page.pixel(x, y);
+                }
+            }
+            out
+        }
+        // Clockwise 270 (= counter-clockwise 90): (x, y) → (y, w - 1 - x).
+        270 => {
+            let mut out = GrayPage::new_white(h, w);
+            for y in 0..h {
+                for x in 0..w {
+                    out.pixels[((w - 1 - x) * h + y) as usize] = page.pixel(x, y);
+                }
+            }
+            out
+        }
+        _ => page.clone(),
+    }
 }
 
 /// In-place Floyd–Steinberg dithering down to 16 evenly spaced gray levels.
@@ -243,6 +296,81 @@ mod tests {
         let out = render_page(&page, &opts);
         assert_eq!(out.width, 200);
         assert_eq!(out.height, 800);
+    }
+
+    /// A 2x3 page with every pixel distinct, so rotations are fully
+    /// position-sensitive:
+    ///
+    /// ```text
+    /// 0 1
+    /// 2 3
+    /// 4 5
+    /// ```
+    fn asymmetric_page() -> GrayPage {
+        GrayPage {
+            width: 2,
+            height: 3,
+            pixels: vec![0, 1, 2, 3, 4, 5],
+        }
+    }
+
+    #[test]
+    fn rotate_0_is_identity() {
+        let page = asymmetric_page();
+        assert_eq!(rotate_page(&page, 0), page);
+        // 360 wraps to 0; non-multiples of 90 are treated as 0 too.
+        assert_eq!(rotate_page(&page, 360), page);
+        assert_eq!(rotate_page(&page, 45), page);
+    }
+
+    #[test]
+    fn rotate_90_clockwise_exact_pixels() {
+        let out = rotate_page(&asymmetric_page(), 90);
+        assert_eq!((out.width, out.height), (3, 2));
+        // Top row of the source becomes the right column.
+        assert_eq!(out.pixels, vec![4, 2, 0, 5, 3, 1]);
+        assert_eq!(out.pixel(2, 0), 0);
+        assert_eq!(out.pixel(2, 1), 1);
+        assert_eq!(out.pixel(0, 0), 4);
+    }
+
+    #[test]
+    fn rotate_180_exact_pixels() {
+        let out = rotate_page(&asymmetric_page(), 180);
+        assert_eq!((out.width, out.height), (2, 3));
+        assert_eq!(out.pixels, vec![5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn rotate_270_clockwise_exact_pixels() {
+        let out = rotate_page(&asymmetric_page(), 270);
+        assert_eq!((out.width, out.height), (3, 2));
+        // Top row of the source becomes the left column.
+        assert_eq!(out.pixels, vec![1, 3, 5, 0, 2, 4]);
+        assert_eq!(out.pixel(0, 1), 0);
+        assert_eq!(out.pixel(0, 0), 1);
+        assert_eq!(out.pixel(2, 0), 5);
+    }
+
+    #[test]
+    fn rotations_compose_back_to_identity() {
+        let page = asymmetric_page();
+        let through_90s = rotate_page(
+            &rotate_page(&rotate_page(&rotate_page(&page, 90), 90), 90),
+            90,
+        );
+        assert_eq!(through_90s, page);
+        assert_eq!(rotate_page(&rotate_page(&page, 90), 270), page);
+        assert_eq!(rotate_page(&rotate_page(&page, 180), 180), page);
+    }
+
+    #[test]
+    fn fit_mode_setting_parses_leniently() {
+        assert_eq!(FitMode::from_setting("fit-width"), FitMode::FitWidth);
+        assert_eq!(FitMode::from_setting("  Fit-Width "), FitMode::FitWidth);
+        assert_eq!(FitMode::from_setting("contain"), FitMode::Contain);
+        assert_eq!(FitMode::from_setting("sideways"), FitMode::Contain);
+        assert_eq!(FitMode::from_setting(""), FitMode::Contain);
     }
 
     #[test]

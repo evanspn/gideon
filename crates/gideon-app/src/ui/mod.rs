@@ -99,6 +99,10 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     library_dir: PathBuf,
     layout: UiLayout,
     stack: Vec<Screen>,
+    /// Reader fit mode (from settings.json `reader_fit`).
+    reader_fit: FitMode,
+    /// Reader rotation in degrees (from settings.json `reader_rotation`).
+    reader_rotation: u32,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -111,7 +115,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             library_dir,
             layout,
             stack: vec![Screen::Home],
+            reader_fit: FitMode::Contain,
+            reader_rotation: 0,
         }
+    }
+
+    /// Apply the reader-related settings (fit mode and rotation).
+    pub fn with_reader_settings(mut self, fit: FitMode, rotation: u32) -> Self {
+        self.reader_fit = fit;
+        self.reader_rotation = rotation;
+        self
     }
 
     /// The underlying display (for tests and headless screenshots).
@@ -477,17 +490,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut store = ProgressStore::load(&progress_file).unwrap_or_default();
 
         let layout = self.layout;
+        let rotation = self.reader_rotation;
         let mut keep_running = true;
         {
-            let mut reader = Reader::new(doc, &mut self.display, FitMode::Contain);
+            let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
             reader.resume_from(&store, key);
             reader.show_current_page()?;
             loop {
-                let Ok(UiEvent::Tap { x, .. }) = self.input.next_event() else {
+                let Ok(UiEvent::Tap { x, y }) = self.input.next_event() else {
                     keep_running = false;
                     break;
                 };
-                match layout.reader_zone(x) {
+                // Tap zones follow the reading orientation, not the panel.
+                match layout.reader_zone_rotated(x, y, rotation) {
                     ReaderZone::NextPage => {
                         reader.next_page()?;
                     }

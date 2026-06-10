@@ -106,19 +106,58 @@ impl UiLayout {
     /// Resolve a tap inside the reader into a zone (thirds of the width:
     /// left = previous page, center = back, right = next page).
     pub fn reader_zone(&self, x: u32) -> ReaderZone {
-        let third = (self.width / 3).max(1);
-        if x < third {
-            ReaderZone::PrevPage
-        } else if x < 2 * third {
-            ReaderZone::Back
+        reader_zone_in_width(self.width, x)
+    }
+
+    /// Resolve a *rotated* reader tap: the panel coordinates are first
+    /// mapped into reading orientation (see [`map_reader_tap`]), then the
+    /// zone is computed against the reading-orientation width — so
+    /// next/prev/back follow the direction the user is reading in, not the
+    /// panel.
+    pub fn reader_zone_rotated(&self, x: u32, y: u32, rotation: u32) -> ReaderZone {
+        let (rx, _ry) = map_reader_tap(x, y, self.width, self.height, rotation);
+        let reading_width = if rotation % 180 == 90 {
+            self.height
         } else {
-            ReaderZone::NextPage
-        }
+            self.width
+        };
+        reader_zone_in_width(reading_width, rx)
     }
 
     /// Number of pages needed to show `n` rows.
     pub fn page_count(&self, n: usize) -> usize {
         n.div_ceil(self.rows_per_page()).max(1)
+    }
+}
+
+/// Reader zone for a tap at `x` within a screen of `width` (thirds: left =
+/// previous, center = back, right = next).
+pub fn reader_zone_in_width(width: u32, x: u32) -> ReaderZone {
+    let third = (width / 3).max(1);
+    if x < third {
+        ReaderZone::PrevPage
+    } else if x < 2 * third {
+        ReaderZone::Back
+    } else {
+        ReaderZone::NextPage
+    }
+}
+
+/// Map a tap at panel coordinates `(x, y)` into reading-orientation
+/// coordinates for a reader rotated clockwise by `rotation` degrees.
+///
+/// The displayed image is `rotate_page(reading_image, rotation)`, so this
+/// applies the inverse rotation. For 90/270 the reading-orientation screen
+/// is `panel_h x panel_w`.
+pub fn map_reader_tap(x: u32, y: u32, panel_w: u32, panel_h: u32, rotation: u32) -> (u32, u32) {
+    match rotation % 360 {
+        90 => (y, panel_w.saturating_sub(1).saturating_sub(x)),
+        180 => (
+            panel_w.saturating_sub(1).saturating_sub(x),
+            panel_h.saturating_sub(1).saturating_sub(y),
+        ),
+        270 => (panel_h.saturating_sub(1).saturating_sub(y), x),
+        _ => (x, y),
     }
 }
 
@@ -169,6 +208,91 @@ mod tests {
         assert_eq!(l.reader_zone(599), ReaderZone::Back);
         assert_eq!(l.reader_zone(600), ReaderZone::NextPage);
         assert_eq!(l.reader_zone(899), ReaderZone::NextPage);
+    }
+
+    #[test]
+    fn map_reader_tap_identity_at_rotation_0() {
+        assert_eq!(map_reader_tap(5, 7, 100, 200, 0), (5, 7));
+        assert_eq!(map_reader_tap(99, 199, 100, 200, 0), (99, 199));
+    }
+
+    #[test]
+    fn map_reader_tap_rotation_90() {
+        // Display = rotate_cw(reading, 90): reading screen is 200x100.
+        // Panel top-left came from the reading bottom-left corner area.
+        assert_eq!(map_reader_tap(0, 0, 100, 200, 90), (0, 99));
+        assert_eq!(map_reader_tap(99, 0, 100, 200, 90), (0, 0));
+        assert_eq!(map_reader_tap(99, 199, 100, 200, 90), (199, 0));
+        assert_eq!(map_reader_tap(0, 199, 100, 200, 90), (199, 99));
+    }
+
+    #[test]
+    fn map_reader_tap_rotation_180() {
+        assert_eq!(map_reader_tap(0, 0, 100, 200, 180), (99, 199));
+        assert_eq!(map_reader_tap(99, 199, 100, 200, 180), (0, 0));
+        assert_eq!(map_reader_tap(5, 7, 100, 200, 180), (94, 192));
+    }
+
+    #[test]
+    fn map_reader_tap_rotation_270() {
+        // Display = rotate_cw(reading, 270): reading screen is 200x100.
+        assert_eq!(map_reader_tap(0, 0, 100, 200, 270), (199, 0));
+        assert_eq!(map_reader_tap(99, 0, 100, 200, 270), (199, 99));
+        assert_eq!(map_reader_tap(0, 199, 100, 200, 270), (0, 0));
+        assert_eq!(map_reader_tap(99, 199, 100, 200, 270), (0, 99));
+    }
+
+    #[test]
+    fn map_reader_tap_round_trips_through_the_pixel_rotation() {
+        // For every rotation, a tap on a panel pixel must map to the
+        // reading-orientation pixel that rotate_page moved there.
+        use gideon_render::{rotate_page, GrayPage};
+        for rotation in [0u32, 90, 180, 270] {
+            let (rw, rh) = if rotation % 180 == 90 { (5, 4) } else { (4, 5) };
+            // Reading-orientation page with unique pixel values.
+            let reading = GrayPage {
+                width: rw,
+                height: rh,
+                pixels: (0..(rw * rh) as usize).map(|i| i as u8).collect(),
+            };
+            let panel = rotate_page(&reading, rotation);
+            for py in 0..panel.height {
+                for px in 0..panel.width {
+                    let (x, y) = map_reader_tap(px, py, panel.width, panel.height, rotation);
+                    assert_eq!(
+                        reading.pixel(x, y),
+                        panel.pixel(px, py),
+                        "rotation {rotation}, panel ({px},{py}) -> reading ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_reader_zones_follow_reading_orientation() {
+        let l = UiLayout::new(900, 1200);
+
+        // Rotation 0: thirds of the panel width.
+        assert_eq!(l.reader_zone_rotated(0, 600, 0), ReaderZone::PrevPage);
+        assert_eq!(l.reader_zone_rotated(450, 600, 0), ReaderZone::Back);
+        assert_eq!(l.reader_zone_rotated(899, 600, 0), ReaderZone::NextPage);
+
+        // Rotation 90 (clockwise): reading width is the panel height
+        // (1200); reading-x = panel-y, so "next" is the bottom of the panel.
+        assert_eq!(l.reader_zone_rotated(450, 0, 90), ReaderZone::PrevPage);
+        assert_eq!(l.reader_zone_rotated(450, 600, 90), ReaderZone::Back);
+        assert_eq!(l.reader_zone_rotated(450, 1199, 90), ReaderZone::NextPage);
+
+        // Rotation 180: reading is upside down — "next" is the panel left.
+        assert_eq!(l.reader_zone_rotated(899, 600, 180), ReaderZone::PrevPage);
+        assert_eq!(l.reader_zone_rotated(450, 600, 180), ReaderZone::Back);
+        assert_eq!(l.reader_zone_rotated(0, 600, 180), ReaderZone::NextPage);
+
+        // Rotation 270: "next" is the top of the panel.
+        assert_eq!(l.reader_zone_rotated(450, 1199, 270), ReaderZone::PrevPage);
+        assert_eq!(l.reader_zone_rotated(450, 600, 270), ReaderZone::Back);
+        assert_eq!(l.reader_zone_rotated(450, 0, 270), ReaderZone::NextPage);
     }
 
     #[test]
