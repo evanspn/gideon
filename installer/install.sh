@@ -147,10 +147,18 @@ if [ -d "$NM_DIR" ]; then
     if [ -f "$SCRIPT_DIR/nickelmenu-gideon" ]; then
         cp "$SCRIPT_DIR/nickelmenu-gideon" "$NM_DIR/gideon"
     else
-        printf 'menu_item :main :gideon :cmd_output :500:/mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga\n' > "$NM_DIR/gideon"
+        printf 'menu_item :main :gideon :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga\n' > "$NM_DIR/gideon"
     fi
 else
-    echo "NickelMenu not found — skipping launcher entry (install NickelMenu to launch gideon from the home menu)"
+    echo ""
+    echo "WARNING: NickelMenu is not installed on this device."
+    echo "gideon is installed, but you won't be able to launch it from the"
+    echo "Kobo home screen without a launcher. To fix this:"
+    echo "  1. Install NickelMenu: https://pgaskin.net/NickelMenu/"
+    echo "     (download KoboRoot.tgz into the device's .kobo folder and eject)"
+    echo "  2. Re-run this installer — it will add the gideon menu entry."
+    echo "Until then you can only run gideon over SSH/telnet."
+    echo ""
 fi
 
 echo

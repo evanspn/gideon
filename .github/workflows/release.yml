@@ -1,0 +1,150 @@
+name: Release
+
+# Fully automatic releases: every merge to main produces a semantically
+# versioned GitHub Release with the installable Kobo bundle attached —
+# no CLI steps required.
+#
+# Versioning (scripts/auto_version.sh):
+#   * If Cargo.toml's version has no tag yet, that exact version is
+#     released (bump the version in a PR to control the number).
+#   * Otherwise the patch version is bumped automatically. Put [minor] or
+#     [major] in the merge commit message — or use "Run workflow" from the
+#     Actions tab — for bigger bumps. Put [skip release] to not release.
+#
+# The version-bump commit and tag are pushed by the workflow itself; the
+# release is only published after the full quality gate and the QEMU
+# integration tests pass against the exact binaries being shipped.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (!contains(github.event.head_commit.message, '[skip release]') &&
+       !startsWith(github.event.head_commit.message, 'release:'))
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Determine release version
+        id: version
+        run: |
+          level="${{ github.event.inputs.bump }}"
+          if [ -z "$level" ]; then
+            level=patch
+            case "${{ github.event.head_commit.message }}" in
+              *"[major]"*) level=major ;;
+              *"[minor]"*) level=minor ;;
+            esac
+          fi
+          out=$(./scripts/auto_version.sh "$level")
+          version=$(echo "$out" | cut -d' ' -f1)
+          bump=$(echo "$out" | grep -o 'bump=.*' | cut -d= -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$version (bump: $bump, level: $level)"
+
+      - name: Apply version bump
+        if: steps.version.outputs.bump == 'yes'
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          current=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          sed -i "0,/^version = \"$current\"/s//version = \"$version\"/" Cargo.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ARM cross toolchain and QEMU
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user-static
+
+      - name: Refresh Cargo.lock after bump
+        if: steps.version.outputs.bump == 'yes'
+        run: cargo update --workspace
+
+      - name: Quality gate (fmt, clippy, tests, installer)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          ./ci/installer_test.sh
+
+      - name: Build Kobo binaries (armv7)
+        env:
+          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: |
+          cargo build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
+          cp target/armv7-unknown-linux-musleabihf/release/gideon /tmp/gideon-kobo
+          cargo build --release --target armv7-unknown-linux-musleabihf
+
+      - name: Run QEMU integration tests against the release binaries
+        run: ./ci/qemu_integration.sh /tmp/gideon-kobo target/armv7-unknown-linux-musleabihf/release/gideon
+
+      - name: Assemble versioned bundle
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p "/tmp/gideon-kobo-v${version}"
+          cp /tmp/gideon-kobo "/tmp/gideon-kobo-v${version}/gideon"
+          cp installer/install.sh installer/nickelmenu-gideon installer/INSTALL.md "/tmp/gideon-kobo-v${version}/"
+          chmod 755 "/tmp/gideon-kobo-v${version}/install.sh" "/tmp/gideon-kobo-v${version}/gideon"
+          echo "gideon ${version} (${GITHUB_SHA::9})" > "/tmp/gideon-kobo-v${version}/VERSION"
+          (cd /tmp && zip -r "gideon-kobo-v${version}.zip" "gideon-kobo-v${version}")
+          # Standalone VERSION asset: devices check
+          # releases/latest/download/VERSION for OTA updates (no API, no
+          # rate limits).
+          mkdir -p /tmp/release-assets
+          cp "/tmp/gideon-kobo-v${version}/VERSION" /tmp/release-assets/VERSION
+
+      - name: Smoke-test the bundle installer
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p /tmp/fake-kobo/.kobo /tmp/fake-kobo/.adds/nm
+          sh "/tmp/gideon-kobo-v${version}/install.sh" --root /tmp/fake-kobo
+          grep -F "gideon ${version}" /tmp/fake-kobo/.adds/gideon/VERSION
+
+      - name: Commit version bump and tag
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ steps.version.outputs.bump }}" = "yes" ]; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "release: v${version}"
+          fi
+          git tag -a "v${version}" -m "gideon v${version}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: gideon v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            /tmp/gideon-kobo-v${{ steps.version.outputs.version }}.zip
+            /tmp/release-assets/VERSION

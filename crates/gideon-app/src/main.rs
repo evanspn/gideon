@@ -70,6 +70,34 @@ enum Command {
         no_defaults: bool,
     },
 
+    /// Render the library as a cover grid (the library cover view),
+    /// saved as a PNG on desktop builds.
+    Shelf {
+        dir: PathBuf,
+        /// Output PNG path.
+        #[arg(short, long, default_value = "shelf.png")]
+        out: PathBuf,
+        /// Number of columns.
+        #[arg(long, default_value_t = 3)]
+        cols: u32,
+        /// Target screen width (Kobo Clara HD default).
+        #[arg(long, default_value_t = 1072)]
+        width: u32,
+        /// Target screen height.
+        #[arg(long, default_value_t = 1448)]
+        height: u32,
+    },
+
+    /// Check for (and install) gideon updates from GitHub releases.
+    Update {
+        /// Only check and report; don't download or install.
+        #[arg(long)]
+        check: bool,
+        /// Allow installing a major version bump (off by default, like bobo).
+        #[arg(long)]
+        major: bool,
+    },
+
     /// Open a CBZ for reading.
     Read {
         path: PathBuf,
@@ -96,6 +124,14 @@ fn main() -> Result<()> {
             add_lists,
             no_defaults,
         } => cmd_sources(add_lists, no_defaults),
+        Command::Shelf {
+            dir,
+            out,
+            cols,
+            width,
+            height,
+        } => cmd_shelf(dir, out, cols, width, height),
+        Command::Update { check, major } => cmd_update(check, major),
         Command::Read {
             path,
             progress_file,
@@ -206,6 +242,14 @@ fn cmd_sources(add_lists: Vec<Url>, no_defaults: bool) -> Result<()> {
     } else {
         SourceLists::default()
     };
+    // Source lists configured in settings.json are always included.
+    let settings = gideon_core::Settings::load(&data_dir())?;
+    for raw in &settings.source_lists {
+        match Url::parse(raw) {
+            Ok(url) => lists.add(url),
+            Err(e) => eprintln!("warning: ignoring invalid source list '{raw}' in settings: {e}"),
+        }
+    }
     for url in add_lists {
         lists.add(url);
     }
@@ -219,7 +263,7 @@ fn cmd_sources(add_lists: Vec<Url>, no_defaults: bool) -> Result<()> {
 
     println!("{} source(s) available:\n", sources.len());
     for source in sources {
-        let lang = source.lang.as_deref().unwrap_or("?");
+        let lang = source.primary_language().unwrap_or("?");
         let origin = source.origin.as_deref().unwrap_or("?");
         println!(
             "  {:<30} [{}] v{} — {} (from {})",
@@ -231,6 +275,120 @@ fn cmd_sources(add_lists: Vec<Url>, no_defaults: bool) -> Result<()> {
 
 fn progress_path(library_dir: &std::path::Path) -> PathBuf {
     library_dir.join(".gideon").join("progress.json")
+}
+
+/// Data directory holding settings.json: $GIDEON_DATA_DIR if set (the Kobo
+/// install uses .adds/gideon/data), otherwise ~/.config/gideon.
+fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("GIDEON_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".config").join("gideon"))
+        .unwrap_or_else(|_| PathBuf::from(".gideon-data"))
+}
+
+fn cmd_shelf(dir: PathBuf, out: PathBuf, cols: u32, width: u32, height: u32) -> Result<()> {
+    use gideon_render::shelf::{compose_shelf, ShelfEntry, ShelfLayout};
+
+    let library = Library::new(&dir);
+    let scanned = library.scan()?;
+    if scanned.is_empty() {
+        bail!("no CBZ files found under {}", dir.display());
+    }
+    let store = ProgressStore::load(&progress_path(&dir))?;
+
+    let layout = ShelfLayout::new(width, height, cols);
+    let mut entries = Vec::new();
+    for entry in scanned.iter().take(layout.capacity()) {
+        let mut doc = CbzDocument::open(&entry.path)?;
+        let cover = doc.decode_page(0)?;
+        let progress = store.get(&entry.relative_path).map(|p| {
+            if p.total_pages == 0 {
+                0.0
+            } else {
+                (p.current_page + 1) as f32 / p.total_pages as f32
+            }
+        });
+        entries.push(ShelfEntry { cover, progress });
+    }
+
+    let page = compose_shelf(&entries, &layout);
+    let gray = image::GrayImage::from_raw(page.width, page.height, page.pixels)
+        .context("shelf buffer has unexpected size")?;
+    gray.save(&out)?;
+    println!(
+        "Rendered shelf with {} cover(s) ({} visible max) to {}",
+        entries.len(),
+        layout.capacity(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
+    use gideon_sources::update;
+
+    let repo = std::env::var("GIDEON_UPDATE_REPO")
+        .unwrap_or_else(|_| update::DEFAULT_UPDATE_REPO.to_string());
+    let current = env!("CARGO_PKG_VERSION");
+    println!("Current version: {current}");
+    println!("Checking {repo} for updates...");
+
+    let fetcher = UreqFetcher::new();
+
+    // Primary: the VERSION asset on the latest release (no API, no rate
+    // limits). Fallback: the GitHub API, the way bobo checks.
+    let base = update::release_base();
+    let release = match update::check_update_via_assets(&fetcher, &base, &repo, current) {
+        Ok(release) => release,
+        Err(assets_err) => match update::check_update(&fetcher, &repo, current) {
+            Ok(release) => release,
+            Err(api_err) => bail!(
+                "couldn't check releases for {repo}.\n\
+                 - asset check failed: {assets_err}\n\
+                 - API check failed: {api_err}\n\
+                 If the repository is private, OTA updates need a public repo \
+                 or a GIDEON_GITHUB_TOKEN environment variable."
+            ),
+        },
+    };
+
+    let Some(release) = release else {
+        println!("Already up to date.");
+        return Ok(());
+    };
+
+    println!("Update available: {} -> {}", current, release.version);
+    if let Some(notes) = &release.notes {
+        println!("\n{notes}\n");
+    }
+    if check_only {
+        println!("Run `gideon update` to install it.");
+        return Ok(());
+    }
+    if !update::is_auto_installable(current, &release.version) && !allow_major {
+        bail!(
+            "{} is a major version bump from {} — review the release notes and \
+             re-run with --major to install it.",
+            release.version,
+            current
+        );
+    }
+
+    let exe = std::env::current_exe()?;
+    let bin_dir = exe
+        .parent()
+        .context("can't determine the binary's directory")?;
+    println!("Downloading {}...", release.asset_url);
+    update::stage_update(&fetcher, &release, bin_dir)?;
+    if update::apply_staged(bin_dir)? {
+        println!(
+            "Updated to {}. Restart gideon to run the new version (previous binary kept as gideon.old).",
+            release.version
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "kobo")]

@@ -5,8 +5,13 @@
 - A Kobo e-reader (armv7 — Clara, Libra, Sage, Forma, Aura, etc.)
 - The `gideon-kobo-bundle` zip from the latest build (post-merge CI artifact,
   or a GitHub release once those exist)
-- Optional but recommended: [NickelMenu](https://pgaskin.net/NickelMenu/) to
-  launch gideon from the Kobo home menu
+- [NickelMenu](https://pgaskin.net/NickelMenu/) — required to *launch*
+  gideon from the Kobo home screen. Installing gideon works without it, but
+  you'd have no way to start the app except over SSH/telnet. Install
+  NickelMenu first (drop its `KoboRoot.tgz` into the device's `.kobo`
+  folder and eject), then run gideon's installer — it detects NickelMenu
+  and adds the menu entry automatically. If you install NickelMenu later,
+  just re-run gideon's installer.
 
 ## Install / upgrade
 
