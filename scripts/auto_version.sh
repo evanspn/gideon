@@ -1,10 +1,12 @@
 #!/bin/sh
 # Decide which version the next release should be.
 #
-# The workspace version in Cargo.toml is the source of truth:
-#   * if no tag exists for it yet, release exactly that version (this lets a
-#     deliberate version bump in a PR control the release number);
-#   * otherwise auto-bump (patch by default, or the requested level).
+#   * If Cargo.toml's version has no tag yet, release exactly that version
+#     (a deliberate version bump in a PR controls the release number).
+#   * Otherwise bump from the HIGHEST existing release tag (patch by
+#     default, or the requested level). Versions live in tags — the release
+#     workflow never has to push commits back to main, so strict branch
+#     protection needs no bypass.
 #
 # Usage: auto_version.sh [patch|minor|major]
 # Output: "<version> bump=<yes|no>"
@@ -20,8 +22,12 @@ if ! git rev-parse "v$current" >/dev/null 2>&1; then
     exit 0
 fi
 
+# Highest existing semver tag (sort -V understands dotted versions).
+latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sed 's/^v//' | sort -V | tail -1)
+[ -n "$latest" ] || latest=$current
+
 IFS=. read -r major minor patch <<EOF
-$current
+$latest
 EOF
 patch=${patch%%-*}
 

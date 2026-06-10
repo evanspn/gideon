@@ -1,0 +1,4 @@
+# Default owner for everything in the repository.
+# GitHub automatically requests a review from code owners on every PR,
+# and (with branch protection / rulesets) can require their approval.
+*       @evanspn

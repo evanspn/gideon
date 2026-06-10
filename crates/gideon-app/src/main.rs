@@ -201,10 +201,26 @@ fn cmd_render(
 }
 
 fn cmd_library(dir: PathBuf) -> Result<()> {
+    // First boot on a device: the library folder may not exist yet. Create
+    // it instead of erroring — the NickelMenu launcher points here before
+    // the user has copied any manga over.
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("couldn't create library directory {}", dir.display()))?;
+        println!(
+            "Library initialized at {}.\nCopy .cbz files there and open gideon again.",
+            dir.display()
+        );
+        return Ok(());
+    }
+
     let library = Library::new(&dir);
     let entries = library.scan()?;
     if entries.is_empty() {
-        println!("No CBZ files found under {}", dir.display());
+        println!(
+            "No CBZ files found under {}.\nCopy .cbz files there and open gideon again.",
+            dir.display()
+        );
         return Ok(());
     }
 

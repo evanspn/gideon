@@ -147,7 +147,7 @@ if [ -d "$NM_DIR" ]; then
     if [ -f "$SCRIPT_DIR/nickelmenu-gideon" ]; then
         cp "$SCRIPT_DIR/nickelmenu-gideon" "$NM_DIR/gideon"
     else
-        printf 'menu_item :main :gideon :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga\n' > "$NM_DIR/gideon"
+        printf 'menu_item :main :gideon :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga 2>&1\n' > "$NM_DIR/gideon"
     fi
 else
     echo ""
