@@ -41,7 +41,7 @@ num_enum = "0.7"
 pared = { git = "https://github.com/hanatsumi/pared.git", branch = "feat/unwrap-or-clone" }
 postcard = "1"
 raqote = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "stream"] }
 semver = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

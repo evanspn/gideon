@@ -14,6 +14,17 @@ pub fn register_std_imports(linker: &mut Linker<WasmStore>) -> Result<()> {
     register_wasm_function!(linker, "std", "current_date", current_date)?; // OK
     register_wasm_function!(linker, "std", "utc_offset", utc_offset)?; // OK
     register_wasm_function!(linker, "std", "parse_date", parse_date)?; // OK
+                                                                       // Newer Aidoku SDKs import print from std (older ones use env::print).
+    register_wasm_function!(linker, "std", "print", print)?;
+    Ok(())
+}
+
+/// `std::print` from newer SDKs — same semantics as `env::print`.
+#[aidoku_wasm_function]
+fn print(caller: Caller<'_, WasmStore>, string: Option<String>) -> Result<()> {
+    let string = string.unwrap_or_default();
+    let wasm_store = caller.data();
+    log::info!("{}: std.print: {string}", wasm_store.id);
     Ok(())
 }
 

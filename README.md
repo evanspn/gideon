@@ -6,6 +6,9 @@ does, focused on manga. It is the standalone sibling of
 [bobo](https://github.com/evanspn/bobo-koreader), the KOReader manga plugin:
 where bobo lives inside KOReader, gideon *is* the reader.
 
+gideon is licensed AGPL-3.0 (the source runtime is ported from
+bobo/rakuyomi, which are AGPL).
+
 ## Status: v0
 
 The core pipeline works end to end:
@@ -18,10 +21,11 @@ The core pipeline works end to end:
   display
 - **Library** — recursive scanning, JSON-backed reading progress with
   resume
-- **Manga sources from GitHub (preinstalled)** — fetches
-  [Aidoku](https://github.com/Aidoku/Aidoku)-compatible source lists (the
-  same format bobo uses); ships with the community source list and accepts
-  any user-added list URL
+- **Manga sources from GitHub (preinstalled, fully working)** — the
+  [Aidoku](https://github.com/Aidoku/Aidoku) WASM source runtime (ported
+  from bobo): install any source from the community list, then search,
+  browse chapters and download manga straight into the library
+  (`gideon source install` / `gideon manga search|chapters|download`)
 - **Kobo display backend** — Linux framebuffer with mxcfb e-ink refresh
   ioctls (full/partial refresh policy), behind the `kobo` feature
 - **Chapter downloads** — fetched pages are packed into `.cbz` for offline

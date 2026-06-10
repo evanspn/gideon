@@ -37,11 +37,13 @@
 
 ## v2 — online sources, end to end
 
-- [ ] Run Aidoku WASM sources (wasmi) so installed sources can search and
-      list chapters, like bobo's backend does
+- [x] Run Aidoku WASM sources (wasmi) so installed sources can search and
+      list chapters, like bobo's backend does (gideon-aidoku, ported from
+      bobo; handles classic and next-SDK sources, unknown host imports
+      degrade gracefully)
 - [ ] Search + browse UI for sources
 - [ ] Chapter download queue with offline storage limits
-- [ ] In-app source install/update from the configured lists
+- [x] Source install from the configured lists (`gideon source install`)
 
 ## Later
 

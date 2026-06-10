@@ -161,3 +161,96 @@ fn ota_version_asset_resolves_on_latest_release() {
         }
     }
 }
+
+#[test]
+#[ignore = "network: full WASM source pipeline — install, search, chapters, download, render"]
+fn wasm_source_end_to_end() {
+    use gideon_aidoku::source::Source;
+    use tokio_util::sync::CancellationToken;
+
+    let fetcher = UreqFetcher::new();
+    let lists = SourceLists::default();
+    let data_dir = tempfile::tempdir().unwrap();
+
+    // Install a real source from the live GitHub list.
+    let (_, package_url) = lists
+        .find_source(&fetcher, "multi.mangadex")
+        .expect("multi.mangadex should exist in the community list");
+    let aix_path = data_dir.path().join("multi.mangadex.aix");
+    std::fs::write(&aix_path, fetcher.get(&package_url).unwrap()).unwrap();
+
+    let settings_dir = data_dir.path().join("settings");
+    let source = Source::from_aix_file(&aix_path, &settings_dir)
+        .expect("source should load in the WASM runtime");
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let token = CancellationToken::new();
+
+        // Search through the WASM source.
+        let mangas = source
+            .search_mangas(token.clone(), "berserk".to_string())
+            .await
+            .expect("search should succeed");
+        assert!(!mangas.is_empty(), "no search results from the source");
+
+        // Find one with chapters and pages (try a few results).
+        for manga in mangas.iter().take(5) {
+            let chapters = match source
+                .get_chapter_list(token.clone(), manga.id.clone())
+                .await
+            {
+                Ok(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+            let chapter = &chapters[0];
+            let pages = match source
+                .get_page_list(
+                    token.clone(),
+                    manga.id.clone(),
+                    chapter.id.clone(),
+                    chapter.chapter_num,
+                )
+                .await
+            {
+                Ok(p) if !p.is_empty() => p,
+                _ => continue,
+            };
+
+            // Download the first page through the source's request hook and
+            // render it through the e-ink pipeline.
+            let page = pages
+                .iter()
+                .find(|p| p.image_url.is_some())
+                .expect("chapter has no image pages");
+            let image_url = page.image_url.clone().unwrap();
+            let request = source
+                .get_image_request(image_url, page.ctx.clone())
+                .await
+                .expect("image request hook failed");
+            let client = reqwest::Client::new();
+            let bytes = client
+                .execute(request)
+                .await
+                .expect("page download failed")
+                .bytes()
+                .await
+                .unwrap();
+            assert!(bytes.len() > 1024, "page suspiciously small");
+
+            let image = image::load_from_memory(&bytes).expect("page should decode");
+            let rendered = render_page(
+                &image,
+                &RenderOptions {
+                    screen_width: 1072,
+                    screen_height: 1448,
+                    fit: FitMode::Contain,
+                    dither: true,
+                },
+            );
+            assert!(rendered.pixels.iter().any(|&p| p != 0xFF));
+            return; // full pipeline verified
+        }
+        panic!("no manga in the first 5 results had downloadable pages");
+    });
+}

@@ -509,6 +509,32 @@ impl BlockingSource {
             register_std_imports(&mut linker)?;
         }
 
+        // Future SDK revisions may add imports we don't implement yet;
+        // stub them as traps so the source still loads and only fails if
+        // it actually calls a missing function.
+        for import in module.imports() {
+            if let ExternType::Func(func_ty) = import.ty() {
+                let label = format!("{}::{}", import.module(), import.name());
+                // Already-registered imports report a duplicate definition,
+                // which is exactly what we want to keep.
+                let result = linker.func_new(
+                    import.module(),
+                    import.name(),
+                    func_ty.clone(),
+                    move |_caller, _params, _results| {
+                        Err(wasmi::Error::new(format!(
+                            "host import {label} is not implemented by this gideon version"
+                        )))
+                    },
+                );
+                if let Err(error) = result {
+                    if !error.to_string().contains("duplicate definition") {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+
         let instance = match linker
             .instantiate_and_start(&mut store, &module)
             .with_context(|| format!("failed creating instance from {}", path.display()))
