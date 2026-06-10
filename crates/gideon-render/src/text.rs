@@ -67,7 +67,7 @@ pub fn draw_text(
 
     let mut pen = 0.0f32;
     let mut prev: Option<ab_glyph::GlyphId> = None;
-    let mut glyphs: Vec<(Glyph, f32)> = Vec::with_capacity(chars.len() + 1);
+    let mut glyphs: Vec<Glyph> = Vec::with_capacity(chars.len() + 1);
     let limit = if truncate {
         (budget - ellipsis_w).max(0.0)
     } else {
@@ -83,7 +83,7 @@ pub fn draw_text(
         if pen + advance > limit {
             break;
         }
-        glyphs.push((id.with_scale_and_position(px, ab_glyph::point(pen, 0.0)), pen));
+        glyphs.push(id.with_scale_and_position(px, ab_glyph::point(pen, 0.0)));
         pen += advance;
         prev = Some(id);
     }
@@ -91,7 +91,7 @@ pub fn draw_text(
     if truncate {
         let id = scaled.glyph_id(ELLIPSIS);
         if pen + ellipsis_w <= budget {
-            glyphs.push((id.with_scale_and_position(px, ab_glyph::point(pen, 0.0)), pen));
+            glyphs.push(id.with_scale_and_position(px, ab_glyph::point(pen, 0.0)));
             pen += ellipsis_w;
         }
     }
@@ -99,7 +99,7 @@ pub fn draw_text(
     // Rasterize. Baseline sits `ascent` below the requested top `y`.
     let ascent = scaled.ascent();
     let mut drawn_right = 0u32;
-    for (glyph, _) in glyphs {
+    for glyph in glyphs {
         let Some(outline) = font.outline_glyph(glyph) else {
             continue; // whitespace has no outline
         };
@@ -127,7 +127,8 @@ pub fn draw_text(
         });
     }
 
-    drawn_right.max(pen.ceil().max(0.0) as u32.min(budget as u32))
+    let advance_width = (pen.ceil().max(0.0) as u32).min(budget as u32);
+    drawn_right.max(advance_width)
 }
 
 #[cfg(test)]

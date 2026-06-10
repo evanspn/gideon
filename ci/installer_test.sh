@@ -34,8 +34,10 @@ grep -q "binary-v1" "$ROOT/.adds/gideon/bin/gideon" || fail "wrong binary instal
 [ -d "$ROOT/.adds/gideon/data" ] || fail "data dir not created"
 [ -f "$ROOT/.adds/nm/gideon" ] || fail "NickelMenu entry not installed"
 ENTRIES=$(grep -c "^menu_item" "$ROOT/.adds/nm/gideon")
-[ "$ENTRIES" -eq 4 ] || fail "expected 4 NickelMenu entries (library/check/install/result), got $ENTRIES"
+[ "$ENTRIES" -eq 5 ] || fail "expected 5 NickelMenu entries (browse/library/check/install/result), got $ENTRIES"
 grep -q "install update" "$ROOT/.adds/nm/gideon" || fail "missing install-update menu entry"
+grep -q "gideon-launch.sh" "$ROOT/.adds/nm/gideon" || fail "first menu entry should launch the browse UI"
+[ -x "$ROOT/.adds/gideon/bin/gideon-launch.sh" ] || fail "launch script not installed executable"
 
 echo "==> install without NickelMenu warns but still succeeds"
 ROOT_NO_NM="$WORKDIR/KoboNoNM"

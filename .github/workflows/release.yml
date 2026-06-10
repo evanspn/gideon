@@ -121,7 +121,7 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           mkdir -p "/tmp/gideon-kobo-v${version}"
           cp /tmp/gideon-kobo "/tmp/gideon-kobo-v${version}/gideon"
-          cp installer/install.sh installer/nickelmenu-gideon installer/INSTALL.md "/tmp/gideon-kobo-v${version}/"
+          cp installer/install.sh installer/gideon-launch.sh installer/nickelmenu-gideon installer/INSTALL.md "/tmp/gideon-kobo-v${version}/"
           chmod 755 "/tmp/gideon-kobo-v${version}/install.sh" "/tmp/gideon-kobo-v${version}/gideon"
           echo "gideon ${version} (${GITHUB_SHA::9})" > "/tmp/gideon-kobo-v${version}/VERSION"
           (cd /tmp && zip -r "gideon-kobo-v${version}.zip" "gideon-kobo-v${version}")

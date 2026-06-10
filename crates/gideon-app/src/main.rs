@@ -13,6 +13,10 @@
 
 mod manga;
 mod reader;
+// Outside device (`kobo`) builds, only the headless screenshot path of the
+// UI is reachable from the binary; the rest is exercised by unit tests.
+#[cfg_attr(not(feature = "kobo"), allow(dead_code))]
+mod ui;
 
 use std::path::PathBuf;
 
@@ -107,6 +111,17 @@ enum Command {
         major: bool,
     },
 
+    /// Browse the library and manga sources on the device's touch screen.
+    Browse {
+        /// Library directory.
+        #[arg(long, default_value = "/mnt/onboard/Manga")]
+        library: PathBuf,
+        /// Render the home screen to a PNG and exit (headless desktop
+        /// verification; no device needed).
+        #[arg(long)]
+        screenshot: Option<PathBuf>,
+    },
+
     /// Open a CBZ for reading.
     Read {
         path: PathBuf,
@@ -195,6 +210,10 @@ fn main() -> Result<()> {
             } => manga::cmd_manga_download(&data_dir(), &source, &manga_id, &chapter_id, &library),
         },
         Command::Update { check, major } => cmd_update(check, major),
+        Command::Browse {
+            library,
+            screenshot,
+        } => cmd_browse(library, screenshot),
         Command::Read {
             path,
             progress_file,
@@ -356,6 +375,17 @@ fn progress_path(library_dir: &std::path::Path) -> PathBuf {
     library_dir.join(".gideon").join("progress.json")
 }
 
+/// Reader fit mode and rotation from settings.json. Lenient end to end: a
+/// missing or unreadable settings file means the defaults (Contain, 0°) —
+/// the reader must always come up.
+fn reader_settings() -> (FitMode, u32) {
+    let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
+    (
+        FitMode::from_setting(&settings.reader_fit),
+        settings.reader_rotation,
+    )
+}
+
 /// Data directory holding settings.json: $GIDEON_DATA_DIR if set (the Kobo
 /// install uses .adds/gideon/data), otherwise ~/.config/gideon.
 fn data_dir() -> PathBuf {
@@ -470,6 +500,63 @@ fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
     Ok(())
 }
 
+/// Render the browse home screen headlessly to a PNG (desktop builds and
+/// CI smoke tests).
+fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
+    use gideon_device::{Display as _, FakeInput, MemoryDisplay};
+
+    let display = MemoryDisplay::new(1072, 1448);
+    let input = FakeInput::new(Vec::new());
+    let gateway = ui::AidokuGateway::new(data_dir());
+    let mut app = ui::UiApp::new(display, input, gateway, library);
+    app.render_once()?;
+
+    let display = app.display();
+    let gray =
+        image::GrayImage::from_raw(display.width(), display.height(), display.buffer.clone())
+            .context("screen buffer has unexpected size")?;
+    gray.save(&out)?;
+    println!("Rendered home screen to {}", out.display());
+    Ok(())
+}
+
+#[cfg(feature = "kobo")]
+fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
+    use gideon_device::kobo::KoboDisplay;
+    use gideon_device::kobo_input::KoboTouch;
+    use gideon_device::Display as _;
+
+    if let Some(out) = screenshot {
+        return browse_screenshot(library, out);
+    }
+
+    let display = KoboDisplay::open()
+        .context("failed to open the e-ink framebuffer — are you running on a Kobo device?")?;
+    let (width, height) = (display.width(), display.height());
+    let input = KoboTouch::open(width, height)
+        .context("failed to open the touch screen — are you running on a Kobo device?")?;
+    let gateway = ui::AidokuGateway::new(data_dir());
+    let (fit, rotation) = reader_settings();
+    ui::UiApp::new(display, input, gateway, library)
+        .with_reader_settings(fit, rotation)
+        .run()
+}
+
+#[cfg(not(feature = "kobo"))]
+fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
+    match screenshot {
+        Some(out) => browse_screenshot(library, out),
+        None => {
+            println!(
+                "gideon browse drives the e-ink display and touch screen, which need \
+                 a Kobo device build (--features kobo).\nUse --screenshot out.png to \
+                 render the home screen headlessly instead."
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(feature = "kobo")]
 fn cmd_read(path: PathBuf, progress_file: Option<PathBuf>) -> Result<()> {
     use gideon_device::kobo::KoboDisplay;
@@ -513,7 +600,8 @@ fn run_reader<D: gideon_device::Display>(
 
     let doc = CbzDocument::open(&path)?;
     let mut store = ProgressStore::load(&progress_file)?;
-    let mut reader = Reader::new(doc, display, FitMode::Contain);
+    let (fit, rotation) = reader_settings();
+    let mut reader = Reader::new(doc, display, fit, rotation);
     reader.resume_from(&store, &progress_key);
     reader.show_current_page()?;
 

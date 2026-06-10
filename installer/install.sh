@@ -129,9 +129,18 @@ cp "$BINARY" "$APP_DIR/bin/.gideon.new"
 chmod 755 "$APP_DIR/bin/.gideon.new"
 mv "$APP_DIR/bin/.gideon.new" "$APP_DIR/bin/gideon"
 
+# Launch script for the NickelMenu browse entry (kills nickel, runs the
+# touch UI, reboots back into nickel on exit). Same atomic-install dance.
+SCRIPT_DIR=$(dirname "$0")
+if [ -f "$SCRIPT_DIR/gideon-launch.sh" ]; then
+    echo "Installing launch script to $APP_DIR/bin/gideon-launch.sh"
+    cp "$SCRIPT_DIR/gideon-launch.sh" "$APP_DIR/bin/.gideon-launch.new"
+    chmod 755 "$APP_DIR/bin/.gideon-launch.new"
+    mv "$APP_DIR/bin/.gideon-launch.new" "$APP_DIR/bin/gideon-launch.sh"
+fi
+
 # Version: prefer the VERSION file shipped in the bundle (the binary itself
 # usually can't execute on the installing computer — it's ARM code).
-SCRIPT_DIR=$(dirname "$0")
 if [ -f "$SCRIPT_DIR/VERSION" ]; then
     VERSION=$(cat "$SCRIPT_DIR/VERSION")
 else
@@ -147,7 +156,7 @@ if [ -d "$NM_DIR" ]; then
     if [ -f "$SCRIPT_DIR/nickelmenu-gideon" ]; then
         cp "$SCRIPT_DIR/nickelmenu-gideon" "$NM_DIR/gideon"
     else
-        printf 'menu_item :main :gideon :cmd_output :500:env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data /mnt/onboard/.adds/gideon/bin/gideon library /mnt/onboard/Manga 2>&1\n' > "$NM_DIR/gideon"
+        printf 'menu_item :main :gideon :cmd_spawn :quiet:/mnt/onboard/.adds/gideon/bin/gideon-launch.sh\n' > "$NM_DIR/gideon"
     fi
 else
     echo ""

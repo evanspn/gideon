@@ -69,7 +69,7 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint shell scripts
-        run: shellcheck installer/install.sh ci/installer_test.sh ci/qemu_integration.sh
+        run: shellcheck installer/install.sh installer/gideon-launch.sh ci/installer_test.sh ci/qemu_integration.sh
       - name: Run installer test suite
         run: ./ci/installer_test.sh
 

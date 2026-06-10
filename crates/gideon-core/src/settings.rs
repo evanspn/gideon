@@ -35,6 +35,17 @@ pub struct Settings {
 
     /// Check GitHub releases for gideon updates automatically.
     pub auto_check_updates: bool,
+
+    /// Reader fit mode: "contain" (whole page visible) or "fit-width"
+    /// (page fills the screen width and scrolls vertically). Parsed
+    /// leniently — unknown values behave like "contain".
+    #[serde(deserialize_with = "lenient_reader_fit")]
+    pub reader_fit: String,
+
+    /// Reader rotation in degrees: 0, 90, 180 or 270. Parsed leniently —
+    /// anything else behaves like 0.
+    #[serde(deserialize_with = "lenient_reader_rotation")]
+    pub reader_rotation: u32,
 }
 
 impl Default for Settings {
@@ -45,8 +56,34 @@ impl Default for Settings {
             storage_size_limit: StorageSize(DEFAULT_STORAGE_LIMIT_BYTES),
             predownload_unread_chapters: 2,
             auto_check_updates: true,
+            reader_fit: "contain".to_string(),
+            reader_rotation: 0,
         }
     }
+}
+
+/// Lenient `reader_fit` parsing: any JSON value is accepted; only strings
+/// pass through (normalized to lowercase), everything else means "contain".
+fn lenient_reader_fit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_str() {
+        Some(s) => s.trim().to_ascii_lowercase(),
+        None => "contain".to_string(),
+    })
+}
+
+/// Lenient `reader_rotation` parsing: only 0/90/180/270 are kept; any other
+/// value (wrong number, wrong type) falls back to 0 instead of erroring.
+fn lenient_reader_rotation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_u64() {
+        Some(degrees @ (90 | 180 | 270)) => degrees as u32,
+        _ => 0,
+    })
 }
 
 impl Settings {
@@ -156,6 +193,8 @@ mod tests {
         assert_eq!(s.predownload_unread_chapters, 2);
         assert!(s.auto_check_updates);
         assert!(s.source_lists.is_empty());
+        assert_eq!(s.reader_fit, "contain");
+        assert_eq!(s.reader_rotation, 0);
     }
 
     #[test]
@@ -174,6 +213,8 @@ mod tests {
             storage_size_limit: StorageSize(500 * 1024 * 1024),
             predownload_unread_chapters: 5,
             auto_check_updates: false,
+            reader_fit: "fit-width".into(),
+            reader_rotation: 90,
         };
         s.save(dir.path()).unwrap();
 
@@ -193,6 +234,48 @@ mod tests {
         assert_eq!(s.languages, vec!["en"]);
         // Everything else got defaults.
         assert_eq!(s.storage_size_limit.bytes(), DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn reader_fit_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap()
+        };
+        // Valid values pass through (normalized).
+        assert_eq!(
+            load(r#"{"reader_fit": "fit-width"}"#).reader_fit,
+            "fit-width"
+        );
+        assert_eq!(
+            load(r#"{"reader_fit": " FIT-WIDTH "}"#).reader_fit,
+            "fit-width"
+        );
+        assert_eq!(load(r#"{"reader_fit": "contain"}"#).reader_fit, "contain");
+        // Unknown strings are kept (the consumer treats them as contain),
+        // wrong types fall back to contain instead of erroring.
+        assert_eq!(load(r#"{"reader_fit": "sideways"}"#).reader_fit, "sideways");
+        assert_eq!(load(r#"{"reader_fit": 42}"#).reader_fit, "contain");
+        assert_eq!(load(r#"{"reader_fit": null}"#).reader_fit, "contain");
+    }
+
+    #[test]
+    fn reader_rotation_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap()
+        };
+        assert_eq!(load(r#"{"reader_rotation": 90}"#).reader_rotation, 90);
+        assert_eq!(load(r#"{"reader_rotation": 180}"#).reader_rotation, 180);
+        assert_eq!(load(r#"{"reader_rotation": 270}"#).reader_rotation, 270);
+        assert_eq!(load(r#"{"reader_rotation": 0}"#).reader_rotation, 0);
+        // Invalid angles and wrong types never error — they mean 0.
+        assert_eq!(load(r#"{"reader_rotation": 45}"#).reader_rotation, 0);
+        assert_eq!(load(r#"{"reader_rotation": -90}"#).reader_rotation, 0);
+        assert_eq!(load(r#"{"reader_rotation": "90"}"#).reader_rotation, 0);
+        assert_eq!(load(r#"{"reader_rotation": null}"#).reader_rotation, 0);
     }
 
     #[test]

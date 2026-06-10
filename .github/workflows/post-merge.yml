@@ -43,7 +43,7 @@ jobs:
         run: |
           mkdir -p /tmp/bundle
           cp /tmp/gideon-kobo /tmp/bundle/gideon
-          cp installer/install.sh installer/nickelmenu-gideon installer/INSTALL.md /tmp/bundle/
+          cp installer/install.sh installer/gideon-launch.sh installer/nickelmenu-gideon installer/INSTALL.md /tmp/bundle/
           chmod 755 /tmp/bundle/install.sh /tmp/bundle/gideon
           pkg_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           echo "gideon ${pkg_version} (${GITHUB_SHA::9})" > /tmp/bundle/VERSION

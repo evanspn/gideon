@@ -8,8 +8,13 @@
 
 use gideon_render::GrayPage;
 
+pub mod input;
 #[cfg(feature = "kobo")]
 pub mod kobo;
+#[cfg(feature = "kobo")]
+pub mod kobo_input;
+
+pub use input::{FakeInput, InputSource, TouchTransform, UiEvent};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -44,6 +49,26 @@ pub trait Display {
 
     /// Push the backbuffer to the physical screen.
     fn flush(&mut self, mode: RefreshMode) -> Result<()>;
+}
+
+/// Allow driving a display through a mutable reference, so a UI can lend
+/// its display to a nested session (e.g. the reader) without giving it up.
+impl<D: Display + ?Sized> Display for &mut D {
+    fn width(&self) -> u32 {
+        (**self).width()
+    }
+
+    fn height(&self) -> u32 {
+        (**self).height()
+    }
+
+    fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
+        (**self).blit(page, offset_y)
+    }
+
+    fn flush(&mut self, mode: RefreshMode) -> Result<()> {
+        (**self).flush(mode)
+    }
 }
 
 /// In-memory display backend for tests and headless use.

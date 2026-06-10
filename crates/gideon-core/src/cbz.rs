@@ -62,6 +62,13 @@ impl CbzDocument {
         &self.path
     }
 
+    /// Open an independent handle to the same CBZ file (re-reads it from
+    /// disk). `ZipArchive` readers can't be shared across threads, so e.g.
+    /// a page prefetcher needs its own clone to decode in the background.
+    pub fn try_clone(&self) -> Result<Self> {
+        Self::open(&self.path)
+    }
+
     /// Number of pages in reading order.
     pub fn page_count(&self) -> usize {
         self.pages.len()
@@ -225,6 +232,32 @@ mod tests {
         let mut doc = CbzDocument::open(&path).unwrap();
         let img = doc.decode_page(0).unwrap();
         assert_eq!((img.width(), img.height()), (7, 9));
+    }
+
+    #[test]
+    fn try_clone_decodes_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.cbz");
+        write_cbz(
+            &path,
+            &[
+                ("p1.png", tiny_png(3, 4).as_slice()),
+                ("p2.png", tiny_png(5, 6).as_slice()),
+            ],
+        );
+
+        let mut doc = CbzDocument::open(&path).unwrap();
+        let mut clone = doc.try_clone().unwrap();
+        assert_eq!(clone.page_names(), doc.page_names());
+
+        // Both handles decode pages independently (and could do so on
+        // different threads).
+        let from_clone = clone.decode_page(1).unwrap();
+        let from_doc = doc.decode_page(1).unwrap();
+        assert_eq!(
+            (from_clone.width(), from_clone.height()),
+            (from_doc.width(), from_doc.height())
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ fn settings_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Source lists from defaults + settings.json.
-fn configured_lists(data_dir: &Path) -> Result<SourceLists> {
+pub fn configured_lists(data_dir: &Path) -> Result<SourceLists> {
     let mut lists = SourceLists::default();
     let settings = Settings::load(data_dir)?;
     for raw in &settings.source_lists {
@@ -45,12 +45,13 @@ pub fn load_source(data_dir: &Path, source_id: &str) -> Result<Source> {
         .with_context(|| format!("failed to load source {source_id}"))
 }
 
-pub fn cmd_source_install(data_dir: &Path, source_id: &str) -> Result<()> {
+/// Download, validate and install a source from the configured lists.
+/// Returns the manifest of the freshly installed source.
+pub fn install_source(data_dir: &Path, source_id: &str) -> Result<gideon_aidoku::SourceManifest> {
     let fetcher = UreqFetcher::new();
     let lists = configured_lists(data_dir)?;
     let (info, package_url) = lists.find_source(&fetcher, source_id)?;
 
-    println!("Downloading {} from {package_url}...", info.name);
     let bytes = fetcher.get(&package_url)?;
 
     let dir = sources_dir(data_dir);
@@ -67,7 +68,12 @@ pub fn cmd_source_install(data_dir: &Path, source_id: &str) -> Result<()> {
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&path);
         })?;
-    let manifest = source.manifest();
+    Ok(source.manifest())
+}
+
+pub fn cmd_source_install(data_dir: &Path, source_id: &str) -> Result<()> {
+    println!("Downloading {source_id}...");
+    let manifest = install_source(data_dir, source_id)?;
     println!(
         "Installed {} v{} ({})",
         manifest.info.name, manifest.info.version, manifest.info.id
@@ -75,28 +81,59 @@ pub fn cmd_source_install(data_dir: &Path, source_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_source_installed(data_dir: &Path) -> Result<()> {
+/// An installed source's identity, as read from its manifest. Sources that
+/// fail to load are reported with `broken = true` so UIs can show them
+/// without offering to browse.
+pub struct InstalledSource {
+    pub id: String,
+    pub name: String,
+    pub broken: bool,
+}
+
+/// List installed sources by scanning the sources directory.
+pub fn installed_sources(data_dir: &Path) -> Result<Vec<InstalledSource>> {
     let dir = sources_dir(data_dir);
-    let mut found = false;
-    if dir.exists() {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "aix"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            match Source::from_aix_file(&path, &settings_dir(data_dir)) {
-                Ok(source) => {
-                    let m = source.manifest();
-                    println!("  {:<30} v{} — {}", m.info.name, m.info.version, m.info.id);
-                    found = true;
-                }
-                Err(e) => println!("  {:<30} (broken: {e})", path.display()),
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "aix"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match Source::from_aix_file(&path, &settings_dir(data_dir)) {
+            Ok(source) => {
+                let m = source.manifest();
+                out.push(InstalledSource {
+                    id: m.info.id,
+                    name: m.info.name,
+                    broken: false,
+                });
             }
+            Err(e) => out.push(InstalledSource {
+                id: stem.clone(),
+                name: format!("{stem} (broken: {e})"),
+                broken: true,
+            }),
         }
     }
-    if !found {
+    Ok(out)
+}
+
+pub fn cmd_source_installed(data_dir: &Path) -> Result<()> {
+    let sources = installed_sources(data_dir)?;
+    for source in &sources {
+        let marker = if source.broken { " [broken]" } else { "" };
+        println!("  {:<30} — {}{}", source.name, source.id, marker);
+    }
+    if sources.is_empty() {
         println!("No sources installed. Try `gideon sources` to see what's available,");
         println!("then `gideon source install <id>`.");
     }
@@ -157,17 +194,43 @@ pub fn cmd_manga_download(
     chapter_id: &str,
     library: &Path,
 ) -> Result<()> {
+    use std::io::Write;
+
     let source = load_source(data_dir, source_id)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(download_chapter(&source, manga_id, chapter_id, library))
+    let mut progress = |done: usize, total: usize| {
+        if done == 0 {
+            println!("Downloading {total} page(s)...");
+        } else {
+            print!(".");
+            std::io::stdout().flush().ok();
+        }
+    };
+    let out_path = runtime.block_on(download_chapter(
+        &source,
+        manga_id,
+        chapter_id,
+        library,
+        &mut progress,
+    ))?;
+    println!(
+        "\nSaved to {} — `gideon read` it or open the library.",
+        out_path.display()
+    );
+    Ok(())
 }
 
-async fn download_chapter(
+/// Download a chapter through `source` into `library` as a CBZ (with a
+/// ComicInfo.xml), reporting `(pages_done, pages_total)` through `progress`
+/// (called once with `(0, total)` before the first page). Returns the path
+/// of the written CBZ.
+pub async fn download_chapter(
     source: &Source,
     manga_id: &str,
     chapter_id: &str,
     library: &Path,
-) -> Result<()> {
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<PathBuf> {
     let token = CancellationToken::new();
 
     // Manga details give us a human title for the library path + metadata.
@@ -191,7 +254,6 @@ async fn download_chapter(
         _ => chapter_id.to_string(),
     };
 
-    println!("Fetching page list for {manga_title} — {chapter_label}...");
     let pages = source
         .get_page_list(
             token.clone(),
@@ -203,7 +265,7 @@ async fn download_chapter(
     if pages.is_empty() {
         bail!("source returned no pages for this chapter");
     }
-    println!("Downloading {} page(s)...", pages.len());
+    progress(0, pages.len());
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
@@ -262,11 +324,8 @@ async fn download_chapter(
             .unwrap_or("jpg")
             .to_ascii_lowercase();
         cbz_pages.push((format!("{:0width$}.{ext}", i + 1, width = width), bytes));
-        print!(".");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
+        progress(i + 1, pages.len());
     }
-    println!();
 
     if cbz_pages.len() <= 1 {
         bail!("no pages were downloaded");
@@ -276,12 +335,7 @@ async fn download_chapter(
         .join(sanitize(&manga_title))
         .join(format!("{}.cbz", sanitize(&chapter_label)));
     pages_to_cbz(&out_path, &cbz_pages)?;
-    println!(
-        "Saved {} page(s) to {} — `gideon read` it or open the library.",
-        cbz_pages.len() - 1,
-        out_path.display()
-    );
-    Ok(())
+    Ok(out_path)
 }
 
 fn xml_escape(raw: &str) -> String {
