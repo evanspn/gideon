@@ -1,1 +1,2 @@
 menu_item :main :gideon :cmd_spawn :quiet:/mnt/onboard/.adds/gideon/bin/gideon-launch.sh
+menu_item :main :gideon - update :cmd_output :9000:sh -c 'env GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data nohup /mnt/onboard/.adds/gideon/bin/gideon update >/mnt/onboard/.adds/gideon/update.log 2>&1 & sleep 6; tail -n 10 /mnt/onboard/.adds/gideon/update.log 2>/dev/null; echo; echo --- last app log:; tail -n 6 /mnt/onboard/.adds/gideon/browse.log 2>/dev/null'

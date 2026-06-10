@@ -34,7 +34,8 @@ grep -q "binary-v1" "$ROOT/.adds/gideon/bin/gideon" || fail "wrong binary instal
 [ -d "$ROOT/.adds/gideon/data" ] || fail "data dir not created"
 [ -f "$ROOT/.adds/nm/gideon" ] || fail "NickelMenu entry not installed"
 ENTRIES=$(grep -c "^menu_item" "$ROOT/.adds/nm/gideon")
-[ "$ENTRIES" -eq 1 ] || fail "expected exactly 1 NickelMenu entry (the app), got $ENTRIES"
+[ "$ENTRIES" -eq 2 ] || fail "expected 2 NickelMenu entries (app + update), got $ENTRIES"
+grep -q "gideon - update" "$ROOT/.adds/nm/gideon" || fail "missing the update menu entry"
 grep -q "gideon-launch.sh" "$ROOT/.adds/nm/gideon" || fail "the menu entry should launch the browse UI"
 [ -x "$ROOT/.adds/gideon/bin/gideon-launch.sh" ] || fail "launch script not installed executable"
 

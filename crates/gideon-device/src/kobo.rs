@@ -184,8 +184,18 @@ impl KoboDisplay {
             )));
         }
 
-        // SAFETY: mapping the framebuffer memory the kernel advertised.
-        let map = unsafe { MmapMut::map_mut(&file)? };
+        // /dev/fb0 is a character device with file length 0 — the mapping
+        // length must come from the driver's advertised memory size, not
+        // the file metadata.
+        let map_len = (fix.smem_len as usize).max(fix.line_length as usize * var.yres as usize);
+        if map_len == 0 {
+            return Err(Error::Display(
+                "framebuffer reports zero memory size".to_string(),
+            ));
+        }
+        // SAFETY: mapping exactly the framebuffer memory the kernel
+        // advertised via FBIOGET_FSCREENINFO.
+        let map = unsafe { memmap2::MmapOptions::new().len(map_len).map_mut(&file)? };
 
         Ok(Self {
             file,
