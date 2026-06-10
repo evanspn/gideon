@@ -6,6 +6,9 @@ members = [
     "crates/gideon-sources",
     "crates/gideon-device",
     "crates/gideon-app",
+    "crates/gideon-aidoku",
+    "crates/gideon-aidoku/wasm_macros",
+    "crates/gideon-aidoku/wasm_shared",
 ]
 
 [workspace.package]
