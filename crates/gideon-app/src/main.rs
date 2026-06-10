@@ -497,6 +497,11 @@ fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
             release.version
         );
     }
+    // OTA only replaces the binary; refresh the launcher script and
+    // NickelMenu entries this binary shipped with.
+    for refreshed in manga::ensure_device_files(bin_dir)? {
+        println!("Refreshed {refreshed}.");
+    }
     Ok(())
 }
 

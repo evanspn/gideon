@@ -343,3 +343,120 @@ fn xml_escape(raw: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+/// The launcher script and NickelMenu config shipped inside the binary.
+/// OTA updates only replace the binary, so the binary itself keeps these
+/// device files current (self-heal after update / on browse startup).
+const EMBEDDED_LAUNCH_SH: &str = include_str!("../../../installer/gideon-launch.sh");
+const EMBEDDED_NICKELMENU: &str = include_str!("../../../installer/nickelmenu-gideon");
+
+/// Ensure the launcher script and NickelMenu entries next to `bin_dir`
+/// match the versions this binary shipped with. Quietly does nothing when
+/// the layout doesn't look like a device install (e.g. desktop builds).
+pub fn ensure_device_files(bin_dir: &Path) -> Result<Vec<&'static str>> {
+    let mut updated = Vec::new();
+
+    // <root>/.adds/gideon/bin -> <root>/.adds
+    let adds_dir = match bin_dir.parent().and_then(|p| p.parent()) {
+        Some(d) if d.file_name().is_some_and(|n| n == ".adds") => d.to_path_buf(),
+        _ => return Ok(updated),
+    };
+
+    let launch = bin_dir.join("gideon-launch.sh");
+    if std::fs::read_to_string(&launch).ok().as_deref() != Some(EMBEDDED_LAUNCH_SH) {
+        write_executable(&launch, EMBEDDED_LAUNCH_SH)?;
+        updated.push("gideon-launch.sh");
+    }
+
+    let nm_dir = adds_dir.join("nm");
+    if nm_dir.is_dir() {
+        let entry = nm_dir.join("gideon");
+        if std::fs::read_to_string(&entry).ok().as_deref() != Some(EMBEDDED_NICKELMENU) {
+            atomic_write(&entry, EMBEDDED_NICKELMENU)?;
+            updated.push("NickelMenu entries");
+        }
+    }
+    Ok(updated)
+}
+
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let tmp = path.with_extension("part");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, content: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    atomic_write(path, content)?;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_executable(path: &Path, content: &str) -> Result<()> {
+    atomic_write(path, content)
+}
+
+#[cfg(test)]
+mod device_files_tests {
+    use super::*;
+
+    fn fake_device(root: &Path) -> PathBuf {
+        let bin = root.join(".adds/gideon/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(root.join(".adds/nm")).unwrap();
+        bin
+    }
+
+    #[test]
+    fn installs_launcher_and_menu_when_missing_or_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_device(dir.path());
+
+        let updated = ensure_device_files(&bin).unwrap();
+        assert_eq!(updated, vec!["gideon-launch.sh", "NickelMenu entries"]);
+        let launch = bin.join("gideon-launch.sh");
+        assert_eq!(
+            std::fs::read_to_string(&launch).unwrap(),
+            EMBEDDED_LAUNCH_SH
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&launch).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111);
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".adds/nm/gideon")).unwrap(),
+            EMBEDDED_NICKELMENU
+        );
+
+        // Up to date: second run is a no-op.
+        assert!(ensure_device_files(&bin).unwrap().is_empty());
+
+        // Stale menu gets healed.
+        std::fs::write(dir.path().join(".adds/nm/gideon"), "old entry").unwrap();
+        assert_eq!(
+            ensure_device_files(&bin).unwrap(),
+            vec!["NickelMenu entries"]
+        );
+    }
+
+    #[test]
+    fn non_device_layout_is_a_quiet_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let updated = ensure_device_files(dir.path()).unwrap();
+        assert!(updated.is_empty());
+        assert!(!dir.path().join("gideon-launch.sh").exists());
+    }
+
+    #[test]
+    fn embedded_menu_launches_browse_ui() {
+        assert!(EMBEDDED_NICKELMENU.contains("gideon-launch.sh"));
+        assert!(EMBEDDED_LAUNCH_SH.contains("browse"));
+    }
+}
