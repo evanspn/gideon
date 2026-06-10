@@ -44,6 +44,20 @@ Copy the bundle to the device, then:
 sh install.sh --root /mnt/onboard
 ```
 
+## Updating over the air
+
+After installation, the NickelMenu has four gideon entries:
+
+- **gideon** — open the library
+- **gideon - check update** — quick check against the latest GitHub release
+- **gideon - install update** — downloads and installs the update in the
+  background (the binary swap is atomic; a failed download can't break the
+  install). Wifi must be on.
+- **gideon - update result** — shows the log of the last update attempt
+
+After installing an update, the next launch of gideon runs the new
+version. The previous binary is kept as `gideon.old` for manual rollback.
+
 ## Uninstall
 
 ```sh

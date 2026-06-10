@@ -1,0 +1,14 @@
+[package]
+name = "gideon-aidoku-wasm-shared"
+description = "Shared WASM value conversion helpers for the gideon-aidoku source runtime (vendored from bobo-koreader's wasm_shared)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+anyhow.workspace = true
+chrono = "0.4"
+chrono-tz = "0.10"
+log = "0.4"
+wasmi = "0.51.5"

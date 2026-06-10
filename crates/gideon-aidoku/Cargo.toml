@@ -1,0 +1,59 @@
+[package]
+name = "gideon-aidoku"
+description = "Aidoku WASM source runtime for gideon, vendored from bobo-koreader (which derives from rakuyomi)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+# This crate is a port of AGPL-licensed code (bobo-koreader / rakuyomi) and is
+# therefore licensed differently from the rest of the workspace.
+license = "AGPL-3.0-only"
+
+[features]
+# The vendored code uses the upstream `all` feature flag to select between the
+# full (server) implementation and the trimmed-down one. We keep the flag (and
+# enable it by default) to preserve the upstream code paths.
+default = ["all"]
+all = []
+
+[dependencies]
+# Workspace-wide dependencies
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+image.workspace = true
+
+# Dependencies specific to the vendored Aidoku runtime; versions follow
+# bobo-koreader's backend/shared/Cargo.toml. Keep these contained here.
+aidoku = { git = "https://github.com/Aidoku/aidoku-rs", branch = "main", default-features = false }
+boa_engine = "0.21"
+chrono = { version = "0.4", default-features = true, features = ["serde"] }
+chrono-tz = "0.10"
+derive_more = { version = "2", features = ["from", "try_unwrap", "deref"] }
+dom_query = { version = "0.24", features = ["atomic"] }
+font-kit = "0.14"
+futures = "0.3"
+html-escape = "0.2"
+log = "0.4"
+mozjpeg = { version = "0.10", default-features = false }
+num_enum = "0.7"
+pared = { git = "https://github.com/hanatsumi/pared.git", branch = "feat/unwrap-or-clone" }
+postcard = "1"
+raqote = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "stream"] }
+semver = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+wasmi = "0.51.5"
+zip = { version = "6", default-features = false, features = ["deflate", "bzip2"] }
+zune-core = "0.5"
+zune-jpeg = "0.5"
+zune-png = "0.5"
+
+# Vendored support crates
+wasm_macros = { package = "gideon-aidoku-wasm-macros", path = "wasm_macros" }
+wasm_shared = { package = "gideon-aidoku-wasm-shared", path = "wasm_shared" }
+
+[dev-dependencies]
+tempfile.workspace = true

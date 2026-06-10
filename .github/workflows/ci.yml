@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # fontconfig is linked via dlopen at runtime (bobo's recipe); no dev
+  # headers needed at build time on any platform.
+  RUST_FONTCONFIG_DLOPEN: "on"
+  FONTCONFIG_NO_PKG_CONFIG: "1"
   RUSTFLAGS: -D warnings
 
 jobs:
@@ -79,9 +83,12 @@ jobs:
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
       - name: Install ARM cross toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
       - name: Check for Kobo target
         env:
           CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CXX_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-g++
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          RUST_FONTCONFIG_DLOPEN: "on"
+          FONTCONFIG_NO_PKG_CONFIG: "1"
         run: cargo check --workspace --features gideon-app/kobo --target armv7-unknown-linux-musleabihf

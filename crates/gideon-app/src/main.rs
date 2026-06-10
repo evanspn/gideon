@@ -11,6 +11,7 @@
 //! * `gideon read <file.cbz>` — read on the device framebuffer (Kobo
 //!   builds) or interactively in the terminal (desktop builds)
 
+mod manga;
 mod reader;
 
 use std::path::PathBuf;
@@ -88,6 +89,14 @@ enum Command {
         height: u32,
     },
 
+    /// Manage installed manga sources (the WASM programs from the source list).
+    #[command(subcommand)]
+    Source(SourceCommand),
+
+    /// Search, browse and download manga through an installed source.
+    #[command(subcommand)]
+    Manga(MangaCommand),
+
     /// Check for (and install) gideon updates from GitHub releases.
     Update {
         /// Only check and report; don't download or install.
@@ -104,6 +113,40 @@ enum Command {
         /// Progress file (defaults to .gideon/progress.json next to the file).
         #[arg(long)]
         progress_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCommand {
+    /// Download and install a source from the configured source lists.
+    Install { source_id: String },
+    /// List installed sources.
+    Installed,
+}
+
+#[derive(Subcommand)]
+enum MangaCommand {
+    /// Search for manga on an installed source.
+    Search {
+        #[arg(short, long)]
+        source: String,
+        query: String,
+    },
+    /// List chapters of a manga.
+    Chapters {
+        #[arg(short, long)]
+        source: String,
+        manga_id: String,
+    },
+    /// Download a chapter into the library as a CBZ.
+    Download {
+        #[arg(short, long)]
+        source: String,
+        manga_id: String,
+        chapter_id: String,
+        /// Library directory to save into.
+        #[arg(short, long, default_value = "/mnt/onboard/Manga")]
+        library: PathBuf,
     },
 }
 
@@ -131,6 +174,26 @@ fn main() -> Result<()> {
             width,
             height,
         } => cmd_shelf(dir, out, cols, width, height),
+        Command::Source(cmd) => match cmd {
+            SourceCommand::Install { source_id } => {
+                manga::cmd_source_install(&data_dir(), &source_id)
+            }
+            SourceCommand::Installed => manga::cmd_source_installed(&data_dir()),
+        },
+        Command::Manga(cmd) => match cmd {
+            MangaCommand::Search { source, query } => {
+                manga::cmd_manga_search(&data_dir(), &source, &query)
+            }
+            MangaCommand::Chapters { source, manga_id } => {
+                manga::cmd_manga_chapters(&data_dir(), &source, &manga_id)
+            }
+            MangaCommand::Download {
+                source,
+                manga_id,
+                chapter_id,
+                library,
+            } => manga::cmd_manga_download(&data_dir(), &source, &manga_id, &chapter_id, &library),
+        },
         Command::Update { check, major } => cmd_update(check, major),
         Command::Read {
             path,

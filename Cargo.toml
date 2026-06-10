@@ -6,12 +6,15 @@ members = [
     "crates/gideon-sources",
     "crates/gideon-device",
     "crates/gideon-app",
+    "crates/gideon-aidoku",
+    "crates/gideon-aidoku/wasm_macros",
+    "crates/gideon-aidoku/wasm_shared",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/evanspn/gideon"
 
 [workspace.dependencies]
