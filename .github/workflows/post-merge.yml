@@ -1,0 +1,82 @@
+name: Post-merge integration
+
+# Heavier checks that run after merges to main (and on demand): execute the
+# real armv7 Kobo binary under QEMU user-mode emulation, and verify the
+# preinstalled GitHub source list still works end to end.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qemu-integration:
+    name: QEMU armv7 integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ARM cross toolchain and QEMU
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user-static
+      - name: Build Kobo binary (armv7, kobo feature)
+        env:
+          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: |
+          cargo build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf
+          cp target/armv7-unknown-linux-musleabihf/release/gideon /tmp/gideon-kobo
+      - name: Build plain binary (armv7, default features)
+        env:
+          CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: cargo build --release --target armv7-unknown-linux-musleabihf
+      - name: Run integration tests under QEMU
+        run: ./ci/qemu_integration.sh /tmp/gideon-kobo target/armv7-unknown-linux-musleabihf/release/gideon
+      - name: Assemble install bundle
+        run: |
+          mkdir -p /tmp/bundle
+          cp /tmp/gideon-kobo /tmp/bundle/gideon
+          cp installer/install.sh installer/nickelmenu-gideon installer/INSTALL.md /tmp/bundle/
+          chmod 755 /tmp/bundle/install.sh /tmp/bundle/gideon
+          pkg_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "gideon ${pkg_version} (${GITHUB_SHA::9})" > /tmp/bundle/VERSION
+      - name: Smoke-test the bundle installer against a fake Kobo
+        run: |
+          mkdir -p /tmp/fake-kobo/.kobo /tmp/fake-kobo/.adds/nm
+          sh /tmp/bundle/install.sh --root /tmp/fake-kobo
+          test -x /tmp/fake-kobo/.adds/gideon/bin/gideon
+          cmp /tmp/bundle/gideon /tmp/fake-kobo/.adds/gideon/bin/gideon
+      - name: Upload Kobo install bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: gideon-kobo-bundle
+          path: /tmp/bundle/
+          retention-days: 30
+
+  live-sources:
+    name: Live GitHub source integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run online integration tests (3 attempts)
+        # Fetches the live source list, downloads a real source package
+        # (validating its WASM payload), and runs the full
+        # download -> CBZ -> decode -> render pipeline on real images
+        # hosted in the GitHub source repository.
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test -p gideon-app --test online -- --ignored; then
+              exit 0
+            fi
+            echo "attempt $attempt failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "online integration tests failed after 3 attempts" >&2
+          exit 1
