@@ -17,6 +17,12 @@ use std::str::FromStr;
 pub enum UiEvent {
     /// A finger tapped the screen at (x, y) in screen coordinates.
     Tap { x: u32, y: u32 },
+    /// The user asked the device to sleep: power button pressed or the
+    /// magnetic sleep cover closed (KOReader: KEY_POWER=116 press, sleep
+    /// cover codes 59/35 press). Waking is *not* an event: the suspend call
+    /// blocks until wakeup, and the key that woke the device is consumed by
+    /// the input drain that follows it.
+    Sleep,
 }
 
 /// A blocking source of UI events.
