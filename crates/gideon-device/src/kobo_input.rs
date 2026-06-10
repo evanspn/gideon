@@ -321,29 +321,42 @@ impl KoboTouch {
     }
 
     /// Drain any already-queued evdev events without blocking and reset the
-    /// trackers: taps made while the UI was busy (e.g. during a chapter
-    /// download), or the key press that woke the device from suspend, must
-    /// not fire stale actions in whatever screen comes next.
+    /// trackers: the key press that woke the device from suspend must not
+    /// fire an action in whatever screen comes next.
     pub fn discard_queued(&mut self) {
-        let mut buf = [0u8; 4096];
         for file in &self.devices {
-            let fd = file.as_raw_fd();
-            loop {
-                // SAFETY: read(2) into a valid local buffer on a
-                // non-blocking fd we own.
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
-                    break;
-                }
-            }
+            let _ = drain_events(file.as_raw_fd(), |_| {});
         }
         self.tracker = TouchTracker::new();
         self.buttons = ButtonTracker::new();
         self.pending.clear();
     }
 
+    /// Drain queued events but keep sleep requests: taps made while a
+    /// chapter downloaded are stale, a sleep cover closed during it is not
+    /// — the device must still go to sleep once the download finishes.
+    pub fn discard_taps(&mut self) {
+        let mut buttons = ButtonTracker::new();
+        let mut slept = false;
+        for file in &self.devices {
+            let _ = drain_events(file.as_raw_fd(), |ev| {
+                slept |= buttons.push(ev).is_some();
+            });
+        }
+        self.tracker = TouchTracker::new();
+        self.buttons = ButtonTracker::new();
+        self.pending.retain(|e| matches!(e, UiEvent::Sleep));
+        if slept && self.pending.is_empty() {
+            // Multiple presses/closes collapse to a single suspend.
+            self.pending.push_back(UiEvent::Sleep);
+        }
+    }
+
     /// Block in `poll(2)` until any device is readable, then drain it
-    /// through the trackers into `pending`.
+    /// through the trackers into `pending`. Devices that die (EOF or a
+    /// fatal read error — drivers can re-register nodes across a
+    /// suspend/resume cycle) are dropped; losing the touch panel is fatal,
+    /// so the app exits to the launcher instead of spinning on a dead fd.
     fn poll_and_read(&mut self) -> Result<()> {
         let mut fds: Vec<libc::pollfd> = self
             .devices
@@ -364,46 +377,81 @@ impl KoboTouch {
             return Err(err.into());
         }
 
-        const EVENT_SIZE: usize = std::mem::size_of::<libc::input_event>();
+        let mut dead: Vec<usize> = Vec::new();
         for (i, pfd) in fds.iter().enumerate() {
             if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
                 continue;
             }
-            loop {
-                let mut events: [libc::input_event; 64] = unsafe { std::mem::zeroed() };
-                // SAFETY: reading whole input_event structs (plain old
-                // data) into a correctly sized local buffer.
-                let n = unsafe {
-                    libc::read(
-                        pfd.fd,
-                        events.as_mut_ptr().cast(),
-                        EVENT_SIZE * events.len(),
-                    )
-                };
-                if n <= 0 {
-                    break; // EAGAIN (drained), EOF, or a transient error
-                }
-                for ev in &events[..(n as usize / EVENT_SIZE)] {
-                    if i == self.touch_idx {
-                        if let Some((raw_x, raw_y)) = self.tracker.push(ev) {
-                            let (x, y) = self.transform.apply(
-                                raw_x,
-                                raw_y,
-                                self.max_x,
-                                self.max_y,
-                                self.screen_w,
-                                self.screen_h,
-                            );
-                            self.pending.push_back(UiEvent::Tap { x, y });
-                        }
-                    }
-                    if let Some(event) = self.buttons.push(ev) {
-                        self.pending.push_back(event);
+            let is_touch = i == self.touch_idx;
+            let tracker = &mut self.tracker;
+            let buttons = &mut self.buttons;
+            let pending = &mut self.pending;
+            let (transform, max_x, max_y) = (self.transform, self.max_x, self.max_y);
+            let (screen_w, screen_h) = (self.screen_w, self.screen_h);
+            let drain = drain_events(pfd.fd, |ev| {
+                if is_touch {
+                    if let Some((raw_x, raw_y)) = tracker.push(ev) {
+                        let (x, y) =
+                            transform.apply(raw_x, raw_y, max_x, max_y, screen_w, screen_h);
+                        pending.push_back(UiEvent::Tap { x, y });
                     }
                 }
+                if let Some(event) = buttons.push(ev) {
+                    pending.push_back(event);
+                }
+            });
+            if matches!(drain, Drain::Dead) {
+                dead.push(i);
+            }
+        }
+
+        for &i in dead.iter().rev() {
+            eprintln!("gideon input: device {i} went away, dropping it");
+            self.devices.remove(i);
+            if i == self.touch_idx {
+                return Err(Error::Display(
+                    "the touch input device disappeared".to_string(),
+                ));
+            }
+            if i < self.touch_idx {
+                self.touch_idx -= 1;
             }
         }
         Ok(())
+    }
+}
+
+/// Outcome of draining one evdev fd.
+enum Drain {
+    /// Read until `EAGAIN`; the device is healthy.
+    Drained,
+    /// EOF or a fatal read error; the node is gone.
+    Dead,
+}
+
+/// Read every queued event off a non-blocking evdev fd, passing each to
+/// `f`. The kernel only ever returns whole `input_event`s.
+fn drain_events(fd: libc::c_int, mut f: impl FnMut(&libc::input_event)) -> Drain {
+    const EVENT_SIZE: usize = std::mem::size_of::<libc::input_event>();
+    loop {
+        let mut events: [libc::input_event; 64] = unsafe { std::mem::zeroed() };
+        // SAFETY: reading whole input_event structs (plain old data) into a
+        // correctly sized local buffer on a fd we own.
+        let n = unsafe { libc::read(fd, events.as_mut_ptr().cast(), EVENT_SIZE * events.len()) };
+        if n > 0 {
+            for ev in &events[..(n as usize / EVENT_SIZE)] {
+                f(ev);
+            }
+            continue;
+        }
+        if n == 0 {
+            return Drain::Dead;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => return Drain::Drained,
+            Some(libc::EINTR) => continue,
+            _ => return Drain::Dead,
+        }
     }
 }
 
@@ -432,6 +480,10 @@ impl InputSource for KoboTouch {
 
     fn discard_queued(&mut self) {
         KoboTouch::discard_queued(self);
+    }
+
+    fn discard_taps(&mut self) {
+        KoboTouch::discard_taps(self);
     }
 }
 
@@ -579,6 +631,41 @@ mod tests {
         assert_eq!(b.push(&ev(EV_KEY, 102, 1)), None, "Home key is not sleep");
         assert_eq!(b.push(&ev(EV_ABS, ABS_MT_POSITION_X, 116)), None);
         assert_eq!(b.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
+    }
+
+    #[test]
+    fn drain_events_classifies_and_detects_dead_fds() {
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe2 with a valid 2-int out array.
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) },
+            0
+        );
+        let (r, w) = (fds[0], fds[1]);
+
+        let events = [ev(EV_KEY, KEY_POWER, 1), ev(EV_SYN, SYN_REPORT, 0)];
+        // SAFETY: input_event is plain old data; viewing the array as bytes
+        // for a pipe write is sound.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(events.as_ptr().cast::<u8>(), std::mem::size_of_val(&events))
+        };
+        // SAFETY: writing a valid buffer to a pipe fd we own.
+        assert_eq!(
+            unsafe { libc::write(w, bytes.as_ptr().cast(), bytes.len()) },
+            bytes.len() as isize
+        );
+
+        let mut seen = Vec::new();
+        let drain = drain_events(r, |e| seen.push((e.type_, e.code, e.value)));
+        assert!(matches!(drain, Drain::Drained), "EAGAIN means healthy");
+        assert_eq!(seen, vec![(EV_KEY, KEY_POWER, 1), (EV_SYN, SYN_REPORT, 0)]);
+
+        // Writer gone: the next drain sees EOF and reports the fd dead —
+        // poll_and_read drops such devices instead of busy-looping on them.
+        // SAFETY: closing fds we own.
+        unsafe { libc::close(w) };
+        assert!(matches!(drain_events(r, |_| {}), Drain::Dead));
+        unsafe { libc::close(r) };
     }
 
     #[test]

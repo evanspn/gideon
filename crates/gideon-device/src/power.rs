@@ -4,22 +4,32 @@
 //! (`Kobo:suspend` / `Kobo:_doSuspend` / `Kobo:resume`) and Nickel's own
 //! strace (`platform/kobo/nickel_suspend_strace.txt`) — is:
 //!
-//! 1. Skip entirely while charging: on MTK (Libra Colour) a suspend attempt
-//!    with the charger plugged in **hangs the kernel** (KOReader guards this
-//!    with `isMTK() and powerd:isCharging()`; we guard unconditionally —
-//!    staying awake while plugged in is harmless on every Kobo).
-//! 2. `echo 1 > /sys/power/state-extended` — sets the kernel-global
+//! 1. Skip entirely while plugged in: on MTK (Libra Colour) a suspend
+//!    attempt with the charger plugged in **hangs the kernel**. The check
+//!    matches KOReader's polarity (`powerd.lua`: charging means status
+//!    `~= "Discharging"`): anything but exactly `Discharging` — including
+//!    `Not charging`, `Full` and `Unknown`, all of which a plugged-in
+//!    charger can report — blocks the suspend. Only a missing status file
+//!    (tests, dev machines) falls through to suspending.
+//! 2. Take Wi-Fi down. KOReader "murders" Wi-Fi before every suspend and
+//!    Nickel powers it down too; suspending with the SDIO radio associated
+//!    risks `EBUSY` loops and a broken association after resume. We
+//!    best-effort `ifconfig wlan0 down` (wpa_supplicant and dhcpcd stay
+//!    alive — only Nickel was killed — so link-up on wake reassociates and
+//!    renews the lease). `GIDEON_SUSPEND_WIFI=0` disables both halves.
+//! 3. `echo 1 > /sys/power/state-extended` — sets the kernel-global
 //!    `gSleep_Mode_Suspend` flag that NTX/MTK kernels use to put peripheral
 //!    subsystems to sleep and arm the wakeup pins. Abort on failure.
-//! 3. Wait ~2 s. KOReader: "I have traumatic memories of things going awry
+//! 4. Wait ~2 s. KOReader: "I have traumatic memories of things going awry
 //!    if we don't sleep between the two writes".
-//! 4. `sync` the filesystems.
-//! 5. `echo mem > /sys/power/state` — the write blocks until wakeup. On
+//! 5. `sync` the filesystems.
+//! 6. `echo mem > /sys/power/state` — the write blocks until wakeup. On
 //!    failure (typically `EBUSY` from the EPDC or touch controller) reset
 //!    `state-extended` to 0 — Nickel's observed `1 → mem(EBUSY) → 0` loop —
 //!    and retry the whole sequence a couple of times before giving up.
-//! 6. On wake: `echo 0 > /sys/power/state-extended` to resume subsystems,
-//!    then wait 100 ms for the kernel to catch up (KOReader's resume HACK).
+//! 7. On wake: `echo 0 > /sys/power/state-extended` to resume subsystems,
+//!    wait 100 ms for the kernel to catch up (KOReader's resume HACK), and
+//!    bring Wi-Fi back up.
 //!
 //! MTK notes (Libra Colour, `monza`): there is no `"standby"` power state —
 //! Nickel and KOReader both use `"mem"` — and the plugged-in guard in step 1
@@ -93,10 +103,14 @@ impl KoboSuspend {
     /// sleep cover opening). Returns [`SuspendOutcome::SkippedCharging`]
     /// without touching `/sys/power` when the charger is plugged in.
     pub fn suspend(&mut self) -> Result<SuspendOutcome> {
-        if self.is_charging() {
-            self.step("charging — skipping suspend (MTK kernels hang otherwise)".to_string());
+        if self.is_plugged_in() {
+            self.step("plugged in — skipping suspend (MTK kernels hang otherwise)".to_string());
             return Ok(SuspendOutcome::SkippedCharging);
         }
+
+        // KOReader kills Wi-Fi before every suspend; a live SDIO radio is
+        // the classic source of EBUSY and post-resume breakage.
+        self.wifi("down");
 
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -108,6 +122,7 @@ impl KoboSuspend {
                     if !self.settle.is_zero() {
                         std::thread::sleep(Duration::from_millis(100));
                     }
+                    self.wifi("up");
                     self.step("woke up".to_string());
                     return Ok(SuspendOutcome::Suspended);
                 }
@@ -120,7 +135,29 @@ impl KoboSuspend {
                 }
             }
         }
+        // Don't leave the radio down after a failed suspend.
+        self.wifi("up");
         Err(last_err.unwrap_or_else(|| Error::Display("suspend failed".to_string())))
+    }
+
+    /// Best-effort `ifconfig wlan0 up|down` on hardware. wpa_supplicant and
+    /// dhcpcd keep running across this (gideon never kills them), so the
+    /// interface coming back up reassociates and renews the lease without
+    /// our help. `GIDEON_SUSPEND_WIFI=0` opts out entirely.
+    fn wifi(&mut self, direction: &str) {
+        if std::env::var("GIDEON_SUSPEND_WIFI").as_deref() == Ok("0") {
+            return;
+        }
+        if self.root == Path::new("/") {
+            let status = std::process::Command::new("ifconfig")
+                .args(["wlan0", direction])
+                .status();
+            if !matches!(status, Ok(s) if s.success()) {
+                self.step(format!("ifconfig wlan0 {direction} failed (ignored)"));
+                return;
+            }
+        }
+        self.step(format!("wifi {direction}"));
     }
 
     /// One `1 → settle → sync → mem` attempt. Returns once the device has
@@ -168,9 +205,13 @@ impl KoboSuspend {
         self.step("sync".to_string());
     }
 
-    /// `true` when any known battery reports Charging/Full. KOReader treats
-    /// "charged but still plugged in" as charging too — so do we.
-    fn is_charging(&self) -> bool {
+    /// `true` unless every known battery reports exactly `Discharging` —
+    /// KOReader's polarity (`powerd.lua`: charging means status
+    /// `~= "Discharging"`). A plugged-in charger can report `Charging`,
+    /// `Full`, `Not charging` or `Unknown`; all of those must block the
+    /// suspend, because an MTK suspend with the charger in hangs the
+    /// kernel. Only a missing status file (tests, dev machines) suspends.
+    fn is_plugged_in(&self) -> bool {
         // Libra Colour / Clara family use bd71827_bat; older NTX boards
         // (and KOReader's generic fallback) use "battery".
         for name in ["battery", "bd71827_bat"] {
@@ -180,10 +221,7 @@ impl KoboSuspend {
                 .join(name)
                 .join("status");
             if let Ok(status) = std::fs::read_to_string(&path) {
-                let status = status.trim();
-                if status.eq_ignore_ascii_case("charging") || status.eq_ignore_ascii_case("full") {
-                    return true;
-                }
+                return !status.trim().eq_ignore_ascii_case("discharging");
             }
         }
         false
@@ -214,14 +252,17 @@ mod tests {
         let (dir, mut suspend) = fixture();
         assert_eq!(suspend.suspend().unwrap(), SuspendOutcome::Suspended);
 
-        // The exact write/step order of the Nickel/KOReader dance.
+        // The exact write/step order of the Nickel/KOReader dance:
+        // Wi-Fi dies first, comes back only after the kernel resumed.
         assert_eq!(
             suspend.log(),
             &[
+                "wifi down",
                 "sys/power/state-extended <- 1",
                 "sync",
                 "sys/power/state <- mem",
                 "sys/power/state-extended <- 0",
+                "wifi up",
                 "woke up",
             ]
         );
@@ -282,22 +323,28 @@ mod tests {
     }
 
     #[test]
-    fn charging_skips_suspend_entirely() {
+    fn any_plugged_in_status_skips_suspend_entirely() {
         let (dir, _) = fixture();
         let battery = dir.path().join("sys/class/power_supply/bd71827_bat");
         std::fs::create_dir_all(&battery).unwrap();
-        std::fs::write(battery.join("status"), "Charging\n").unwrap();
 
-        let mut suspend = KoboSuspend::with_root(dir.path()).settle(Duration::ZERO);
-        assert_eq!(suspend.suspend().unwrap(), SuspendOutcome::SkippedCharging);
-        assert!(
-            !suspend.log().iter().any(|l| l.contains("<-")),
-            "no sysfs writes while charging"
-        );
-        // Full (charged but plugged in) also counts, like KOReader.
-        std::fs::write(battery.join("status"), "Full").unwrap();
-        let mut suspend = KoboSuspend::with_root(dir.path()).settle(Duration::ZERO);
-        assert_eq!(suspend.suspend().unwrap(), SuspendOutcome::SkippedCharging);
+        // KOReader polarity: everything except exactly "Discharging" means
+        // a charger may be attached — and an MTK suspend with the charger
+        // in hangs the kernel. "Not charging" (topped-off battery, charger
+        // still plugged) is the trap case.
+        for status in ["Charging\n", "Full", "Not charging\n", "Unknown"] {
+            std::fs::write(battery.join("status"), status).unwrap();
+            let mut suspend = KoboSuspend::with_root(dir.path()).settle(Duration::ZERO);
+            assert_eq!(
+                suspend.suspend().unwrap(),
+                SuspendOutcome::SkippedCharging,
+                "status {status:?} must block suspend"
+            );
+            assert!(
+                !suspend.log().iter().any(|l| l.contains("<-")),
+                "no sysfs writes while plugged in (status {status:?})"
+            );
+        }
     }
 
     #[test]

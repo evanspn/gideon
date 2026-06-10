@@ -39,7 +39,9 @@ pub enum Key {
 
 /// Character rows of the keyboard, top to bottom. The bottom row
 /// (backspace / space / search) is built separately in [`keyboard_keys`].
-pub const KEYBOARD_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"];
+/// Manga titles lean on punctuation ("Re:Zero", "Dr. Stone", "Frieren -"),
+/// so the letter rows carry the common marks.
+pub const KEYBOARD_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-:."];
 
 /// A key and its screen rectangle: `(key, x, y, w, h)`.
 pub type KeyRect = (Key, u32, u32, u32, u32);

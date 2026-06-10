@@ -592,9 +592,12 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     // Power button / sleep cover: suspend to RAM via the Nickel/KOReader
     // sysfs dance. The call blocks until the device wakes up.
     let sleeper: ui::SleepFn = Box::new(|| {
-        let mut suspend = gideon_device::power::KoboSuspend::new();
-        suspend.suspend().context("suspend to RAM failed")?;
-        Ok(())
+        use gideon_device::power::{KoboSuspend, SuspendOutcome};
+        let mut suspend = KoboSuspend::new();
+        Ok(match suspend.suspend().context("suspend to RAM failed")? {
+            SuspendOutcome::Suspended => ui::SleepResult::Slept,
+            SuspendOutcome::SkippedCharging => ui::SleepResult::Skipped,
+        })
     });
     let result = ui::UiApp::new(display, input, gateway, library)
         .with_reader_settings(fit, rotation)

@@ -34,6 +34,14 @@ pub trait InputSource {
     /// during a long download) so they don't fire stale actions. Default:
     /// no-op — test inputs replay their script unaffected.
     fn discard_queued(&mut self) {}
+
+    /// Like [`Self::discard_queued`], but sleep requests survive the drain:
+    /// taps made during a long download are stale, a sleep cover closed
+    /// during it is not — the device must still go to sleep afterwards.
+    /// Default: same as `discard_queued`.
+    fn discard_taps(&mut self) {
+        self.discard_queued();
+    }
 }
 
 /// Test input source: replays a fixed list of events, then errors.
