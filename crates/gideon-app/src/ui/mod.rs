@@ -31,8 +31,23 @@ use gideon_render::{FitMode, GrayPage};
 
 use crate::reader::Reader;
 
-const HOME_ROWS: [&str; 4] = ["Library", "Search", "Browse sources", "Check for updates"];
+const HOME_ROWS: [&str; 5] = [
+    "Library",
+    "Search",
+    "Browse sources",
+    "Settings",
+    "Check for updates",
+];
 const SHELF_COLUMNS: u32 = 3;
+
+/// Values the Settings screen cycles through per tap.
+const PREDOWNLOAD_STEPS: [u32; 5] = [0, 1, 2, 3, 5];
+const STORAGE_LIMIT_STEPS: [u64; 4] = [
+    500 * 1024 * 1024,
+    1024 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    5 * 1024 * 1024 * 1024,
+];
 
 /// One row on the Sources screen.
 #[derive(Debug, Clone)]
@@ -107,6 +122,9 @@ enum Screen {
     NewProfile {
         name: String,
     },
+    /// Device-global settings (NOT per profile): each tap cycles a value
+    /// and saves settings.json immediately.
+    Settings,
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
     /// Update available; any content tap installs, Back declines.
@@ -527,6 +545,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(Flow::Continue)
                 }
                 3 => {
+                    self.push(Screen::Settings)?;
+                    Ok(Flow::Continue)
+                }
+                4 => {
                     self.check_updates()?;
                     Ok(Flow::Continue)
                 }
@@ -645,6 +667,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                     _ => {}
                 }
+                Ok(Flow::Continue)
+            }
+            Screen::Settings => {
+                self.tap_setting(row)?;
                 Ok(Flow::Continue)
             }
             Screen::ProfileMenu { profiles } => {
@@ -809,6 +835,39 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             RefreshMode::Partial
         };
         self.render_current(mode)
+    }
+
+    // --- settings screen ---
+
+    /// Cycle the setting on row `row` to its next value, persist
+    /// settings.json immediately (atomic save) and repaint in place.
+    fn tap_setting(&mut self, row: usize) -> Result<()> {
+        let mut settings = self.load_settings();
+        match row {
+            0 => {
+                settings.predownload_unread_chapters =
+                    cycle(&PREDOWNLOAD_STEPS, settings.predownload_unread_chapters);
+            }
+            1 => {
+                settings.storage_size_limit = gideon_core::StorageSize(cycle(
+                    &STORAGE_LIMIT_STEPS,
+                    settings.storage_size_limit.bytes(),
+                ));
+            }
+            2 => {
+                settings.reader_fit = match FitMode::from_setting(&settings.reader_fit) {
+                    FitMode::FitWidth => "contain",
+                    _ => "fit-width",
+                }
+                .to_string();
+                // The next opened book must use the new fit immediately.
+                self.reader_fit = FitMode::from_setting(&settings.reader_fit);
+            }
+            3 => settings.auto_check_updates = !settings.auto_check_updates,
+            _ => return Ok(()),
+        }
+        self.save_settings(&settings);
+        self.render_current(RefreshMode::Partial)
     }
 
     // --- profiles ---
@@ -1412,6 +1471,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Profiles", &rows, 0, 1)
             }
             Screen::NewProfile { name } => compose_keyboard(l, "New profile", name, "Create"),
+            Screen::Settings => {
+                let rows = settings_rows(&self.load_settings());
+                compose_list(l, "Settings", &rows, 0, 1)
+            }
             Screen::PowerMenu => {
                 let rows = vec![
                     ("Restart gideon".to_string(), true),
@@ -1935,6 +1998,31 @@ fn entry_title(relative_path: &str) -> String {
 
 fn placeholder_cover() -> image::DynamicImage {
     image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(3, 4, image::Luma([0xCC])))
+}
+
+/// The Settings screen's rows, showing current values.
+fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
+    let fit = match gideon_render::FitMode::from_setting(&s.reader_fit) {
+        gideon_render::FitMode::FitWidth => "fit-width",
+        _ => "contain",
+    };
+    let auto = if s.auto_check_updates { "on" } else { "off" };
+    vec![
+        (
+            format!("Pre-download ahead: {}", s.predownload_unread_chapters),
+            true,
+        ),
+        (format!("Storage limit: {}", s.storage_size_limit), true),
+        (format!("Reader fit: {fit}"), true),
+        (format!("Check updates automatically: {auto}"), true),
+    ]
+}
+
+/// Next value in a cycle: the entry after `current`, wrapping around; the
+/// first entry when `current` isn't in the list (hand-edited settings).
+fn cycle<T: Copy + PartialEq>(steps: &[T], current: T) -> T {
+    let position = steps.iter().position(|s| *s == current);
+    steps[position.map_or(0, |i| (i + 1) % steps.len())]
 }
 
 /// The library directory of a profile: the root itself for "default",

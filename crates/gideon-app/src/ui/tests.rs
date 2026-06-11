@@ -693,7 +693,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(3)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(4)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -946,6 +946,99 @@ fn picking_the_active_profile_just_closes_the_menu() {
     assert!(matches!(app.screen(), Screen::Home));
     let settings = gideon_core::Settings::load(&settings_dir).unwrap();
     assert_eq!(settings.active_profile, "default");
+}
+
+// --- settings screen ---
+
+#[test]
+fn settings_rows_cycle_and_persist_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let events = vec![
+        tap_row(3), // Home -> Settings
+        tap_row(0), // pre-download 2 -> 3
+        tap_row(0), // 3 -> 5
+        tap_row(1), // storage 2 GB -> 5 GB
+        tap_row(3), // auto-check on -> off
+        tap_back(),
+    ];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    assert!(matches!(app.screen(), Screen::Home));
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.predownload_unread_chapters, 5);
+    assert_eq!(
+        settings.storage_size_limit.bytes(),
+        5 * 1024 * 1024 * 1024,
+        "2 GB cycles to 5 GB"
+    );
+    assert!(!settings.auto_check_updates);
+    // Value cycles repaint in place with partial refreshes.
+    assert!(app.display().flushes.contains(&RefreshMode::Partial));
+}
+
+#[test]
+fn storage_limit_cycle_wraps_around() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        storage_size_limit: gideon_core::StorageSize(5 * 1024 * 1024 * 1024),
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let events = vec![tap_row(3), tap_row(1)];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.storage_size_limit.bytes(),
+        500 * 1024 * 1024,
+        "5 GB wraps back to 500 MB"
+    );
+}
+
+#[test]
+fn reader_fit_toggle_applies_to_the_next_book_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+    make_tall_cbz(&lib.join("Tall/vol1.cbz"), 2);
+
+    // Toggle contain -> fit-width, then open a tall page: a "next" tap
+    // must scroll within the page (no page turn), without a restart.
+    let events = vec![
+        tap_row(3), // Settings
+        tap_row(2), // Reader fit: contain -> fit-width
+        tap_back(), // Home
+        tap_row(0), // Library
+        tap_shelf_cell0(),
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_fit, "fit-width");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Tall/vol1.cbz").unwrap().current_page,
+        0,
+        "the reader must pick up the new fit immediately (scroll, not turn)"
+    );
 }
 
 // --- frontlight edge slides ---
@@ -1560,8 +1653,8 @@ fn update_prompt_installs_on_tap() {
         update_message: "Update available: 0.0.0 -> 9.9.9.".into(),
         ..FakeGateway::default()
     };
-    // Home row 2 = "Check for updates" -> prompt; content tap installs.
-    let mut app = app(dir.path(), gateway, vec![tap_row(3), tap_row(0)]);
+    // Home row 4 = "Check for updates" -> prompt; content tap installs.
+    let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_row(0)]);
     app.run().unwrap();
 
     assert_eq!(
@@ -2250,7 +2343,7 @@ fn update_prompt_back_declines() {
         update_message: "Update available.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(3), tap_back()]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_back()]);
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
 }
