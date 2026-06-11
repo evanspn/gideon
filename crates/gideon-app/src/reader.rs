@@ -175,6 +175,29 @@ impl<D: Display> Reader<D> {
         Ok(())
     }
 
+    /// Repaint the current page with a transient banner overlaid along the
+    /// top edge (e.g. "Brightness 70%"), without dirtying the page cache —
+    /// the next page repaint wipes the banner away.
+    pub fn show_banner(&mut self, text: &str) -> Result<()> {
+        let cached = matches!(&self.rendered, Some((index, _)) if *index == self.current_page);
+        if !cached {
+            self.show_current_page()?;
+        }
+        let (_, reading_h) = self.reading_dims();
+        let page = &self.rendered.as_ref().expect("rendered above").1;
+        let offset = self.scroll_y.min(page.height.saturating_sub(1));
+        let mut window = crop_rows(page, offset, reading_h);
+        draw_banner(&mut window, text);
+        if self.rotation == 0 {
+            self.display.blit(&window, 0)?;
+        } else {
+            let rotated = rotate_page(&window, self.rotation);
+            self.display.blit(&rotated, 0)?;
+        }
+        self.display.flush(RefreshMode::Partial)?;
+        Ok(())
+    }
+
     /// Repaint the current page with a guaranteed full refresh — for waking
     /// from suspend, when the panel contents can't be trusted.
     pub fn repaint_full(&mut self) -> Result<()> {
@@ -239,6 +262,27 @@ fn normalize_rotation(degrees: u32) -> u32 {
 }
 
 /// Copy `height` rows of `page` starting at `offset_y` (clamped).
+/// Draw a white banner strip with `text` along the top of `page`.
+fn draw_banner(page: &mut GrayPage, text: &str) {
+    use gideon_render::text::draw_text;
+
+    let banner_h = 56.min(page.height);
+    for y in 0..banner_h {
+        let row = (y * page.width) as usize;
+        let value = if y + 1 == banner_h { 0x00 } else { 0xFF };
+        page.pixels[row..row + page.width as usize].fill(value);
+    }
+    draw_text(
+        page,
+        16,
+        12,
+        30.0,
+        text,
+        page.width.saturating_sub(32),
+        true,
+    );
+}
+
 fn crop_rows(page: &GrayPage, offset_y: u32, height: u32) -> GrayPage {
     let offset_y = offset_y.min(page.height.saturating_sub(1));
     let height = height.min(page.height - offset_y);

@@ -95,16 +95,29 @@ fn bit_set(bits: &[u8], code: u16) -> bool {
     byte < bits.len() && bits[byte] & (1 << (code % 8)) != 0
 }
 
-/// Pure state machine: feed raw `input_event`s, get a raw-coordinate tap on
-/// finger release. Tracks both the multitouch protocol (type B:
-/// `ABS_MT_POSITION_*` + `ABS_MT_TRACKING_ID`) and the legacy single-touch
-/// one (`ABS_X/Y` + `BTN_TOUCH`).
+/// Pure state machine: feed raw `input_event`s, get a raw-coordinate
+/// gesture — `(start, end)` positions — on finger release. Tracks both the
+/// multitouch protocol (type B: `ABS_MT_POSITION_*` + `ABS_MT_TRACKING_ID`)
+/// and the legacy single-touch one (`ABS_X/Y` + `BTN_TOUCH`). The caller
+/// classifies the gesture: short travel is a tap, long travel a swipe.
 #[derive(Debug, Default)]
 pub struct TouchTracker {
+    first_x: Option<i32>,
+    first_y: Option<i32>,
     last_x: Option<i32>,
     last_y: Option<i32>,
+    /// Kernel timestamp (ms) of the first event of this contact.
+    down_ms: Option<u64>,
     touching: bool,
     release_seen: bool,
+}
+
+/// A completed raw gesture: start position, end position, hold time (ms).
+pub type RawGesture = ((u32, u32), (u32, u32), u64);
+
+/// Kernel timestamp of an event, in milliseconds.
+fn ev_millis(ev: &libc::input_event) -> u64 {
+    ev.time.tv_sec as u64 * 1000 + ev.time.tv_usec as u64 / 1000
 }
 
 impl TouchTracker {
@@ -112,23 +125,29 @@ impl TouchTracker {
         Self::default()
     }
 
-    /// Process one event. Returns the raw `(x, y)` of a completed tap when
-    /// the finger lifts.
-    pub fn push(&mut self, ev: &libc::input_event) -> Option<(u32, u32)> {
+    /// Process one event. Returns the raw `(start, end)` positions and the
+    /// contact duration (ms) of a completed gesture when the finger lifts.
+    pub fn push(&mut self, ev: &libc::input_event) -> Option<RawGesture> {
         match (ev.type_, ev.code) {
             (EV_ABS, ABS_MT_POSITION_X) | (EV_ABS, ABS_X) => {
+                if self.first_x.is_none() {
+                    self.first_x = Some(ev.value);
+                }
                 self.last_x = Some(ev.value);
-                self.touching = true;
+                self.begin_contact(ev);
             }
             (EV_ABS, ABS_MT_POSITION_Y) | (EV_ABS, ABS_Y) => {
+                if self.first_y.is_none() {
+                    self.first_y = Some(ev.value);
+                }
                 self.last_y = Some(ev.value);
-                self.touching = true;
+                self.begin_contact(ev);
             }
             (EV_ABS, ABS_MT_TRACKING_ID) => {
                 if ev.value == -1 {
                     self.release_seen = true;
                 } else {
-                    self.touching = true;
+                    self.begin_contact(ev);
                 }
             }
             (EV_ABS, ABS_MT_PRESSURE) => {
@@ -138,33 +157,77 @@ impl TouchTracker {
                 if ev.value == 0 {
                     self.release_seen = true;
                 } else {
-                    self.touching = true;
+                    self.begin_contact(ev);
                 }
             }
             (EV_KEY, BTN_TOUCH) => {
                 if ev.value == 0 {
                     // Finger lifted: emit immediately.
-                    return self.finish_tap();
+                    return self.finish_tap(ev_millis(ev));
                 }
-                self.touching = true;
+                self.begin_contact(ev);
             }
             (EV_SYN, SYN_REPORT) if self.release_seen => {
-                return self.finish_tap();
+                return self.finish_tap(ev_millis(ev));
             }
             _ => {}
         }
         None
     }
 
-    fn finish_tap(&mut self) -> Option<(u32, u32)> {
+    /// Mark the contact as active, stamping its start time on the
+    /// transition (idle -> touching) only.
+    fn begin_contact(&mut self, ev: &libc::input_event) {
+        if !self.touching {
+            self.down_ms = Some(ev_millis(ev));
+        }
+        self.touching = true;
+    }
+
+    fn finish_tap(&mut self, now_ms: u64) -> Option<RawGesture> {
         self.release_seen = false;
+        let (first_x, first_y) = (self.first_x.take(), self.first_y.take());
+        let down_ms = self.down_ms.take();
         if !self.touching {
             return None;
         }
         self.touching = false;
         match (self.last_x, self.last_y) {
-            (Some(x), Some(y)) => Some((x.max(0) as u32, y.max(0) as u32)),
+            (Some(x), Some(y)) => {
+                let end = (x.max(0) as u32, y.max(0) as u32);
+                let start = (
+                    first_x.unwrap_or(x).max(0) as u32,
+                    first_y.unwrap_or(y).max(0) as u32,
+                );
+                let held = now_ms.saturating_sub(down_ms.unwrap_or(now_ms));
+                Some((start, end, held))
+            }
             _ => None,
+        }
+    }
+}
+
+/// Drags shorter than this (in screen pixels, either axis) are taps.
+const TAP_SLOP_PX: u32 = 30;
+
+/// Contacts held at least this long without travel are long-presses.
+const LONG_PRESS_MS: u64 = 600;
+
+/// Turn a completed gesture (screen coordinates + hold time) into a
+/// [`UiEvent`].
+fn classify_gesture(start: (u32, u32), end: (u32, u32), held_ms: u64) -> UiEvent {
+    if start.0.abs_diff(end.0) <= TAP_SLOP_PX && start.1.abs_diff(end.1) <= TAP_SLOP_PX {
+        if held_ms >= LONG_PRESS_MS {
+            UiEvent::LongPress { x: end.0, y: end.1 }
+        } else {
+            UiEvent::Tap { x: end.0, y: end.1 }
+        }
+    } else {
+        UiEvent::Swipe {
+            x0: start.0,
+            y0: start.1,
+            x1: end.0,
+            y1: end.1,
         }
     }
 }
@@ -451,10 +514,18 @@ impl KoboTouch {
             let (screen_w, screen_h) = (self.screen_w, self.screen_h);
             let drain = drain_events(pfd.fd, |ev| {
                 if is_touch {
-                    if let Some((raw_x, raw_y)) = tracker.push(ev) {
-                        let (x, y) =
-                            transform.apply(raw_x, raw_y, max_x, max_y, screen_w, screen_h);
-                        pending.push_back(UiEvent::Tap { x, y });
+                    if let Some((raw_start, raw_end, held_ms)) = tracker.push(ev) {
+                        let start = transform.apply(
+                            raw_start.0,
+                            raw_start.1,
+                            max_x,
+                            max_y,
+                            screen_w,
+                            screen_h,
+                        );
+                        let end =
+                            transform.apply(raw_end.0, raw_end.1, max_x, max_y, screen_w, screen_h);
+                        pending.push_back(classify_gesture(start, end, held_ms));
                     }
                 }
                 if let Some(event) = buttons.push(ev) {
@@ -582,7 +653,10 @@ mod tests {
         assert_eq!(t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 540)), None);
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
         assert_eq!(t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1)), None);
-        assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), Some((320, 540)));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(((320, 540), (320, 540), 0))
+        );
         // Nothing further without a new touch.
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
     }
@@ -594,7 +668,10 @@ mod tests {
         assert_eq!(t.push(&ev(EV_ABS, ABS_X, 10)), None);
         assert_eq!(t.push(&ev(EV_ABS, ABS_Y, 20)), None);
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
-        assert_eq!(t.push(&ev(EV_KEY, BTN_TOUCH, 0)), Some((10, 20)));
+        assert_eq!(
+            t.push(&ev(EV_KEY, BTN_TOUCH, 0)),
+            Some(((10, 20), (10, 20), 0))
+        );
         // The trailing SYN_REPORT must not double-emit.
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
     }
@@ -609,7 +686,11 @@ mod tests {
         t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 300));
         t.push(&ev(EV_SYN, SYN_REPORT, 0));
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
-        assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), Some((250, 300)));
+        // A drag: the gesture carries both where it started and ended.
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(((100, 100), (250, 300), 0))
+        );
     }
 
     #[test]
@@ -625,7 +706,10 @@ mod tests {
         t.push(&ev(EV_ABS, ABS_MT_POSITION_X, -5));
         t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 7));
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
-        assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), Some((0, 7)));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(((0, 7), (0, 7), 0))
+        );
     }
 
     #[test]
@@ -634,13 +718,19 @@ mod tests {
         t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 1));
         t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 2));
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
-        assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), Some((1, 2)));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(((1, 2), (1, 2), 0))
+        );
 
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, 3));
         t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 9));
         t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 8));
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
-        assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), Some((9, 8)));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(((9, 8), (9, 8), 0))
+        );
     }
 
     #[test]
@@ -663,7 +753,7 @@ mod tests {
         assert_eq!(t.push(&ev(EV_ABS, ABS_MT_PRESSURE, 0)), None);
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some((100, 200)),
+            Some(((100, 200), (100, 200), 0)),
             "pressure 0 + SYN should tap"
         );
     }
@@ -784,13 +874,81 @@ mod tests {
             ev(EV_SYN, SYN_REPORT, 0),
         ];
         for e in &stream {
-            if let Some((x, y)) = touch.push(e) {
-                out.push(UiEvent::Tap { x, y });
+            if let Some((start, end, held)) = touch.push(e) {
+                out.push(classify_gesture(start, end, held));
             }
             if let Some(event) = buttons.push(e) {
                 out.push(event);
             }
         }
         assert_eq!(out, vec![UiEvent::Sleep, UiEvent::Tap { x: 100, y: 200 }]);
+    }
+
+    // --- gesture classification (tap vs swipe) ---
+
+    #[test]
+    fn short_travel_is_a_tap_at_the_release_point() {
+        assert_eq!(
+            classify_gesture((100, 100), (110, 120), 80),
+            UiEvent::Tap { x: 110, y: 120 }
+        );
+        // Exactly at the slop still counts as a tap (finger wobble).
+        assert_eq!(
+            classify_gesture((100, 100), (100 + TAP_SLOP_PX, 100), 80),
+            UiEvent::Tap {
+                x: 100 + TAP_SLOP_PX,
+                y: 100
+            }
+        );
+    }
+
+    #[test]
+    fn long_travel_is_a_swipe_with_both_endpoints() {
+        assert_eq!(
+            classify_gesture((1200, 1400), (1210, 600), 200),
+            UiEvent::Swipe {
+                x0: 1200,
+                y0: 1400,
+                x1: 1210,
+                y1: 600
+            }
+        );
+    }
+
+    #[test]
+    fn held_contact_without_travel_is_a_long_press() {
+        assert_eq!(
+            classify_gesture((100, 100), (105, 102), LONG_PRESS_MS),
+            UiEvent::LongPress { x: 105, y: 102 }
+        );
+        // Held but dragged: still a swipe, not a long press.
+        assert_eq!(
+            classify_gesture((100, 100), (100, 900), LONG_PRESS_MS * 2),
+            UiEvent::Swipe {
+                x0: 100,
+                y0: 100,
+                x1: 100,
+                y1: 900
+            }
+        );
+    }
+
+    #[test]
+    fn tracker_reports_hold_duration_from_kernel_timestamps() {
+        let at = |ms: u64, type_: u16, code: u16, value: i32| {
+            let mut e = ev(type_, code, value);
+            e.time.tv_sec = (ms / 1000) as _;
+            e.time.tv_usec = ((ms % 1000) * 1000) as _;
+            e
+        };
+        let mut t = TouchTracker::new();
+        assert_eq!(t.push(&at(1000, EV_ABS, ABS_MT_POSITION_X, 50)), None);
+        assert_eq!(t.push(&at(1000, EV_ABS, ABS_MT_POSITION_Y, 60)), None);
+        assert_eq!(t.push(&at(1700, EV_ABS, ABS_MT_TRACKING_ID, -1)), None);
+        assert_eq!(
+            t.push(&at(1700, EV_SYN, SYN_REPORT, 0)),
+            Some(((50, 60), (50, 60), 700)),
+            "held 700ms"
+        );
     }
 }

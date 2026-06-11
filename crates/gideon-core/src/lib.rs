@@ -9,12 +9,14 @@ pub mod comicinfo;
 pub mod error;
 pub mod library;
 pub mod natsort;
+pub mod series;
 pub mod settings;
 
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
 pub use error::Error;
 pub use library::{Library, LibraryEntry, ProgressStore, ReadingProgress};
+pub use series::{SeriesIndex, SeriesRef};
 pub use settings::{Settings, StorageSize};
 
 pub type Result<T> = std::result::Result<T, Error>;

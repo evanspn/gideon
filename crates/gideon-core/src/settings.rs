@@ -46,6 +46,16 @@ pub struct Settings {
     /// anything else behaves like 0.
     #[serde(deserialize_with = "lenient_reader_rotation")]
     pub reader_rotation: u32,
+
+    /// Frontlight brightness percent (0–100), restored at startup and
+    /// updated from the reader's right-edge slide. Parsed leniently.
+    #[serde(deserialize_with = "lenient_percent")]
+    pub frontlight_brightness: u32,
+
+    /// Frontlight warmth ("night light") percent (0–100), restored at
+    /// startup and updated from the reader's left-edge slide.
+    #[serde(deserialize_with = "lenient_percent")]
+    pub frontlight_warmth: u32,
 }
 
 impl Default for Settings {
@@ -58,8 +68,19 @@ impl Default for Settings {
             auto_check_updates: true,
             reader_fit: "contain".to_string(),
             reader_rotation: 0,
+            frontlight_brightness: 20,
+            frontlight_warmth: 0,
         }
     }
+}
+
+/// Lenient percent parsing: numbers are clamped to 0–100; anything else
+/// (wrong type, missing) falls back to 0.
+fn lenient_percent<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_u64().map_or(0, |v| v.min(100) as u32))
 }
 
 /// Lenient `reader_fit` parsing: any JSON value is accepted; only strings
@@ -215,6 +236,8 @@ mod tests {
             auto_check_updates: false,
             reader_fit: "fit-width".into(),
             reader_rotation: 90,
+            frontlight_brightness: 65,
+            frontlight_warmth: 40,
         };
         s.save(dir.path()).unwrap();
 

@@ -21,6 +21,13 @@ pub enum UiEvent {
     PageForward,
     /// Physical page-back button (Kobo Libra family: code 193, RPgBack).
     PageBack,
+    /// A drag from (x0, y0) to (x1, y1) in screen coordinates — emitted on
+    /// finger release when the travel exceeds the tap slop. Edge slides
+    /// adjust the frontlight in the reader.
+    Swipe { x0: u32, y0: u32, x1: u32, y1: u32 },
+    /// A press held in place (≥600 ms without travel) — context actions,
+    /// e.g. a library book's chapter list.
+    LongPress { x: u32, y: u32 },
     /// The user asked the device to sleep: power button pressed or the
     /// magnetic sleep cover closed (KOReader: KEY_POWER=116 press, sleep
     /// cover codes 59/35 press). Waking is *not* an event: the suspend call

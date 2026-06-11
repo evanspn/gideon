@@ -690,16 +690,304 @@ fn check_updates_shows_message_screen() {
 }
 
 #[test]
-fn back_on_home_quits() {
+fn back_on_home_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    // Two back taps; the app must quit on the first and not consume more.
+    // Back taps on Home are ignored — quitting goes through the power
+    // menu. The tap after them still works.
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![tap_back(), tap_back()],
+        vec![tap_back(), tap_back(), tap_row(0)],
     );
+    let lib = dir.path().join("x");
+    let _ = lib; // silence unused in case of edits
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+}
+
+// --- power menu ---
+
+/// Tap the power symbol region: top-right corner of the title bar.
+fn tap_power_icon() -> UiEvent {
+    let l = layout();
+    UiEvent::Tap {
+        x: l.width - 2,
+        y: l.title_h / 2,
+    }
+}
+
+#[test]
+fn power_icon_opens_the_menu_and_back_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![tap_power_icon(), tap_back()];
+    let mut app = app(dir.path(), FakeGateway::default(), events);
+    assert_eq!(app.run().unwrap(), Exit::Close); // input exhausted
+    assert!(matches!(app.screen(), Screen::Home));
+}
+
+#[test]
+fn power_menu_close_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![tap_power_icon(), tap_row(1)];
+    let mut app = app(dir.path(), FakeGateway::default(), events);
+    assert_eq!(app.run().unwrap(), Exit::Close);
+}
+
+#[test]
+fn power_menu_restart_requests_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![tap_power_icon(), tap_row(0)];
+    let mut app = app(dir.path(), FakeGateway::default(), events);
+    assert_eq!(app.run().unwrap(), Exit::Restart);
+}
+
+#[test]
+fn title_taps_off_the_power_icon_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![UiEvent::Tap { x: 5, y: 5 }];
+    let mut app = app(dir.path(), FakeGateway::default(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Home));
+}
+
+// --- frontlight edge slides ---
+
+/// Scriptable light control recording every set.
+struct FakeLights {
+    levels: SharedLevels,
+}
+
+impl LightControl for FakeLights {
+    fn brightness(&self) -> u8 {
+        self.levels.borrow().0
+    }
+    fn set_brightness(&mut self, p: u8) {
+        self.levels.borrow_mut().0 = p;
+    }
+    fn warmth(&self) -> u8 {
+        self.levels.borrow().1
+    }
+    fn set_warmth(&mut self, p: u8) {
+        self.levels.borrow_mut().1 = p;
+    }
+}
+
+type SharedLevels = std::rc::Rc<RefCell<(u8, u8)>>;
+
+fn lights() -> (SharedLevels, Box<dyn LightControl>) {
+    let levels = std::rc::Rc::new(RefCell::new((20u8, 0u8)));
+    (
+        levels.clone(),
+        Box::new(FakeLights { levels }) as Box<dyn LightControl>,
+    )
+}
+
+#[test]
+fn right_edge_slide_up_raises_brightness() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+    let (levels, lights) = lights();
+
+    // Slide along the right edge, upward by half the screen = +50.
+    let slide = UiEvent::Swipe {
+        x0: W - 5,
+        y0: H - 100,
+        x1: W - 5,
+        y1: H - 100 - H / 2,
+    };
+    let events = vec![tap_row(0), tap_shelf_cell0(), slide, reader_tap_back()];
+    let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
+    app.run().unwrap();
+
+    assert_eq!(levels.borrow().0, 70, "20 + 50 = 70");
+    assert_eq!(levels.borrow().1, 0, "warmth untouched");
+}
+
+#[test]
+fn left_edge_slide_adjusts_night_light() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+    let (levels, lights) = lights();
+
+    let slide_up = UiEvent::Swipe {
+        x0: 3,
+        y0: H - 50,
+        x1: 3,
+        y1: H - 50 - H / 4, // +25
+    };
+    let events = vec![tap_row(0), tap_shelf_cell0(), slide_up, reader_tap_back()];
+    let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
+    app.run().unwrap();
+
+    assert_eq!(levels.borrow().1, 25);
+    assert_eq!(levels.borrow().0, 20, "brightness untouched");
+}
+
+#[test]
+fn edge_slides_without_a_light_hook_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+    let slide = UiEvent::Swipe {
+        x0: W - 5,
+        y0: H - 100,
+        x1: W - 5,
+        y1: 100,
+    };
+    let events = vec![tap_row(0), tap_shelf_cell0(), slide, reader_tap_back()];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+}
+
+#[test]
+fn swipe_down_leaves_the_manga() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    let swipe_down = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 100,
+        x1: W / 2,
+        y1: H - 100,
+    };
+    let events = vec![tap_row(0), tap_shelf_cell0(), reader_tap_next(), swipe_down];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    // Back on the shelf, with progress saved.
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+}
+
+// --- long press: library card -> source chapter list ---
+
+#[test]
+fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Manga One/Chapter 1.cbz"), 2);
+    let mut index = gideon_core::SeriesIndex::load(&lib);
+    index.record(
+        "Manga One",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Manga One".into(),
+        },
+    );
+    index.save(&lib).unwrap();
+
+    let gateway = FakeGateway {
+        chapters: vec![
+            ChapterEntry {
+                id: "c1".into(),
+                num: Some(1.0),
+                title: None,
+                lang: None,
+            },
+            ChapterEntry {
+                id: "c2".into(),
+                num: Some(2.0),
+                title: None,
+                lang: None,
+            },
+        ],
+        ..FakeGateway::default()
+    };
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    let Screen::ChapterList {
+        source,
+        manga,
+        chapters,
+        ..
+    } = app.screen()
+    else {
+        panic!("expected the source's chapter list");
+    };
+    assert_eq!(source.id, "src");
+    assert_eq!(manga.id, "m1");
+    assert_eq!(chapters.len(), 2, "all chapters listed for download");
+}
+
+#[test]
+fn long_press_on_a_sideloaded_book_explains_no_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sideload/vol1.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected explanation");
+    };
+    assert_eq!(title, "Chapters");
+    assert!(body.contains("Sideload"));
+}
+
+#[test]
+fn downloading_records_the_series_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_row(2), // Sources
+        tap_row(0), // Listings
+        tap_row(0), // Popular
+        tap_row(0), // Manga One
+        tap_row(0), // download + Reader
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    let index = gideon_core::SeriesIndex::load(&lib);
+    let origin = index.get("Manga One").expect("origin recorded");
+    assert_eq!(origin.source_id, "src");
+    assert_eq!(origin.manga_id, "m1");
+    assert_eq!(origin.manga_title, "Manga One");
 }
 
 #[test]
@@ -1295,6 +1583,47 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
 
     assert_eq!(count.get(), 1, "queued sleep must still suspend");
     assert!(matches!(app.screen(), Screen::ChapterList { .. }));
+}
+
+#[test]
+fn waking_reapplies_the_frontlight() {
+    // The kernel powers the light down across suspend; after the sleeper
+    // returns, the saved levels must be written to the hardware again.
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let writes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+
+    struct CountingLights {
+        writes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl LightControl for CountingLights {
+        fn brightness(&self) -> u8 {
+            55
+        }
+        fn set_brightness(&mut self, _: u8) {
+            self.writes.set(self.writes.get() + 1);
+        }
+        fn warmth(&self) -> u8 {
+            30
+        }
+        fn set_warmth(&mut self, _: u8) {
+            self.writes.set(self.writes.get() + 1);
+        }
+    }
+
+    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
+        .with_sleeper(sleeper)
+        .with_lights(Box::new(CountingLights {
+            writes: writes.clone(),
+        }));
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1);
+    assert_eq!(
+        writes.get(),
+        2,
+        "brightness and warmth must both be rewritten after wake"
+    );
 }
 
 #[test]

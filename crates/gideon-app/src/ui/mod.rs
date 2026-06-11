@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
-use gideon_device::{Display, InputSource, RefreshMode, UiEvent};
+use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
 use gideon_render::{FitMode, GrayPage};
@@ -93,6 +93,8 @@ enum Screen {
         chapters: Vec<ChapterEntry>,
         page: usize,
     },
+    /// Restart/close menu, opened from the power symbol on Home.
+    PowerMenu,
     /// Update available; any content tap installs, Back declines.
     UpdatePrompt {
         body: String,
@@ -104,9 +106,18 @@ enum Screen {
     },
 }
 
+/// Why the UI loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    /// Close the app: the launcher takes over (back to Nickel).
+    Close,
+    /// Restart the app in place (exec of the current binary).
+    Restart,
+}
+
 enum Flow {
     Continue,
-    Quit,
+    Quit(Exit),
 }
 
 /// What the suspend hook did.
@@ -153,6 +164,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Keyboard repaints since the search screen opened, for the periodic
     /// anti-ghosting full refresh.
     keyboard_paints: u32,
+    /// Frontlight hook for the reader's edge slides; `None` (tests,
+    /// headless) means swipes are ignored.
+    lights: Option<Box<dyn LightControl>>,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -170,6 +184,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             sleeper: None,
             last_wake: None,
             keyboard_paints: 0,
+            lights: None,
         }
     }
 
@@ -183,6 +198,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Install the suspend hook (power button / sleep cover).
     pub fn with_sleeper(mut self, sleeper: SleepFn) -> Self {
         self.sleeper = Some(sleeper);
+        self
+    }
+
+    /// Install the frontlight hook (reader edge slides).
+    pub fn with_lights(mut self, lights: Box<dyn LightControl>) -> Self {
+        self.lights = Some(lights);
         self
     }
 
@@ -212,17 +233,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Full)
     }
 
-    /// Main loop: render, then process events until the input source ends
-    /// (or the user backs out of the home screen).
-    pub fn run(&mut self) -> Result<()> {
+    /// Main loop: render, then process events until the user quits through
+    /// the power menu (or the input source ends). Returns how to exit.
+    pub fn run(&mut self) -> Result<Exit> {
         self.render_current(RefreshMode::Full)?;
         loop {
             match self.input.next_event() {
-                Err(_) => return Ok(()), // input source closed
+                Err(_) => return Ok(Exit::Close), // input source closed
                 Ok(UiEvent::Tap { x, y }) => match self.handle_tap(x, y) {
-                    Ok(Flow::Quit) => return Ok(()),
+                    Ok(Flow::Quit(exit)) => return Ok(exit),
                     Ok(Flow::Continue) => {}
                     // The UI must never die on an error: show it instead.
+                    Err(e) => self.show_error(&e)?,
+                },
+                // Edge slides only matter in the reader; elsewhere a swipe
+                // is just an overshot tap — ignore it.
+                Ok(UiEvent::Swipe { .. }) => {}
+                Ok(UiEvent::LongPress { x, y }) => match self.handle_long_press(x, y) {
+                    Ok(Flow::Quit(exit)) => return Ok(exit),
+                    Ok(Flow::Continue) => {}
                     Err(e) => self.show_error(&e)?,
                 },
                 // Physical page-turn buttons page through whatever list is
@@ -271,6 +300,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // suspend — reopen them, then drop the key press that woke us.
         self.input.refresh_devices();
         self.input.discard_queued();
+        // Suspend powers the frontlight down; bring it back to its levels.
+        if let Some(lights) = self.lights.as_mut() {
+            lights.reapply();
+        }
         self.render_current(RefreshMode::Full)?;
         result.map(|_| ())
     }
@@ -291,7 +324,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     fn pop(&mut self) -> Result<Flow> {
         if self.stack.len() <= 1 {
-            return Ok(Flow::Quit); // Back on Home exits the app
+            // Home has no Back: quitting goes through the power menu.
+            return Ok(Flow::Continue);
         }
         self.stack.pop();
         self.render_current(RefreshMode::Full)?;
@@ -319,8 +353,56 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             TapTarget::Row(row) => self.activate(row, x, y),
-            TapTarget::Title => Ok(Flow::Continue),
+            TapTarget::Title => {
+                // The power symbol lives in Home's top-right corner.
+                if matches!(self.screen(), Screen::Home)
+                    && x >= self.layout.width.saturating_sub(self.layout.title_h * 2)
+                {
+                    self.push(Screen::PowerMenu)?;
+                }
+                Ok(Flow::Continue)
+            }
         }
+    }
+
+    /// Long press: on a library book, open its source's chapter list so
+    /// more chapters of the series can be downloaded straight from the
+    /// card. Everywhere else a long press is just a slow tap.
+    fn handle_long_press(&mut self, x: u32, y: u32) -> Result<Flow> {
+        let screen = self.stack.last().cloned().expect("stack never empty");
+        let Screen::Library { entries, page } = screen else {
+            return self.handle_tap(x, y);
+        };
+        let Some(entry) = self.library_cell_at(&entries, page, x, y) else {
+            return Ok(Flow::Continue);
+        };
+        let series_dir = entry
+            .relative_path
+            .split('/')
+            .next()
+            .unwrap_or(&entry.relative_path)
+            .to_string();
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let Some(origin) = index.get(&series_dir) else {
+            self.push(Screen::Message {
+                title: "Chapters".to_string(),
+                body: format!(
+                    "\"{series_dir}\" isn't linked to a source (copied over USB?), \
+                     so there's no chapter list to fetch."
+                ),
+            })?;
+            return Ok(Flow::Continue);
+        };
+        let source = SourceEntry {
+            id: origin.source_id.clone(),
+            name: origin.source_name.clone(),
+        };
+        let manga = MangaEntry {
+            id: origin.manga_id.clone(),
+            title: origin.manga_title.clone(),
+        };
+        self.open_chapter_list(&source, &manga)?;
+        Ok(Flow::Continue)
     }
 
     /// Change page within the current screen (partial refresh).
@@ -437,6 +519,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Screen::PowerMenu => match row {
+                0 => Ok(Flow::Quit(Exit::Restart)),
+                1 => Ok(Flow::Quit(Exit::Close)),
+                _ => Ok(Flow::Continue),
+            },
             Screen::UpdatePrompt { .. } => {
                 self.install_update()?;
                 Ok(Flow::Continue)
@@ -742,6 +829,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &mut progress,
         )?;
 
+        // Remember where this series came from, so a long press on its
+        // library card can reopen the source's chapter list later.
+        if let Some(dir) = cbz_path.parent().and_then(|p| p.file_name()) {
+            let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+            index.record(
+                &dir.to_string_lossy(),
+                gideon_core::SeriesRef {
+                    source_id: source.id.clone(),
+                    source_name: source.name.clone(),
+                    manga_id: manga.id.clone(),
+                    manga_title: manga.title.clone(),
+                },
+            );
+            if let Err(e) = index.save(&self.library_dir) {
+                eprintln!("gideon: couldn't save the series index: {e}");
+            }
+        }
+
         // Taps queued while the download ran were aimed at the (now gone)
         // chapter list — drop them so they don't flip pages in the reader.
         // A sleep cover closed during the download survives the drain: the
@@ -752,7 +857,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.run_reader(&cbz_path, &key)? {
             Ok(Flow::Continue)
         } else {
-            Ok(Flow::Quit)
+            Ok(Flow::Quit(Exit::Close))
         }
     }
 
@@ -766,13 +871,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         )
     }
 
-    fn tap_library_cell(
-        &mut self,
+    /// The library entry whose shelf cell contains the tap, if any.
+    fn library_cell_at(
+        &self,
         entries: &[LibraryEntry],
         page: usize,
         x: u32,
         y: u32,
-    ) -> Result<Flow> {
+    ) -> Option<LibraryEntry> {
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
         let local_y = y.saturating_sub(self.layout.content_top());
@@ -784,16 +890,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 && local_y >= cy
                 && local_y < cy + shelf.cell_height()
             {
-                let entry = entries[page * capacity + cell].clone();
-                let keep_running = self.run_reader(&entry.path, &entry.relative_path)?;
-                return Ok(if keep_running {
-                    Flow::Continue
-                } else {
-                    Flow::Quit
-                });
+                return Some(entries[page * capacity + cell].clone());
             }
         }
-        Ok(Flow::Continue)
+        None
+    }
+
+    fn tap_library_cell(
+        &mut self,
+        entries: &[LibraryEntry],
+        page: usize,
+        x: u32,
+        y: u32,
+    ) -> Result<Flow> {
+        let Some(entry) = self.library_cell_at(entries, page, x, y) else {
+            return Ok(Flow::Continue);
+        };
+        let keep_running = self.run_reader(&entry.path, &entry.relative_path)?;
+        Ok(if keep_running {
+            Flow::Continue
+        } else {
+            Flow::Quit(Exit::Close)
+        })
     }
 
     // --- reader session ---
@@ -836,6 +954,53 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(UiEvent::PageBack) => {
                         reader.prev_page()?;
                     }
+                    // Edge slides (panel coordinates — the physical bezel
+                    // edge, regardless of reading rotation): right edge is
+                    // brightness, left edge is night-light warmth. Sliding
+                    // up increases; the full screen height is the full
+                    // 0–100 range.
+                    Ok(UiEvent::Swipe { x0, y0, x1, y1 }) => {
+                        let edge = (layout.width / 8).max(1);
+                        let on_right = x0 >= layout.width - edge && x1 >= layout.width - edge;
+                        let on_left = x0 < edge && x1 < edge;
+                        if !on_right && !on_left {
+                            // A mid-screen downward swipe leaves the manga.
+                            if y1 > y0 && (y1 - y0) > x1.abs_diff(x0) {
+                                break;
+                            }
+                            continue;
+                        }
+                        let Some(lights) = self.lights.as_mut() else {
+                            continue;
+                        };
+                        let height = layout.height.max(1);
+                        let delta = ((y0 as i64 - y1 as i64) * 100 / height as i64) as i32;
+                        if delta == 0 {
+                            continue;
+                        }
+                        let banner = if on_right {
+                            let new = (lights.brightness() as i32 + delta).clamp(0, 100) as u8;
+                            lights.set_brightness(new);
+                            format!("Brightness {new}%")
+                        } else {
+                            let new = (lights.warmth() as i32 + delta).clamp(0, 100) as u8;
+                            lights.set_warmth(new);
+                            format!("Night light {new}%")
+                        };
+                        reader.show_banner(&banner)?;
+                    }
+                    // A slow tap is still a tap in the reader.
+                    Ok(UiEvent::LongPress { x, y }) => {
+                        match layout.reader_zone_rotated(x, y, rotation) {
+                            ReaderZone::NextPage => {
+                                reader.next_page()?;
+                            }
+                            ReaderZone::PrevPage => {
+                                reader.prev_page()?;
+                            }
+                            ReaderZone::Back => break,
+                        }
+                    }
                     Ok(UiEvent::Sleep) => {
                         // Field accesses only: `reader` is borrowing
                         // `self.display`, so no whole-`self` method calls.
@@ -857,9 +1022,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             continue; // still awake, screen untouched
                         }
                         // Reopen possibly re-registered input nodes, drop
-                        // the wake key press, repaint in full.
+                        // the wake key press, relight, repaint in full.
                         self.input.refresh_devices();
                         self.input.discard_queued();
+                        if let Some(lights) = self.lights.as_mut() {
+                            lights.reapply();
+                        }
                         reader.repaint_full()?;
                     }
                 }
@@ -911,9 +1079,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let rows: Vec<(String, bool)> =
                     HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
                 // The version in the title answers "did the update take?"
-                // at a glance.
+                // at a glance. No Back on Home — the power symbol in the
+                // top-right corner opens the restart/close menu instead.
                 let title = concat!("gideon v", env!("CARGO_PKG_VERSION"));
-                compose_list(l, title, &rows, 0, 1)
+                let mut canvas = compose_list_opts(l, title, &rows, 0, 1, false);
+                draw_power_icon(&mut canvas, l);
+                canvas
+            }
+            Screen::PowerMenu => {
+                let rows = vec![
+                    ("Restart gideon".to_string(), true),
+                    ("Close gideon".to_string(), true),
+                ];
+                compose_list(l, "Power", &rows, 0, 1)
             }
             Screen::Library { entries, page } => self.compose_library(entries, *page)?,
             Screen::Sources { rows, page } => {
@@ -1024,7 +1202,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     (p.current_page + 1) as f32 / p.total_pages as f32
                 }
             });
-            shelf_entries.push(ShelfEntry { cover, progress });
+            shelf_entries.push(ShelfEntry {
+                cover,
+                title: entry_title(&entry.relative_path),
+                progress,
+            });
         }
         let grid = compose_shelf(&shelf_entries, &shelf);
         copy_into(&mut canvas, &grid, 0, l.content_top());
@@ -1042,6 +1224,18 @@ fn paged<T>(items: &[T], page: usize, per_page: usize) -> &[T] {
 
 /// White canvas with the title bar and bottom navigation bar drawn.
 fn compose_chrome(l: &UiLayout, title: &str, page: usize, page_count: usize) -> GrayPage {
+    compose_chrome_opts(l, title, page, page_count, true)
+}
+
+/// Like [`compose_chrome`], but Home passes `show_back = false`: its
+/// bottom-left corner has no Back (quitting goes through the power menu).
+fn compose_chrome_opts(
+    l: &UiLayout,
+    title: &str,
+    page: usize,
+    page_count: usize,
+    show_back: bool,
+) -> GrayPage {
     let mut canvas = GrayPage::new_white(l.width, l.height);
     let text_y = |top: u32, h: u32| top + h.saturating_sub(l.text_px as u32 + 4) / 2;
 
@@ -1074,15 +1268,17 @@ fn compose_chrome(l: &UiLayout, title: &str, page: usize, page_count: usize) -> 
     hline(&mut canvas, l.nav_top(), 0x55);
     let third = (l.width / 3).max(1);
     let nav_y = text_y(l.nav_top(), l.nav_h);
-    draw_text(
-        &mut canvas,
-        l.pad,
-        nav_y,
-        l.text_px,
-        "< Back",
-        third.saturating_sub(l.pad),
-        false,
-    );
+    if show_back {
+        draw_text(
+            &mut canvas,
+            l.pad,
+            nav_y,
+            l.text_px,
+            "< Back",
+            third.saturating_sub(l.pad),
+            false,
+        );
+    }
     if page_count > 1 {
         draw_text(
             &mut canvas,
@@ -1114,7 +1310,18 @@ fn compose_list(
     page: usize,
     page_count: usize,
 ) -> GrayPage {
-    let mut canvas = compose_chrome(l, title, page, page_count);
+    compose_list_opts(l, title, rows, page, page_count, true)
+}
+
+fn compose_list_opts(
+    l: &UiLayout,
+    title: &str,
+    rows: &[(String, bool)],
+    page: usize,
+    page_count: usize,
+    show_back: bool,
+) -> GrayPage {
+    let mut canvas = compose_chrome_opts(l, title, page, page_count, show_back);
     for (i, (text, bold)) in rows.iter().take(l.rows_per_page()).enumerate() {
         let top = l.row_top(i);
         draw_text(
@@ -1253,6 +1460,35 @@ fn wrap_text(px: f32, text: &str, max_w: u32) -> Vec<String> {
     lines
 }
 
+/// The standard power symbol (an arc with a stem through its gap), drawn
+/// in the top-right corner of the title bar. Tappable region: the right
+/// `2 × title_h` of the title bar (see `handle_tap`).
+fn draw_power_icon(canvas: &mut GrayPage, l: &UiLayout) {
+    let r = (l.title_h as f32) / 3.2;
+    let cx = l.width.saturating_sub(l.title_h / 2 + l.pad) as f32;
+    let cy = (l.title_h as f32) * 0.55;
+
+    let span = (r as u32) + 3;
+    for dy in -(span as i32)..=(span as i32) {
+        for dx in -(span as i32)..=(span as i32) {
+            let (fx, fy) = (dx as f32, dy as f32);
+            let dist = (fx * fx + fy * fy).sqrt();
+            // The arc: a ring with a gap at the top for the stem.
+            let on_ring = (dist - r).abs() <= 1.6;
+            let in_gap = fy < 0.0 && fx.abs() < r * 0.45;
+            // The stem: a vertical bar through the gap.
+            let on_stem = fx.abs() <= 1.6 && (-r - 3.0..=-r * 0.15).contains(&fy);
+            if (on_ring && !in_gap) || on_stem {
+                let x = cx + fx;
+                let y = cy + fy;
+                if x >= 0.0 && y >= 0.0 && (x as u32) < canvas.width && (y as u32) < canvas.height {
+                    canvas.pixels[(y as u32 * canvas.width + x as u32) as usize] = 0x00;
+                }
+            }
+        }
+    }
+}
+
 /// 1px rectangle outline, clipped to the canvas.
 fn rect_outline(canvas: &mut GrayPage, x: u32, y: u32, w: u32, h: u32, value: u8) {
     if w == 0 || h == 0 {
@@ -1292,6 +1528,21 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
         let dst_start = ((off_y + y) * dst.width + off_x) as usize;
         dst.pixels[dst_start..dst_start + copy_w as usize]
             .copy_from_slice(&src.pixels[src_start..src_start + copy_w as usize]);
+    }
+}
+
+/// Card name for a library entry: "Series — Chapter" when it lives in a
+/// series directory, just the file stem otherwise.
+fn entry_title(relative_path: &str) -> String {
+    let mut parts = relative_path.rsplitn(2, '/');
+    let file = parts.next().unwrap_or(relative_path);
+    let stem = file
+        .strip_suffix(".cbz")
+        .or_else(|| file.strip_suffix(".CBZ"))
+        .unwrap_or(file);
+    match parts.next() {
+        Some(series) if !series.is_empty() => format!("{series} — {stem}"),
+        _ => stem.to_string(),
     }
 }
 
