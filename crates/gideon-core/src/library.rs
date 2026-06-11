@@ -93,6 +93,12 @@ fn scan_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             continue;
         }
         if path.is_dir() {
+            // Profile libraries live in "@name" subdirectories; a scan of
+            // the root (the default profile) must not see other profiles'
+            // books. The @ prefix keeps them apart from series dirs.
+            if name.starts_with('@') {
+                continue;
+            }
             scan_dir(&path, out)?;
         } else if name.to_ascii_lowercase().ends_with(".cbz") {
             out.push(path);
@@ -190,6 +196,24 @@ mod tests {
                 "One Piece/vol10.cbz",
             ]
         );
+    }
+
+    #[test]
+    fn scan_skips_profile_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("Shared/vol1.cbz"));
+        touch(&root.join("@alex/Alexs Series/vol1.cbz"));
+
+        // The root (default profile) doesn't see other profiles' books...
+        let entries = Library::new(root).scan().unwrap();
+        let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+        assert_eq!(rel, vec!["Shared/vol1.cbz"]);
+
+        // ...but a scan rooted at the profile dir sees its own.
+        let entries = Library::new(root.join("@alex")).scan().unwrap();
+        let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+        assert_eq!(rel, vec!["Alexs Series/vol1.cbz"]);
     }
 
     #[test]

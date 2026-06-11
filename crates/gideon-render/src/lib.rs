@@ -58,8 +58,65 @@ impl GrayPage {
     }
 }
 
+/// A rendered color page: 8-bit RGB pixels, row-major, 3 bytes per pixel
+/// (`width * height * 3` long). Used where color survives to the panel —
+/// today the library shelf's covers on Kaleido devices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbPage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl RgbPage {
+    pub fn new_white(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![0xFF; (width * height * 3) as usize],
+        }
+    }
+
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 3] {
+        let idx = ((y * self.width + x) * 3) as usize;
+        [self.pixels[idx], self.pixels[idx + 1], self.pixels[idx + 2]]
+    }
+
+    /// Replicate a grayscale page into RGB (equal channels).
+    pub fn from_gray(gray: &GrayPage) -> Self {
+        let mut pixels = Vec::with_capacity(gray.pixels.len() * 3);
+        for &g in &gray.pixels {
+            pixels.extend_from_slice(&[g, g, g]);
+        }
+        Self {
+            width: gray.width,
+            height: gray.height,
+            pixels,
+        }
+    }
+
+    /// Collapse to grayscale with Rec.601 luma — what grayscale panels
+    /// (and the default device blit) show for color content.
+    pub fn to_gray(&self) -> GrayPage {
+        GrayPage {
+            width: self.width,
+            height: self.height,
+            pixels: self
+                .pixels
+                .chunks_exact(3)
+                .map(|px| luma_rec601(px[0], px[1], px[2]))
+                .collect(),
+        }
+    }
+}
+
+/// Rec.601 luma: 0.299 R + 0.587 G + 0.114 B, rounded.
+pub fn luma_rec601(r: u8, g: u8, b: u8) -> u8 {
+    ((299 * r as u32 + 587 * g as u32 + 114 * b as u32 + 500) / 1000) as u8
+}
+
 /// Rendering options.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
     pub screen_width: u32,
     pub screen_height: u32,
@@ -116,9 +173,16 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
         opts.fit,
     );
 
-    let scaled = page
-        .resize_exact(target_w, target_h, FilterType::Lanczos3)
-        .into_luma8();
+    // Downscales (the normal case) use Triangle: ~4x faster than Lanczos3
+    // on the device's ARM core and indistinguishable for manga once
+    // dithered. Upscales (low-res sources) use CatmullRom — Triangle is
+    // visibly soft when enlarging.
+    let filter = if target_w > page.width() || target_h > page.height() {
+        FilterType::CatmullRom
+    } else {
+        FilterType::Triangle
+    };
+    let scaled = page.resize_exact(target_w, target_h, filter).into_luma8();
 
     let canvas_w = opts.screen_width.max(target_w);
     let canvas_h = opts.screen_height.max(target_h);
@@ -371,6 +435,27 @@ mod tests {
         assert_eq!(FitMode::from_setting("contain"), FitMode::Contain);
         assert_eq!(FitMode::from_setting("sideways"), FitMode::Contain);
         assert_eq!(FitMode::from_setting(""), FitMode::Contain);
+    }
+
+    #[test]
+    fn rgb_page_round_trips_gray_and_collapses_with_rec601() {
+        let gray = GrayPage {
+            width: 2,
+            height: 1,
+            pixels: vec![0x12, 0xAB],
+        };
+        let rgb = RgbPage::from_gray(&gray);
+        assert_eq!(rgb.pixel(0, 0), [0x12, 0x12, 0x12]);
+        // Gray in, gray out: equal channels survive the luma exactly.
+        assert_eq!(rgb.to_gray(), gray);
+
+        // Primaries collapse with the Rec.601 weights.
+        let color = RgbPage {
+            width: 3,
+            height: 1,
+            pixels: vec![255, 0, 0, 0, 255, 0, 0, 0, 255],
+        };
+        assert_eq!(color.to_gray().pixels, vec![76, 150, 29]);
     }
 
     #[test]

@@ -10,9 +10,11 @@
 //!   taller than the screen; `next_page` scrolls down (with a small overlap)
 //!   until the bottom is reached, and only then turns the page. `prev_page`
 //!   scrolls up first, and enters the previous page at its bottom.
-//! * **Pre-decoding** — while page N is on screen, a [`Prefetcher`] decodes
-//!   page N+1 on a background thread (with its own [`CbzDocument`] handle)
-//!   so the next page turn doesn't wait on the decoder.
+//! * **Render-ahead** — while page N is on screen, a [`Prefetcher`] decodes
+//!   *and fully renders* page N+1 (scale + dither) on a background thread
+//!   (with its own [`CbzDocument`] handle), so a page turn is just a blit
+//!   and a refresh. The previous page stays cached, so going back is
+//!   equally instant.
 //! * **Rotation** — pages are rendered against the *reading* orientation
 //!   (screen dimensions swapped for 90/270) and the visible window is
 //!   rotated into the panel orientation just before blitting.
@@ -21,13 +23,17 @@ use anyhow::Result;
 use gideon_core::{CbzDocument, ProgressStore};
 use gideon_device::{Display, RefreshMode};
 use gideon_render::{render_page, rotate_page, FitMode, GrayPage, RenderOptions};
-use image::DynamicImage;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 /// Do a full (flashing) e-ink refresh every N page turns to clear ghosting;
 /// partial refreshes in between keep page turns fast.
 const FULL_REFRESH_INTERVAL: u32 = 6;
+
+/// Keep rendered pages cached only while each stays under this many
+/// screenfuls of pixels — webtoon-length FitWidth strips would otherwise
+/// pin tens of MB per cache slot on a 512MB device.
+const CACHE_BUDGET_SCREENS: usize = 4;
 
 /// When scrolling within a FitWidth page, keep this many pixels of the
 /// previous view visible so the reader doesn't lose their place.
@@ -45,6 +51,9 @@ pub struct Reader<D: Display> {
     /// The current page rendered in reading orientation, keyed by index,
     /// so scrolling never re-decodes.
     rendered: Option<(usize, GrayPage)>,
+    /// The previously shown page, kept rendered so `prev_page` is as fast
+    /// as `next_page`.
+    spare: Option<(usize, GrayPage)>,
     prefetcher: Prefetcher,
     turns_since_full_refresh: u32,
 }
@@ -62,9 +71,31 @@ impl<D: Display> Reader<D> {
             current_page: 0,
             scroll_y: 0,
             rendered: None,
+            spare: None,
             prefetcher,
             turns_since_full_refresh: 0,
         }
+    }
+
+    /// The current reading rotation in degrees.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rotation(&self) -> u32 {
+        self.rotation
+    }
+
+    /// Change the reading rotation (0/90/180/270). Invalidates every
+    /// rendered page — the fit is computed against the rotated screen —
+    /// and forces the next paint to be a full refresh.
+    pub fn set_rotation(&mut self, degrees: u32) {
+        let rotation = normalize_rotation(degrees);
+        if rotation == self.rotation {
+            return;
+        }
+        self.rotation = rotation;
+        self.rendered = None;
+        self.spare = None;
+        self.scroll_y = 0;
+        self.turns_since_full_refresh = 0;
     }
 
     /// Access the underlying display (used by tests and debug tooling).
@@ -132,23 +163,27 @@ impl<D: Display> Reader<D> {
     pub fn show_current_page(&mut self) -> Result<()> {
         let (reading_w, reading_h) = self.reading_dims();
 
+        let opts = RenderOptions {
+            screen_width: reading_w,
+            screen_height: reading_h,
+            fit: self.fit,
+            dither: true,
+        };
         let cached = matches!(&self.rendered, Some((index, _)) if *index == self.current_page);
         if !cached {
-            // Use the prefetched image when it's for this page; otherwise
-            // decode synchronously.
-            let image = match self.prefetcher.take(self.current_page) {
-                Some(image) => image,
-                None => self.doc.decode_page(self.current_page)?,
+            // Cheapest first: the spare slot (the page we just came from),
+            // then the render-ahead result, then a synchronous decode.
+            let spare_hit = matches!(&self.spare, Some((i, _)) if *i == self.current_page);
+            let page = if spare_hit {
+                self.spare.take().expect("matched above").1
+            } else if let Some(page) = self.prefetcher.take(self.current_page, &opts) {
+                page
+            } else {
+                let image = self.doc.decode_page(self.current_page)?;
+                render_page(&image, &opts)
             };
-            let opts = RenderOptions {
-                screen_width: reading_w,
-                screen_height: reading_h,
-                fit: self.fit,
-                dither: true,
-            };
-            self.rendered = Some((self.current_page, render_page(&image, &opts)));
-            // Kick off decoding of the next page in the background.
-            self.prefetcher.start(self.current_page + 1);
+            // The outgoing page becomes the spare: going back is instant.
+            self.spare = self.rendered.replace((self.current_page, page));
         }
 
         let page = &self.rendered.as_ref().expect("rendered above").1;
@@ -172,6 +207,24 @@ impl<D: Display> Reader<D> {
             RefreshMode::Partial
         };
         self.display.flush(mode)?;
+
+        // Cache policy AFTER the paint (never stall a blit on a stale
+        // in-flight render): tall FitWidth pages can be enormous —
+        // 1680xN webtoon strips — so cap what stays resident. Past the
+        // budget, drop the spare and skip the render-ahead; neighbors of
+        // a huge page are almost certainly huge too.
+        let budget = (reading_w as usize) * (reading_h as usize) * CACHE_BUDGET_SCREENS;
+        let huge = self
+            .rendered
+            .as_ref()
+            .is_some_and(|(_, p)| p.pixels.len() > budget);
+        if huge {
+            self.spare = None;
+        } else {
+            // Render the next page ahead, fully (scale + dither): the
+            // next turn is then just a blit + refresh.
+            self.prefetcher.start(self.current_page + 1, &opts);
+        }
         Ok(())
     }
 
@@ -295,23 +348,26 @@ fn crop_rows(page: &GrayPage, offset_y: u32, height: u32) -> GrayPage {
     }
 }
 
-/// Decodes the upcoming page on a background thread so page turns don't
-/// wait on the image decoder.
+/// Decodes *and renders* the upcoming page on a background thread so a
+/// page turn is just a blit + refresh — the decode, scale and dither all
+/// happened while the user was still reading the previous page.
 ///
 /// The prefetcher owns its own [`CbzDocument`] (an independent handle to
-/// the same file) and moves it into each decode thread, taking it back
-/// through the result channel. Without a document (e.g. `try_clone`
-/// failed) every call degrades to a no-op and the reader decodes
-/// synchronously.
+/// the same file) and moves it into each render thread, taking it back
+/// through the result channel. Results are keyed by the render options:
+/// a rotation or fit change invalidates an in-flight prefetch. Without a
+/// document (e.g. `try_clone` failed) every call degrades to a no-op and
+/// the reader renders synchronously.
 struct Prefetcher {
-    /// The idle document handle, ready to move into the next decode thread.
+    /// The idle document handle, ready to move into the next render thread.
     doc: Option<CbzDocument>,
     pending: Option<Pending>,
 }
 
 struct Pending {
     index: usize,
-    rx: mpsc::Receiver<(CbzDocument, Option<DynamicImage>)>,
+    opts: RenderOptions,
+    rx: mpsc::Receiver<(CbzDocument, Option<GrayPage>)>,
     handle: JoinHandle<()>,
 }
 
@@ -320,10 +376,18 @@ impl Prefetcher {
         Self { doc, pending: None }
     }
 
-    /// Start decoding `index` in the background. Any in-flight prefetch is
-    /// drained first (its result is discarded). Out-of-range indices are
-    /// ignored, so prefetching past the last page is a no-op.
-    fn start(&mut self, index: usize) {
+    /// Start rendering `index` with `opts` in the background. Any in-flight
+    /// prefetch is drained first (its result is discarded unless it already
+    /// matches). Out-of-range indices are ignored, so prefetching past the
+    /// last page is a no-op.
+    fn start(&mut self, index: usize, opts: &RenderOptions) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.index == index && p.opts == *opts)
+        {
+            return; // already in flight for exactly this page
+        }
         self.reclaim();
         let Some(mut doc) = self.doc.take() else {
             return;
@@ -333,37 +397,49 @@ impl Prefetcher {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        let thread_opts = *opts;
         let handle = std::thread::spawn(move || {
-            // Decode errors aren't fatal here: the reader falls back to a
-            // synchronous decode and reports the error from there.
-            let image = doc.decode_page(index).ok();
-            let _ = tx.send((doc, image));
+            // Errors aren't fatal here: the reader falls back to a
+            // synchronous render and reports the error from there.
+            let page = doc
+                .decode_page(index)
+                .ok()
+                .map(|image| render_page(&image, &thread_opts));
+            let _ = tx.send((doc, page));
         });
-        self.pending = Some(Pending { index, rx, handle });
+        self.pending = Some(Pending {
+            index,
+            opts: *opts,
+            rx,
+            handle,
+        });
     }
 
-    /// Take the prefetched image if it was decoded for exactly `index`.
-    /// Returns `None` (caller decodes synchronously) when nothing is in
-    /// flight, the prefetch was for another page, or decoding failed.
-    fn take(&mut self, index: usize) -> Option<DynamicImage> {
-        let wanted = self.pending.as_ref().is_some_and(|p| p.index == index);
-        let image = self.reclaim();
+    /// Take the prefetched page if it was rendered for exactly `index`
+    /// with exactly `opts`. Returns `None` (caller renders synchronously)
+    /// when nothing matching is in flight or rendering failed.
+    fn take(&mut self, index: usize, opts: &RenderOptions) -> Option<GrayPage> {
+        let wanted = self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.index == index && p.opts == *opts);
+        let page = self.reclaim();
         if wanted {
-            image
+            page
         } else {
             None
         }
     }
 
-    /// Wait for any in-flight decode, take the document handle back and
-    /// return the decoded image (if any).
-    fn reclaim(&mut self) -> Option<DynamicImage> {
+    /// Wait for any in-flight render, take the document handle back and
+    /// return the rendered page (if any).
+    fn reclaim(&mut self) -> Option<GrayPage> {
         let pending = self.pending.take()?;
         let received = pending.rx.recv().ok();
         let _ = pending.handle.join();
-        let (doc, image) = received?;
+        let (doc, page) = received?;
         self.doc = Some(doc);
-        image
+        page
     }
 }
 
@@ -639,25 +715,34 @@ mod tests {
 
     // --- prefetching ---
 
+    fn opts(w: u32, h: u32) -> RenderOptions {
+        RenderOptions {
+            screen_width: w,
+            screen_height: h,
+            fit: FitMode::Contain,
+            dither: true,
+        }
+    }
+
     #[test]
-    fn prefetcher_returns_the_right_image_for_the_right_index() {
+    fn prefetcher_returns_the_rendered_page_for_the_right_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.cbz");
-        // Distinct dimensions per page so images are distinguishable.
+        // Distinct dimensions per page so pages are distinguishable.
         make_cbz_sized(&path, &[(8, 8), (10, 12), (14, 6)]);
         let mut doc = CbzDocument::open(&path).unwrap();
         let mut prefetcher = Prefetcher::new(doc.try_clone().ok());
+        let o = opts(16, 16);
 
-        prefetcher.start(1);
-        let image = prefetcher.take(1).expect("prefetched image for index 1");
-        let direct = doc.decode_page(1).unwrap();
-        assert_eq!((image.width(), image.height()), (10, 12));
-        assert_eq!(image.into_luma8(), direct.into_luma8());
+        prefetcher.start(1, &o);
+        let page = prefetcher.take(1, &o).expect("rendered page for index 1");
+        // The background render matches a synchronous one exactly.
+        let direct = render_page(&doc.decode_page(1).unwrap(), &o);
+        assert_eq!(page.pixels, direct.pixels);
 
         // The prefetcher reclaimed its document and can go again.
-        prefetcher.start(2);
-        let image = prefetcher.take(2).expect("prefetched image for index 2");
-        assert_eq!((image.width(), image.height()), (14, 6));
+        prefetcher.start(2, &o);
+        assert!(prefetcher.take(2, &o).is_some());
     }
 
     #[test]
@@ -667,14 +752,33 @@ mod tests {
         make_cbz_sized(&path, &[(8, 8), (10, 12), (14, 6)]);
         let doc = CbzDocument::open(&path).unwrap();
         let mut prefetcher = Prefetcher::new(doc.try_clone().ok());
+        let o = opts(16, 16);
 
-        prefetcher.start(1);
+        prefetcher.start(1, &o);
         // The user went backwards: the prefetched page 1 is useless.
-        assert!(prefetcher.take(0).is_none());
+        assert!(prefetcher.take(0, &o).is_none());
         // The document handle survived; the next prefetch still works.
-        prefetcher.start(2);
-        let image = prefetcher.take(2).expect("prefetcher still functional");
-        assert_eq!((image.width(), image.height()), (14, 6));
+        prefetcher.start(2, &o);
+        assert!(prefetcher.take(2, &o).is_some());
+    }
+
+    #[test]
+    fn changed_render_options_invalidate_the_prefetch() {
+        // A rotation (or fit) change between prefetch and take means the
+        // in-flight page was rendered for the wrong screen: discard it.
+        let dir = tempfile::tempdir().unwrap();
+        let doc = open_doc(dir.path(), 3);
+        let mut prefetcher = Prefetcher::new(doc.try_clone().ok());
+
+        prefetcher.start(1, &opts(16, 16));
+        assert!(
+            prefetcher.take(1, &opts(32, 16)).is_none(),
+            "stale options must not be served"
+        );
+        // Still functional with the new options afterwards.
+        prefetcher.start(1, &opts(32, 16));
+        let page = prefetcher.take(1, &opts(32, 16)).expect("fresh render");
+        assert_eq!((page.width, page.height), (32, 16));
     }
 
     #[test]
@@ -682,8 +786,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let doc = open_doc(dir.path(), 2);
         let mut prefetcher = Prefetcher::new(doc.try_clone().ok());
-        assert!(prefetcher.take(0).is_none());
-        assert!(prefetcher.take(1).is_none());
+        let o = opts(16, 16);
+        assert!(prefetcher.take(0, &o).is_none());
+        assert!(prefetcher.take(1, &o).is_none());
     }
 
     #[test]
@@ -691,19 +796,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let doc = open_doc(dir.path(), 2);
         let mut prefetcher = Prefetcher::new(doc.try_clone().ok());
+        let o = opts(16, 16);
 
-        prefetcher.start(2); // out of range
-        assert!(prefetcher.take(2).is_none());
+        prefetcher.start(2, &o); // out of range
+        assert!(prefetcher.take(2, &o).is_none());
         // Still usable afterwards.
-        prefetcher.start(1);
-        assert!(prefetcher.take(1).is_some());
+        prefetcher.start(1, &o);
+        assert!(prefetcher.take(1, &o).is_some());
     }
 
     #[test]
     fn prefetcher_without_document_degrades_to_sync() {
         let mut prefetcher = Prefetcher::new(None);
-        prefetcher.start(1);
-        assert!(prefetcher.take(1).is_none());
+        let o = opts(16, 16);
+        prefetcher.start(1, &o);
+        assert!(prefetcher.take(1, &o).is_none());
+    }
+
+    #[test]
+    fn going_back_uses_the_spare_page() {
+        // After 0 -> 1, page 0 sits in the spare slot; 1 -> 0 must reuse it
+        // (and render identically to a fresh paint).
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = new_reader(dir.path(), 3);
+        reader.show_current_page().unwrap();
+        let first_paint = reader.display().buffer.clone();
+
+        reader.next_page().unwrap();
+        assert!(
+            matches!(&reader.spare, Some((0, _))),
+            "page 0 kept rendered"
+        );
+        reader.prev_page().unwrap();
+        assert_eq!(reader.display().buffer, first_paint);
+        assert!(
+            matches!(&reader.spare, Some((1, _))),
+            "page 1 becomes the spare in turn"
+        );
+    }
+
+    #[test]
+    fn set_rotation_rerenders_against_the_rotated_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = rotated_reader(dir.path(), 0);
+        reader.show_current_page().unwrap();
+        assert!(reader.display().pixel(10, 50) < 0x40, "black left at 0°");
+
+        reader.set_rotation(90);
+        assert_eq!(reader.rotation(), 90);
+        reader.show_current_page().unwrap();
+        // Clockwise: the reading-left (black) half lands at the panel top,
+        // and the post-rotation paint is a full refresh.
+        assert!(reader.display().pixel(50, 10) < 0x40);
+        assert!(reader.display().pixel(50, 90) > 0xC0);
+        assert_eq!(
+            reader.display().flushes.last(),
+            Some(&RefreshMode::Full),
+            "rotation repaint must flash clean"
+        );
     }
 
     #[test]

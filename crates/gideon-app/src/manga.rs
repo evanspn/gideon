@@ -220,6 +220,27 @@ pub fn cmd_manga_download(
     Ok(())
 }
 
+/// Download a manga cover image to `dest`. Cover art is metadata: callers
+/// treat failures as non-fatal (the shelf falls back to the first page).
+pub async fn download_cover(url: &str, dest: &Path) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .danger_accept_invalid_certs(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let response = client.get(url).send().await?.error_for_status()?;
+    let bytes = response.bytes().await?;
+    // Only persist real images — an HTML error page is not a cover.
+    image::guess_format(&bytes).map_err(|_| anyhow::anyhow!("cover at {url} is not an image"))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, &bytes)?;
+    Ok(())
+}
+
 /// Download a chapter through `source` into `library` as a CBZ (with a
 /// ComicInfo.xml), reporting `(pages_done, pages_total)` through `progress`
 /// (called once with `(0, total)` before the first page). Returns the path

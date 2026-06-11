@@ -6,7 +6,7 @@
 //! * `KoboDisplay` (feature `kobo`) — Linux framebuffer with mxcfb e-ink
 //!   refresh ioctls, for actual Kobo hardware.
 
-use gideon_render::GrayPage;
+use gideon_render::{GrayPage, RgbPage};
 
 pub mod input;
 #[cfg(feature = "kobo")]
@@ -50,6 +50,14 @@ pub trait Display {
     /// vertical scroll position within it.
     fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()>;
 
+    /// Copy a rendered COLOR page onto the backbuffer. The default
+    /// collapses to grayscale (Rec.601 luma) and blits that, so
+    /// monochrome backends and tests behave exactly like [`Self::blit`];
+    /// color-capable backends (Kaleido) override it.
+    fn blit_rgb(&mut self, page: &RgbPage, offset_y: u32) -> Result<()> {
+        self.blit(&page.to_gray(), offset_y)
+    }
+
     /// Push the backbuffer to the physical screen.
     fn flush(&mut self, mode: RefreshMode) -> Result<()>;
 }
@@ -67,6 +75,10 @@ impl<D: Display + ?Sized> Display for &mut D {
 
     fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
         (**self).blit(page, offset_y)
+    }
+
+    fn blit_rgb(&mut self, page: &RgbPage, offset_y: u32) -> Result<()> {
+        (**self).blit_rgb(page, offset_y)
     }
 
     fn flush(&mut self, mode: RefreshMode) -> Result<()> {
@@ -147,6 +159,34 @@ pub(crate) fn blit_into(
     }
 }
 
+/// Like [`blit_into`], but for packed RGB (3 bytes per pixel) buffers.
+/// Same window/centering/padding semantics as the grayscale version.
+#[cfg(feature = "kobo")]
+pub(crate) fn blit_rgb_into(
+    buffer: &mut [u8],
+    screen_w: u32,
+    screen_h: u32,
+    page: &RgbPage,
+    offset_y: u32,
+) {
+    buffer.fill(0xFF);
+
+    let copy_w = page.width.min(screen_w);
+    let dst_x = (screen_w - copy_w) / 2;
+    let src_x = (page.width - copy_w) / 2;
+
+    let max_offset = page.height.saturating_sub(1);
+    let offset_y = offset_y.min(max_offset);
+    let copy_h = (page.height - offset_y).min(screen_h);
+
+    for row in 0..copy_h {
+        let src_start = (((offset_y + row) * page.width + src_x) * 3) as usize;
+        let dst_start = ((row * screen_w + dst_x) * 3) as usize;
+        buffer[dst_start..dst_start + copy_w as usize * 3]
+            .copy_from_slice(&page.pixels[src_start..src_start + copy_w as usize * 3]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +243,20 @@ mod tests {
         // Clamped to last row: one row of page visible, rest white.
         assert_eq!(d.pixel(0, 0), 0x00);
         assert_eq!(d.pixel(0, 1), 0xFF);
+    }
+
+    #[test]
+    fn default_blit_rgb_collapses_with_rec601_luma() {
+        // MemoryDisplay doesn't override blit_rgb: the default impl must
+        // convert with Rec.601 (0.299 R + 0.587 G + 0.114 B) and blit.
+        let mut d = MemoryDisplay::new(3, 1);
+        let page = RgbPage {
+            width: 3,
+            height: 1,
+            pixels: vec![255, 0, 0, 0, 255, 0, 0, 0, 255],
+        };
+        d.blit_rgb(&page, 0).unwrap();
+        assert_eq!(d.buffer, vec![76, 150, 29]);
     }
 
     #[test]

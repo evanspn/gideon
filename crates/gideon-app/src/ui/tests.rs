@@ -53,6 +53,8 @@ struct FakeGateway {
     update_message: String,
     update_available: bool,
     installs: std::cell::Cell<usize>,
+    /// How many cover downloads were requested.
+    covers: std::cell::Cell<usize>,
 }
 
 impl Default for FakeGateway {
@@ -69,6 +71,7 @@ impl Default for FakeGateway {
             update_message: "up to date".to_string(),
             update_available: false,
             installs: std::cell::Cell::new(0),
+            covers: std::cell::Cell::new(0),
         }
     }
 }
@@ -94,6 +97,15 @@ impl SourceGateway for FakeGateway {
 
     fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
         self.mangas.clone().map_err(|e| anyhow!(e))
+    }
+
+    fn download_cover(&self, _url: &str, dest: &Path) -> Result<()> {
+        self.covers.set(self.covers.get() + 1);
+        // A real (tiny) image so the shelf can decode it.
+        let img = image::GrayImage::from_pixel(3, 4, image::Luma([0x11]));
+        std::fs::create_dir_all(dest.parent().unwrap())?;
+        image::DynamicImage::ImageLuma8(img).save_with_format(dest, image::ImageFormat::Jpeg)?;
+        Ok(())
     }
 
     fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>> {
@@ -438,6 +450,85 @@ fn library_paginates_with_prev_next() {
     );
 }
 
+/// Write a solid-red series cover where the shelf looks for it.
+fn make_red_cover(series_dir: &Path) {
+    std::fs::create_dir_all(series_dir).unwrap();
+    let img = image::RgbImage::from_pixel(30, 40, image::Rgb([255, 0, 0]));
+    image::DynamicImage::ImageRgb8(img)
+        .save_with_format(series_dir.join(".cover.jpg"), image::ImageFormat::Jpeg)
+        .unwrap();
+}
+
+#[test]
+fn library_with_cover_art_renders_in_color() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_red_cover(&lib.join("Series"));
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+
+    // The shelf went through blit_rgb: MemoryDisplay's default impl
+    // collapses with Rec.601 luma, so a red cover lands at ~76 — the
+    // grayscale path (the image crate's BT.709 weights) would give ~54.
+    let l = layout();
+    let shelf = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS);
+    let (cx, cy) = shelf.cell_origin(0);
+    let cover_h = shelf.cell_height() - shelf.title_height - shelf.progress_bar_height;
+    let px = app.display().pixel(
+        cx + shelf.cell_width() / 2,
+        l.content_top() + cy + cover_h / 2,
+    );
+    assert!(
+        (66..=86).contains(&px),
+        "expected the Rec.601 luma of red (~76) from the RGB path, got {px}"
+    );
+    // Color shelves always flush in full, so the Kaleido color waveform
+    // (GCC16, FULL-only) can fire.
+    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Full));
+}
+
+#[test]
+fn color_library_page_flips_promote_to_full_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let l = layout();
+    let capacity = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS).capacity();
+    for i in 0..capacity + 1 {
+        make_cbz(&lib.join(format!("Series/vol{i:02}.cbz")), 1);
+    }
+    make_red_cover(&lib.join("Series"));
+
+    let events = vec![tap_row(0), tap_nav_next()];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    // Without covers this flip would be Partial (see
+    // library_paginates_with_prev_next); in color it must be Full.
+    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Full));
+}
+
+#[test]
+fn library_without_covers_stays_on_the_grayscale_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+
+    // The CBZ's first page is gray; nothing here may take the color path
+    // (covers come only from downloaded .cover.jpg art).
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(app
+        .display()
+        .flushes
+        .iter()
+        .all(|m| *m == RefreshMode::Full));
+}
+
 #[test]
 fn sources_screen_lists_installed_then_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -538,6 +629,7 @@ fn full_browse_download_and_read_flow() {
         mangas: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Manga One".into(),
+            cover_url: None,
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -595,6 +687,7 @@ fn manga_list_paginates() {
         .map(|i| MangaEntry {
             id: format!("m{i}"),
             title: format!("Manga {i}"),
+            cover_url: None,
         })
         .collect();
     let gateway = FakeGateway {
@@ -679,7 +772,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(3)]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(4)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -744,10 +837,287 @@ fn power_menu_restart_requests_restart() {
 #[test]
 fn title_taps_off_the_power_icon_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![UiEvent::Tap { x: 5, y: 5 }];
+    // Between the profile zone (left half) and the power zone (right
+    // 2 × title_h): a dead-zone tap must do nothing.
+    let l = layout();
+    let x = (l.width / 2 + l.width.saturating_sub(l.title_h * 2)) / 2;
+    let events = vec![UiEvent::Tap { x, y: 5 }];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Home));
+}
+
+// --- profiles ---
+
+/// Tap the left half of the title bar (the profile name on Home).
+fn tap_title_left() -> UiEvent {
+    let l = layout();
+    UiEvent::Tap {
+        x: 5,
+        y: l.title_h / 2,
+    }
+}
+
+/// Settings dir preloaded with the given profiles ("default" stays active).
+fn profile_settings_dir(dir: &Path, profiles: &[&str]) -> PathBuf {
+    let settings_dir = dir.join("data");
+    let settings = gideon_core::Settings {
+        profiles: profiles.iter().map(|p| p.to_string()).collect(),
+        ..gideon_core::Settings::default()
+    };
+    settings.save(&settings_dir).unwrap();
+    settings_dir
+}
+
+#[test]
+fn title_left_tap_opens_the_profile_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    let events = vec![tap_title_left()];
+    let mut app = app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    let Screen::ProfileMenu { profiles } = app.screen() else {
+        panic!("expected the profile menu");
+    };
+    assert_eq!(profiles, &vec!["default".to_string(), "alex".to_string()]);
+}
+
+#[test]
+fn switching_profile_shows_only_that_profiles_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+
+    let events = vec![
+        tap_title_left(), // profile menu
+        tap_row(1),       // switch to alex -> back on Home
+        tap_row(0),       // Library
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected alex's library");
+    };
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Alexs Series/vol1.cbz"]);
+    // The switch persisted for the next start.
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.active_profile, "alex");
+}
+
+#[test]
+fn default_profile_does_not_see_other_profiles_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected the default library");
+    };
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Shared/vol1.cbz"]);
+}
+
+#[test]
+fn downloads_land_in_the_active_profiles_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            // The fake writes into whatever library dir the UI passes —
+            // exactly how the real gateway behaves.
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_title_left(), // profile menu
+        tap_row(1),       // switch to alex
+        tap_row(2),       // Sources
+        tap_row(0),       // Listings
+        tap_row(0),       // Popular
+        tap_row(0),       // Manga One
+        tap_row(0),       // download + Reader
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events).with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    assert!(
+        lib.join("@alex/Manga One/Chapter 1.cbz").exists(),
+        "download must land in the active profile's directory"
+    );
+    assert!(
+        !lib.join("Manga One").exists(),
+        "nothing may leak into the default profile's library"
+    );
+}
+
+#[test]
+fn new_profile_keyboard_creates_and_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = profile_settings_dir(dir.path(), &["default"]);
+
+    let events = vec![
+        tap_title_left(), // profile menu: [default, New profile…]
+        tap_row(1),       // New profile…
+        tap_key(Key::Char('b')),
+        tap_key(Key::Char('o')),
+        tap_key(Key::Char('b')),
+        tap_key(Key::Search), // create
+        tap_row(0),           // Library (of the new profile)
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.profiles,
+        vec!["default".to_string(), "bob".to_string()]
+    );
+    assert_eq!(settings.active_profile, "bob");
+    // The new profile's library exists and is empty.
+    assert!(lib.join("@bob").is_dir());
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected the new profile's (empty) library");
+    };
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn picking_the_active_profile_just_closes_the_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    let events = vec![tap_title_left(), tap_row(0)];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    assert!(matches!(app.screen(), Screen::Home));
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.active_profile, "default");
+}
+
+// --- settings screen ---
+
+#[test]
+fn settings_rows_cycle_and_persist_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let events = vec![
+        tap_row(3), // Home -> Settings
+        tap_row(0), // pre-download 2 -> 3
+        tap_row(0), // 3 -> 5
+        tap_row(1), // storage 2 GB -> 5 GB
+        tap_row(3), // auto-check on -> off
+        tap_back(),
+    ];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    assert!(matches!(app.screen(), Screen::Home));
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.predownload_unread_chapters, 5);
+    assert_eq!(
+        settings.storage_size_limit.bytes(),
+        5 * 1024 * 1024 * 1024,
+        "2 GB cycles to 5 GB"
+    );
+    assert!(!settings.auto_check_updates);
+    // Value cycles repaint in place with partial refreshes.
+    assert!(app.display().flushes.contains(&RefreshMode::Partial));
+}
+
+#[test]
+fn storage_limit_cycle_wraps_around() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        storage_size_limit: gideon_core::StorageSize(5 * 1024 * 1024 * 1024),
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let events = vec![tap_row(3), tap_row(1)];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.storage_size_limit.bytes(),
+        500 * 1024 * 1024,
+        "5 GB wraps back to 500 MB"
+    );
+}
+
+#[test]
+fn reader_fit_toggle_applies_to_the_next_book_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+    make_tall_cbz(&lib.join("Tall/vol1.cbz"), 2);
+
+    // Toggle contain -> fit-width, then open a tall page: a "next" tap
+    // must scroll within the page (no page turn), without a restart.
+    let events = vec![
+        tap_row(3), // Settings
+        tap_row(2), // Reader fit: contain -> fit-width
+        tap_back(), // Home
+        tap_row(0), // Library
+        tap_shelf_cell0(),
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_fit, "fit-width");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Tall/vol1.cbz").unwrap().current_page,
+        0,
+        "the reader must pick up the new fit immediately (scroll, not turn)"
+    );
 }
 
 // --- frontlight edge slides ---
@@ -843,6 +1213,166 @@ fn edge_slides_without_a_light_hook_are_ignored() {
 }
 
 #[test]
+fn swipe_up_rotates_and_locks_the_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let swipe_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 100,
+        x1: W / 2,
+        y1: 100,
+    };
+    // After one up-swipe the reading orientation is 90°: "next" moves to
+    // the panel bottom (reading-right), like the rotated-taps test.
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    // In the 90° orientation the back zone is the panel's vertical middle.
+    let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        swipe_up,         // rotate to 90 and lock
+        tap_panel_bottom, // next page in the rotated orientation
+        tap_rotated_back,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    // The page actually turned under the rotated tap zones...
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+    // ...and the lock persisted for the next session.
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 90);
+}
+
+#[test]
+fn four_up_swipes_come_back_around_to_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    // Each swipe is "up" in the CURRENT reading frame (gestures follow
+    // the orientation): panel-up, then panel-left-to-right, panel-down,
+    // panel-right-to-left.
+    let up_at_0 = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 100,
+        x1: W / 2,
+        y1: 100,
+    };
+    let up_at_90 = UiEvent::Swipe {
+        x0: 150,
+        y0: H / 2,
+        x1: W - 150,
+        y1: H / 2,
+    };
+    let up_at_180 = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 100,
+        x1: W / 2,
+        y1: H - 100,
+    };
+    let up_at_270 = UiEvent::Swipe {
+        x0: W - 150,
+        y0: H / 2,
+        x1: 150,
+        y1: H / 2,
+    };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        up_at_0,
+        up_at_90,
+        up_at_180,
+        up_at_270,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 0, "full circle");
+}
+
+#[test]
+fn sloppy_tap_drift_neither_rotates_nor_exits() {
+    // The auditor's blocker: a page-turn tap that drifts 40px (past the
+    // 30px slop) classifies as a swipe — it must NOT rotate-and-lock the
+    // reader, and must not exit the book either.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let drift_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 400,
+        x1: W / 2,
+        y1: 360, // 40px: a sloppy tap, not a gesture
+    };
+    let drift_down = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 360,
+        x1: W / 2,
+        y1: 400,
+    };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        drift_up,
+        drift_down,
+        reader_tap_next(), // reader still alive, unrotated zones
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 0, "drift must not rotate");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "drift must not exit; the next tap still turned the page"
+    );
+}
+
+#[test]
+fn rotation_gestures_follow_the_reading_orientation() {
+    // After rotating to 90°, the user's "up" is the panel's left-to-right.
+    // Their natural swipe must rotate again (to 180), not be ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    let panel_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 100,
+        x1: W / 2,
+        y1: 100,
+    };
+    // Reading-frame "up" at rotation 90: panel x increases, y steady.
+    // (map_reader_tap: reading_y = panel_w - 1 - x, so larger x = smaller
+    // reading y = upward.) Mid-screen vertically to dodge the edge bands.
+    let rotated_up = UiEvent::Swipe {
+        x0: 150,
+        y0: H / 2,
+        x1: W - 150,
+        y1: H / 2,
+    };
+    let events = vec![tap_row(0), tap_shelf_cell0(), panel_up, rotated_up];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 180, "90 + one rotated up-swipe");
+}
+
+#[test]
 fn swipe_down_leaves_the_manga() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
@@ -879,6 +1409,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
             source_name: "Src".into(),
             manga_id: "m1".into(),
             manga_title: "Manga One".into(),
+            ..gideon_core::SeriesRef::default()
         },
     );
     index.save(&lib).unwrap();
@@ -905,7 +1436,8 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    // Long press -> book menu -> "All chapters (from source)".
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(0)];
     let mut app = app(&lib, gateway, events);
     app.run().unwrap();
 
@@ -924,7 +1456,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
 }
 
 #[test]
-fn long_press_on_a_sideloaded_book_explains_no_source() {
+fn long_press_opens_the_book_menu() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Sideload/vol1.cbz"), 2);
@@ -937,11 +1469,77 @@ fn long_press_on_a_sideloaded_book_explains_no_source() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::Message { title, body } = app.screen() else {
-        panic!("expected explanation");
+    let Screen::BookMenu { series_dir, .. } = app.screen() else {
+        panic!("expected the book menu");
     };
-    assert_eq!(title, "Chapters");
-    assert!(body.contains("Sideload"));
+    assert_eq!(series_dir, "Sideload");
+}
+
+#[test]
+fn unlinked_book_chapters_falls_back_to_prefilled_search() {
+    // A book downloaded before origins were recorded (or sideloaded):
+    // "All chapters" drops into global search with the series name typed.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sideload/vol1.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(0)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Search { source, query } = app.screen() else {
+        panic!("expected prefilled search");
+    };
+    assert!(source.is_none());
+    assert_eq!(query, "sideload");
+}
+
+#[test]
+fn book_menu_deletes_a_chapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected refreshed library");
+    };
+    assert_eq!(entries.len(), 1, "one chapter deleted, one remains");
+    assert!(lib.join("Series").exists(), "series dir keeps the other");
+}
+
+#[test]
+fn book_menu_deletes_the_whole_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected refreshed library");
+    };
+    assert!(entries.is_empty(), "whole series gone");
+    assert!(!lib.join("Series").exists());
 }
 
 #[test]
@@ -957,6 +1555,7 @@ fn downloading_records_the_series_origin() {
         mangas: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Manga One".into(),
+            cover_url: Some("https://example.com/cover.jpg".into()),
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -988,6 +1587,122 @@ fn downloading_records_the_series_origin() {
     assert_eq!(origin.source_id, "src");
     assert_eq!(origin.manga_id, "m1");
     assert_eq!(origin.manga_title, "Manga One");
+    assert_eq!(
+        origin.downloaded.get("c1"),
+        Some(&"Chapter 1.cbz".to_string()),
+        "the chapter file is recorded"
+    );
+    // The manga cover was fetched once and saved next to the chapters.
+    assert_eq!(app.gateway().covers.get(), 1);
+    assert!(lib.join("Manga One/.cover.jpg").exists());
+}
+
+#[test]
+fn downloaded_chapters_open_instantly_without_redownloading() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let downloads = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = downloads.clone();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            counter.set(counter.get() + 1);
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_row(2),        // Sources
+        tap_row(0),        // Listings
+        tap_row(0),        // Popular
+        tap_row(0),        // Manga One
+        tap_row(0),        // chapter -> download + read
+        reader_tap_back(), // back to the chapter list
+        tap_row(0),        // same chapter again -> instant open
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    assert_eq!(
+        downloads.get(),
+        1,
+        "the second open must come from disk, not the network"
+    );
+}
+
+#[test]
+fn long_press_a_chapter_downloads_without_opening_the_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let chapter_row = tap_row(0);
+    let UiEvent::Tap { x, y } = chapter_row else {
+        unreachable!()
+    };
+    let events = vec![
+        tap_row(2),
+        tap_row(0),
+        tap_row(0),
+        tap_row(0),                  // ChapterList
+        UiEvent::LongPress { x, y }, // download only
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    assert!(
+        matches!(app.screen(), Screen::ChapterList { .. }),
+        "stay on the list after a download-only long press"
+    );
+    assert!(lib.join("Manga One/Chapter 1.cbz").exists());
+    let index = gideon_core::SeriesIndex::load(&lib);
+    assert!(index
+        .get("Manga One")
+        .unwrap()
+        .downloaded
+        .contains_key("c1"));
 }
 
 #[test]
@@ -1017,8 +1732,8 @@ fn update_prompt_installs_on_tap() {
         update_message: "Update available: 0.0.0 -> 9.9.9.".into(),
         ..FakeGateway::default()
     };
-    // Home row 2 = "Check for updates" -> prompt; content tap installs.
-    let mut app = app(dir.path(), gateway, vec![tap_row(3), tap_row(0)]);
+    // Home row 4 = "Check for updates" -> prompt; content tap installs.
+    let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_row(0)]);
     app.run().unwrap();
 
     assert_eq!(
@@ -1057,6 +1772,7 @@ fn search_gateway() -> FakeGateway {
         search_results: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Naruto".into(),
+            cover_url: None,
         }]),
         ..FakeGateway::default()
     }
@@ -1107,6 +1823,7 @@ fn global_search_queries_every_source_and_labels_results() {
         search_results: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Naruto".into(),
+            cover_url: None,
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -1553,6 +2270,7 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
         mangas: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Manga One".into(),
+            cover_url: None,
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -1704,7 +2422,7 @@ fn update_prompt_back_declines() {
         update_message: "Update available.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(3), tap_back()]);
+    let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_back()]);
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
 }

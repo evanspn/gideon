@@ -25,14 +25,29 @@ use anyhow::{Context, Result};
 
 use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
-use gideon_render::shelf::{compose_shelf, ShelfEntry, ShelfLayout};
+use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{FitMode, GrayPage};
+use gideon_render::{FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
-const HOME_ROWS: [&str; 4] = ["Library", "Search", "Browse sources", "Check for updates"];
+const HOME_ROWS: [&str; 5] = [
+    "Library",
+    "Search",
+    "Browse sources",
+    "Settings",
+    "Check for updates",
+];
 const SHELF_COLUMNS: u32 = 3;
+
+/// Values the Settings screen cycles through per tap.
+const PREDOWNLOAD_STEPS: [u32; 5] = [0, 1, 2, 3, 5];
+const STORAGE_LIMIT_STEPS: [u64; 4] = [
+    500 * 1024 * 1024,
+    1024 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    5 * 1024 * 1024 * 1024,
+];
 
 /// One row on the Sources screen.
 #[derive(Debug, Clone)]
@@ -93,6 +108,23 @@ enum Screen {
         chapters: Vec<ChapterEntry>,
         page: usize,
     },
+    /// Context menu for a library book (long press on its card).
+    BookMenu {
+        entry: LibraryEntry,
+        series_dir: String,
+    },
+    /// Profile picker, opened from the left half of Home's title bar.
+    ProfileMenu {
+        profiles: Vec<String>,
+    },
+    /// On-screen keyboard for naming a new profile; the action key creates
+    /// it and switches to it.
+    NewProfile {
+        name: String,
+    },
+    /// Device-global settings (NOT per profile): each tap cycles a value
+    /// and saves settings.json immediately.
+    Settings,
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
     /// Update available; any content tap installs, Back declines.
@@ -149,7 +181,14 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
     gateway: G,
+    /// The profile-resolved library directory: every scan, download and
+    /// progress path goes through this.
     library_dir: PathBuf,
+    /// The library ROOT passed at startup; profile dirs hang off it (the
+    /// "default" profile IS the root).
+    base_library: PathBuf,
+    /// Active profile name (settings.json `active_profile`).
+    active_profile: String,
     layout: UiLayout,
     stack: Vec<Screen>,
     /// Reader fit mode (from settings.json `reader_fit`).
@@ -167,6 +206,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Frontlight hook for the reader's edge slides; `None` (tests,
     /// headless) means swipes are ignored.
     lights: Option<Box<dyn LightControl>>,
+    /// Where settings.json lives, for persisting in-reader changes
+    /// (rotation lock). `None` skips persistence.
+    settings_dir: Option<PathBuf>,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -176,7 +218,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             display,
             input,
             gateway,
+            base_library: library_dir.clone(),
             library_dir,
+            active_profile: "default".to_string(),
             layout,
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
@@ -185,7 +229,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             last_wake: None,
             keyboard_paints: 0,
             lights: None,
+            settings_dir: None,
         }
+    }
+
+    /// Start in this profile (resolved from settings.json at startup):
+    /// the library directory becomes the profile's subdirectory.
+    pub fn with_profile(mut self, name: &str) -> Self {
+        self.active_profile = name.to_string();
+        self.library_dir = profile_library_dir(&self.base_library, name);
+        self
     }
 
     /// Apply the reader-related settings (fit mode and rotation).
@@ -204,6 +257,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Install the frontlight hook (reader edge slides).
     pub fn with_lights(mut self, lights: Box<dyn LightControl>) -> Self {
         self.lights = Some(lights);
+        self
+    }
+
+    /// Persist in-reader setting changes (rotation lock) to this directory.
+    pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
+        self.settings_dir = Some(dir);
         self
     }
 
@@ -354,44 +413,73 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
-                // The power symbol lives in Home's top-right corner.
-                if matches!(self.screen(), Screen::Home)
-                    && x >= self.layout.width.saturating_sub(self.layout.title_h * 2)
-                {
-                    self.push(Screen::PowerMenu)?;
+                if matches!(self.screen(), Screen::Home) {
+                    if x >= self.layout.width.saturating_sub(self.layout.title_h * 2) {
+                        // The power symbol lives in Home's top-right corner.
+                        self.push(Screen::PowerMenu)?;
+                    } else if x < self.layout.width / 2 {
+                        // The active profile name sits in the title's left
+                        // half: tapping it opens the profile picker.
+                        self.open_profile_menu()?;
+                    }
                 }
                 Ok(Flow::Continue)
             }
         }
     }
 
-    /// Long press: on a library book, open its source's chapter list so
-    /// more chapters of the series can be downloaded straight from the
-    /// card. Everywhere else a long press is just a slow tap.
+    /// Long press: a library card opens its book menu; a chapter row
+    /// downloads that chapter without opening the reader. Everywhere else
+    /// a long press is just a slow tap.
     fn handle_long_press(&mut self, x: u32, y: u32) -> Result<Flow> {
         let screen = self.stack.last().cloned().expect("stack never empty");
-        let Screen::Library { entries, page } = screen else {
-            return self.handle_tap(x, y);
-        };
-        let Some(entry) = self.library_cell_at(&entries, page, x, y) else {
-            return Ok(Flow::Continue);
-        };
-        let series_dir = entry
-            .relative_path
-            .split('/')
-            .next()
-            .unwrap_or(&entry.relative_path)
-            .to_string();
+        match screen {
+            Screen::Library { entries, page } => {
+                let Some(entry) = self.library_cell_at(&entries, page, x, y) else {
+                    return Ok(Flow::Continue);
+                };
+                let series_dir = entry
+                    .relative_path
+                    .split('/')
+                    .next()
+                    .unwrap_or(&entry.relative_path)
+                    .to_string();
+                self.push(Screen::BookMenu { entry, series_dir })?;
+                Ok(Flow::Continue)
+            }
+            Screen::ChapterList {
+                source,
+                manga,
+                chapters,
+                page,
+            } => {
+                // Long press on a chapter row: download it and stay on the
+                // list — for stocking up before going offline.
+                if let TapTarget::Row(row) = self.layout.tap_target(x, y) {
+                    let index = page * self.layout.rows_per_page() + row;
+                    if let Some(chapter) = chapters.get(index).cloned() {
+                        self.download_to_library(&source, &manga, &chapter)?;
+                        self.input.discard_taps();
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                }
+                Ok(Flow::Continue)
+            }
+            _ => self.handle_tap(x, y),
+        }
+    }
+
+    /// Open the book menu's "chapters" entry: the source's chapter list
+    /// when the series is linked, otherwise the search keyboard prefilled
+    /// with the series name so one download can re-link it.
+    fn open_series_chapters(&mut self, series_dir: &str) -> Result<()> {
         let index = gideon_core::SeriesIndex::load(&self.library_dir);
-        let Some(origin) = index.get(&series_dir) else {
-            self.push(Screen::Message {
-                title: "Chapters".to_string(),
-                body: format!(
-                    "\"{series_dir}\" isn't linked to a source (copied over USB?), \
-                     so there's no chapter list to fetch."
-                ),
-            })?;
-            return Ok(Flow::Continue);
+        let Some(origin) = index.get(series_dir) else {
+            self.keyboard_paints = 0;
+            return self.push(Screen::Search {
+                source: None,
+                query: series_dir.to_ascii_lowercase(),
+            });
         };
         let source = SourceEntry {
             id: origin.source_id.clone(),
@@ -400,9 +488,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let manga = MangaEntry {
             id: origin.manga_id.clone(),
             title: origin.manga_title.clone(),
+            cover_url: origin.cover_url.clone(),
         };
-        self.open_chapter_list(&source, &manga)?;
-        Ok(Flow::Continue)
+        self.open_chapter_list(&source, &manga)
+    }
+
+    /// Rebuild the Library screen beneath the book menu after a delete.
+    fn refresh_library_after_delete(&mut self) -> Result<()> {
+        let entries = Library::new(&self.library_dir).scan()?;
+        self.stack.pop(); // leave the book menu
+        if let Some(screen @ Screen::Library { .. }) = self.stack.last_mut() {
+            *screen = Screen::Library { entries, page: 0 };
+        }
+        self.render_current(RefreshMode::Full)
     }
 
     /// Change page within the current screen (partial refresh).
@@ -447,6 +545,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(Flow::Continue)
                 }
                 3 => {
+                    self.push(Screen::Settings)?;
+                    Ok(Flow::Continue)
+                }
+                4 => {
                     self.check_updates()?;
                     Ok(Flow::Continue)
                 }
@@ -517,6 +619,77 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if let Some(chapter) = chapters.get(index).cloned() {
                     return self.download_and_read(&source, &manga, &chapter);
                 }
+                Ok(Flow::Continue)
+            }
+            Screen::BookMenu { entry, series_dir } => {
+                match row {
+                    0 => self.open_series_chapters(&series_dir)?,
+                    1 => {
+                        // Delete this chapter's file; drop it from the
+                        // series' download history.
+                        std::fs::remove_file(&entry.path)
+                            .with_context(|| format!("couldn't delete {}", entry.path.display()))?;
+                        if let Some(file) = entry.path.file_name() {
+                            let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+                            index.forget_download(&series_dir, &file.to_string_lossy());
+                            let _ = index.save(&self.library_dir);
+                        }
+                        // Remove the series dir too when it's now empty.
+                        if let Some(parent) = entry.path.parent() {
+                            if parent != self.library_dir
+                                && std::fs::read_dir(parent)
+                                    .map(|mut d| d.next().is_none())
+                                    .unwrap_or(false)
+                            {
+                                let _ = std::fs::remove_dir(parent);
+                            }
+                        }
+                        self.refresh_library_after_delete()?;
+                    }
+                    2 => {
+                        // Delete the whole series directory.
+                        let target = entry
+                            .path
+                            .parent()
+                            .filter(|p| *p != self.library_dir)
+                            .map(|p| p.to_path_buf());
+                        match target {
+                            Some(dir) => std::fs::remove_dir_all(&dir)
+                                .with_context(|| format!("couldn't delete {}", dir.display()))?,
+                            None => std::fs::remove_file(&entry.path).with_context(|| {
+                                format!("couldn't delete {}", entry.path.display())
+                            })?,
+                        }
+                        let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+                        index.remove(&series_dir);
+                        let _ = index.save(&self.library_dir);
+                        self.refresh_library_after_delete()?;
+                    }
+                    _ => {}
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::Settings => {
+                self.tap_setting(row)?;
+                Ok(Flow::Continue)
+            }
+            Screen::ProfileMenu { profiles } => {
+                if let Some(name) = profiles.get(row).cloned() {
+                    if name == self.active_profile {
+                        self.pop()?; // already there — just close the menu
+                    } else {
+                        self.switch_profile(&name)?;
+                    }
+                } else if row == profiles.len() {
+                    self.keyboard_paints = 0;
+                    self.push(Screen::NewProfile {
+                        name: String::new(),
+                    })?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::NewProfile { name } => {
+                self.tap_new_profile(&name, x, y)?;
                 Ok(Flow::Continue)
             }
             Screen::PowerMenu => match row {
@@ -611,53 +784,144 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         x: u32,
         y: u32,
     ) -> Result<()> {
-        let edited = match self.layout.key_at(x, y) {
-            Some(Key::Char(c)) => {
-                let mut q = query.to_string();
-                q.push(c);
-                Some(q)
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let trimmed = query.trim();
+            if !trimmed.is_empty() {
+                self.run_search(source, trimmed)?;
             }
-            Some(Key::Space) => {
-                // No leading or doubled spaces — sources won't match them.
-                let q = query.to_string();
-                if q.is_empty() || q.ends_with(' ') {
-                    None
-                } else {
-                    Some(q + " ")
-                }
-            }
-            Some(Key::Backspace) => {
-                let mut q = query.to_string();
-                q.pop();
-                Some(q)
-            }
-            Some(Key::Search) => {
-                let trimmed = query.trim();
-                if !trimmed.is_empty() {
-                    self.run_search(source, trimmed)?;
-                }
-                return Ok(());
-            }
-            None => None,
-        };
-        if let Some(q) = edited {
+            return Ok(());
+        }
+        if let Some(q) = key.and_then(|key| apply_key_edit(query, key)) {
             if let Some(Screen::Search { query, .. }) = self.stack.last_mut() {
                 *query = q;
             }
-            // Mostly-partial refreshes keep typing fast, but ghosting
-            // accumulates — flash the panel clean every Nth repaint.
-            self.keyboard_paints += 1;
-            let mode = if self
-                .keyboard_paints
-                .is_multiple_of(KEYBOARD_FULL_REFRESH_INTERVAL)
-            {
-                RefreshMode::Full
-            } else {
-                RefreshMode::Partial
-            };
-            self.render_current(mode)?;
+            self.keyboard_repaint()?;
         }
         Ok(())
+    }
+
+    /// Handle a tap on the new-profile keyboard: edit the name in place,
+    /// or (action key) create the profile and switch to it.
+    fn tap_new_profile(&mut self, name: &str, x: u32, y: u32) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let trimmed = name.trim().to_string();
+            if !trimmed.is_empty() {
+                self.switch_profile(&trimmed)?;
+            }
+            return Ok(());
+        }
+        if let Some(n) = key.and_then(|key| apply_key_edit(name, key)) {
+            if let Some(Screen::NewProfile { name }) = self.stack.last_mut() {
+                *name = n;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
+    }
+
+    /// Repaint after a keyboard edit. Mostly-partial refreshes keep typing
+    /// fast, but ghosting accumulates — flash the panel clean every Nth
+    /// repaint.
+    fn keyboard_repaint(&mut self) -> Result<()> {
+        self.keyboard_paints += 1;
+        let mode = if self
+            .keyboard_paints
+            .is_multiple_of(KEYBOARD_FULL_REFRESH_INTERVAL)
+        {
+            RefreshMode::Full
+        } else {
+            RefreshMode::Partial
+        };
+        self.render_current(mode)
+    }
+
+    // --- settings screen ---
+
+    /// Cycle the setting on row `row` to its next value, persist
+    /// settings.json immediately (atomic save) and repaint in place.
+    fn tap_setting(&mut self, row: usize) -> Result<()> {
+        let mut settings = self.load_settings();
+        match row {
+            0 => {
+                settings.predownload_unread_chapters =
+                    cycle(&PREDOWNLOAD_STEPS, settings.predownload_unread_chapters);
+            }
+            1 => {
+                settings.storage_size_limit = gideon_core::StorageSize(cycle(
+                    &STORAGE_LIMIT_STEPS,
+                    settings.storage_size_limit.bytes(),
+                ));
+            }
+            2 => {
+                settings.reader_fit = match FitMode::from_setting(&settings.reader_fit) {
+                    FitMode::FitWidth => "contain",
+                    _ => "fit-width",
+                }
+                .to_string();
+                // The next opened book must use the new fit immediately.
+                self.reader_fit = FitMode::from_setting(&settings.reader_fit);
+            }
+            3 => settings.auto_check_updates = !settings.auto_check_updates,
+            _ => return Ok(()),
+        }
+        self.save_settings(&settings);
+        self.render_current(RefreshMode::Partial)
+    }
+
+    // --- profiles ---
+
+    /// Current settings; defaults when no settings dir is configured
+    /// (tests, headless) or the file is unreadable.
+    fn load_settings(&self) -> gideon_core::Settings {
+        self.settings_dir
+            .as_deref()
+            .map(|dir| gideon_core::Settings::load(dir).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Persist settings (no-op without a settings dir); a failed save is
+    /// logged, never fatal.
+    fn save_settings(&self, settings: &gideon_core::Settings) {
+        if let Some(dir) = &self.settings_dir {
+            if let Err(e) = settings.save(dir) {
+                eprintln!("gideon: couldn't save settings: {e}");
+            }
+        }
+    }
+
+    /// Open the profile picker from Home's title bar.
+    fn open_profile_menu(&mut self) -> Result<()> {
+        let mut profiles = self.load_settings().profiles;
+        // Lenient: a hand-edited settings.json may activate a profile the
+        // list doesn't know — show it anyway.
+        if !profiles.contains(&self.active_profile) {
+            profiles.push(self.active_profile.clone());
+        }
+        self.push(Screen::ProfileMenu { profiles })
+    }
+
+    /// Switch to (creating if needed) the named profile: persist the
+    /// choice, repoint the library and drop back to a fresh Home — the
+    /// whole navigation context (library, downloads) just changed.
+    fn switch_profile(&mut self, name: &str) -> Result<()> {
+        self.active_profile = name.to_string();
+        self.library_dir = profile_library_dir(&self.base_library, name);
+        std::fs::create_dir_all(&self.library_dir).with_context(|| {
+            format!(
+                "couldn't create profile library {}",
+                self.library_dir.display()
+            )
+        })?;
+        let mut settings = self.load_settings();
+        if !settings.profiles.iter().any(|p| p == name) {
+            settings.profiles.push(name.to_string());
+        }
+        settings.active_profile = name.to_string();
+        self.save_settings(&settings);
+        self.stack.truncate(1);
+        self.render_current(RefreshMode::Full)
     }
 
     /// Open the global-search keyboard from Home (every installed source).
@@ -790,12 +1054,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
-    fn download_and_read(
+    /// The on-disk CBZ for a chapter, when it was downloaded before.
+    fn downloaded_chapter_path(
+        &self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapter_id: &str,
+    ) -> Option<PathBuf> {
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let (dir, series) = index.find_manga(&source.id, &manga.id)?;
+        let file = series.downloaded.get(chapter_id)?;
+        let path = self.library_dir.join(dir).join(file);
+        path.exists().then_some(path)
+    }
+
+    /// Download a chapter into the library with live progress, recording
+    /// the series origin, the chapter file and (once per series) the cover.
+    fn download_to_library(
         &mut self,
         source: &SourceEntry,
         manga: &MangaEntry,
         chapter: &ChapterEntry,
-    ) -> Result<Flow> {
+    ) -> Result<PathBuf> {
         let label = chapter.label();
         self.show_status(&[&format!("Downloading {label}…")])?;
 
@@ -829,23 +1109,55 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &mut progress,
         )?;
 
-        // Remember where this series came from, so a long press on its
-        // library card can reopen the source's chapter list later.
+        // Remember where this series came from (long press on its card
+        // reopens the chapter list) and which chapters are on disk (they
+        // open instantly, get a check mark, and survive re-listing).
         if let Some(dir) = cbz_path.parent().and_then(|p| p.file_name()) {
+            let dir = dir.to_string_lossy().to_string();
             let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
             index.record(
-                &dir.to_string_lossy(),
+                &dir,
                 gideon_core::SeriesRef {
                     source_id: source.id.clone(),
                     source_name: source.name.clone(),
                     manga_id: manga.id.clone(),
                     manga_title: manga.title.clone(),
+                    cover_url: manga.cover_url.clone(),
+                    ..gideon_core::SeriesRef::default()
                 },
             );
+            if let Some(file) = cbz_path.file_name() {
+                index.record_download(&dir, &chapter.id, &file.to_string_lossy());
+            }
             if let Err(e) = index.save(&self.library_dir) {
                 eprintln!("gideon: couldn't save the series index: {e}");
             }
+
+            // Fetch the manga cover once per series: library cards show
+            // the real cover art instead of a chapter's first page.
+            let cover_path = self.library_dir.join(&dir).join(".cover.jpg");
+            if !cover_path.exists() {
+                if let Some(url) = manga.cover_url.as_deref() {
+                    if let Err(e) = self.gateway.download_cover(url, &cover_path) {
+                        eprintln!("gideon: couldn't fetch the cover: {e:#}");
+                    }
+                }
+            }
         }
+        Ok(cbz_path)
+    }
+
+    fn download_and_read(
+        &mut self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapter: &ChapterEntry,
+    ) -> Result<Flow> {
+        // Already on disk? Straight into the reader — no network, no wait.
+        let cbz_path = match self.downloaded_chapter_path(source, manga, &chapter.id) {
+            Some(path) => path,
+            None => self.download_to_library(source, manga, chapter)?,
+        };
 
         // Taps queued while the download ran were aimed at the (now gone)
         // chapter list — drop them so they don't flip pages in the reader.
@@ -926,7 +1238,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut store = ProgressStore::load(&progress_file).unwrap_or_default();
 
         let layout = self.layout;
-        let rotation = self.reader_rotation;
+        let mut rotation = self.reader_rotation;
         let mut keep_running = true;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
@@ -964,9 +1276,52 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         let on_right = x0 >= layout.width - edge && x1 >= layout.width - edge;
                         let on_left = x0 < edge && x1 < edge;
                         if !on_right && !on_left {
-                            // A mid-screen downward swipe leaves the manga.
-                            if y1 > y0 && (y1 - y0) > x1.abs_diff(x0) {
+                            // Mid-screen gestures follow the READING
+                            // orientation (taps already do): swipe down to
+                            // leave the manga, swipe up to rotate 90°
+                            // clockwise and lock it (persisted) — for
+                            // reading on your side in bed. Both demand
+                            // deliberate travel (a quarter of the reading
+                            // height): a sloppy page-turn tap drifting past
+                            // the 30px slop must never exit, and certainly
+                            // never rotate-and-lock the whole reader.
+                            let (mx0, my0) = layout::map_reader_tap(
+                                x0,
+                                y0,
+                                layout.width,
+                                layout.height,
+                                rotation,
+                            );
+                            let (mx1, my1) = layout::map_reader_tap(
+                                x1,
+                                y1,
+                                layout.width,
+                                layout.height,
+                                rotation,
+                            );
+                            let reading_h = if rotation % 180 == 90 {
+                                layout.width
+                            } else {
+                                layout.height
+                            };
+                            let min_travel = (reading_h / 4).max(1);
+                            let vertical = my0.abs_diff(my1) > mx0.abs_diff(mx1);
+                            if my1 > my0 && vertical && my1 - my0 >= min_travel {
                                 break;
+                            }
+                            if my0 > my1 && vertical && my0 - my1 >= min_travel {
+                                rotation = (rotation + 90) % 360;
+                                reader.set_rotation(rotation);
+                                self.reader_rotation = rotation;
+                                if let Some(dir) = &self.settings_dir {
+                                    let mut settings =
+                                        gideon_core::Settings::load(dir).unwrap_or_default();
+                                    settings.reader_rotation = rotation;
+                                    if let Err(e) = settings.save(dir) {
+                                        eprintln!("gideon: couldn't persist rotation: {e}");
+                                    }
+                                }
+                                reader.show_banner(&format!("Rotation {rotation}° — locked"))?;
                             }
                             continue;
                         }
@@ -1053,6 +1408,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn render_current(&mut self, mode: RefreshMode) -> Result<()> {
+        // Color shelf: when a visible Library card has real cover art,
+        // compose in RGB so Kaleido panels show it in color. Always a full
+        // refresh — the MTK driver's color waveform (GCC16) only runs on
+        // FULL updates.
+        if let Some(page) = self.compose_color_current()? {
+            self.display.blit_rgb(&page, 0)?;
+            self.display.flush(RefreshMode::Full)?;
+            return Ok(());
+        }
         let page = match self.compose_current() {
             Ok(page) => page,
             // Composition failures (e.g. an unreadable CBZ) become an error
@@ -1070,6 +1434,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(())
     }
 
+    /// The current screen as a color page, when it has one: the Library
+    /// shelf with at least one visible downloaded cover (.cover.jpg).
+    /// Everything else renders grayscale.
+    fn compose_color_current(&self) -> Result<Option<RgbPage>> {
+        let Some(Screen::Library { entries, page }) = self.stack.last() else {
+            return Ok(None);
+        };
+        let l = &self.layout;
+        let shelf = self.shelf_layout();
+        let capacity = shelf.capacity().max(1);
+        let visible = || entries.iter().skip(page * capacity).take(capacity);
+        if !visible().any(|e| self.cover_path(e).exists()) {
+            return Ok(None);
+        }
+        let page_count = entries.len().div_ceil(capacity).max(1);
+        let chrome = compose_chrome(l, "Library", *page, page_count);
+        let grid = compose_shelf_rgb(
+            &self.shelf_entries_for_page(entries, *page, capacity),
+            &shelf,
+        );
+        let mut canvas = RgbPage::from_gray(&chrome);
+        copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
+        Ok(Some(canvas))
+    }
+
     fn compose_current(&self) -> Result<GrayPage> {
         let l = &self.layout;
         let per_page = l.rows_per_page();
@@ -1079,12 +1468,46 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let rows: Vec<(String, bool)> =
                     HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
                 // The version in the title answers "did the update take?"
-                // at a glance. No Back on Home — the power symbol in the
-                // top-right corner opens the restart/close menu instead.
-                let title = concat!("gideon v", env!("CARGO_PKG_VERSION"));
-                let mut canvas = compose_list_opts(l, title, &rows, 0, 1, false);
+                // at a glance; the profile name after it says whose library
+                // this is (tapping the left half switches). No Back on Home
+                // — the power symbol in the top-right corner opens the
+                // restart/close menu instead.
+                let title = format!(
+                    "gideon v{} — {}",
+                    env!("CARGO_PKG_VERSION"),
+                    self.active_profile
+                );
+                let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
                 draw_power_icon(&mut canvas, l);
                 canvas
+            }
+            Screen::BookMenu { series_dir, .. } => {
+                let rows = vec![
+                    ("All chapters (from source)".to_string(), true),
+                    ("Delete this chapter".to_string(), true),
+                    ("Delete whole series".to_string(), true),
+                ];
+                compose_list(l, series_dir, &rows, 0, 1)
+            }
+            Screen::ProfileMenu { profiles } => {
+                let mut rows: Vec<(String, bool)> = profiles
+                    .iter()
+                    .map(|p| {
+                        let mark = if *p == self.active_profile {
+                            "● "
+                        } else {
+                            ""
+                        };
+                        (format!("{mark}{p}"), true)
+                    })
+                    .collect();
+                rows.push(("New profile…".to_string(), true));
+                compose_list(l, "Profiles", &rows, 0, 1)
+            }
+            Screen::NewProfile { name } => compose_keyboard(l, "New profile", name, "Create"),
+            Screen::Settings => {
+                let rows = settings_rows(&self.load_settings());
+                compose_list(l, "Settings", &rows, 0, 1)
             }
             Screen::PowerMenu => {
                 let rows = vec![
@@ -1144,14 +1567,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, &title, &rows, *page, l.page_count(mangas.len()))
             }
             Screen::ChapterList {
+                source,
                 manga,
                 chapters,
                 page,
-                ..
             } => {
+                // Mark chapters that are already on disk: they open
+                // instantly, and a check tells the user what's stocked up.
+                let index = gideon_core::SeriesIndex::load(&self.library_dir);
+                let downloaded = index
+                    .find_manga(&source.id, &manga.id)
+                    .map(|(_, series)| series.downloaded.clone())
+                    .unwrap_or_default();
                 let rows: Vec<(String, bool)> = paged(chapters, *page, per_page)
                     .iter()
-                    .map(|c| (c.label(), true))
+                    .map(|c| {
+                        let mark = if downloaded.contains_key(&c.id) {
+                            "✓ "
+                        } else {
+                            ""
+                        };
+                        (format!("{mark}{}", c.label()), true)
+                    })
                     .collect();
                 compose_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
             }
@@ -1165,7 +1602,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
         let page_count = entries.len().div_ceil(capacity).max(1);
-        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
 
         let mut canvas = compose_chrome(l, "Library", page, page_count);
         if entries.is_empty() {
@@ -1190,11 +1626,45 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(canvas);
         }
 
+        let grid = compose_shelf(
+            &self.shelf_entries_for_page(entries, page, capacity),
+            &shelf,
+        );
+        copy_into(&mut canvas, &grid, 0, l.content_top());
+        Ok(canvas)
+    }
+
+    /// The series cover art for a library entry (fetched at download time).
+    fn cover_path(&self, entry: &LibraryEntry) -> PathBuf {
+        let series_dir = entry
+            .relative_path
+            .split('/')
+            .next()
+            .unwrap_or(&entry.relative_path);
+        self.library_dir.join(series_dir).join(".cover.jpg")
+    }
+
+    /// Build the shelf cards for one Library page, shared by the gray and
+    /// RGB compositors.
+    fn shelf_entries_for_page(
+        &self,
+        entries: &[LibraryEntry],
+        page: usize,
+        capacity: usize,
+    ) -> Vec<ShelfEntry> {
+        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
         let mut shelf_entries = Vec::new();
         for entry in entries.iter().skip(page * capacity).take(capacity) {
-            let cover = CbzDocument::open(&entry.path)
-                .and_then(|mut doc| doc.decode_page(0))
-                .unwrap_or_else(|_| placeholder_cover());
+            // Prefer the manga's cover art (fetched at download time);
+            // fall back to the chapter's first page, then a placeholder.
+            let cover = image::open(self.cover_path(entry))
+                .ok()
+                .or_else(|| {
+                    CbzDocument::open(&entry.path)
+                        .and_then(|mut doc| doc.decode_page(0))
+                        .ok()
+                })
+                .unwrap_or_else(placeholder_cover);
             let progress = store.get(&entry.relative_path).map(|p| {
                 if p.total_pages == 0 {
                     0.0
@@ -1208,9 +1678,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 progress,
             });
         }
-        let grid = compose_shelf(&shelf_entries, &shelf);
-        copy_into(&mut canvas, &grid, 0, l.content_top());
-        Ok(canvas)
+        shelf_entries
     }
 }
 
@@ -1341,15 +1809,49 @@ fn compose_list_opts(
     canvas
 }
 
+/// Apply an edit key to a keyboard buffer; `None` means no change (the
+/// action key is handled by the caller). Shared by the search and
+/// new-profile keyboards.
+fn apply_key_edit(buffer: &str, key: Key) -> Option<String> {
+    match key {
+        Key::Char(c) => {
+            let mut b = buffer.to_string();
+            b.push(c);
+            Some(b)
+        }
+        // No leading or doubled spaces — sources won't match them, and
+        // directory names shouldn't carry them either.
+        Key::Space => {
+            if buffer.is_empty() || buffer.ends_with(' ') {
+                None
+            } else {
+                Some(format!("{buffer} "))
+            }
+        }
+        Key::Backspace => {
+            let mut b = buffer.to_string();
+            b.pop();
+            Some(b)
+        }
+        Key::Search => None,
+    }
+}
+
 /// The search screen: chrome + the query line + the on-screen keyboard.
 fn compose_search(l: &UiLayout, source_name: &str, query: &str) -> GrayPage {
-    let mut canvas = compose_chrome(l, &format!("Search {source_name}"), 0, 1);
+    compose_keyboard(l, &format!("Search {source_name}"), query, "Search")
+}
 
-    // Query line with a trailing caret, in the area above the keyboard.
-    // When the query outgrows the line, show its tail — the user needs to
-    // see what they are typing, not how the query started.
+/// A keyboard screen: chrome + the edited line + the on-screen keyboard,
+/// with the action key labeled `action` ("Search", "Create"…).
+fn compose_keyboard(l: &UiLayout, title: &str, buffer: &str, action: &str) -> GrayPage {
+    let mut canvas = compose_chrome(l, title, 0, 1);
+
+    // Edited line with a trailing caret, in the area above the keyboard.
+    // When the text outgrows the line, show its tail — the user needs to
+    // see what they are typing, not how the text started.
     let max_w = l.width.saturating_sub(2 * l.pad);
-    let mut shown = format!("{query}_");
+    let mut shown = format!("{buffer}_");
     while measure_text(l.text_px, &shown, true) > max_w && shown.chars().count() > 1 {
         shown.remove(0);
     }
@@ -1370,7 +1872,7 @@ fn compose_search(l: &UiLayout, source_name: &str, query: &str) -> GrayPage {
             Key::Char(c) => c.to_string(),
             Key::Backspace => "<del".to_string(),
             Key::Space => "space".to_string(),
-            Key::Search => "Search".to_string(),
+            Key::Search => action.to_string(),
         };
         let bold = key == Key::Search;
         let tw = measure_text(l.text_px, &label, bold).min(w);
@@ -1531,6 +2033,18 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
     }
 }
 
+/// [`copy_into`] for RGB pages (3 bytes per pixel).
+fn copy_into_rgb(dst: &mut RgbPage, src: &RgbPage, off_x: u32, off_y: u32) {
+    let copy_w = src.width.min(dst.width.saturating_sub(off_x));
+    let copy_h = src.height.min(dst.height.saturating_sub(off_y));
+    for y in 0..copy_h {
+        let src_start = (y * src.width * 3) as usize;
+        let dst_start = (((off_y + y) * dst.width + off_x) * 3) as usize;
+        dst.pixels[dst_start..dst_start + copy_w as usize * 3]
+            .copy_from_slice(&src.pixels[src_start..src_start + copy_w as usize * 3]);
+    }
+}
+
 /// Card name for a library entry: "Series — Chapter" when it lives in a
 /// series directory, just the file stem otherwise.
 fn entry_title(relative_path: &str) -> String {
@@ -1548,6 +2062,42 @@ fn entry_title(relative_path: &str) -> String {
 
 fn placeholder_cover() -> image::DynamicImage {
     image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(3, 4, image::Luma([0xCC])))
+}
+
+/// The Settings screen's rows, showing current values.
+fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
+    let fit = match gideon_render::FitMode::from_setting(&s.reader_fit) {
+        gideon_render::FitMode::FitWidth => "fit-width",
+        _ => "contain",
+    };
+    let auto = if s.auto_check_updates { "on" } else { "off" };
+    vec![
+        (
+            format!("Pre-download ahead: {}", s.predownload_unread_chapters),
+            true,
+        ),
+        (format!("Storage limit: {}", s.storage_size_limit), true),
+        (format!("Reader fit: {fit}"), true),
+        (format!("Check updates automatically: {auto}"), true),
+    ]
+}
+
+/// Next value in a cycle: the entry after `current`, wrapping around; the
+/// first entry when `current` isn't in the list (hand-edited settings).
+fn cycle<T: Copy + PartialEq>(steps: &[T], current: T) -> T {
+    let position = steps.iter().position(|s| *s == current);
+    steps[position.map_or(0, |i| (i + 1) % steps.len())]
+}
+
+/// The library directory of a profile: the root itself for "default",
+/// `<root>/@<name>` otherwise. The @ prefix keeps profile dirs from
+/// colliding with series dirs, and the root scan skips them.
+fn profile_library_dir(base: &Path, profile: &str) -> PathBuf {
+    if profile == "default" {
+        base.to_path_buf()
+    } else {
+        base.join(format!("@{profile}"))
+    }
 }
 
 /// Progress file shared with `gideon library` / `gideon read`.

@@ -25,6 +25,19 @@ pub struct Settings {
     /// If set, only show sources/chapters for these languages.
     pub languages: Vec<String>,
 
+    /// Profiles: each profile sees its own library subdirectory. The
+    /// "default" profile uses the library root (existing books stay
+    /// visible); any other profile lives in `<library>/@<name>`. Parsed
+    /// leniently — non-string entries are dropped, and an empty or
+    /// wrong-typed list falls back to just "default".
+    #[serde(deserialize_with = "lenient_profiles")]
+    pub profiles: Vec<String>,
+
+    /// The profile whose library is currently shown. Parsed leniently —
+    /// anything but a non-empty string means "default".
+    #[serde(deserialize_with = "lenient_profile_name")]
+    pub active_profile: String,
+
     /// Storage budget for downloaded chapters, e.g. "2 GB" or "500 MB".
     /// Oldest-read chapters are evicted when the budget is exceeded.
     pub storage_size_limit: StorageSize,
@@ -63,6 +76,8 @@ impl Default for Settings {
         Self {
             source_lists: Vec::new(),
             languages: Vec::new(),
+            profiles: vec!["default".to_string()],
+            active_profile: "default".to_string(),
             storage_size_limit: StorageSize(DEFAULT_STORAGE_LIMIT_BYTES),
             predownload_unread_chapters: 2,
             auto_check_updates: true,
@@ -81,6 +96,41 @@ fn lenient_percent<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<u32, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(value.as_u64().map_or(0, |v| v.min(100) as u32))
+}
+
+/// Lenient profile-list parsing: only non-empty string entries are kept
+/// (trimmed); an empty or wrong-typed list falls back to just "default".
+fn lenient_profiles<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let mut profiles: Vec<String> = value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if profiles.is_empty() {
+        profiles.push("default".to_string());
+    }
+    Ok(profiles)
+}
+
+/// Lenient `active_profile` parsing: a non-empty string passes through
+/// (trimmed); anything else (wrong type, missing) means "default".
+fn lenient_profile_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "default".to_string(),
+    })
 }
 
 /// Lenient `reader_fit` parsing: any JSON value is accepted; only strings
@@ -214,6 +264,8 @@ mod tests {
         assert_eq!(s.predownload_unread_chapters, 2);
         assert!(s.auto_check_updates);
         assert!(s.source_lists.is_empty());
+        assert_eq!(s.profiles, vec!["default"]);
+        assert_eq!(s.active_profile, "default");
         assert_eq!(s.reader_fit, "contain");
         assert_eq!(s.reader_rotation, 0);
     }
@@ -231,6 +283,8 @@ mod tests {
         let s = Settings {
             source_lists: vec!["https://example.com/index.json".into()],
             languages: vec!["en".into(), "es".into()],
+            profiles: vec!["default".into(), "alex".into()],
+            active_profile: "alex".into(),
             storage_size_limit: StorageSize(500 * 1024 * 1024),
             predownload_unread_chapters: 5,
             auto_check_updates: false,
@@ -257,6 +311,36 @@ mod tests {
         assert_eq!(s.languages, vec!["en"]);
         // Everything else got defaults.
         assert_eq!(s.storage_size_limit.bytes(), DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn profiles_parse_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap()
+        };
+        // Valid lists pass through; non-string entries are dropped.
+        assert_eq!(
+            load(r#"{"profiles": ["default", "alex"]}"#).profiles,
+            vec!["default", "alex"]
+        );
+        assert_eq!(
+            load(r#"{"profiles": ["default", 42, null, " bo "]}"#).profiles,
+            vec!["default", "bo"]
+        );
+        // Empty lists and wrong types fall back to just "default".
+        assert_eq!(load(r#"{"profiles": []}"#).profiles, vec!["default"]);
+        assert_eq!(load(r#"{"profiles": "alex"}"#).profiles, vec!["default"]);
+        // Active profile: non-empty strings pass through, the rest means
+        // "default".
+        assert_eq!(load(r#"{"active_profile": "alex"}"#).active_profile, "alex");
+        assert_eq!(load(r#"{"active_profile": ""}"#).active_profile, "default");
+        assert_eq!(load(r#"{"active_profile": 7}"#).active_profile, "default");
+        assert_eq!(
+            load(r#"{"active_profile": null}"#).active_profile,
+            "default"
+        );
     }
 
     #[test]

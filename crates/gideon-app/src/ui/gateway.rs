@@ -26,10 +26,13 @@ pub struct SourceEntry {
 }
 
 /// A manga as shown in list screens.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MangaEntry {
     pub id: String,
     pub title: String,
+    /// Cover art URL from the source, fetched once per series at download
+    /// time so library cards can show the real manga cover.
+    pub cover_url: Option<String>,
 }
 
 /// A chapter as shown in the chapter list.
@@ -79,6 +82,9 @@ pub trait SourceGateway {
 
     /// Search a source for manga matching `query`.
     fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>>;
+
+    /// Download a manga cover image to `dest` (best-effort metadata).
+    fn download_cover(&self, url: &str, dest: &Path) -> Result<()>;
 
     /// Chapter list for a manga.
     fn chapters(&self, source_id: &str, manga_id: &str) -> Result<Vec<ChapterEntry>>;
@@ -190,6 +196,7 @@ impl SourceGateway for AidokuGateway {
             .into_iter()
             .map(|m| MangaEntry {
                 title: m.title.unwrap_or_else(|| m.id.clone()),
+                cover_url: m.cover_url.map(|u| u.to_string()),
                 id: m.id,
             })
             .collect())
@@ -204,9 +211,15 @@ impl SourceGateway for AidokuGateway {
             .into_iter()
             .map(|m| MangaEntry {
                 title: m.title.unwrap_or_else(|| m.id.clone()),
+                cover_url: m.cover_url.map(|u| u.to_string()),
                 id: m.id,
             })
             .collect())
+    }
+
+    fn download_cover(&self, url: &str, dest: &Path) -> Result<()> {
+        let runtime = self.runtime()?;
+        runtime.block_on(manga::download_cover(url, dest))
     }
 
     fn chapters(&self, source_id: &str, manga_id: &str) -> Result<Vec<ChapterEntry>> {

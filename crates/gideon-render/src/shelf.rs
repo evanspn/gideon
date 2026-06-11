@@ -8,7 +8,7 @@
 use image::imageops::FilterType;
 use image::DynamicImage;
 
-use crate::GrayPage;
+use crate::{GrayPage, RgbPage};
 
 /// Grid geometry, all in pixels.
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +82,78 @@ pub struct ShelfEntry {
 /// title clipped to the card width (pixel-clipped — long names can never
 /// overflow the card), and a progress bar along the bottom.
 pub fn compose_shelf(entries: &[ShelfEntry], layout: &ShelfLayout) -> GrayPage {
+    let mut canvas = compose_shelf_chrome(entries, layout);
+    for (index, entry) in entries.iter().take(layout.capacity()).enumerate() {
+        let (off_x, off_y, fit_w, fit_h) = cover_placement(layout, &entry.cover, index);
+        let thumb = entry
+            .cover
+            .resize_exact(fit_w, fit_h, FilterType::Triangle)
+            .into_luma8();
+        for y in 0..fit_h {
+            for x in 0..fit_w {
+                let px = thumb.get_pixel(x, y).0[0];
+                let canvas_idx = ((off_y + y) * canvas.width + off_x + x) as usize;
+                canvas.pixels[canvas_idx] = px;
+            }
+        }
+    }
+    canvas
+}
+
+/// Color variant of [`compose_shelf`]: the covers keep their RGB color
+/// (Kaleido panels show it), everything else — borders, titles, progress —
+/// stays the grayscale chrome converted to RGB. Same geometry as the gray
+/// compositor, by construction.
+pub fn compose_shelf_rgb(entries: &[ShelfEntry], layout: &ShelfLayout) -> RgbPage {
+    let mut canvas = RgbPage::from_gray(&compose_shelf_chrome(entries, layout));
+    for (index, entry) in entries.iter().take(layout.capacity()).enumerate() {
+        let (off_x, off_y, fit_w, fit_h) = cover_placement(layout, &entry.cover, index);
+        let thumb = entry
+            .cover
+            .resize_exact(fit_w, fit_h, FilterType::Triangle)
+            .into_rgb8();
+        for y in 0..fit_h {
+            for x in 0..fit_w {
+                let px = thumb.get_pixel(x, y).0;
+                let canvas_idx = (((off_y + y) * canvas.width + off_x + x) * 3) as usize;
+                canvas.pixels[canvas_idx..canvas_idx + 3].copy_from_slice(&px);
+            }
+        }
+    }
+    canvas
+}
+
+/// Where a cover lands on the canvas: `(x, y, w, h)` — scaled to fit its
+/// cell's cover area and centered in it. Single source of truth for the
+/// gray and RGB compositors.
+fn cover_placement(
+    layout: &ShelfLayout,
+    cover: &DynamicImage,
+    index: usize,
+) -> (u32, u32, u32, u32) {
+    let cell_w = layout.cell_width();
+    let cover_h = layout
+        .cell_height()
+        .saturating_sub(layout.title_height + layout.progress_bar_height);
+    let (cell_x, cell_y) = layout.cell_origin(index);
+    let (fit_w, fit_h) = crate::compute_fit(
+        cover.width(),
+        cover.height(),
+        cell_w,
+        cover_h,
+        crate::FitMode::Contain,
+    );
+    (
+        cell_x + (cell_w - fit_w) / 2,
+        cell_y + (cover_h - fit_h) / 2,
+        fit_w,
+        fit_h,
+    )
+}
+
+/// Everything on the shelf except the cover pixels: card borders, title
+/// strips and progress bars, shared by the gray and RGB compositors.
+fn compose_shelf_chrome(entries: &[ShelfEntry], layout: &ShelfLayout) -> GrayPage {
     let mut canvas = GrayPage::new_white(layout.screen_width, layout.screen_height);
     let cell_w = layout.cell_width();
     let cover_h = layout
@@ -100,29 +172,6 @@ pub fn compose_shelf(entries: &[ShelfEntry], layout: &ShelfLayout) -> GrayPage {
             layout.cell_height(),
             0xAA,
         );
-
-        // Scale the cover to fit within the cell's cover area.
-        let (fit_w, fit_h) = crate::compute_fit(
-            entry.cover.width(),
-            entry.cover.height(),
-            cell_w,
-            cover_h,
-            crate::FitMode::Contain,
-        );
-        let thumb = entry
-            .cover
-            .resize_exact(fit_w, fit_h, FilterType::Triangle)
-            .into_luma8();
-
-        let off_x = cell_x + (cell_w - fit_w) / 2;
-        let off_y = cell_y + (cover_h - fit_h) / 2;
-        for y in 0..fit_h {
-            for x in 0..fit_w {
-                let px = thumb.get_pixel(x, y).0[0];
-                let canvas_idx = ((off_y + y) * canvas.width + off_x + x) as usize;
-                canvas.pixels[canvas_idx] = px;
-            }
-        }
 
         // Title strip: the name, pixel-clipped to the card's inner width.
         let text_px = (layout.title_height as f32 * 0.55).max(11.0);
@@ -302,6 +351,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rgb_shelf_keeps_cover_color_and_gray_chrome() {
+        let l = layout();
+        let entries = vec![ShelfEntry {
+            cover: DynamicImage::ImageRgb8(RgbImage::from_pixel(
+                300,
+                400,
+                image::Rgb([220, 20, 20]),
+            )),
+            title: "Red".into(),
+            progress: Some(0.5),
+        }];
+        let page = compose_shelf_rgb(&entries, &l);
+        assert_eq!((page.width, page.height), (l.screen_width, l.screen_height));
+
+        // The cover cell's center is still red — not collapsed to gray.
+        let (cx, cy) = l.cell_origin(0);
+        let cover_h = l.cell_height() - l.title_height - l.progress_bar_height;
+        let [r, g, b] = page.pixel(cx + l.cell_width() / 2, cy + cover_h / 2);
+        assert!(
+            r > 180 && g < 80 && b < 80,
+            "cover lost its color: {r},{g},{b}"
+        );
+
+        // The card border stays neutral gray (the 3:4 cover overdraws the
+        // top edge, like the gray path — check the bottom edge)...
+        assert_eq!(page.pixel(cx, cy + l.cell_height() - 1), [0xAA, 0xAA, 0xAA]);
+        // ...and so does the empty margin and the progress bar.
+        assert_eq!(page.pixel(0, 0), [0xFF, 0xFF, 0xFF]);
+        let bar_y = cy + l.cell_height() - l.progress_bar_height + 1;
+        assert_eq!(
+            page.pixel(cx + l.cell_width() / 4, bar_y),
+            [0x22, 0x22, 0x22]
+        );
+        assert_eq!(
+            page.pixel(cx + l.cell_width() * 3 / 4, bar_y),
+            [0xCC, 0xCC, 0xCC]
+        );
+    }
+
+    #[test]
+    fn rgb_and_gray_shelves_share_their_geometry() {
+        // A pure-gray cover composes to the SAME image through both paths:
+        // any drift here means the layout math forked.
+        let l = layout();
+        let entries = vec![
+            ShelfEntry {
+                cover: cover(300, 400, 90),
+                title: "One".into(),
+                progress: Some(0.25),
+            },
+            ShelfEntry {
+                cover: cover(120, 400, 40),
+                title: "Two".into(),
+                progress: None,
+            },
+        ];
+        let gray = compose_shelf(&entries, &l);
+        let rgb = compose_shelf_rgb(&entries, &l);
+        assert_eq!(rgb.to_gray(), gray);
     }
 
     #[test]
