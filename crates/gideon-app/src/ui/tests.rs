@@ -450,6 +450,85 @@ fn library_paginates_with_prev_next() {
     );
 }
 
+/// Write a solid-red series cover where the shelf looks for it.
+fn make_red_cover(series_dir: &Path) {
+    std::fs::create_dir_all(series_dir).unwrap();
+    let img = image::RgbImage::from_pixel(30, 40, image::Rgb([255, 0, 0]));
+    image::DynamicImage::ImageRgb8(img)
+        .save_with_format(series_dir.join(".cover.jpg"), image::ImageFormat::Jpeg)
+        .unwrap();
+}
+
+#[test]
+fn library_with_cover_art_renders_in_color() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_red_cover(&lib.join("Series"));
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+
+    // The shelf went through blit_rgb: MemoryDisplay's default impl
+    // collapses with Rec.601 luma, so a red cover lands at ~76 — the
+    // grayscale path (the image crate's BT.709 weights) would give ~54.
+    let l = layout();
+    let shelf = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS);
+    let (cx, cy) = shelf.cell_origin(0);
+    let cover_h = shelf.cell_height() - shelf.title_height - shelf.progress_bar_height;
+    let px = app.display().pixel(
+        cx + shelf.cell_width() / 2,
+        l.content_top() + cy + cover_h / 2,
+    );
+    assert!(
+        (66..=86).contains(&px),
+        "expected the Rec.601 luma of red (~76) from the RGB path, got {px}"
+    );
+    // Color shelves always flush in full, so the Kaleido color waveform
+    // (GCC16, FULL-only) can fire.
+    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Full));
+}
+
+#[test]
+fn color_library_page_flips_promote_to_full_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let l = layout();
+    let capacity = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS).capacity();
+    for i in 0..capacity + 1 {
+        make_cbz(&lib.join(format!("Series/vol{i:02}.cbz")), 1);
+    }
+    make_red_cover(&lib.join("Series"));
+
+    let events = vec![tap_row(0), tap_nav_next()];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    // Without covers this flip would be Partial (see
+    // library_paginates_with_prev_next); in color it must be Full.
+    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Full));
+}
+
+#[test]
+fn library_without_covers_stays_on_the_grayscale_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+
+    // The CBZ's first page is gray; nothing here may take the color path
+    // (covers come only from downloaded .cover.jpg art).
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(app
+        .display()
+        .flushes
+        .iter()
+        .all(|m| *m == RefreshMode::Full));
+}
+
 #[test]
 fn sources_screen_lists_installed_then_available() {
     let dir = tempfile::tempdir().unwrap();

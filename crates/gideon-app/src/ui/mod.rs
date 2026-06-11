@@ -25,9 +25,9 @@ use anyhow::{Context, Result};
 
 use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
-use gideon_render::shelf::{compose_shelf, ShelfEntry, ShelfLayout};
+use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{FitMode, GrayPage};
+use gideon_render::{FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
@@ -1408,6 +1408,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn render_current(&mut self, mode: RefreshMode) -> Result<()> {
+        // Color shelf: when a visible Library card has real cover art,
+        // compose in RGB so Kaleido panels show it in color. Always a full
+        // refresh — the MTK driver's color waveform (GCC16) only runs on
+        // FULL updates.
+        if let Some(page) = self.compose_color_current()? {
+            self.display.blit_rgb(&page, 0)?;
+            self.display.flush(RefreshMode::Full)?;
+            return Ok(());
+        }
         let page = match self.compose_current() {
             Ok(page) => page,
             // Composition failures (e.g. an unreadable CBZ) become an error
@@ -1423,6 +1432,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.display.blit(&page, 0)?;
         self.display.flush(mode)?;
         Ok(())
+    }
+
+    /// The current screen as a color page, when it has one: the Library
+    /// shelf with at least one visible downloaded cover (.cover.jpg).
+    /// Everything else renders grayscale.
+    fn compose_color_current(&self) -> Result<Option<RgbPage>> {
+        let Some(Screen::Library { entries, page }) = self.stack.last() else {
+            return Ok(None);
+        };
+        let l = &self.layout;
+        let shelf = self.shelf_layout();
+        let capacity = shelf.capacity().max(1);
+        let visible = || entries.iter().skip(page * capacity).take(capacity);
+        if !visible().any(|e| self.cover_path(e).exists()) {
+            return Ok(None);
+        }
+        let page_count = entries.len().div_ceil(capacity).max(1);
+        let chrome = compose_chrome(l, "Library", *page, page_count);
+        let grid = compose_shelf_rgb(
+            &self.shelf_entries_for_page(entries, *page, capacity),
+            &shelf,
+        );
+        let mut canvas = RgbPage::from_gray(&chrome);
+        copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
+        Ok(Some(canvas))
     }
 
     fn compose_current(&self) -> Result<GrayPage> {
@@ -1568,7 +1602,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
         let page_count = entries.len().div_ceil(capacity).max(1);
-        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
 
         let mut canvas = compose_chrome(l, "Library", page, page_count);
         if entries.is_empty() {
@@ -1593,17 +1626,38 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(canvas);
         }
 
+        let grid = compose_shelf(
+            &self.shelf_entries_for_page(entries, page, capacity),
+            &shelf,
+        );
+        copy_into(&mut canvas, &grid, 0, l.content_top());
+        Ok(canvas)
+    }
+
+    /// The series cover art for a library entry (fetched at download time).
+    fn cover_path(&self, entry: &LibraryEntry) -> PathBuf {
+        let series_dir = entry
+            .relative_path
+            .split('/')
+            .next()
+            .unwrap_or(&entry.relative_path);
+        self.library_dir.join(series_dir).join(".cover.jpg")
+    }
+
+    /// Build the shelf cards for one Library page, shared by the gray and
+    /// RGB compositors.
+    fn shelf_entries_for_page(
+        &self,
+        entries: &[LibraryEntry],
+        page: usize,
+        capacity: usize,
+    ) -> Vec<ShelfEntry> {
+        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
         let mut shelf_entries = Vec::new();
         for entry in entries.iter().skip(page * capacity).take(capacity) {
             // Prefer the manga's cover art (fetched at download time);
             // fall back to the chapter's first page, then a placeholder.
-            let series_dir = entry
-                .relative_path
-                .split('/')
-                .next()
-                .unwrap_or(&entry.relative_path);
-            let cover_file = self.library_dir.join(series_dir).join(".cover.jpg");
-            let cover = image::open(&cover_file)
+            let cover = image::open(self.cover_path(entry))
                 .ok()
                 .or_else(|| {
                     CbzDocument::open(&entry.path)
@@ -1624,9 +1678,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 progress,
             });
         }
-        let grid = compose_shelf(&shelf_entries, &shelf);
-        copy_into(&mut canvas, &grid, 0, l.content_top());
-        Ok(canvas)
+        shelf_entries
     }
 }
 
@@ -1978,6 +2030,18 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
         let dst_start = ((off_y + y) * dst.width + off_x) as usize;
         dst.pixels[dst_start..dst_start + copy_w as usize]
             .copy_from_slice(&src.pixels[src_start..src_start + copy_w as usize]);
+    }
+}
+
+/// [`copy_into`] for RGB pages (3 bytes per pixel).
+fn copy_into_rgb(dst: &mut RgbPage, src: &RgbPage, off_x: u32, off_y: u32) {
+    let copy_w = src.width.min(dst.width.saturating_sub(off_x));
+    let copy_h = src.height.min(dst.height.saturating_sub(off_y));
+    for y in 0..copy_h {
+        let src_start = (y * src.width * 3) as usize;
+        let dst_start = (((off_y + y) * dst.width + off_x) * 3) as usize;
+        dst.pixels[dst_start..dst_start + copy_w as usize * 3]
+            .copy_from_slice(&src.pixels[src_start..src_start + copy_w as usize * 3]);
     }
 }
 

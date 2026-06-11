@@ -15,10 +15,10 @@
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 
-use gideon_render::GrayPage;
+use gideon_render::{GrayPage, RgbPage};
 use memmap2::MmapMut;
 
-use crate::{blit_into, Display, Error, RefreshMode, Result};
+use crate::{blit_into, blit_rgb_into, Display, Error, RefreshMode, Result};
 
 // --- Linux fb + mxcfb ABI (from linux/fb.h and mxcfb.h) ---
 
@@ -45,6 +45,11 @@ const HWTCON_WAIT_FOR_UPDATE_SUBMISSION: u32 = 0x40044637;
 // MTK REAGL: KOReader's partial-refresh waveform on HWTCON devices
 // ("REAGL is *always* available" there).
 const HWTCON_WAVEFORM_MODE_GLR16: u32 = 4;
+// Kaleido color GC16: mtk-kobo.h's HWTCON_WAVEFORM_MODE_GCC16 = 10 ("Used
+// for images on color panels"), and like everything Kaleido-tweaked it is
+// *always* paired with UPDATE_MODE_FULL. KOReader uses it as
+// `waveform_color` for flashing refreshes of color content.
+const HWTCON_WAVEFORM_MODE_GCC16: u32 = 10;
 const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 // Mark 7 dithering: passthrough (off).
 const EPDC_FLAG_USE_DITHERING_PASSTHROUGH: i32 = 0x0;
@@ -239,6 +244,9 @@ pub struct KoboDisplay {
     /// The upright rotation we asked for (`upright_rotate_for_product`,
     /// or the `GIDEON_FB_ROTATE` override).
     upright_rotate: u32,
+    /// Whether the last blit carried real color: a FULL refresh then uses
+    /// the Kaleido color waveform (GCC16) on MTK kernels.
+    last_blit_color: bool,
 }
 
 impl KoboDisplay {
@@ -345,6 +353,7 @@ impl KoboDisplay {
             update_api: None,
             rotate: var.rotate,
             upright_rotate: wanted_rotate,
+            last_blit_color: false,
         })
     }
 
@@ -422,6 +431,24 @@ impl Display for KoboDisplay {
             let dst_row = &mut self.map[dst..dst + self.width as usize * bpp];
             write_gray_row(src_row, dst_row, bpp);
         }
+        self.last_blit_color = false;
+        Ok(())
+    }
+
+    fn blit_rgb(&mut self, page: &RgbPage, offset_y: u32) -> Result<()> {
+        // Same staging dance as `blit`, but the color survives all the way
+        // into the framebuffer (the Kaleido panel's CFA does the rest).
+        let mut staging = vec![0xFFu8; (self.width * self.height * 3) as usize];
+        blit_rgb_into(&mut staging, self.width, self.height, page, offset_y);
+
+        let bpp = self.bytes_per_pixel as usize;
+        for y in 0..self.height as usize {
+            let src_row = &staging[y * self.width as usize * 3..(y + 1) * self.width as usize * 3];
+            let dst = y * self.line_length as usize;
+            let dst_row = &mut self.map[dst..dst + self.width as usize * bpp];
+            write_rgb_row(src_row, dst_row, bpp);
+        }
+        self.last_blit_color = true;
         Ok(())
     }
 
@@ -462,8 +489,11 @@ impl Display for KoboDisplay {
                     // KOReader's HWTCON config: GC16 flashes, REAGL (GLR16)
                     // partials — and REAGL must ALWAYS be paired with
                     // UPDATE_MODE_FULL on these kernels (it doesn't flash;
-                    // see mtk-kobo.h and KOReader's hard promotion).
+                    // see mtk-kobo.h and KOReader's hard promotion). When
+                    // the framebuffer holds real color (an RGB blit), the
+                    // flash uses the Kaleido color waveform instead.
                     let mtk_waveform = match mode {
+                        RefreshMode::Full if self.last_blit_color => HWTCON_WAVEFORM_MODE_GCC16,
                         RefreshMode::Full => WAVEFORM_MODE_GC16,
                         RefreshMode::Partial => HWTCON_WAVEFORM_MODE_GLR16,
                     };
@@ -581,9 +611,61 @@ fn write_gray_row(gray: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
     }
 }
 
+/// Convert one row of packed RGB (3 bytes per pixel) into the framebuffer
+/// pixel format. Kobo color framebuffers are BGRA — blue lands in byte 0;
+/// grayscale (8bpp) framebuffers get the Rec.601 luma.
+fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
+    match bytes_per_pixel {
+        1 => {
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                out[i] = gideon_render::luma_rec601(px[0], px[1], px[2]);
+            }
+        }
+        2 => {
+            // RGB565, little-endian: r in the top 5 bits.
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                let v =
+                    ((px[0] as u16 >> 3) << 11) | ((px[1] as u16 >> 2) << 5) | (px[2] as u16 >> 3);
+                out[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        3 => {
+            // 24bpp BGR.
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                out[i * 3..i * 3 + 3].copy_from_slice(&[px[2], px[1], px[0]]);
+            }
+        }
+        4 => {
+            // 32bpp BGRA with opaque alpha.
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&[px[2], px[1], px[0], 0xFF]);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod waveform_tests {
+    use super::*;
+
+    #[test]
+    fn kaleido_color_waveform_is_gcc16_equals_10() {
+        // Cross-checked against KOReader's bindings (koreader-base
+        // ffi/mxcfb_kobo_h.lua: HWTCON_WAVEFORM_MODE_GCC16 = 10) and the
+        // kernel header (mtk-kobo.h HWTCON_WAVEFORM_MODE_ENUM: GCC16 = 10,
+        // "Used for images on color panels"). Pin it so a typo can't
+        // silently turn color refreshes into something else.
+        assert_eq!(HWTCON_WAVEFORM_MODE_GCC16, 10);
+        // And its grayscale neighbors, for completeness.
+        assert_eq!(WAVEFORM_MODE_GC16, 2);
+        assert_eq!(HWTCON_WAVEFORM_MODE_GLR16, 4);
+    }
+}
+
 #[cfg(test)]
 mod pixel_format_tests {
-    use super::write_gray_row;
+    use super::{write_gray_row, write_rgb_row};
 
     #[test]
     fn gray_to_8bpp_is_identity() {
@@ -618,6 +700,37 @@ mod pixel_format_tests {
         let mut out = [0u8; 6];
         write_gray_row(&[0x10, 0xF0], &mut out, 3);
         assert_eq!(out, [0x10, 0x10, 0x10, 0xF0, 0xF0, 0xF0]);
+    }
+
+    #[test]
+    fn rgb_to_32bpp_is_bgra_with_blue_in_byte_0() {
+        // Kobo framebuffers are BGRA: red must land in byte 2, blue in 0.
+        let mut out = [0u8; 8];
+        write_rgb_row(&[0xFF, 0x00, 0x00, 0x12, 0x34, 0x56], &mut out, 4);
+        assert_eq!(out, [0x00, 0x00, 0xFF, 0xFF, 0x56, 0x34, 0x12, 0xFF]);
+    }
+
+    #[test]
+    fn rgb_to_rgb565() {
+        let mut out = [0u8; 6];
+        write_rgb_row(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00], &mut out, 2);
+        // Pure red -> 0xF800, pure green -> 0x07E0 (little-endian).
+        assert_eq!(&out[0..2], &0xF800u16.to_le_bytes());
+        assert_eq!(&out[2..4], &0x07E0u16.to_le_bytes());
+    }
+
+    #[test]
+    fn rgb_to_8bpp_uses_rec601_luma() {
+        let mut out = [0u8; 3];
+        write_rgb_row(&[255, 0, 0, 0, 255, 0, 0, 0, 255], &mut out, 1);
+        assert_eq!(out, [76, 150, 29]);
+    }
+
+    #[test]
+    fn rgb_to_24bpp_is_bgr() {
+        let mut out = [0u8; 3];
+        write_rgb_row(&[0x11, 0x22, 0x33], &mut out, 3);
+        assert_eq!(out, [0x33, 0x22, 0x11]);
     }
 }
 
