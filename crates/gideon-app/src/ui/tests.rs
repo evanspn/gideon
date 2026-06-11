@@ -1372,6 +1372,141 @@ fn rotation_gestures_follow_the_reading_orientation() {
     assert_eq!(settings.reader_rotation, 180, "90 + one rotated up-swipe");
 }
 
+// --- chapter continuation ---
+
+#[test]
+fn finishing_a_chapter_flows_into_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = calls.clone();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        // Newest-first, like real sources: chapter 2 sits ABOVE chapter 1.
+        chapters: vec![
+            ChapterEntry {
+                id: "c2".into(),
+                num: Some(2.0),
+                title: None,
+                lang: None,
+            },
+            ChapterEntry {
+                id: "c1".into(),
+                num: Some(1.0),
+                title: None,
+                lang: None,
+            },
+        ],
+        download: Some(Box::new(move |library, _| {
+            counter.set(counter.get() + 1);
+            let path = library.join(format!("Manga One/Chapter {}.cbz", counter.get()));
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_row(2),        // Sources
+        tap_row(0),        // Listings
+        tap_row(0),        // Popular
+        tap_row(0),        // Manga One
+        tap_row(1),        // chapter 1 (second row: newest-first)
+        reader_tap_next(), // page 2 (last page of chapter 1)
+        reader_tap_next(), // past the end -> chapter 2 downloads + opens
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    assert_eq!(calls.get(), 2, "chapter 2 must auto-download");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Manga One/Chapter 2.cbz").is_some(),
+        "reading continued into chapter 2"
+    );
+    assert!(matches!(app.screen(), Screen::ChapterList { .. }));
+}
+
+#[test]
+fn last_chapter_end_stays_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Solo/only.cbz"), 2);
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(), // page 2 (last)
+        reader_tap_next(), // past the end, no next chapter: ignored
+        reader_tap_next(), // still ignored
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Solo/only.cbz").unwrap().current_page, 1);
+}
+
+#[test]
+fn library_reading_continues_into_the_next_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol01.cbz"), 2);
+    make_cbz(&lib.join("Series/vol02.cbz"), 2);
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(), // vol01 page 2
+        reader_tap_next(), // past the end -> vol02 opens
+        reader_tap_next(), // vol02 page 2
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Series/vol02.cbz").map(|p| p.current_page),
+        Some(1),
+        "vol02 was opened and read"
+    );
+}
+
+#[test]
+fn next_chapter_orders_by_number_not_position() {
+    let ch = |id: &str, num: Option<f32>| ChapterEntry {
+        id: id.into(),
+        num,
+        title: None,
+        lang: None,
+    };
+    // Newest-first list: 3, 2, 1.
+    let list = vec![
+        ch("c3", Some(3.0)),
+        ch("c2", Some(2.0)),
+        ch("c1", Some(1.0)),
+    ];
+    assert_eq!(next_chapter(&list, "c1").map(|c| c.id), Some("c2".into()));
+    assert_eq!(next_chapter(&list, "c2").map(|c| c.id), Some("c3".into()));
+    assert_eq!(next_chapter(&list, "c3"), None, "no chapter after the last");
+    // Without numbers: assume newest-first, step toward the front.
+    let bare = vec![ch("b3", None), ch("b2", None), ch("b1", None)];
+    assert_eq!(next_chapter(&bare, "b2").map(|c| c.id), Some("b3".into()));
+    assert_eq!(next_chapter(&bare, "b3"), None);
+}
+
 #[test]
 fn swipe_down_leaves_the_manga() {
     let dir = tempfile::tempdir().unwrap();

@@ -152,6 +152,17 @@ enum Flow {
     Quit(Exit),
 }
 
+/// How a reader session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderOutcome {
+    /// The user backed out to the screen beneath.
+    Back,
+    /// The input source closed: quit the app.
+    Quit,
+    /// The user turned past the last page and a next chapter exists.
+    NextChapter,
+}
+
 /// What the suspend hook did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SleepResult {
@@ -617,7 +628,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             } => {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(chapter) = chapters.get(index).cloned() {
-                    return self.download_and_read(&source, &manga, &chapter);
+                    return self.download_and_read(&source, &manga, &chapter, &chapters);
                 }
                 Ok(Flow::Continue)
             }
@@ -1152,24 +1163,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         source: &SourceEntry,
         manga: &MangaEntry,
         chapter: &ChapterEntry,
+        chapters: &[ChapterEntry],
     ) -> Result<Flow> {
-        // Already on disk? Straight into the reader — no network, no wait.
-        let cbz_path = match self.downloaded_chapter_path(source, manga, &chapter.id) {
-            Some(path) => path,
-            None => self.download_to_library(source, manga, chapter)?,
-        };
+        let mut chapter = chapter.clone();
+        loop {
+            // Already on disk? Straight into the reader — no network.
+            let cbz_path = match self.downloaded_chapter_path(source, manga, &chapter.id) {
+                Some(path) => path,
+                None => self.download_to_library(source, manga, &chapter)?,
+            };
 
-        // Taps queued while the download ran were aimed at the (now gone)
-        // chapter list — drop them so they don't flip pages in the reader.
-        // A sleep cover closed during the download survives the drain: the
-        // device must still suspend instead of sitting awake in a bag.
-        self.input.discard_taps();
+            // Taps queued while the download ran were aimed at the (now
+            // gone) chapter list — drop them so they don't flip pages in
+            // the reader. A sleep cover closed during the download
+            // survives the drain: the device must still suspend instead
+            // of sitting awake in a bag.
+            self.input.discard_taps();
 
-        let key = progress_key(&self.library_dir, &cbz_path);
-        if self.run_reader(&cbz_path, &key)? {
-            Ok(Flow::Continue)
-        } else {
-            Ok(Flow::Quit(Exit::Close))
+            let next = next_chapter(chapters, &chapter.id);
+            let key = progress_key(&self.library_dir, &cbz_path);
+            match self.run_reader(&cbz_path, &key, next.is_some())? {
+                ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
+                ReaderOutcome::Back => return Ok(Flow::Continue),
+                // Turning past the last page flows into the next chapter.
+                ReaderOutcome::NextChapter => {
+                    chapter = next.expect("NextChapter only with a next");
+                }
+            }
         }
     }
 
@@ -1215,23 +1235,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         x: u32,
         y: u32,
     ) -> Result<Flow> {
-        let Some(entry) = self.library_cell_at(entries, page, x, y) else {
+        let Some(mut entry) = self.library_cell_at(entries, page, x, y) else {
             return Ok(Flow::Continue);
         };
-        let keep_running = self.run_reader(&entry.path, &entry.relative_path)?;
-        Ok(if keep_running {
-            Flow::Continue
-        } else {
-            Flow::Quit(Exit::Close)
-        })
+        loop {
+            // Continuation within the series: the next CBZ in the same
+            // directory (entries come naturally sorted from the scan).
+            let next = next_in_series(entries, &entry);
+            match self.run_reader(&entry.path, &entry.relative_path, next.is_some())? {
+                ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
+                ReaderOutcome::Back => return Ok(Flow::Continue),
+                ReaderOutcome::NextChapter => {
+                    entry = next.expect("NextChapter only with a next");
+                }
+            }
+        }
     }
 
     // --- reader session ---
 
     /// Open a CBZ in the reader and loop until the user taps the center
-    /// zone (back) or the input source ends. Returns `false` when the app
-    /// should quit (input closed).
-    fn run_reader(&mut self, path: &Path, key: &str) -> Result<bool> {
+    /// zone (back), turns past the last page (with `next_available`), or
+    /// the input source ends.
+    fn run_reader(
+        &mut self,
+        path: &Path,
+        key: &str,
+        next_available: bool,
+    ) -> Result<ReaderOutcome> {
         let doc =
             CbzDocument::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
         let progress_file = progress_path(&self.library_dir);
@@ -1239,7 +1270,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
         let layout = self.layout;
         let mut rotation = self.reader_rotation;
-        let mut keep_running = true;
+        let mut outcome = ReaderOutcome::Back;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
             reader.resume_from(&store, key);
@@ -1247,13 +1278,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             loop {
                 match self.input.next_event() {
                     Err(_) => {
-                        keep_running = false;
+                        outcome = ReaderOutcome::Quit;
                         break;
                     }
                     // Tap zones follow the reading orientation, not the panel.
                     Ok(UiEvent::Tap { x, y }) => match layout.reader_zone_rotated(x, y, rotation) {
                         ReaderZone::NextPage => {
-                            reader.next_page()?;
+                            // Turning past the last page continues into
+                            // the next chapter (when one exists).
+                            if !reader.next_page()? && next_available {
+                                outcome = ReaderOutcome::NextChapter;
+                                break;
+                            }
                         }
                         ReaderZone::PrevPage => {
                             reader.prev_page()?;
@@ -1261,7 +1297,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         ReaderZone::Back => break,
                     },
                     Ok(UiEvent::PageForward) => {
-                        reader.next_page()?;
+                        if !reader.next_page()? && next_available {
+                            outcome = ReaderOutcome::NextChapter;
+                            break;
+                        }
                     }
                     Ok(UiEvent::PageBack) => {
                         reader.prev_page()?;
@@ -1348,7 +1387,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(UiEvent::LongPress { x, y }) => {
                         match layout.reader_zone_rotated(x, y, rotation) {
                             ReaderZone::NextPage => {
-                                reader.next_page()?;
+                                if !reader.next_page()? && next_available {
+                                    outcome = ReaderOutcome::NextChapter;
+                                    break;
+                                }
                             }
                             ReaderZone::PrevPage => {
                                 reader.prev_page()?;
@@ -1391,12 +1433,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         store.save(&progress_file)?;
 
-        if keep_running {
-            // Repaint the screen the reader covered.
+        if outcome == ReaderOutcome::Back {
+            // Repaint the screen the reader covered. (NextChapter goes
+            // straight into the next reader session — no repaint between.)
             self.render_current(RefreshMode::Full)?;
         }
-        Ok(keep_running)
+        Ok(outcome)
     }
+
+    // --- chapter continuation helpers ---
 
     // --- rendering ---
 
@@ -2103,6 +2148,39 @@ fn profile_library_dir(base: &Path, profile: &str) -> PathBuf {
 /// Progress file shared with `gideon library` / `gideon read`.
 pub(crate) fn progress_path(library_dir: &Path) -> PathBuf {
     library_dir.join(".gideon").join("progress.json")
+}
+
+/// The chapter that follows `current_id` in reading order. Chapter lists
+/// from sources are usually newest-first, so order by chapter number when
+/// numbers exist: the next chapter is the one with the smallest number
+/// greater than the current. Without numbers, assume newest-first and
+/// step toward the front of the list.
+fn next_chapter(chapters: &[ChapterEntry], current_id: &str) -> Option<ChapterEntry> {
+    let index = chapters.iter().position(|c| c.id == current_id)?;
+    if let Some(current_num) = chapters[index].num {
+        return chapters
+            .iter()
+            .filter(|c| c.num.is_some_and(|n| n > current_num))
+            .min_by(|a, b| {
+                a.num
+                    .partial_cmp(&b.num)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+    }
+    index.checked_sub(1).map(|i| chapters[i].clone())
+}
+
+/// The next CBZ of the same series on the shelf (entries arrive naturally
+/// sorted from the library scan).
+fn next_in_series(entries: &[LibraryEntry], current: &LibraryEntry) -> Option<LibraryEntry> {
+    let series = current.relative_path.rsplit_once('/').map(|(dir, _)| dir);
+    entries
+        .iter()
+        .skip_while(|e| e.relative_path != current.relative_path)
+        .skip(1)
+        .find(|e| e.relative_path.rsplit_once('/').map(|(dir, _)| dir) == series)
+        .cloned()
 }
 
 /// Progress key for a document: its path relative to the library root.
