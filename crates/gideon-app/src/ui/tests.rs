@@ -899,20 +899,121 @@ fn four_up_swipes_come_back_around_to_zero() {
     let settings_dir = dir.path().join("data");
     make_cbz(&lib.join("Sample/vol1.cbz"), 3);
 
-    let swipe_up = UiEvent::Swipe {
+    // Each swipe is "up" in the CURRENT reading frame (gestures follow
+    // the orientation): panel-up, then panel-left-to-right, panel-down,
+    // panel-right-to-left.
+    let up_at_0 = UiEvent::Swipe {
         x0: W / 2,
         y0: H - 100,
         x1: W / 2,
         y1: 100,
     };
-    let mut events = vec![tap_row(0), tap_shelf_cell0()];
-    events.extend(std::iter::repeat_n(swipe_up, 4));
-    events.push(reader_tap_back());
+    let up_at_90 = UiEvent::Swipe {
+        x0: 150,
+        y0: H / 2,
+        x1: W - 150,
+        y1: H / 2,
+    };
+    let up_at_180 = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 100,
+        x1: W / 2,
+        y1: H - 100,
+    };
+    let up_at_270 = UiEvent::Swipe {
+        x0: W - 150,
+        y0: H / 2,
+        x1: 150,
+        y1: H / 2,
+    };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        up_at_0,
+        up_at_90,
+        up_at_180,
+        up_at_270,
+    ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
     let settings = gideon_core::Settings::load(&settings_dir).unwrap();
     assert_eq!(settings.reader_rotation, 0, "full circle");
+}
+
+#[test]
+fn sloppy_tap_drift_neither_rotates_nor_exits() {
+    // The auditor's blocker: a page-turn tap that drifts 40px (past the
+    // 30px slop) classifies as a swipe — it must NOT rotate-and-lock the
+    // reader, and must not exit the book either.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let drift_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 400,
+        x1: W / 2,
+        y1: 360, // 40px: a sloppy tap, not a gesture
+    };
+    let drift_down = UiEvent::Swipe {
+        x0: W / 2,
+        y0: 360,
+        x1: W / 2,
+        y1: 400,
+    };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        drift_up,
+        drift_down,
+        reader_tap_next(), // reader still alive, unrotated zones
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 0, "drift must not rotate");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "drift must not exit; the next tap still turned the page"
+    );
+}
+
+#[test]
+fn rotation_gestures_follow_the_reading_orientation() {
+    // After rotating to 90°, the user's "up" is the panel's left-to-right.
+    // Their natural swipe must rotate again (to 180), not be ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    let panel_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 100,
+        x1: W / 2,
+        y1: 100,
+    };
+    // Reading-frame "up" at rotation 90: panel x increases, y steady.
+    // (map_reader_tap: reading_y = panel_w - 1 - x, so larger x = smaller
+    // reading y = upward.) Mid-screen vertically to dodge the edge bands.
+    let rotated_up = UiEvent::Swipe {
+        x0: 150,
+        y0: H / 2,
+        x1: W - 150,
+        y1: H / 2,
+    };
+    let events = vec![tap_row(0), tap_shelf_cell0(), panel_up, rotated_up];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 180, "90 + one rotated up-swipe");
 }
 
 #[test]

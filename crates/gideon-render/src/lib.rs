@@ -116,12 +116,16 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
         opts.fit,
     );
 
-    // Triangle (bilinear) is ~4x faster than Lanczos3 on the device's ARM
-    // core and visually indistinguishable for manga line art once dithered
-    // — page-turn latency matters more than resampling theory.
-    let scaled = page
-        .resize_exact(target_w, target_h, FilterType::Triangle)
-        .into_luma8();
+    // Downscales (the normal case) use Triangle: ~4x faster than Lanczos3
+    // on the device's ARM core and indistinguishable for manga once
+    // dithered. Upscales (low-res sources) use CatmullRom — Triangle is
+    // visibly soft when enlarging.
+    let filter = if target_w > page.width() || target_h > page.height() {
+        FilterType::CatmullRom
+    } else {
+        FilterType::Triangle
+    };
+    let scaled = page.resize_exact(target_w, target_h, filter).into_luma8();
 
     let canvas_w = opts.screen_width.max(target_w);
     let canvas_h = opts.screen_height.max(target_h);

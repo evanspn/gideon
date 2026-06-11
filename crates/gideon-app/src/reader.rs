@@ -30,6 +30,11 @@ use std::thread::JoinHandle;
 /// partial refreshes in between keep page turns fast.
 const FULL_REFRESH_INTERVAL: u32 = 6;
 
+/// Keep rendered pages cached only while each stays under this many
+/// screenfuls of pixels — webtoon-length FitWidth strips would otherwise
+/// pin tens of MB per cache slot on a 512MB device.
+const CACHE_BUDGET_SCREENS: usize = 4;
+
 /// When scrolling within a FitWidth page, keep this many pixels of the
 /// previous view visible so the reader doesn't lose their place.
 const SCROLL_OVERLAP_PX: u32 = 60;
@@ -180,9 +185,6 @@ impl<D: Display> Reader<D> {
             // The outgoing page becomes the spare: going back is instant.
             self.spare = self.rendered.replace((self.current_page, page));
         }
-        // Render the next page ahead, fully (scale + dither): the next
-        // turn is then just a blit + refresh.
-        self.prefetcher.start(self.current_page + 1, &opts);
 
         let page = &self.rendered.as_ref().expect("rendered above").1;
         let max_scroll = page.height.saturating_sub(reading_h);
@@ -205,6 +207,24 @@ impl<D: Display> Reader<D> {
             RefreshMode::Partial
         };
         self.display.flush(mode)?;
+
+        // Cache policy AFTER the paint (never stall a blit on a stale
+        // in-flight render): tall FitWidth pages can be enormous —
+        // 1680xN webtoon strips — so cap what stays resident. Past the
+        // budget, drop the spare and skip the render-ahead; neighbors of
+        // a huge page are almost certainly huge too.
+        let budget = (reading_w as usize) * (reading_h as usize) * CACHE_BUDGET_SCREENS;
+        let huge = self
+            .rendered
+            .as_ref()
+            .is_some_and(|(_, p)| p.pixels.len() > budget);
+        if huge {
+            self.spare = None;
+        } else {
+            // Render the next page ahead, fully (scale + dither): the
+            // next turn is then just a blit + refresh.
+            self.prefetcher.start(self.current_page + 1, &opts);
+        }
         Ok(())
     }
 

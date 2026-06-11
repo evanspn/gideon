@@ -1110,14 +1110,40 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         let on_right = x0 >= layout.width - edge && x1 >= layout.width - edge;
                         let on_left = x0 < edge && x1 < edge;
                         if !on_right && !on_left {
-                            // A mid-screen downward swipe leaves the manga;
-                            // an upward one rotates the reading orientation
-                            // 90° clockwise and locks it (persisted), for
-                            // reading on your side in bed.
-                            if y1 > y0 && (y1 - y0) > x1.abs_diff(x0) {
+                            // Mid-screen gestures follow the READING
+                            // orientation (taps already do): swipe down to
+                            // leave the manga, swipe up to rotate 90°
+                            // clockwise and lock it (persisted) — for
+                            // reading on your side in bed. Both demand
+                            // deliberate travel (a quarter of the reading
+                            // height): a sloppy page-turn tap drifting past
+                            // the 30px slop must never exit, and certainly
+                            // never rotate-and-lock the whole reader.
+                            let (mx0, my0) = layout::map_reader_tap(
+                                x0,
+                                y0,
+                                layout.width,
+                                layout.height,
+                                rotation,
+                            );
+                            let (mx1, my1) = layout::map_reader_tap(
+                                x1,
+                                y1,
+                                layout.width,
+                                layout.height,
+                                rotation,
+                            );
+                            let reading_h = if rotation % 180 == 90 {
+                                layout.width
+                            } else {
+                                layout.height
+                            };
+                            let min_travel = (reading_h / 4).max(1);
+                            let vertical = my0.abs_diff(my1) > mx0.abs_diff(mx1);
+                            if my1 > my0 && vertical && my1 - my0 >= min_travel {
                                 break;
                             }
-                            if y0 > y1 && (y0 - y1) > x1.abs_diff(x0) {
+                            if my0 > my1 && vertical && my0 - my1 >= min_travel {
                                 rotation = (rotation + 90) % 360;
                                 reader.set_rotation(rotation);
                                 self.reader_rotation = rotation;
