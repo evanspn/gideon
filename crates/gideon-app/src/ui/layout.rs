@@ -64,10 +64,11 @@ pub struct UiLayout {
 
 impl UiLayout {
     pub fn new(width: u32, height: u32) -> Self {
-        // 1448px tall → 64px rows; scale proportionally, clamped to stay
-        // readable on small test displays.
-        let row_h = (height * 64 / 1448).clamp(24, 96);
-        let text_px = (row_h as f32 * 28.0 / 64.0).clamp(11.0, 40.0);
+        // 1448px tall → 88px rows (~7.5 mm at 300 dpi — finger-sized; 64px
+        // rows proved too small on the device); scale proportionally,
+        // clamped to stay usable on small test displays.
+        let row_h = (height * 88 / 1448).clamp(32, 132);
+        let text_px = (row_h as f32 * 28.0 / 64.0).clamp(11.0, 48.0);
         Self {
             width,
             height,
@@ -224,15 +225,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kobo_sized_layout_has_64px_rows() {
+    fn kobo_sized_layout_has_finger_sized_rows() {
         let l = UiLayout::new(1072, 1448);
-        assert_eq!(l.row_h, 64);
-        assert_eq!(l.title_h, 64);
-        assert_eq!(l.nav_h, 64);
-        assert!((l.text_px - 28.0).abs() < 0.01);
-        assert_eq!(l.content_top(), 64);
-        assert_eq!(l.nav_top(), 1448 - 64);
-        assert_eq!(l.rows_per_page(), ((1448 - 128) / 64) as usize);
+        assert_eq!(l.row_h, 88);
+        assert_eq!(l.title_h, 88);
+        assert_eq!(l.nav_h, 88);
+        assert!((l.text_px - 38.5).abs() < 0.01);
+        assert_eq!(l.content_top(), 88);
+        assert_eq!(l.nav_top(), 1448 - 88);
+        assert_eq!(l.rows_per_page(), ((1448 - 176) / 88) as usize);
     }
 
     #[test]
@@ -240,11 +241,11 @@ mod tests {
         let l = UiLayout::new(1072, 1448);
         // Title bar.
         assert_eq!(l.tap_target(500, 0), TapTarget::Title);
-        assert_eq!(l.tap_target(500, 63), TapTarget::Title);
-        // First row starts at 64.
-        assert_eq!(l.tap_target(500, 64), TapTarget::Row(0));
-        assert_eq!(l.tap_target(500, 127), TapTarget::Row(0));
-        assert_eq!(l.tap_target(500, 128), TapTarget::Row(1));
+        assert_eq!(l.tap_target(500, 87), TapTarget::Title);
+        // First row starts at 88.
+        assert_eq!(l.tap_target(500, 88), TapTarget::Row(0));
+        assert_eq!(l.tap_target(500, 175), TapTarget::Row(0));
+        assert_eq!(l.tap_target(500, 176), TapTarget::Row(1));
         // Nav bar thirds: width 1072 → third = 357.
         let nav_y = l.nav_top();
         assert_eq!(l.tap_target(0, nav_y), TapTarget::Back);

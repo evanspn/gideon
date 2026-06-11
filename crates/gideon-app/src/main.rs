@@ -419,7 +419,17 @@ fn cmd_shelf(dir: PathBuf, out: PathBuf, cols: u32, width: u32, height: u32) -> 
                 (p.current_page + 1) as f32 / p.total_pages as f32
             }
         });
-        entries.push(ShelfEntry { cover, progress });
+        entries.push(ShelfEntry {
+            cover,
+            title: entry
+                .relative_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&entry.relative_path)
+                .trim_end_matches(".cbz")
+                .to_string(),
+            progress,
+        });
     }
 
     let page = compose_shelf(&entries, &layout);
@@ -589,6 +599,18 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     };
     let gateway = ui::AidokuGateway::new(data_dir());
     let (fit, rotation) = reader_settings();
+    // Frontlight: restore the saved levels, persist every change from the
+    // reader's edge slides.
+    let saved = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
+    let mut frontlight = gideon_device::KoboFrontlight::new(
+        saved.frontlight_brightness.min(100) as u8,
+        saved.frontlight_warmth.min(100) as u8,
+    );
+    frontlight.apply();
+    let lights = Box::new(PersistedLights {
+        inner: frontlight,
+        data_dir: data_dir(),
+    });
     // Power button / sleep cover: suspend to RAM via the Nickel/KOReader
     // sysfs dance. The call blocks until the device wakes up.
     let sleeper: ui::SleepFn = Box::new(|| {
@@ -602,14 +624,69 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     let result = ui::UiApp::new(display, input, gateway, library)
         .with_reader_settings(fit, rotation)
         .with_sleeper(sleeper)
+        .with_lights(lights)
         .run();
-    if let Err(e) = &result {
-        // The UiApp owns the display; reopen for the error screen.
-        if let Ok(mut d) = KoboDisplay::open() {
-            show_fatal_on_display(&mut d, &format!("gideon stopped:\n{e:#}"));
+    match &result {
+        Err(e) => {
+            // The UiApp owns the display; reopen for the error screen.
+            if let Ok(mut d) = KoboDisplay::open() {
+                show_fatal_on_display(&mut d, &format!("gideon stopped:\n{e:#}"));
+            }
+        }
+        Ok(ui::Exit::Restart) => {
+            // Replace this process with a fresh copy of the binary — the
+            // launcher never sees an exit, so the device doesn't reboot.
+            use std::os::unix::process::CommandExt;
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let err = std::process::Command::new(exe).args(args).exec();
+            eprintln!("gideon: restart failed: {err}");
+        }
+        Ok(ui::Exit::Close) => {}
+    }
+    result.map(|_| ())
+}
+
+/// Frontlight wrapper that writes every change through to settings.json,
+/// so brightness and warmth survive restarts.
+#[cfg(feature = "kobo")]
+struct PersistedLights {
+    inner: gideon_device::KoboFrontlight,
+    data_dir: PathBuf,
+}
+
+#[cfg(feature = "kobo")]
+impl PersistedLights {
+    fn persist(&self) {
+        use gideon_device::LightControl as _;
+        let mut settings = gideon_core::Settings::load(&self.data_dir).unwrap_or_default();
+        settings.frontlight_brightness = u32::from(self.inner.brightness());
+        settings.frontlight_warmth = u32::from(self.inner.warmth());
+        if let Err(e) = settings.save(&self.data_dir) {
+            eprintln!("gideon: couldn't persist frontlight settings: {e}");
         }
     }
-    result
+}
+
+#[cfg(feature = "kobo")]
+impl gideon_device::LightControl for PersistedLights {
+    fn brightness(&self) -> u8 {
+        self.inner.brightness()
+    }
+
+    fn set_brightness(&mut self, percent: u8) {
+        self.inner.set_brightness(percent);
+        self.persist();
+    }
+
+    fn warmth(&self) -> u8 {
+        self.inner.warmth()
+    }
+
+    fn set_warmth(&mut self, percent: u8) {
+        self.inner.set_warmth(percent);
+        self.persist();
+    }
 }
 
 #[cfg(feature = "kobo")]

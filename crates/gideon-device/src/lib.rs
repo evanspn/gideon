@@ -13,9 +13,11 @@ pub mod input;
 pub mod kobo;
 #[cfg(feature = "kobo")]
 pub mod kobo_input;
+pub mod light;
 pub mod power;
 
 pub use input::{FakeInput, InputSource, TouchTransform, UiEvent};
+pub use light::{KoboFrontlight, LightControl};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
