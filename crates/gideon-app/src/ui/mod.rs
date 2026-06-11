@@ -220,6 +220,17 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Where settings.json lives, for persisting in-reader changes
     /// (rotation lock). `None` skips persistence.
     settings_dir: Option<PathBuf>,
+    /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
+    /// hides the percentage from the Home title and the sleep notice.
+    battery: Option<Box<dyn Fn() -> Option<u8>>>,
+    /// Decoded shelf covers keyed by source path, with the file mtime that
+    /// was decoded: Library repaints (page flips, returning from the
+    /// reader) re-compose the shelf, and re-decoding every cover JPEG each
+    /// time made repaints visibly slow. Evicted wholesale past two shelf
+    /// pages of entries.
+    cover_cache: std::cell::RefCell<
+        std::collections::HashMap<PathBuf, (std::time::SystemTime, image::DynamicImage)>,
+    >,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -241,6 +252,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             keyboard_paints: 0,
             lights: None,
             settings_dir: None,
+            battery: None,
+            cover_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -275,6 +288,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
         self
+    }
+
+    /// Install the battery probe (sysfs capacity on hardware): the Home
+    /// title and the sleep notice show the charge percentage.
+    pub fn with_battery(mut self, battery: Box<dyn Fn() -> Option<u8>>) -> Self {
+        self.battery = Some(battery);
+        self
+    }
+
+    /// The current battery percentage, when a probe is installed and a
+    /// battery reports one.
+    fn battery_now(&self) -> Option<u8> {
+        self.battery.as_ref().and_then(|probe| probe())
     }
 
     /// The underlying display (for tests and headless screenshots).
@@ -354,8 +380,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         // E-ink keeps its image with zero power: this stays on the panel
         // for the whole nap, and doubles as feedback that the cover close
-        // / button press registered.
-        self.show_status(&["Sleeping…", "Press power or open the cover to wake."])?;
+        // / button press registered. The battery line answers "should I
+        // plug it in before the nap?" at a glance.
+        let mut lines = vec!["Sleeping…".to_string()];
+        if let Some(percent) = self.battery_now() {
+            lines.push(format!("Battery {percent}%"));
+        }
+        lines.push("Press power or open the cover to wake.".to_string());
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        self.show_status(&lines)?;
         let result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -708,10 +741,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 1 => Ok(Flow::Quit(Exit::Close)),
                 _ => Ok(Flow::Continue),
             },
-            Screen::UpdatePrompt { .. } => {
-                self.install_update()?;
-                Ok(Flow::Continue)
-            }
+            Screen::UpdatePrompt { .. } => self.install_update(),
             Screen::Message { .. } => self.pop(),
         }
     }
@@ -1052,17 +1082,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    fn install_update(&mut self) -> Result<()> {
+    /// Install the update; on success the app restarts itself in place so
+    /// the new version is live immediately (no manual close-and-reopen).
+    fn install_update(&mut self) -> Result<Flow> {
         self.show_status(&["Downloading update…"])?;
         let body = self
             .gateway
             .install_update()
             .context("update install failed")?;
+        if body.starts_with("Updated to") {
+            self.show_status(&["Update installed — restarting…"])?;
+            return Ok(Flow::Quit(Exit::Restart));
+        }
         self.pop()?; // leave the prompt
         self.push(Screen::Message {
             title: "Updates".to_string(),
             body,
-        })
+        })?;
+        Ok(Flow::Continue)
     }
 
     /// The on-disk CBZ for a chapter, when it was downloaded before.
@@ -1454,12 +1491,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     fn render_current(&mut self, mode: RefreshMode) -> Result<()> {
         // Color shelf: when a visible Library card has real cover art,
-        // compose in RGB so Kaleido panels show it in color. Always a full
-        // refresh — the MTK driver's color waveform (GCC16) only runs on
-        // FULL updates.
+        // compose in RGB so Kaleido panels show it in color. The caller's
+        // refresh mode passes through: the MTK driver has a non-flashing
+        // color waveform (GLRC16) for partials, so shelf page flips don't
+        // have to flash.
         if let Some(page) = self.compose_color_current()? {
             self.display.blit_rgb(&page, 0)?;
-            self.display.flush(RefreshMode::Full)?;
+            self.display.flush(mode)?;
             return Ok(());
         }
         let page = match self.compose_current() {
@@ -1514,13 +1552,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
                 // The version in the title answers "did the update take?"
                 // at a glance; the profile name after it says whose library
-                // this is (tapping the left half switches). No Back on Home
-                // — the power symbol in the top-right corner opens the
-                // restart/close menu instead.
-                let title = format!(
-                    "gideon v{} — {}",
+                // this is (tapping the left half switches); the battery
+                // percent closes the line (the panel has no status bar
+                // otherwise). No Back on Home — the power symbol in the
+                // top-right corner opens the restart/close menu instead.
+                let title = home_title(
                     env!("CARGO_PKG_VERSION"),
-                    self.active_profile
+                    &self.active_profile,
+                    self.battery_now(),
                 );
                 let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
                 draw_power_icon(&mut canvas, l);
@@ -1700,16 +1739,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
         let mut shelf_entries = Vec::new();
         for entry in entries.iter().skip(page * capacity).take(capacity) {
-            // Prefer the manga's cover art (fetched at download time);
-            // fall back to the chapter's first page, then a placeholder.
-            let cover = image::open(self.cover_path(entry))
-                .ok()
-                .or_else(|| {
-                    CbzDocument::open(&entry.path)
-                        .and_then(|mut doc| doc.decode_page(0))
-                        .ok()
-                })
-                .unwrap_or_else(placeholder_cover);
+            let cover = self.shelf_cover(entry, capacity);
             let progress = store.get(&entry.relative_path).map(|p| {
                 if p.total_pages == 0 {
                     0.0
@@ -1724,6 +1754,51 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             });
         }
         shelf_entries
+    }
+
+    /// The decoded cover for a library entry, through the cover cache.
+    /// Prefers the manga's cover art (fetched at download time), falling
+    /// back to the chapter's first page, then a placeholder. Successful
+    /// decodes are cached by path + mtime; the cache is cleared once it
+    /// outgrows two shelf pages (`capacity`) of entries.
+    fn shelf_cover(&self, entry: &LibraryEntry, capacity: usize) -> image::DynamicImage {
+        // Which file would supply the cover? Its mtime invalidates stale
+        // cache entries (e.g. a re-fetched .cover.jpg).
+        let cover_path = self.cover_path(entry);
+        let path = if cover_path.exists() {
+            cover_path
+        } else {
+            entry.path.clone()
+        };
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+
+        let mut cache = self.cover_cache.borrow_mut();
+        if let Some((stamp, image)) = cache.get(&path) {
+            if *stamp == mtime {
+                return image.clone();
+            }
+        }
+        let decoded = if path.extension().is_some_and(|e| e == "jpg") {
+            image::open(&path).ok()
+        } else {
+            CbzDocument::open(&path)
+                .and_then(|mut doc| doc.decode_page(0))
+                .ok()
+        };
+        match decoded {
+            Some(image) => {
+                if cache.len() >= 2 * capacity.max(1) {
+                    cache.clear();
+                }
+                cache.insert(path, (mtime, image.clone()));
+                image
+            }
+            // Failures aren't cached: they're cheap to re-hit, and the
+            // file may become readable later (e.g. a finished copy).
+            None => placeholder_cover(),
+        }
     }
 }
 
@@ -2107,6 +2182,16 @@ fn entry_title(relative_path: &str) -> String {
 
 fn placeholder_cover() -> image::DynamicImage {
     image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(3, 4, image::Luma([0xCC])))
+}
+
+/// Home's title line: `gideon vX — profile — 47%`, with the battery part
+/// omitted when no battery reports a charge (tests, dev machines).
+fn home_title(version: &str, profile: &str, battery: Option<u8>) -> String {
+    let mut title = format!("gideon v{version} — {profile}");
+    if let Some(percent) = battery {
+        title.push_str(&format!(" — {percent}%"));
+    }
+    title
 }
 
 /// The Settings screen's rows, showing current values.

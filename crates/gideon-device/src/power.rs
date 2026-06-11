@@ -234,6 +234,32 @@ impl Default for KoboSuspend {
     }
 }
 
+/// Battery charge percent from sysfs, `None` when no battery reports one
+/// (tests, dev machines). Reads `capacity` from the same power-supply
+/// directories as the charging probe.
+pub fn battery_percent() -> Option<u8> {
+    battery_percent_at(Path::new("/"))
+}
+
+/// [`battery_percent`] rooted at `root`, so tests can point it at a
+/// tempdir laid out like `/`. Lenient: an unparsable capacity file is
+/// treated like a missing one, and values are clamped to 0–100.
+pub fn battery_percent_at(root: &Path) -> Option<u8> {
+    for name in ["battery", "bd71827_bat"] {
+        let path = root
+            .join("sys/class/power_supply")
+            .join(name)
+            .join("capacity");
+        if let Some(percent) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u8>().ok())
+        {
+            return Some(percent.min(100));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +371,29 @@ mod tests {
                 "no sysfs writes while plugged in (status {status:?})"
             );
         }
+    }
+
+    #[test]
+    fn battery_percent_reads_capacity_from_either_supply() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(battery_percent_at(dir.path()), None, "no sysfs yet");
+
+        let battery = dir.path().join("sys/class/power_supply/bd71827_bat");
+        std::fs::create_dir_all(&battery).unwrap();
+        std::fs::write(battery.join("capacity"), "47\n").unwrap();
+        assert_eq!(battery_percent_at(dir.path()), Some(47));
+
+        // Lenient: clamp overshoot, treat garbage as missing.
+        std::fs::write(battery.join("capacity"), "147").unwrap();
+        assert_eq!(battery_percent_at(dir.path()), Some(100), "clamped");
+        std::fs::write(battery.join("capacity"), "wat").unwrap();
+        assert_eq!(battery_percent_at(dir.path()), None);
+
+        // The older NTX name works too.
+        let ntx = dir.path().join("sys/class/power_supply/battery");
+        std::fs::create_dir_all(&ntx).unwrap();
+        std::fs::write(ntx.join("capacity"), "12").unwrap();
+        assert_eq!(battery_percent_at(dir.path()), Some(12));
     }
 
     #[test]

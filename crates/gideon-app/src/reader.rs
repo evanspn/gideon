@@ -190,13 +190,15 @@ impl<D: Display> Reader<D> {
         let max_scroll = page.height.saturating_sub(reading_h);
         self.scroll_y = self.scroll_y.min(max_scroll);
 
+        // Cut the visible window out of the reading-orientation page,
+        // overlay the page indicator, then rotate into the panel
+        // orientation (the indicator follows the reading direction).
+        let indicator = self.page_indicator_text();
+        let mut window = crop_rows(page, self.scroll_y, reading_h);
+        draw_page_indicator(&mut window, &indicator);
         if self.rotation == 0 {
-            // The display's blit handles vertical scrolling natively.
-            self.display.blit(page, self.scroll_y)?;
+            self.display.blit(&window, 0)?;
         } else {
-            // Cut the visible window out of the reading-orientation page,
-            // then rotate it into the panel orientation.
-            let window = crop_rows(page, self.scroll_y, reading_h);
             let rotated = rotate_page(&window, self.rotation);
             self.display.blit(&rotated, 0)?;
         }
@@ -304,6 +306,20 @@ impl<D: Display> Reader<D> {
     fn bump_refresh_counter(&mut self) {
         self.turns_since_full_refresh = (self.turns_since_full_refresh + 1) % FULL_REFRESH_INTERVAL;
     }
+
+    /// The page-indicator label: "13/187", with the scroll position within
+    /// a FitWidth page appended ("13/187 ·40%") so long strips show where
+    /// the reader is.
+    fn page_indicator_text(&self) -> String {
+        let mut text = format!("{}/{}", self.current_page + 1, self.doc.page_count());
+        if self.fit == FitMode::FitWidth {
+            let (scroll, max_scroll) = self.scroll_state();
+            if let Some(percent) = (scroll * 100).checked_div(max_scroll) {
+                text.push_str(&format!(" ·{percent}%"));
+            }
+        }
+        text
+    }
 }
 
 /// Normalize a rotation setting to 0/90/180/270 (anything else → 0).
@@ -334,6 +350,32 @@ fn draw_banner(page: &mut GrayPage, text: &str) {
         page.width.saturating_sub(32),
         true,
     );
+}
+
+/// Draw a compact page-indicator box ("13/187") in the bottom-right corner
+/// of the visible window — same approach as [`draw_banner`], shrunk to a
+/// corner box with ~24px text. Skipped when the window is too small for
+/// unobtrusive chrome (tiny test displays).
+fn draw_page_indicator(page: &mut GrayPage, text: &str) {
+    use gideon_render::text::{draw_text, measure_text};
+
+    const TEXT_PX: f32 = 24.0;
+    const PAD: u32 = 8;
+    let box_w = measure_text(TEXT_PX, text, false) + 2 * PAD;
+    let box_h = TEXT_PX as u32 + 2 * PAD;
+    if page.width < box_w * 3 || page.height < box_h * 3 {
+        return;
+    }
+    let x0 = page.width - box_w;
+    let y0 = page.height - box_h;
+    for y in y0..page.height {
+        let row = (y * page.width + x0) as usize;
+        // White box with a 1px dark edge on its top and left sides.
+        let value = if y == y0 { 0x00 } else { 0xFF };
+        page.pixels[row..row + box_w as usize].fill(value);
+        page.pixels[row] = 0x00;
+    }
+    draw_text(page, x0 + PAD, y0 + PAD, TEXT_PX, text, box_w - PAD, false);
 }
 
 fn crop_rows(page: &GrayPage, offset_y: u32, height: u32) -> GrayPage {
@@ -1033,6 +1075,66 @@ mod tests {
         assert_eq!(normalize_rotation(360), 0);
         assert_eq!(normalize_rotation(450), 90);
         assert_eq!(normalize_rotation(45), 0);
+    }
+
+    // --- page indicator (the banner's compact corner sibling) ---
+
+    #[test]
+    fn page_indicator_text_shows_page_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = new_reader(dir.path(), 3);
+        reader.show_current_page().unwrap();
+        assert_eq!(reader.page_indicator_text(), "1/3");
+        reader.next_page().unwrap();
+        assert_eq!(reader.page_indicator_text(), "2/3");
+    }
+
+    #[test]
+    fn page_indicator_includes_scroll_percent_in_fit_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = fit_width_reader(dir.path(), 2);
+        reader.show_current_page().unwrap();
+        assert_eq!(reader.page_indicator_text(), "1/2 ·0%");
+        // One tap scrolls 40 of 300: 13%.
+        reader.next_page().unwrap();
+        assert_eq!(reader.page_indicator_text(), "1/2 ·13%");
+    }
+
+    #[test]
+    fn page_indicator_is_drawn_in_the_bottom_right_corner() {
+        // A black page on a large display: the indicator box puts white
+        // pixels in the corner where the page is otherwise black.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("black.cbz");
+        make_cbz_sized(&path, &[(50, 50), (50, 50)]);
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(300, 300),
+            FitMode::Contain,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        assert!(
+            reader.display().pixel(295, 295) > 0xC0,
+            "corner box should be white over the black page"
+        );
+        assert!(
+            reader.display().pixel(150, 150) < 0x40,
+            "the page itself stays black"
+        );
+    }
+
+    #[test]
+    fn page_indicator_is_skipped_on_tiny_windows() {
+        // 16x16 test displays have no room for chrome: the indicator must
+        // not paint over the page (existing pixel assertions rely on it).
+        let mut page = GrayPage {
+            width: 16,
+            height: 16,
+            pixels: vec![0x00; 256],
+        };
+        draw_page_indicator(&mut page, "1/2");
+        assert!(page.pixels.iter().all(|&p| p == 0x00));
     }
 
     #[test]

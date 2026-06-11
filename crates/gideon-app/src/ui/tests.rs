@@ -491,7 +491,7 @@ fn library_with_cover_art_renders_in_color() {
 }
 
 #[test]
-fn color_library_page_flips_promote_to_full_refresh() {
+fn color_library_page_flips_stay_partial() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     let l = layout();
@@ -505,9 +505,47 @@ fn color_library_page_flips_promote_to_full_refresh() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    // Without covers this flip would be Partial (see
-    // library_paginates_with_prev_next); in color it must be Full.
-    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Full));
+    // Color page flips pass the caller's Partial through: the MTK driver
+    // runs them on the NON-flashing color waveform (GLRC16), so the shelf
+    // doesn't flash on every flip.
+    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Partial));
+}
+
+#[test]
+fn shelf_covers_are_cached_across_repaints() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 1);
+    make_red_cover(&lib.join("Series"));
+    let cover = lib.join("Series/.cover.jpg");
+
+    let app = app(&lib, FakeGateway::default(), vec![]);
+    let entry = LibraryEntry {
+        path: lib.join("Series/vol1.cbz"),
+        relative_path: "Series/vol1.cbz".to_string(),
+    };
+    let first = app.shelf_cover(&entry, 6);
+
+    // Replace the cover with garbage but keep its mtime: a cache hit keeps
+    // serving the old pixels, a re-decode would fall back elsewhere.
+    let mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&cover).unwrap());
+    std::fs::write(&cover, b"not a jpeg").unwrap();
+    filetime::set_file_mtime(&cover, mtime).unwrap();
+    assert_eq!(
+        app.shelf_cover(&entry, 6),
+        first,
+        "an unchanged mtime must serve the cached cover, not re-decode"
+    );
+
+    // Bumping the mtime invalidates the cache entry: the garbage file
+    // fails to decode and the cover falls back (here: the CBZ's page).
+    filetime::set_file_mtime(&cover, filetime::FileTime::from_unix_time(99, 0)).unwrap();
+    assert_ne!(
+        app.shelf_cover(&entry, 6),
+        first,
+        "a changed mtime must re-decode the cover"
+    );
 }
 
 #[test]
@@ -1867,20 +1905,16 @@ fn update_prompt_installs_on_tap() {
         update_message: "Update available: 0.0.0 -> 9.9.9.".into(),
         ..FakeGateway::default()
     };
-    // Home row 4 = "Check for updates" -> prompt; content tap installs.
+    // Home row 4 = "Check for updates" -> prompt; content tap installs,
+    // and a successful install restarts the app in place so the new
+    // binary is live immediately.
     let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_row(0)]);
-    app.run().unwrap();
-
+    assert_eq!(app.run().unwrap(), Exit::Restart);
     assert_eq!(
         app.gateway().installs.get(),
         1,
         "tap on prompt should install"
     );
-    let Screen::Message { title, body } = app.screen() else {
-        panic!("expected result message screen");
-    };
-    assert_eq!(title, "Updates");
-    assert!(body.contains("Updated to 9.9.9"));
 }
 
 // --- search keyboard ---
@@ -2547,6 +2581,47 @@ fn sleep_in_the_reader_saves_progress_first_and_resumes() {
     // The post-wake repaint is a full refresh.
     let flushes = &app.display().flushes;
     assert!(flushes.iter().filter(|m| **m == RefreshMode::Full).count() >= 3);
+}
+
+// --- battery ---
+
+#[test]
+fn home_title_includes_battery_percent_when_known() {
+    assert_eq!(
+        home_title("0.3.0", "default", Some(47)),
+        "gideon v0.3.0 — default — 47%"
+    );
+    assert_eq!(
+        home_title("0.3.0", "alex", None),
+        "gideon v0.3.0 — alex",
+        "no battery, no dangling separator"
+    );
+}
+
+#[test]
+fn battery_probe_feeds_home_and_sleep_without_breaking_either() {
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let probe = reads.clone();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
+        .with_sleeper(sleeper)
+        .with_battery(Box::new(move || {
+            probe.set(probe.get() + 1);
+            Some(47)
+        }));
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1, "sleep still suspends with a battery probe");
+    assert!(
+        reads.get() >= 2,
+        "both the Home title and the sleep notice must read the battery"
+    );
+    assert!(matches!(app.screen(), Screen::Home));
+    assert!(
+        app.display().buffer.iter().any(|&p| p < 0x80),
+        "home screen is blank"
+    );
 }
 
 #[test]
