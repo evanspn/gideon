@@ -59,7 +59,7 @@ impl GrayPage {
 }
 
 /// Rendering options.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
     pub screen_width: u32,
     pub screen_height: u32,
@@ -116,8 +116,11 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
         opts.fit,
     );
 
+    // Triangle (bilinear) is ~4x faster than Lanczos3 on the device's ARM
+    // core and visually indistinguishable for manga line art once dithered
+    // — page-turn latency matters more than resampling theory.
     let scaled = page
-        .resize_exact(target_w, target_h, FilterType::Lanczos3)
+        .resize_exact(target_w, target_h, FilterType::Triangle)
         .into_luma8();
 
     let canvas_w = opts.screen_width.max(target_w);

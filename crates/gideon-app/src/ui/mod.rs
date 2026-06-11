@@ -172,6 +172,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Frontlight hook for the reader's edge slides; `None` (tests,
     /// headless) means swipes are ignored.
     lights: Option<Box<dyn LightControl>>,
+    /// Where settings.json lives, for persisting in-reader changes
+    /// (rotation lock). `None` skips persistence.
+    settings_dir: Option<PathBuf>,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -190,6 +193,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             last_wake: None,
             keyboard_paints: 0,
             lights: None,
+            settings_dir: None,
         }
     }
 
@@ -209,6 +213,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Install the frontlight hook (reader edge slides).
     pub fn with_lights(mut self, lights: Box<dyn LightControl>) -> Self {
         self.lights = Some(lights);
+        self
+    }
+
+    /// Persist in-reader setting changes (rotation lock) to this directory.
+    pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
+        self.settings_dir = Some(dir);
         self
     }
 
@@ -1062,7 +1072,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut store = ProgressStore::load(&progress_file).unwrap_or_default();
 
         let layout = self.layout;
-        let rotation = self.reader_rotation;
+        let mut rotation = self.reader_rotation;
         let mut keep_running = true;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
@@ -1100,9 +1110,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         let on_right = x0 >= layout.width - edge && x1 >= layout.width - edge;
                         let on_left = x0 < edge && x1 < edge;
                         if !on_right && !on_left {
-                            // A mid-screen downward swipe leaves the manga.
+                            // A mid-screen downward swipe leaves the manga;
+                            // an upward one rotates the reading orientation
+                            // 90° clockwise and locks it (persisted), for
+                            // reading on your side in bed.
                             if y1 > y0 && (y1 - y0) > x1.abs_diff(x0) {
                                 break;
+                            }
+                            if y0 > y1 && (y0 - y1) > x1.abs_diff(x0) {
+                                rotation = (rotation + 90) % 360;
+                                reader.set_rotation(rotation);
+                                self.reader_rotation = rotation;
+                                if let Some(dir) = &self.settings_dir {
+                                    let mut settings =
+                                        gideon_core::Settings::load(dir).unwrap_or_default();
+                                    settings.reader_rotation = rotation;
+                                    if let Err(e) = settings.save(dir) {
+                                        eprintln!("gideon: couldn't persist rotation: {e}");
+                                    }
+                                }
+                                reader.show_banner(&format!("Rotation {rotation}° — locked"))?;
                             }
                             continue;
                         }

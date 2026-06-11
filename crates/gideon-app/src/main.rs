@@ -625,6 +625,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         .with_reader_settings(fit, rotation)
         .with_sleeper(sleeper)
         .with_lights(lights)
+        .with_settings_dir(data_dir())
         .run();
     match &result {
         Err(e) => {

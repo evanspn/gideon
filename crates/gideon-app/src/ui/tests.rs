@@ -857,6 +857,65 @@ fn edge_slides_without_a_light_hook_are_ignored() {
 }
 
 #[test]
+fn swipe_up_rotates_and_locks_the_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let swipe_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 100,
+        x1: W / 2,
+        y1: 100,
+    };
+    // After one up-swipe the reading orientation is 90°: "next" moves to
+    // the panel bottom (reading-right), like the rotated-taps test.
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    // In the 90° orientation the back zone is the panel's vertical middle.
+    let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        swipe_up,         // rotate to 90 and lock
+        tap_panel_bottom, // next page in the rotated orientation
+        tap_rotated_back,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    // The page actually turned under the rotated tap zones...
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+    // ...and the lock persisted for the next session.
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 90);
+}
+
+#[test]
+fn four_up_swipes_come_back_around_to_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    let swipe_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 100,
+        x1: W / 2,
+        y1: 100,
+    };
+    let mut events = vec![tap_row(0), tap_shelf_cell0()];
+    events.extend(std::iter::repeat_n(swipe_up, 4));
+    events.push(reader_tap_back());
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 0, "full circle");
+}
+
+#[test]
 fn swipe_down_leaves_the_manga() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
