@@ -534,7 +534,9 @@ fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
     let display = MemoryDisplay::new(1072, 1448);
     let input = FakeInput::new(Vec::new());
     let gateway = ui::AidokuGateway::new(data_dir());
-    let mut app = ui::UiApp::new(display, input, gateway, library);
+    let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
+    let mut app =
+        ui::UiApp::new(display, input, gateway, library).with_profile(&settings.active_profile);
     app.render_once()?;
 
     let display = app.display();
@@ -622,6 +624,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         })
     });
     let result = ui::UiApp::new(display, input, gateway, library)
+        .with_profile(&saved.active_profile)
         .with_reader_settings(fit, rotation)
         .with_sleeper(sleeper)
         .with_lights(lights)

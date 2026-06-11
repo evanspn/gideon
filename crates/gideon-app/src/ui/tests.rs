@@ -758,10 +758,194 @@ fn power_menu_restart_requests_restart() {
 #[test]
 fn title_taps_off_the_power_icon_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![UiEvent::Tap { x: 5, y: 5 }];
+    // Between the profile zone (left half) and the power zone (right
+    // 2 × title_h): a dead-zone tap must do nothing.
+    let l = layout();
+    let x = (l.width / 2 + l.width.saturating_sub(l.title_h * 2)) / 2;
+    let events = vec![UiEvent::Tap { x, y: 5 }];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Home));
+}
+
+// --- profiles ---
+
+/// Tap the left half of the title bar (the profile name on Home).
+fn tap_title_left() -> UiEvent {
+    let l = layout();
+    UiEvent::Tap {
+        x: 5,
+        y: l.title_h / 2,
+    }
+}
+
+/// Settings dir preloaded with the given profiles ("default" stays active).
+fn profile_settings_dir(dir: &Path, profiles: &[&str]) -> PathBuf {
+    let settings_dir = dir.join("data");
+    let settings = gideon_core::Settings {
+        profiles: profiles.iter().map(|p| p.to_string()).collect(),
+        ..gideon_core::Settings::default()
+    };
+    settings.save(&settings_dir).unwrap();
+    settings_dir
+}
+
+#[test]
+fn title_left_tap_opens_the_profile_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    let events = vec![tap_title_left()];
+    let mut app = app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    let Screen::ProfileMenu { profiles } = app.screen() else {
+        panic!("expected the profile menu");
+    };
+    assert_eq!(profiles, &vec!["default".to_string(), "alex".to_string()]);
+}
+
+#[test]
+fn switching_profile_shows_only_that_profiles_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+
+    let events = vec![
+        tap_title_left(), // profile menu
+        tap_row(1),       // switch to alex -> back on Home
+        tap_row(0),       // Library
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected alex's library");
+    };
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Alexs Series/vol1.cbz"]);
+    // The switch persisted for the next start.
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.active_profile, "alex");
+}
+
+#[test]
+fn default_profile_does_not_see_other_profiles_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected the default library");
+    };
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Shared/vol1.cbz"]);
+}
+
+#[test]
+fn downloads_land_in_the_active_profiles_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            // The fake writes into whatever library dir the UI passes —
+            // exactly how the real gateway behaves.
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_title_left(), // profile menu
+        tap_row(1),       // switch to alex
+        tap_row(2),       // Sources
+        tap_row(0),       // Listings
+        tap_row(0),       // Popular
+        tap_row(0),       // Manga One
+        tap_row(0),       // download + Reader
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events).with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    assert!(
+        lib.join("@alex/Manga One/Chapter 1.cbz").exists(),
+        "download must land in the active profile's directory"
+    );
+    assert!(
+        !lib.join("Manga One").exists(),
+        "nothing may leak into the default profile's library"
+    );
+}
+
+#[test]
+fn new_profile_keyboard_creates_and_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = profile_settings_dir(dir.path(), &["default"]);
+
+    let events = vec![
+        tap_title_left(), // profile menu: [default, New profile…]
+        tap_row(1),       // New profile…
+        tap_key(Key::Char('b')),
+        tap_key(Key::Char('o')),
+        tap_key(Key::Char('b')),
+        tap_key(Key::Search), // create
+        tap_row(0),           // Library (of the new profile)
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.profiles,
+        vec!["default".to_string(), "bob".to_string()]
+    );
+    assert_eq!(settings.active_profile, "bob");
+    // The new profile's library exists and is empty.
+    assert!(lib.join("@bob").is_dir());
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected the new profile's (empty) library");
+    };
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn picking_the_active_profile_just_closes_the_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    let events = vec![tap_title_left(), tap_row(0)];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    assert!(matches!(app.screen(), Screen::Home));
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.active_profile, "default");
 }
 
 // --- frontlight edge slides ---

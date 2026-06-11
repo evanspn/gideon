@@ -98,6 +98,15 @@ enum Screen {
         entry: LibraryEntry,
         series_dir: String,
     },
+    /// Profile picker, opened from the left half of Home's title bar.
+    ProfileMenu {
+        profiles: Vec<String>,
+    },
+    /// On-screen keyboard for naming a new profile; the action key creates
+    /// it and switches to it.
+    NewProfile {
+        name: String,
+    },
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
     /// Update available; any content tap installs, Back declines.
@@ -154,7 +163,14 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
     gateway: G,
+    /// The profile-resolved library directory: every scan, download and
+    /// progress path goes through this.
     library_dir: PathBuf,
+    /// The library ROOT passed at startup; profile dirs hang off it (the
+    /// "default" profile IS the root).
+    base_library: PathBuf,
+    /// Active profile name (settings.json `active_profile`).
+    active_profile: String,
     layout: UiLayout,
     stack: Vec<Screen>,
     /// Reader fit mode (from settings.json `reader_fit`).
@@ -184,7 +200,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             display,
             input,
             gateway,
+            base_library: library_dir.clone(),
             library_dir,
+            active_profile: "default".to_string(),
             layout,
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
@@ -195,6 +213,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             lights: None,
             settings_dir: None,
         }
+    }
+
+    /// Start in this profile (resolved from settings.json at startup):
+    /// the library directory becomes the profile's subdirectory.
+    pub fn with_profile(mut self, name: &str) -> Self {
+        self.active_profile = name.to_string();
+        self.library_dir = profile_library_dir(&self.base_library, name);
+        self
     }
 
     /// Apply the reader-related settings (fit mode and rotation).
@@ -369,11 +395,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
-                // The power symbol lives in Home's top-right corner.
-                if matches!(self.screen(), Screen::Home)
-                    && x >= self.layout.width.saturating_sub(self.layout.title_h * 2)
-                {
-                    self.push(Screen::PowerMenu)?;
+                if matches!(self.screen(), Screen::Home) {
+                    if x >= self.layout.width.saturating_sub(self.layout.title_h * 2) {
+                        // The power symbol lives in Home's top-right corner.
+                        self.push(Screen::PowerMenu)?;
+                    } else if x < self.layout.width / 2 {
+                        // The active profile name sits in the title's left
+                        // half: tapping it opens the profile picker.
+                        self.open_profile_menu()?;
+                    }
                 }
                 Ok(Flow::Continue)
             }
@@ -617,6 +647,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Screen::ProfileMenu { profiles } => {
+                if let Some(name) = profiles.get(row).cloned() {
+                    if name == self.active_profile {
+                        self.pop()?; // already there — just close the menu
+                    } else {
+                        self.switch_profile(&name)?;
+                    }
+                } else if row == profiles.len() {
+                    self.keyboard_paints = 0;
+                    self.push(Screen::NewProfile {
+                        name: String::new(),
+                    })?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::NewProfile { name } => {
+                self.tap_new_profile(&name, x, y)?;
+                Ok(Flow::Continue)
+            }
             Screen::PowerMenu => match row {
                 0 => Ok(Flow::Quit(Exit::Restart)),
                 1 => Ok(Flow::Quit(Exit::Close)),
@@ -709,53 +758,111 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         x: u32,
         y: u32,
     ) -> Result<()> {
-        let edited = match self.layout.key_at(x, y) {
-            Some(Key::Char(c)) => {
-                let mut q = query.to_string();
-                q.push(c);
-                Some(q)
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let trimmed = query.trim();
+            if !trimmed.is_empty() {
+                self.run_search(source, trimmed)?;
             }
-            Some(Key::Space) => {
-                // No leading or doubled spaces — sources won't match them.
-                let q = query.to_string();
-                if q.is_empty() || q.ends_with(' ') {
-                    None
-                } else {
-                    Some(q + " ")
-                }
-            }
-            Some(Key::Backspace) => {
-                let mut q = query.to_string();
-                q.pop();
-                Some(q)
-            }
-            Some(Key::Search) => {
-                let trimmed = query.trim();
-                if !trimmed.is_empty() {
-                    self.run_search(source, trimmed)?;
-                }
-                return Ok(());
-            }
-            None => None,
-        };
-        if let Some(q) = edited {
+            return Ok(());
+        }
+        if let Some(q) = key.and_then(|key| apply_key_edit(query, key)) {
             if let Some(Screen::Search { query, .. }) = self.stack.last_mut() {
                 *query = q;
             }
-            // Mostly-partial refreshes keep typing fast, but ghosting
-            // accumulates — flash the panel clean every Nth repaint.
-            self.keyboard_paints += 1;
-            let mode = if self
-                .keyboard_paints
-                .is_multiple_of(KEYBOARD_FULL_REFRESH_INTERVAL)
-            {
-                RefreshMode::Full
-            } else {
-                RefreshMode::Partial
-            };
-            self.render_current(mode)?;
+            self.keyboard_repaint()?;
         }
         Ok(())
+    }
+
+    /// Handle a tap on the new-profile keyboard: edit the name in place,
+    /// or (action key) create the profile and switch to it.
+    fn tap_new_profile(&mut self, name: &str, x: u32, y: u32) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let trimmed = name.trim().to_string();
+            if !trimmed.is_empty() {
+                self.switch_profile(&trimmed)?;
+            }
+            return Ok(());
+        }
+        if let Some(n) = key.and_then(|key| apply_key_edit(name, key)) {
+            if let Some(Screen::NewProfile { name }) = self.stack.last_mut() {
+                *name = n;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
+    }
+
+    /// Repaint after a keyboard edit. Mostly-partial refreshes keep typing
+    /// fast, but ghosting accumulates — flash the panel clean every Nth
+    /// repaint.
+    fn keyboard_repaint(&mut self) -> Result<()> {
+        self.keyboard_paints += 1;
+        let mode = if self
+            .keyboard_paints
+            .is_multiple_of(KEYBOARD_FULL_REFRESH_INTERVAL)
+        {
+            RefreshMode::Full
+        } else {
+            RefreshMode::Partial
+        };
+        self.render_current(mode)
+    }
+
+    // --- profiles ---
+
+    /// Current settings; defaults when no settings dir is configured
+    /// (tests, headless) or the file is unreadable.
+    fn load_settings(&self) -> gideon_core::Settings {
+        self.settings_dir
+            .as_deref()
+            .map(|dir| gideon_core::Settings::load(dir).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Persist settings (no-op without a settings dir); a failed save is
+    /// logged, never fatal.
+    fn save_settings(&self, settings: &gideon_core::Settings) {
+        if let Some(dir) = &self.settings_dir {
+            if let Err(e) = settings.save(dir) {
+                eprintln!("gideon: couldn't save settings: {e}");
+            }
+        }
+    }
+
+    /// Open the profile picker from Home's title bar.
+    fn open_profile_menu(&mut self) -> Result<()> {
+        let mut profiles = self.load_settings().profiles;
+        // Lenient: a hand-edited settings.json may activate a profile the
+        // list doesn't know — show it anyway.
+        if !profiles.contains(&self.active_profile) {
+            profiles.push(self.active_profile.clone());
+        }
+        self.push(Screen::ProfileMenu { profiles })
+    }
+
+    /// Switch to (creating if needed) the named profile: persist the
+    /// choice, repoint the library and drop back to a fresh Home — the
+    /// whole navigation context (library, downloads) just changed.
+    fn switch_profile(&mut self, name: &str) -> Result<()> {
+        self.active_profile = name.to_string();
+        self.library_dir = profile_library_dir(&self.base_library, name);
+        std::fs::create_dir_all(&self.library_dir).with_context(|| {
+            format!(
+                "couldn't create profile library {}",
+                self.library_dir.display()
+            )
+        })?;
+        let mut settings = self.load_settings();
+        if !settings.profiles.iter().any(|p| p == name) {
+            settings.profiles.push(name.to_string());
+        }
+        settings.active_profile = name.to_string();
+        self.save_settings(&settings);
+        self.stack.truncate(1);
+        self.render_current(RefreshMode::Full)
     }
 
     /// Open the global-search keyboard from Home (every installed source).
@@ -1268,10 +1375,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let rows: Vec<(String, bool)> =
                     HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
                 // The version in the title answers "did the update take?"
-                // at a glance. No Back on Home — the power symbol in the
-                // top-right corner opens the restart/close menu instead.
-                let title = concat!("gideon v", env!("CARGO_PKG_VERSION"));
-                let mut canvas = compose_list_opts(l, title, &rows, 0, 1, false);
+                // at a glance; the profile name after it says whose library
+                // this is (tapping the left half switches). No Back on Home
+                // — the power symbol in the top-right corner opens the
+                // restart/close menu instead.
+                let title = format!(
+                    "gideon v{} — {}",
+                    env!("CARGO_PKG_VERSION"),
+                    self.active_profile
+                );
+                let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
                 draw_power_icon(&mut canvas, l);
                 canvas
             }
@@ -1283,6 +1396,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ];
                 compose_list(l, series_dir, &rows, 0, 1)
             }
+            Screen::ProfileMenu { profiles } => {
+                let mut rows: Vec<(String, bool)> = profiles
+                    .iter()
+                    .map(|p| {
+                        let mark = if *p == self.active_profile {
+                            "● "
+                        } else {
+                            ""
+                        };
+                        (format!("{mark}{p}"), true)
+                    })
+                    .collect();
+                rows.push(("New profile…".to_string(), true));
+                compose_list(l, "Profiles", &rows, 0, 1)
+            }
+            Screen::NewProfile { name } => compose_keyboard(l, "New profile", name, "Create"),
             Screen::PowerMenu => {
                 let rows = vec![
                     ("Restart gideon".to_string(), true),
@@ -1565,15 +1694,49 @@ fn compose_list_opts(
     canvas
 }
 
+/// Apply an edit key to a keyboard buffer; `None` means no change (the
+/// action key is handled by the caller). Shared by the search and
+/// new-profile keyboards.
+fn apply_key_edit(buffer: &str, key: Key) -> Option<String> {
+    match key {
+        Key::Char(c) => {
+            let mut b = buffer.to_string();
+            b.push(c);
+            Some(b)
+        }
+        // No leading or doubled spaces — sources won't match them, and
+        // directory names shouldn't carry them either.
+        Key::Space => {
+            if buffer.is_empty() || buffer.ends_with(' ') {
+                None
+            } else {
+                Some(format!("{buffer} "))
+            }
+        }
+        Key::Backspace => {
+            let mut b = buffer.to_string();
+            b.pop();
+            Some(b)
+        }
+        Key::Search => None,
+    }
+}
+
 /// The search screen: chrome + the query line + the on-screen keyboard.
 fn compose_search(l: &UiLayout, source_name: &str, query: &str) -> GrayPage {
-    let mut canvas = compose_chrome(l, &format!("Search {source_name}"), 0, 1);
+    compose_keyboard(l, &format!("Search {source_name}"), query, "Search")
+}
 
-    // Query line with a trailing caret, in the area above the keyboard.
-    // When the query outgrows the line, show its tail — the user needs to
-    // see what they are typing, not how the query started.
+/// A keyboard screen: chrome + the edited line + the on-screen keyboard,
+/// with the action key labeled `action` ("Search", "Create"…).
+fn compose_keyboard(l: &UiLayout, title: &str, buffer: &str, action: &str) -> GrayPage {
+    let mut canvas = compose_chrome(l, title, 0, 1);
+
+    // Edited line with a trailing caret, in the area above the keyboard.
+    // When the text outgrows the line, show its tail — the user needs to
+    // see what they are typing, not how the text started.
     let max_w = l.width.saturating_sub(2 * l.pad);
-    let mut shown = format!("{query}_");
+    let mut shown = format!("{buffer}_");
     while measure_text(l.text_px, &shown, true) > max_w && shown.chars().count() > 1 {
         shown.remove(0);
     }
@@ -1594,7 +1757,7 @@ fn compose_search(l: &UiLayout, source_name: &str, query: &str) -> GrayPage {
             Key::Char(c) => c.to_string(),
             Key::Backspace => "<del".to_string(),
             Key::Space => "space".to_string(),
-            Key::Search => "Search".to_string(),
+            Key::Search => action.to_string(),
         };
         let bold = key == Key::Search;
         let tw = measure_text(l.text_px, &label, bold).min(w);
@@ -1772,6 +1935,17 @@ fn entry_title(relative_path: &str) -> String {
 
 fn placeholder_cover() -> image::DynamicImage {
     image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(3, 4, image::Luma([0xCC])))
+}
+
+/// The library directory of a profile: the root itself for "default",
+/// `<root>/@<name>` otherwise. The @ prefix keeps profile dirs from
+/// colliding with series dirs, and the root scan skips them.
+fn profile_library_dir(base: &Path, profile: &str) -> PathBuf {
+    if profile == "default" {
+        base.to_path_buf()
+    } else {
+        base.join(format!("@{profile}"))
+    }
 }
 
 /// Progress file shared with `gideon library` / `gideon read`.
