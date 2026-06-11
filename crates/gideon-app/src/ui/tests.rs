@@ -53,6 +53,8 @@ struct FakeGateway {
     update_message: String,
     update_available: bool,
     installs: std::cell::Cell<usize>,
+    /// How many cover downloads were requested.
+    covers: std::cell::Cell<usize>,
 }
 
 impl Default for FakeGateway {
@@ -69,6 +71,7 @@ impl Default for FakeGateway {
             update_message: "up to date".to_string(),
             update_available: false,
             installs: std::cell::Cell::new(0),
+            covers: std::cell::Cell::new(0),
         }
     }
 }
@@ -94,6 +97,15 @@ impl SourceGateway for FakeGateway {
 
     fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
         self.mangas.clone().map_err(|e| anyhow!(e))
+    }
+
+    fn download_cover(&self, _url: &str, dest: &Path) -> Result<()> {
+        self.covers.set(self.covers.get() + 1);
+        // A real (tiny) image so the shelf can decode it.
+        let img = image::GrayImage::from_pixel(3, 4, image::Luma([0x11]));
+        std::fs::create_dir_all(dest.parent().unwrap())?;
+        image::DynamicImage::ImageLuma8(img).save_with_format(dest, image::ImageFormat::Jpeg)?;
+        Ok(())
     }
 
     fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>> {
@@ -538,6 +550,7 @@ fn full_browse_download_and_read_flow() {
         mangas: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Manga One".into(),
+            cover_url: None,
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -595,6 +608,7 @@ fn manga_list_paginates() {
         .map(|i| MangaEntry {
             id: format!("m{i}"),
             title: format!("Manga {i}"),
+            cover_url: None,
         })
         .collect();
     let gateway = FakeGateway {
@@ -879,6 +893,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
             source_name: "Src".into(),
             manga_id: "m1".into(),
             manga_title: "Manga One".into(),
+            ..gideon_core::SeriesRef::default()
         },
     );
     index.save(&lib).unwrap();
@@ -905,7 +920,8 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    // Long press -> book menu -> "All chapters (from source)".
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(0)];
     let mut app = app(&lib, gateway, events);
     app.run().unwrap();
 
@@ -924,7 +940,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
 }
 
 #[test]
-fn long_press_on_a_sideloaded_book_explains_no_source() {
+fn long_press_opens_the_book_menu() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Sideload/vol1.cbz"), 2);
@@ -937,11 +953,77 @@ fn long_press_on_a_sideloaded_book_explains_no_source() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::Message { title, body } = app.screen() else {
-        panic!("expected explanation");
+    let Screen::BookMenu { series_dir, .. } = app.screen() else {
+        panic!("expected the book menu");
     };
-    assert_eq!(title, "Chapters");
-    assert!(body.contains("Sideload"));
+    assert_eq!(series_dir, "Sideload");
+}
+
+#[test]
+fn unlinked_book_chapters_falls_back_to_prefilled_search() {
+    // A book downloaded before origins were recorded (or sideloaded):
+    // "All chapters" drops into global search with the series name typed.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sideload/vol1.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(0)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Search { source, query } = app.screen() else {
+        panic!("expected prefilled search");
+    };
+    assert!(source.is_none());
+    assert_eq!(query, "sideload");
+}
+
+#[test]
+fn book_menu_deletes_a_chapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected refreshed library");
+    };
+    assert_eq!(entries.len(), 1, "one chapter deleted, one remains");
+    assert!(lib.join("Series").exists(), "series dir keeps the other");
+}
+
+#[test]
+fn book_menu_deletes_the_whole_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::Library { entries, .. } = app.screen() else {
+        panic!("expected refreshed library");
+    };
+    assert!(entries.is_empty(), "whole series gone");
+    assert!(!lib.join("Series").exists());
 }
 
 #[test]
@@ -957,6 +1039,7 @@ fn downloading_records_the_series_origin() {
         mangas: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Manga One".into(),
+            cover_url: Some("https://example.com/cover.jpg".into()),
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -988,6 +1071,122 @@ fn downloading_records_the_series_origin() {
     assert_eq!(origin.source_id, "src");
     assert_eq!(origin.manga_id, "m1");
     assert_eq!(origin.manga_title, "Manga One");
+    assert_eq!(
+        origin.downloaded.get("c1"),
+        Some(&"Chapter 1.cbz".to_string()),
+        "the chapter file is recorded"
+    );
+    // The manga cover was fetched once and saved next to the chapters.
+    assert_eq!(app.gateway().covers.get(), 1);
+    assert!(lib.join("Manga One/.cover.jpg").exists());
+}
+
+#[test]
+fn downloaded_chapters_open_instantly_without_redownloading() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let downloads = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = downloads.clone();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            counter.set(counter.get() + 1);
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_row(2),        // Sources
+        tap_row(0),        // Listings
+        tap_row(0),        // Popular
+        tap_row(0),        // Manga One
+        tap_row(0),        // chapter -> download + read
+        reader_tap_back(), // back to the chapter list
+        tap_row(0),        // same chapter again -> instant open
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    assert_eq!(
+        downloads.get(),
+        1,
+        "the second open must come from disk, not the network"
+    );
+}
+
+#[test]
+fn long_press_a_chapter_downloads_without_opening_the_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        mangas: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Manga One".into(),
+            cover_url: None,
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        download: Some(Box::new(move |library, _| {
+            let path = library.join("Manga One/Chapter 1.cbz");
+            make_cbz(&path, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let chapter_row = tap_row(0);
+    let UiEvent::Tap { x, y } = chapter_row else {
+        unreachable!()
+    };
+    let events = vec![
+        tap_row(2),
+        tap_row(0),
+        tap_row(0),
+        tap_row(0),                  // ChapterList
+        UiEvent::LongPress { x, y }, // download only
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    assert!(
+        matches!(app.screen(), Screen::ChapterList { .. }),
+        "stay on the list after a download-only long press"
+    );
+    assert!(lib.join("Manga One/Chapter 1.cbz").exists());
+    let index = gideon_core::SeriesIndex::load(&lib);
+    assert!(index
+        .get("Manga One")
+        .unwrap()
+        .downloaded
+        .contains_key("c1"));
 }
 
 #[test]
@@ -1057,6 +1256,7 @@ fn search_gateway() -> FakeGateway {
         search_results: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Naruto".into(),
+            cover_url: None,
         }]),
         ..FakeGateway::default()
     }
@@ -1107,6 +1307,7 @@ fn global_search_queries_every_source_and_labels_results() {
         search_results: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Naruto".into(),
+            cover_url: None,
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),
@@ -1553,6 +1754,7 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
         mangas: Ok(vec![MangaEntry {
             id: "m1".into(),
             title: "Manga One".into(),
+            cover_url: None,
         }]),
         chapters: vec![ChapterEntry {
             id: "c1".into(),

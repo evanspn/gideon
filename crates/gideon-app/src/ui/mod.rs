@@ -93,6 +93,11 @@ enum Screen {
         chapters: Vec<ChapterEntry>,
         page: usize,
     },
+    /// Context menu for a library book (long press on its card).
+    BookMenu {
+        entry: LibraryEntry,
+        series_dir: String,
+    },
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
     /// Update available; any content tap installs, Back declines.
@@ -365,33 +370,58 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    /// Long press: on a library book, open its source's chapter list so
-    /// more chapters of the series can be downloaded straight from the
-    /// card. Everywhere else a long press is just a slow tap.
+    /// Long press: a library card opens its book menu; a chapter row
+    /// downloads that chapter without opening the reader. Everywhere else
+    /// a long press is just a slow tap.
     fn handle_long_press(&mut self, x: u32, y: u32) -> Result<Flow> {
         let screen = self.stack.last().cloned().expect("stack never empty");
-        let Screen::Library { entries, page } = screen else {
-            return self.handle_tap(x, y);
-        };
-        let Some(entry) = self.library_cell_at(&entries, page, x, y) else {
-            return Ok(Flow::Continue);
-        };
-        let series_dir = entry
-            .relative_path
-            .split('/')
-            .next()
-            .unwrap_or(&entry.relative_path)
-            .to_string();
+        match screen {
+            Screen::Library { entries, page } => {
+                let Some(entry) = self.library_cell_at(&entries, page, x, y) else {
+                    return Ok(Flow::Continue);
+                };
+                let series_dir = entry
+                    .relative_path
+                    .split('/')
+                    .next()
+                    .unwrap_or(&entry.relative_path)
+                    .to_string();
+                self.push(Screen::BookMenu { entry, series_dir })?;
+                Ok(Flow::Continue)
+            }
+            Screen::ChapterList {
+                source,
+                manga,
+                chapters,
+                page,
+            } => {
+                // Long press on a chapter row: download it and stay on the
+                // list — for stocking up before going offline.
+                if let TapTarget::Row(row) = self.layout.tap_target(x, y) {
+                    let index = page * self.layout.rows_per_page() + row;
+                    if let Some(chapter) = chapters.get(index).cloned() {
+                        self.download_to_library(&source, &manga, &chapter)?;
+                        self.input.discard_taps();
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                }
+                Ok(Flow::Continue)
+            }
+            _ => self.handle_tap(x, y),
+        }
+    }
+
+    /// Open the book menu's "chapters" entry: the source's chapter list
+    /// when the series is linked, otherwise the search keyboard prefilled
+    /// with the series name so one download can re-link it.
+    fn open_series_chapters(&mut self, series_dir: &str) -> Result<()> {
         let index = gideon_core::SeriesIndex::load(&self.library_dir);
-        let Some(origin) = index.get(&series_dir) else {
-            self.push(Screen::Message {
-                title: "Chapters".to_string(),
-                body: format!(
-                    "\"{series_dir}\" isn't linked to a source (copied over USB?), \
-                     so there's no chapter list to fetch."
-                ),
-            })?;
-            return Ok(Flow::Continue);
+        let Some(origin) = index.get(series_dir) else {
+            self.keyboard_paints = 0;
+            return self.push(Screen::Search {
+                source: None,
+                query: series_dir.to_ascii_lowercase(),
+            });
         };
         let source = SourceEntry {
             id: origin.source_id.clone(),
@@ -400,9 +430,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let manga = MangaEntry {
             id: origin.manga_id.clone(),
             title: origin.manga_title.clone(),
+            cover_url: origin.cover_url.clone(),
         };
-        self.open_chapter_list(&source, &manga)?;
-        Ok(Flow::Continue)
+        self.open_chapter_list(&source, &manga)
+    }
+
+    /// Rebuild the Library screen beneath the book menu after a delete.
+    fn refresh_library_after_delete(&mut self) -> Result<()> {
+        let entries = Library::new(&self.library_dir).scan()?;
+        self.stack.pop(); // leave the book menu
+        if let Some(screen @ Screen::Library { .. }) = self.stack.last_mut() {
+            *screen = Screen::Library { entries, page: 0 };
+        }
+        self.render_current(RefreshMode::Full)
     }
 
     /// Change page within the current screen (partial refresh).
@@ -516,6 +556,54 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(chapter) = chapters.get(index).cloned() {
                     return self.download_and_read(&source, &manga, &chapter);
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookMenu { entry, series_dir } => {
+                match row {
+                    0 => self.open_series_chapters(&series_dir)?,
+                    1 => {
+                        // Delete this chapter's file; drop it from the
+                        // series' download history.
+                        std::fs::remove_file(&entry.path)
+                            .with_context(|| format!("couldn't delete {}", entry.path.display()))?;
+                        if let Some(file) = entry.path.file_name() {
+                            let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+                            index.forget_download(&series_dir, &file.to_string_lossy());
+                            let _ = index.save(&self.library_dir);
+                        }
+                        // Remove the series dir too when it's now empty.
+                        if let Some(parent) = entry.path.parent() {
+                            if parent != self.library_dir
+                                && std::fs::read_dir(parent)
+                                    .map(|mut d| d.next().is_none())
+                                    .unwrap_or(false)
+                            {
+                                let _ = std::fs::remove_dir(parent);
+                            }
+                        }
+                        self.refresh_library_after_delete()?;
+                    }
+                    2 => {
+                        // Delete the whole series directory.
+                        let target = entry
+                            .path
+                            .parent()
+                            .filter(|p| *p != self.library_dir)
+                            .map(|p| p.to_path_buf());
+                        match target {
+                            Some(dir) => std::fs::remove_dir_all(&dir)
+                                .with_context(|| format!("couldn't delete {}", dir.display()))?,
+                            None => std::fs::remove_file(&entry.path).with_context(|| {
+                                format!("couldn't delete {}", entry.path.display())
+                            })?,
+                        }
+                        let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+                        index.remove(&series_dir);
+                        let _ = index.save(&self.library_dir);
+                        self.refresh_library_after_delete()?;
+                    }
+                    _ => {}
                 }
                 Ok(Flow::Continue)
             }
@@ -790,12 +878,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
-    fn download_and_read(
+    /// The on-disk CBZ for a chapter, when it was downloaded before.
+    fn downloaded_chapter_path(
+        &self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapter_id: &str,
+    ) -> Option<PathBuf> {
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let (dir, series) = index.find_manga(&source.id, &manga.id)?;
+        let file = series.downloaded.get(chapter_id)?;
+        let path = self.library_dir.join(dir).join(file);
+        path.exists().then_some(path)
+    }
+
+    /// Download a chapter into the library with live progress, recording
+    /// the series origin, the chapter file and (once per series) the cover.
+    fn download_to_library(
         &mut self,
         source: &SourceEntry,
         manga: &MangaEntry,
         chapter: &ChapterEntry,
-    ) -> Result<Flow> {
+    ) -> Result<PathBuf> {
         let label = chapter.label();
         self.show_status(&[&format!("Downloading {label}…")])?;
 
@@ -829,23 +933,55 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &mut progress,
         )?;
 
-        // Remember where this series came from, so a long press on its
-        // library card can reopen the source's chapter list later.
+        // Remember where this series came from (long press on its card
+        // reopens the chapter list) and which chapters are on disk (they
+        // open instantly, get a check mark, and survive re-listing).
         if let Some(dir) = cbz_path.parent().and_then(|p| p.file_name()) {
+            let dir = dir.to_string_lossy().to_string();
             let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
             index.record(
-                &dir.to_string_lossy(),
+                &dir,
                 gideon_core::SeriesRef {
                     source_id: source.id.clone(),
                     source_name: source.name.clone(),
                     manga_id: manga.id.clone(),
                     manga_title: manga.title.clone(),
+                    cover_url: manga.cover_url.clone(),
+                    ..gideon_core::SeriesRef::default()
                 },
             );
+            if let Some(file) = cbz_path.file_name() {
+                index.record_download(&dir, &chapter.id, &file.to_string_lossy());
+            }
             if let Err(e) = index.save(&self.library_dir) {
                 eprintln!("gideon: couldn't save the series index: {e}");
             }
+
+            // Fetch the manga cover once per series: library cards show
+            // the real cover art instead of a chapter's first page.
+            let cover_path = self.library_dir.join(&dir).join(".cover.jpg");
+            if !cover_path.exists() {
+                if let Some(url) = manga.cover_url.as_deref() {
+                    if let Err(e) = self.gateway.download_cover(url, &cover_path) {
+                        eprintln!("gideon: couldn't fetch the cover: {e:#}");
+                    }
+                }
+            }
         }
+        Ok(cbz_path)
+    }
+
+    fn download_and_read(
+        &mut self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapter: &ChapterEntry,
+    ) -> Result<Flow> {
+        // Already on disk? Straight into the reader — no network, no wait.
+        let cbz_path = match self.downloaded_chapter_path(source, manga, &chapter.id) {
+            Some(path) => path,
+            None => self.download_to_library(source, manga, chapter)?,
+        };
 
         // Taps queued while the download ran were aimed at the (now gone)
         // chapter list — drop them so they don't flip pages in the reader.
@@ -1086,6 +1222,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 draw_power_icon(&mut canvas, l);
                 canvas
             }
+            Screen::BookMenu { series_dir, .. } => {
+                let rows = vec![
+                    ("All chapters (from source)".to_string(), true),
+                    ("Delete this chapter".to_string(), true),
+                    ("Delete whole series".to_string(), true),
+                ];
+                compose_list(l, series_dir, &rows, 0, 1)
+            }
             Screen::PowerMenu => {
                 let rows = vec![
                     ("Restart gideon".to_string(), true),
@@ -1144,14 +1288,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, &title, &rows, *page, l.page_count(mangas.len()))
             }
             Screen::ChapterList {
+                source,
                 manga,
                 chapters,
                 page,
-                ..
             } => {
+                // Mark chapters that are already on disk: they open
+                // instantly, and a check tells the user what's stocked up.
+                let index = gideon_core::SeriesIndex::load(&self.library_dir);
+                let downloaded = index
+                    .find_manga(&source.id, &manga.id)
+                    .map(|(_, series)| series.downloaded.clone())
+                    .unwrap_or_default();
                 let rows: Vec<(String, bool)> = paged(chapters, *page, per_page)
                     .iter()
-                    .map(|c| (c.label(), true))
+                    .map(|c| {
+                        let mark = if downloaded.contains_key(&c.id) {
+                            "✓ "
+                        } else {
+                            ""
+                        };
+                        (format!("{mark}{}", c.label()), true)
+                    })
                     .collect();
                 compose_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
             }
@@ -1192,9 +1350,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
         let mut shelf_entries = Vec::new();
         for entry in entries.iter().skip(page * capacity).take(capacity) {
-            let cover = CbzDocument::open(&entry.path)
-                .and_then(|mut doc| doc.decode_page(0))
-                .unwrap_or_else(|_| placeholder_cover());
+            // Prefer the manga's cover art (fetched at download time);
+            // fall back to the chapter's first page, then a placeholder.
+            let series_dir = entry
+                .relative_path
+                .split('/')
+                .next()
+                .unwrap_or(&entry.relative_path);
+            let cover_file = self.library_dir.join(series_dir).join(".cover.jpg");
+            let cover = image::open(&cover_file)
+                .ok()
+                .or_else(|| {
+                    CbzDocument::open(&entry.path)
+                        .and_then(|mut doc| doc.decode_page(0))
+                        .ok()
+                })
+                .unwrap_or_else(placeholder_cover);
             let progress = store.get(&entry.relative_path).map(|p| {
                 if p.total_pages == 0 {
                     0.0
