@@ -314,8 +314,8 @@ impl<D: Display> Reader<D> {
         let mut text = format!("{}/{}", self.current_page + 1, self.doc.page_count());
         if self.fit == FitMode::FitWidth {
             let (scroll, max_scroll) = self.scroll_state();
-            if max_scroll > 0 {
-                text.push_str(&format!(" ·{}%", scroll * 100 / max_scroll));
+            if let Some(percent) = (scroll * 100).checked_div(max_scroll) {
+                text.push_str(&format!(" ·{percent}%"));
             }
         }
         text
