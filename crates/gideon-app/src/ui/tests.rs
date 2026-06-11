@@ -1905,20 +1905,16 @@ fn update_prompt_installs_on_tap() {
         update_message: "Update available: 0.0.0 -> 9.9.9.".into(),
         ..FakeGateway::default()
     };
-    // Home row 4 = "Check for updates" -> prompt; content tap installs.
+    // Home row 4 = "Check for updates" -> prompt; content tap installs,
+    // and a successful install restarts the app in place so the new
+    // binary is live immediately.
     let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_row(0)]);
-    app.run().unwrap();
-
+    assert_eq!(app.run().unwrap(), Exit::Restart);
     assert_eq!(
         app.gateway().installs.get(),
         1,
         "tap on prompt should install"
     );
-    let Screen::Message { title, body } = app.screen() else {
-        panic!("expected result message screen");
-    };
-    assert_eq!(title, "Updates");
-    assert!(body.contains("Updated to 9.9.9"));
 }
 
 // --- search keyboard ---

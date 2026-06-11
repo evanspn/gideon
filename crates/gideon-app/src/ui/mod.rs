@@ -717,10 +717,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 1 => Ok(Flow::Quit(Exit::Close)),
                 _ => Ok(Flow::Continue),
             },
-            Screen::UpdatePrompt { .. } => {
-                self.install_update()?;
-                Ok(Flow::Continue)
-            }
+            Screen::UpdatePrompt { .. } => self.install_update(),
             Screen::Message { .. } => self.pop(),
         }
     }
@@ -1061,17 +1058,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    fn install_update(&mut self) -> Result<()> {
+    /// Install the update; on success the app restarts itself in place so
+    /// the new version is live immediately (no manual close-and-reopen).
+    fn install_update(&mut self) -> Result<Flow> {
         self.show_status(&["Downloading update…"])?;
         let body = self
             .gateway
             .install_update()
             .context("update install failed")?;
+        if body.starts_with("Updated to") {
+            self.show_status(&["Update installed — restarting…"])?;
+            return Ok(Flow::Quit(Exit::Restart));
+        }
         self.pop()?; // leave the prompt
         self.push(Screen::Message {
             title: "Updates".to_string(),
             body,
-        })
+        })?;
+        Ok(Flow::Continue)
     }
 
     /// The on-disk CBZ for a chapter, when it was downloaded before.
