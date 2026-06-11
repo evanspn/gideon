@@ -220,6 +220,14 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Where settings.json lives, for persisting in-reader changes
     /// (rotation lock). `None` skips persistence.
     settings_dir: Option<PathBuf>,
+    /// Decoded shelf covers keyed by source path, with the file mtime that
+    /// was decoded: Library repaints (page flips, returning from the
+    /// reader) re-compose the shelf, and re-decoding every cover JPEG each
+    /// time made repaints visibly slow. Evicted wholesale past two shelf
+    /// pages of entries.
+    cover_cache: std::cell::RefCell<
+        std::collections::HashMap<PathBuf, (std::time::SystemTime, image::DynamicImage)>,
+    >,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -241,6 +249,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             keyboard_paints: 0,
             lights: None,
             settings_dir: None,
+            cover_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1454,12 +1463,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     fn render_current(&mut self, mode: RefreshMode) -> Result<()> {
         // Color shelf: when a visible Library card has real cover art,
-        // compose in RGB so Kaleido panels show it in color. Always a full
-        // refresh — the MTK driver's color waveform (GCC16) only runs on
-        // FULL updates.
+        // compose in RGB so Kaleido panels show it in color. The caller's
+        // refresh mode passes through: the MTK driver has a non-flashing
+        // color waveform (GLRC16) for partials, so shelf page flips don't
+        // have to flash.
         if let Some(page) = self.compose_color_current()? {
             self.display.blit_rgb(&page, 0)?;
-            self.display.flush(RefreshMode::Full)?;
+            self.display.flush(mode)?;
             return Ok(());
         }
         let page = match self.compose_current() {
@@ -1700,16 +1710,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
         let mut shelf_entries = Vec::new();
         for entry in entries.iter().skip(page * capacity).take(capacity) {
-            // Prefer the manga's cover art (fetched at download time);
-            // fall back to the chapter's first page, then a placeholder.
-            let cover = image::open(self.cover_path(entry))
-                .ok()
-                .or_else(|| {
-                    CbzDocument::open(&entry.path)
-                        .and_then(|mut doc| doc.decode_page(0))
-                        .ok()
-                })
-                .unwrap_or_else(placeholder_cover);
+            let cover = self.shelf_cover(entry, capacity);
             let progress = store.get(&entry.relative_path).map(|p| {
                 if p.total_pages == 0 {
                     0.0
@@ -1724,6 +1725,51 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             });
         }
         shelf_entries
+    }
+
+    /// The decoded cover for a library entry, through the cover cache.
+    /// Prefers the manga's cover art (fetched at download time), falling
+    /// back to the chapter's first page, then a placeholder. Successful
+    /// decodes are cached by path + mtime; the cache is cleared once it
+    /// outgrows two shelf pages (`capacity`) of entries.
+    fn shelf_cover(&self, entry: &LibraryEntry, capacity: usize) -> image::DynamicImage {
+        // Which file would supply the cover? Its mtime invalidates stale
+        // cache entries (e.g. a re-fetched .cover.jpg).
+        let cover_path = self.cover_path(entry);
+        let path = if cover_path.exists() {
+            cover_path
+        } else {
+            entry.path.clone()
+        };
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+
+        let mut cache = self.cover_cache.borrow_mut();
+        if let Some((stamp, image)) = cache.get(&path) {
+            if *stamp == mtime {
+                return image.clone();
+            }
+        }
+        let decoded = if path.extension().is_some_and(|e| e == "jpg") {
+            image::open(&path).ok()
+        } else {
+            CbzDocument::open(&path)
+                .and_then(|mut doc| doc.decode_page(0))
+                .ok()
+        };
+        match decoded {
+            Some(image) => {
+                if cache.len() >= 2 * capacity.max(1) {
+                    cache.clear();
+                }
+                cache.insert(path, (mtime, image.clone()));
+                image
+            }
+            // Failures aren't cached: they're cheap to re-hit, and the
+            // file may become readable later (e.g. a finished copy).
+            None => placeholder_cover(),
+        }
     }
 }
 

@@ -32,3 +32,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 tempfile.workspace = true
 zip.workspace = true
 serde_json.workspace = true
+filetime = "0.2"

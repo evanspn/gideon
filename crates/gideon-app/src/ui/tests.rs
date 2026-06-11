@@ -491,7 +491,7 @@ fn library_with_cover_art_renders_in_color() {
 }
 
 #[test]
-fn color_library_page_flips_promote_to_full_refresh() {
+fn color_library_page_flips_stay_partial() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     let l = layout();
@@ -505,9 +505,47 @@ fn color_library_page_flips_promote_to_full_refresh() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    // Without covers this flip would be Partial (see
-    // library_paginates_with_prev_next); in color it must be Full.
-    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Full));
+    // Color page flips pass the caller's Partial through: the MTK driver
+    // runs them on the NON-flashing color waveform (GLRC16), so the shelf
+    // doesn't flash on every flip.
+    assert_eq!(app.display().flushes.last(), Some(&RefreshMode::Partial));
+}
+
+#[test]
+fn shelf_covers_are_cached_across_repaints() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 1);
+    make_red_cover(&lib.join("Series"));
+    let cover = lib.join("Series/.cover.jpg");
+
+    let app = app(&lib, FakeGateway::default(), vec![]);
+    let entry = LibraryEntry {
+        path: lib.join("Series/vol1.cbz"),
+        relative_path: "Series/vol1.cbz".to_string(),
+    };
+    let first = app.shelf_cover(&entry, 6);
+
+    // Replace the cover with garbage but keep its mtime: a cache hit keeps
+    // serving the old pixels, a re-decode would fall back elsewhere.
+    let mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&cover).unwrap());
+    std::fs::write(&cover, b"not a jpeg").unwrap();
+    filetime::set_file_mtime(&cover, mtime).unwrap();
+    assert_eq!(
+        app.shelf_cover(&entry, 6),
+        first,
+        "an unchanged mtime must serve the cached cover, not re-decode"
+    );
+
+    // Bumping the mtime invalidates the cache entry: the garbage file
+    // fails to decode and the cover falls back (here: the CBZ's page).
+    filetime::set_file_mtime(&cover, filetime::FileTime::from_unix_time(99, 0)).unwrap();
+    assert_ne!(
+        app.shelf_cover(&entry, 6),
+        first,
+        "a changed mtime must re-decode the cover"
+    );
 }
 
 #[test]

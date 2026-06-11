@@ -50,6 +50,19 @@ const HWTCON_WAVEFORM_MODE_GLR16: u32 = 4;
 // *always* paired with UPDATE_MODE_FULL. KOReader uses it as
 // `waveform_color` for flashing refreshes of color content.
 const HWTCON_WAVEFORM_MODE_GCC16: u32 = 10;
+// Kaleido color REAGL: mtk-kobo.h's HWTCON_WAVEFORM_MODE_GLRC16 = 11 —
+// KOReader's `waveform_partial_color`. Non-flashing despite the mandatory
+// UPDATE_MODE_FULL pairing, exactly like GLR16 for grayscale.
+const HWTCON_WAVEFORM_MODE_GLRC16: u32 = 11;
+// HWTCON ioctl flags (mxcfb_kobo_h.lua / mtk-kobo.h): hardware dithering
+// and the Kaleido G2 color-filter-array saturation post-process. KOReader
+// sets both on every color refresh of a Kaleido panel.
+const HWTCON_FLAG_USE_DITHERING: u32 = 1;
+// 1536 in KOReader's decimal bindings.
+const HWTCON_FLAG_CFA_EINK_G2: u32 = 0x600;
+// HWTCON dither mode for color content: Y8 -> Y4, "S" variant
+// (HWTCON_FLAG_USE_DITHERING_Y8_Y4_S in mxcfb_kobo_h.lua).
+const HWTCON_DITHER_Y8_Y4_S: i32 = 0x102;
 const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 // Mark 7 dithering: passthrough (off).
 const EPDC_FLAG_USE_DITHERING_PASSTHROUGH: i32 = 0x0;
@@ -247,6 +260,10 @@ pub struct KoboDisplay {
     /// Whether the last blit carried real color: a FULL refresh then uses
     /// the Kaleido color waveform (GCC16) on MTK kernels.
     last_blit_color: bool,
+    /// Whether the framebuffer stores blue in byte 0 (BGRA, the monza
+    /// norm): probed from the kernel's reported red-channel offset at open
+    /// instead of hardcoding one channel order.
+    swap_rb: bool,
 }
 
 impl KoboDisplay {
@@ -342,6 +359,11 @@ impl KoboDisplay {
         // advertised via FBIOGET_FSCREENINFO.
         let map = unsafe { memmap2::MmapOptions::new().len(map_len).map_mut(&file)? };
 
+        // Channel order from the settled vinfo: a nonzero red offset means
+        // blue sits in byte 0 (BGRA — what monza reports); red at offset 0
+        // means a straight RGBA layout.
+        let swap_rb = var.red.offset != 0;
+
         Ok(Self {
             file,
             map,
@@ -354,6 +376,7 @@ impl KoboDisplay {
             rotate: var.rotate,
             upright_rotate: wanted_rotate,
             last_blit_color: false,
+            swap_rb,
         })
     }
 
@@ -446,7 +469,7 @@ impl Display for KoboDisplay {
             let src_row = &staging[y * self.width as usize * 3..(y + 1) * self.width as usize * 3];
             let dst = y * self.line_length as usize;
             let dst_row = &mut self.map[dst..dst + self.width as usize * bpp];
-            write_rgb_row(src_row, dst_row, bpp);
+            write_rgb_row(src_row, dst_row, bpp, self.swap_rb);
         }
         self.last_blit_color = true;
         Ok(())
@@ -491,19 +514,32 @@ impl Display for KoboDisplay {
                     // UPDATE_MODE_FULL on these kernels (it doesn't flash;
                     // see mtk-kobo.h and KOReader's hard promotion). When
                     // the framebuffer holds real color (an RGB blit), the
-                    // flash uses the Kaleido color waveform instead.
-                    let mtk_waveform = match mode {
-                        RefreshMode::Full if self.last_blit_color => HWTCON_WAVEFORM_MODE_GCC16,
-                        RefreshMode::Full => WAVEFORM_MODE_GC16,
-                        RefreshMode::Partial => HWTCON_WAVEFORM_MODE_GLR16,
+                    // Kaleido color waveforms run instead: GCC16 for
+                    // flashes, GLRC16 (non-flashing color REAGL) for
+                    // partials — with the G2 CFA saturation post-process
+                    // and Y8→Y4 dithering, like KOReader. Grayscale sends
+                    // keep flags = 0 / dither off.
+                    let (mtk_waveform, mtk_flags, mtk_dither) = match (mode, self.last_blit_color) {
+                        (RefreshMode::Full, true) => (
+                            HWTCON_WAVEFORM_MODE_GCC16,
+                            HWTCON_FLAG_CFA_EINK_G2 | HWTCON_FLAG_USE_DITHERING,
+                            HWTCON_DITHER_Y8_Y4_S,
+                        ),
+                        (RefreshMode::Partial, true) => (
+                            HWTCON_WAVEFORM_MODE_GLRC16,
+                            HWTCON_FLAG_CFA_EINK_G2 | HWTCON_FLAG_USE_DITHERING,
+                            HWTCON_DITHER_Y8_Y4_S,
+                        ),
+                        (RefreshMode::Full, false) => (WAVEFORM_MODE_GC16, 0, 0),
+                        (RefreshMode::Partial, false) => (HWTCON_WAVEFORM_MODE_GLR16, 0, 0),
                     };
                     let mut update = hwtcon_update_data {
                         update_region: region,
                         waveform_mode: mtk_waveform,
                         update_mode: UPDATE_MODE_FULL,
                         update_marker: self.update_marker,
-                        flags: 0,
-                        dither_mode: 0,
+                        flags: mtk_flags,
+                        dither_mode: mtk_dither,
                     };
                     // SAFETY: fully initialized struct matching the ioctl.
                     unsafe { ioctl(self.file.as_raw_fd(), HWTCON_SEND_UPDATE, &mut update) }
@@ -612,9 +648,10 @@ fn write_gray_row(gray: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
 }
 
 /// Convert one row of packed RGB (3 bytes per pixel) into the framebuffer
-/// pixel format. Kobo color framebuffers are BGRA — blue lands in byte 0;
-/// grayscale (8bpp) framebuffers get the Rec.601 luma.
-fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
+/// pixel format. `swap_rb` selects the 24/32bpp channel order: BGR(A) with
+/// blue in byte 0 (the monza norm, red offset ≠ 0 in the vinfo) or plain
+/// RGB(A); grayscale (8bpp) framebuffers get the Rec.601 luma.
+fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize, swap_rb: bool) {
     match bytes_per_pixel {
         1 => {
             for (i, px) in rgb.chunks_exact(3).enumerate() {
@@ -630,15 +667,25 @@ fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
             }
         }
         3 => {
-            // 24bpp BGR.
+            // 24bpp BGR or RGB.
             for (i, px) in rgb.chunks_exact(3).enumerate() {
-                out[i * 3..i * 3 + 3].copy_from_slice(&[px[2], px[1], px[0]]);
+                let (b0, b2) = if swap_rb {
+                    (px[2], px[0])
+                } else {
+                    (px[0], px[2])
+                };
+                out[i * 3..i * 3 + 3].copy_from_slice(&[b0, px[1], b2]);
             }
         }
         4 => {
-            // 32bpp BGRA with opaque alpha.
+            // 32bpp BGRA or RGBA with opaque alpha.
             for (i, px) in rgb.chunks_exact(3).enumerate() {
-                out[i * 4..i * 4 + 4].copy_from_slice(&[px[2], px[1], px[0], 0xFF]);
+                let (b0, b2) = if swap_rb {
+                    (px[2], px[0])
+                } else {
+                    (px[0], px[2])
+                };
+                out[i * 4..i * 4 + 4].copy_from_slice(&[b0, px[1], b2, 0xFF]);
             }
         }
         _ => {}
@@ -657,9 +704,20 @@ mod waveform_tests {
         // "Used for images on color panels"). Pin it so a typo can't
         // silently turn color refreshes into something else.
         assert_eq!(HWTCON_WAVEFORM_MODE_GCC16, 10);
+        // The non-flashing color partial: GLRC16 = 11 in the same enum.
+        assert_eq!(HWTCON_WAVEFORM_MODE_GLRC16, 11);
         // And its grayscale neighbors, for completeness.
         assert_eq!(WAVEFORM_MODE_GC16, 2);
         assert_eq!(HWTCON_WAVEFORM_MODE_GLR16, 4);
+    }
+
+    #[test]
+    fn kaleido_color_flags_match_koreader_bindings() {
+        // mxcfb_kobo_h.lua: HWTCON_FLAG_CFA_EINK_G2 = 1536,
+        // HWTCON_FLAG_USE_DITHERING = 1, Y8_Y4_S dither = 0x102.
+        assert_eq!(HWTCON_FLAG_CFA_EINK_G2, 1536);
+        assert_eq!(HWTCON_FLAG_CFA_EINK_G2 | HWTCON_FLAG_USE_DITHERING, 1537);
+        assert_eq!(HWTCON_DITHER_Y8_Y4_S, 0x102);
     }
 }
 
@@ -703,17 +761,26 @@ mod pixel_format_tests {
     }
 
     #[test]
-    fn rgb_to_32bpp_is_bgra_with_blue_in_byte_0() {
-        // Kobo framebuffers are BGRA: red must land in byte 2, blue in 0.
+    fn rgb_to_32bpp_bgra_puts_blue_in_byte_0() {
+        // swap_rb = true: the monza norm (red offset ≠ 0 in the vinfo) —
+        // red must land in byte 2, blue in 0.
         let mut out = [0u8; 8];
-        write_rgb_row(&[0xFF, 0x00, 0x00, 0x12, 0x34, 0x56], &mut out, 4);
+        write_rgb_row(&[0xFF, 0x00, 0x00, 0x12, 0x34, 0x56], &mut out, 4, true);
         assert_eq!(out, [0x00, 0x00, 0xFF, 0xFF, 0x56, 0x34, 0x12, 0xFF]);
+    }
+
+    #[test]
+    fn rgb_to_32bpp_rgba_keeps_red_in_byte_0() {
+        // swap_rb = false: a kernel reporting red at offset 0 stores RGBA.
+        let mut out = [0u8; 8];
+        write_rgb_row(&[0xFF, 0x00, 0x00, 0x12, 0x34, 0x56], &mut out, 4, false);
+        assert_eq!(out, [0xFF, 0x00, 0x00, 0xFF, 0x12, 0x34, 0x56, 0xFF]);
     }
 
     #[test]
     fn rgb_to_rgb565() {
         let mut out = [0u8; 6];
-        write_rgb_row(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00], &mut out, 2);
+        write_rgb_row(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00], &mut out, 2, true);
         // Pure red -> 0xF800, pure green -> 0x07E0 (little-endian).
         assert_eq!(&out[0..2], &0xF800u16.to_le_bytes());
         assert_eq!(&out[2..4], &0x07E0u16.to_le_bytes());
@@ -722,15 +789,17 @@ mod pixel_format_tests {
     #[test]
     fn rgb_to_8bpp_uses_rec601_luma() {
         let mut out = [0u8; 3];
-        write_rgb_row(&[255, 0, 0, 0, 255, 0, 0, 0, 255], &mut out, 1);
+        write_rgb_row(&[255, 0, 0, 0, 255, 0, 0, 0, 255], &mut out, 1, true);
         assert_eq!(out, [76, 150, 29]);
     }
 
     #[test]
-    fn rgb_to_24bpp_is_bgr() {
+    fn rgb_to_24bpp_honors_both_channel_orders() {
         let mut out = [0u8; 3];
-        write_rgb_row(&[0x11, 0x22, 0x33], &mut out, 3);
-        assert_eq!(out, [0x33, 0x22, 0x11]);
+        write_rgb_row(&[0x11, 0x22, 0x33], &mut out, 3, true);
+        assert_eq!(out, [0x33, 0x22, 0x11], "BGR when red offset != 0");
+        write_rgb_row(&[0x11, 0x22, 0x33], &mut out, 3, false);
+        assert_eq!(out, [0x11, 0x22, 0x33], "RGB when red offset == 0");
     }
 }
 
