@@ -629,6 +629,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         .with_sleeper(sleeper)
         .with_lights(lights)
         .with_settings_dir(data_dir())
+        .with_battery(Box::new(gideon_device::power::battery_percent))
         .run();
     match &result {
         Err(e) => {

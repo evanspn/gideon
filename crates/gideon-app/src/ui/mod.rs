@@ -220,6 +220,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Where settings.json lives, for persisting in-reader changes
     /// (rotation lock). `None` skips persistence.
     settings_dir: Option<PathBuf>,
+    /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
+    /// hides the percentage from the Home title and the sleep notice.
+    battery: Option<Box<dyn Fn() -> Option<u8>>>,
     /// Decoded shelf covers keyed by source path, with the file mtime that
     /// was decoded: Library repaints (page flips, returning from the
     /// reader) re-compose the shelf, and re-decoding every cover JPEG each
@@ -249,6 +252,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             keyboard_paints: 0,
             lights: None,
             settings_dir: None,
+            battery: None,
             cover_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
@@ -284,6 +288,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
         self
+    }
+
+    /// Install the battery probe (sysfs capacity on hardware): the Home
+    /// title and the sleep notice show the charge percentage.
+    pub fn with_battery(mut self, battery: Box<dyn Fn() -> Option<u8>>) -> Self {
+        self.battery = Some(battery);
+        self
+    }
+
+    /// The current battery percentage, when a probe is installed and a
+    /// battery reports one.
+    fn battery_now(&self) -> Option<u8> {
+        self.battery.as_ref().and_then(|probe| probe())
     }
 
     /// The underlying display (for tests and headless screenshots).
@@ -363,8 +380,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         // E-ink keeps its image with zero power: this stays on the panel
         // for the whole nap, and doubles as feedback that the cover close
-        // / button press registered.
-        self.show_status(&["Sleeping…", "Press power or open the cover to wake."])?;
+        // / button press registered. The battery line answers "should I
+        // plug it in before the nap?" at a glance.
+        let mut lines = vec!["Sleeping…".to_string()];
+        if let Some(percent) = self.battery_now() {
+            lines.push(format!("Battery {percent}%"));
+        }
+        lines.push("Press power or open the cover to wake.".to_string());
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        self.show_status(&lines)?;
         let result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -1528,13 +1552,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
                 // The version in the title answers "did the update take?"
                 // at a glance; the profile name after it says whose library
-                // this is (tapping the left half switches). No Back on Home
-                // — the power symbol in the top-right corner opens the
-                // restart/close menu instead.
-                let title = format!(
-                    "gideon v{} — {}",
+                // this is (tapping the left half switches); the battery
+                // percent closes the line (the panel has no status bar
+                // otherwise). No Back on Home — the power symbol in the
+                // top-right corner opens the restart/close menu instead.
+                let title = home_title(
                     env!("CARGO_PKG_VERSION"),
-                    self.active_profile
+                    &self.active_profile,
+                    self.battery_now(),
                 );
                 let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
                 draw_power_icon(&mut canvas, l);
@@ -2157,6 +2182,16 @@ fn entry_title(relative_path: &str) -> String {
 
 fn placeholder_cover() -> image::DynamicImage {
     image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(3, 4, image::Luma([0xCC])))
+}
+
+/// Home's title line: `gideon vX — profile — 47%`, with the battery part
+/// omitted when no battery reports a charge (tests, dev machines).
+fn home_title(version: &str, profile: &str, battery: Option<u8>) -> String {
+    let mut title = format!("gideon v{version} — {profile}");
+    if let Some(percent) = battery {
+        title.push_str(&format!(" — {percent}%"));
+    }
+    title
 }
 
 /// The Settings screen's rows, showing current values.

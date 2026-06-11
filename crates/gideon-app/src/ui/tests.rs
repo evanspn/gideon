@@ -2583,6 +2583,47 @@ fn sleep_in_the_reader_saves_progress_first_and_resumes() {
     assert!(flushes.iter().filter(|m| **m == RefreshMode::Full).count() >= 3);
 }
 
+// --- battery ---
+
+#[test]
+fn home_title_includes_battery_percent_when_known() {
+    assert_eq!(
+        home_title("0.3.0", "default", Some(47)),
+        "gideon v0.3.0 — default — 47%"
+    );
+    assert_eq!(
+        home_title("0.3.0", "alex", None),
+        "gideon v0.3.0 — alex",
+        "no battery, no dangling separator"
+    );
+}
+
+#[test]
+fn battery_probe_feeds_home_and_sleep_without_breaking_either() {
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let probe = reads.clone();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
+        .with_sleeper(sleeper)
+        .with_battery(Box::new(move || {
+            probe.set(probe.get() + 1);
+            Some(47)
+        }));
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1, "sleep still suspends with a battery probe");
+    assert!(
+        reads.get() >= 2,
+        "both the Home title and the sleep notice must read the battery"
+    );
+    assert!(matches!(app.screen(), Screen::Home));
+    assert!(
+        app.display().buffer.iter().any(|&p| p < 0x80),
+        "home screen is blank"
+    );
+}
+
 #[test]
 fn update_prompt_back_declines() {
     let dir = tempfile::tempdir().unwrap();
