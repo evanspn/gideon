@@ -475,6 +475,28 @@ impl Display for KoboDisplay {
         Ok(())
     }
 
+    fn overlay(&mut self, page: &GrayPage, x: u32, y: u32) -> Result<()> {
+        // Small chrome (the reader's page indicator) stamped straight into
+        // the mapped framebuffer over the previous blit: no staging buffer,
+        // no full-screen rewrite — only `page`'s rows are converted.
+        let bpp = self.bytes_per_pixel as usize;
+        let copy_w = page.width.min(self.width.saturating_sub(x)) as usize;
+        let copy_h = page.height.min(self.height.saturating_sub(y));
+        if copy_w == 0 {
+            return Ok(());
+        }
+        for row in 0..copy_h {
+            let src_start = (row * page.width) as usize;
+            let dst = (y + row) as usize * self.line_length as usize + x as usize * bpp;
+            write_gray_row(
+                &page.pixels[src_start..src_start + copy_w],
+                &mut self.map[dst..dst + copy_w * bpp],
+                bpp,
+            );
+        }
+        Ok(())
+    }
+
     fn flush(&mut self, mode: RefreshMode) -> Result<()> {
         // No msync here: framebuffer mappings are device memory — writes
         // are immediately visible to the EPDC, and msync on a character

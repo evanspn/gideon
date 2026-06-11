@@ -190,15 +190,28 @@ impl<D: Display> Reader<D> {
         let max_scroll = page.height.saturating_sub(reading_h);
         self.scroll_y = self.scroll_y.min(max_scroll);
 
-        // Cut the visible window out of the reading-orientation page,
-        // overlay the page indicator, then rotate into the panel
-        // orientation (the indicator follows the reading direction).
         let indicator = self.page_indicator_text();
-        let mut window = crop_rows(page, self.scroll_y, reading_h);
-        draw_page_indicator(&mut window, &indicator);
         if self.rotation == 0 {
-            self.display.blit(&window, 0)?;
+            // Steady-state fast path: the display's blit handles vertical
+            // scrolling natively, so the cached page goes straight to the
+            // backbuffer with zero copies, and the page indicator is a
+            // tiny (~few KB) box stamped onto the backbuffer afterwards —
+            // never a clone of the page or its visible window.
+            self.display.blit(page, self.scroll_y)?;
+            let visible_w = page.width.min(reading_w);
+            let visible_h = (page.height - self.scroll_y).min(reading_h);
+            if let Some(overlay) = render_page_indicator(&indicator, visible_w, visible_h) {
+                // Bottom-right corner of the blitted (centered) window.
+                let x = (reading_w - visible_w) / 2 + visible_w - overlay.width;
+                let y = visible_h - overlay.height;
+                self.display.overlay(&overlay, x, y)?;
+            }
         } else {
+            // Rotated reading copies anyway (crop + rotate into the panel
+            // orientation), so the indicator is drawn into the window
+            // before rotating — it follows the reading direction.
+            let mut window = crop_rows(page, self.scroll_y, reading_h);
+            draw_page_indicator(&mut window, &indicator);
             let rotated = rotate_page(&window, self.rotation);
             self.display.blit(&rotated, 0)?;
         }
@@ -352,30 +365,46 @@ fn draw_banner(page: &mut GrayPage, text: &str) {
     );
 }
 
-/// Draw a compact page-indicator box ("13/187") in the bottom-right corner
-/// of the visible window — same approach as [`draw_banner`], shrunk to a
-/// corner box with ~24px text. Skipped when the window is too small for
-/// unobtrusive chrome (tiny test displays).
-fn draw_page_indicator(page: &mut GrayPage, text: &str) {
+/// Render the compact page-indicator box ("13/187") as its own tiny page
+/// (~52x40 px, a few KB): a white box with a 1px dark edge on its top and
+/// left sides and ~24px text. Returns `None` when the visible window is
+/// too small for unobtrusive chrome (tiny test displays), matching
+/// [`draw_page_indicator`]'s old skip rule.
+fn render_page_indicator(text: &str, avail_w: u32, avail_h: u32) -> Option<GrayPage> {
     use gideon_render::text::{draw_text, measure_text};
 
     const TEXT_PX: f32 = 24.0;
     const PAD: u32 = 8;
     let box_w = measure_text(TEXT_PX, text, false) + 2 * PAD;
     let box_h = TEXT_PX as u32 + 2 * PAD;
-    if page.width < box_w * 3 || page.height < box_h * 3 {
+    if avail_w < box_w * 3 || avail_h < box_h * 3 {
+        return None;
+    }
+    let mut overlay = GrayPage::new_white(box_w, box_h);
+    overlay.pixels[..box_w as usize].fill(0x00); // top edge
+    for y in 1..box_h {
+        overlay.pixels[(y * box_w) as usize] = 0x00; // left edge
+    }
+    draw_text(&mut overlay, PAD, PAD, TEXT_PX, text, box_w - PAD, false);
+    Some(overlay)
+}
+
+/// Draw a compact page-indicator box ("13/187") in the bottom-right corner
+/// of the visible window — used on the rotated paint path, where the
+/// window is a copy anyway. Skipped when the window is too small for
+/// unobtrusive chrome (tiny test displays).
+fn draw_page_indicator(page: &mut GrayPage, text: &str) {
+    let Some(overlay) = render_page_indicator(text, page.width, page.height) else {
         return;
+    };
+    let x0 = page.width - overlay.width;
+    let y0 = page.height - overlay.height;
+    for y in 0..overlay.height {
+        let src = (y * overlay.width) as usize;
+        let dst = ((y0 + y) * page.width + x0) as usize;
+        page.pixels[dst..dst + overlay.width as usize]
+            .copy_from_slice(&overlay.pixels[src..src + overlay.width as usize]);
     }
-    let x0 = page.width - box_w;
-    let y0 = page.height - box_h;
-    for y in y0..page.height {
-        let row = (y * page.width + x0) as usize;
-        // White box with a 1px dark edge on its top and left sides.
-        let value = if y == y0 { 0x00 } else { 0xFF };
-        page.pixels[row..row + box_w as usize].fill(value);
-        page.pixels[row] = 0x00;
-    }
-    draw_text(page, x0 + PAD, y0 + PAD, TEXT_PX, text, box_w - PAD, false);
 }
 
 fn crop_rows(page: &GrayPage, offset_y: u32, height: u32) -> GrayPage {
@@ -1135,6 +1164,46 @@ mod tests {
         };
         draw_page_indicator(&mut page, "1/2");
         assert!(page.pixels.iter().all(|&p| p == 0x00));
+    }
+
+    #[test]
+    fn page_indicator_does_not_dirty_the_cached_page() {
+        // The rotation-0 fast path blits the cached page directly and
+        // stamps the indicator onto the display backbuffer only: the
+        // cached render must stay pristine (no baked-in stale "1/2").
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("black.cbz");
+        make_cbz_sized(&path, &[(50, 50), (50, 50)]);
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(300, 300),
+            FitMode::Contain,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        assert!(reader.display().pixel(295, 295) > 0xC0, "indicator shown");
+        let (_, page) = reader.rendered.as_ref().expect("page cached");
+        let corner = page.pixel(page.width - 5, page.height - 5);
+        assert!(
+            corner < 0x40,
+            "cached page corner must stay black (got {corner:#x}): the \
+             indicator may only live on the display backbuffer"
+        );
+    }
+
+    #[test]
+    fn page_indicator_overlay_box_matches_the_skip_rule() {
+        // Too-small windows produce no box at all…
+        assert!(render_page_indicator("1/2", 16, 16).is_none());
+        // …large ones get a small white box with dark top/left edges.
+        let overlay = render_page_indicator("1/2", 300, 300).expect("box");
+        assert!(overlay.width < 100 && overlay.height < 50, "stays tiny");
+        assert_eq!(overlay.pixel(overlay.width / 2, 0), 0x00, "top edge");
+        assert_eq!(overlay.pixel(0, overlay.height / 2), 0x00, "left edge");
+        assert!(
+            overlay.pixel(overlay.width - 2, overlay.height - 2) > 0xC0,
+            "white interior"
+        );
     }
 
     #[test]
