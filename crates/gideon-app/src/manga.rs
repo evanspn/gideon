@@ -225,6 +225,7 @@ pub fn cmd_manga_download(
 
     let source = load_source(data_dir, source_id)?;
     let runtime = tokio::runtime::Runtime::new()?;
+    let client = http_client()?;
     let mut progress = |done: usize, total: usize| {
         if done == 0 {
             println!("Downloading {total} page(s)...");
@@ -235,6 +236,7 @@ pub fn cmd_manga_download(
     };
     let out_path = runtime.block_on(download_chapter(
         &source,
+        &client,
         manga_id,
         chapter_id,
         library,
@@ -247,17 +249,38 @@ pub fn cmd_manga_download(
     Ok(())
 }
 
-/// Download a manga cover image to `dest`. Cover art is metadata: callers
-/// treat failures as non-fatal (the shelf falls back to the first page).
-pub async fn download_cover(url: &str, dest: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
+/// The shared HTTP client for chapter pages and cover art. Its
+/// configuration mirrors bobo's proven downloader: redirects are followed
+/// manually (so a source-set Referer survives every hop, see
+/// `execute_with_forced_referer`) and broken CDN certificates are
+/// tolerated — manga mirrors routinely have invalid TLS. The user-agent
+/// is only a fallback: `get_image_request` always sets a browser UA.
+/// Timeouts are mandatory: a stalled TCP connection must surface as an
+/// error page, never freeze the device forever.
+///
+/// Build it ONCE and reuse it (the UI gateway keeps one for the whole
+/// session): a client is a connection pool, and rebuilding it per call
+/// threw away keep-alive connections and TLS sessions.
+pub fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let response = client.get(url).send().await?.error_for_status()?;
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("failed to build the HTTP client")
+}
+
+/// Download a manga cover image to `dest`. Cover art is metadata: callers
+/// treat failures as non-fatal (the shelf falls back to the first page).
+pub async fn download_cover(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+    // The shared client doesn't auto-follow redirects; walk them manually
+    // (no Referer set, so this is a plain follow).
+    let request = client.get(url).build()?;
+    let response = execute_with_forced_referer(client, request)
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
     // Only persist real images — an HTML error page is not a cover.
     image::guess_format(&bytes).map_err(|_| anyhow::anyhow!("cover at {url} is not an image"))?;
@@ -279,6 +302,7 @@ pub async fn download_cover(url: &str, dest: &Path) -> Result<()> {
 /// is an error.
 pub async fn download_chapter(
     source: &Source,
+    client: &reqwest::Client,
     manga_id: &str,
     chapter_id: &str,
     library: &Path,
@@ -320,20 +344,6 @@ pub async fn download_chapter(
     }
     progress(0, pages.len());
 
-    // Client configuration mirrors bobo's proven downloader: redirects are
-    // followed manually (so the source-set Referer survives every hop, see
-    // `execute_with_forced_referer`) and broken CDN certificates are
-    // tolerated — manga mirrors routinely have invalid TLS. The user-agent
-    // here is only a fallback: `get_image_request` always sets a browser UA.
-    // Timeouts are mandatory: a stalled TCP connection must surface as an
-    // error page, never freeze the device forever.
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(true)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
     let total = pages.len();
     let width = total.to_string().len().max(3);
     let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(total + 1);
@@ -365,7 +375,6 @@ pub async fn download_chapter(
     let mut downloaded = 0usize;
     let mut completed = 0usize;
     {
-        let client = &client;
         let token = &token;
         let mut downloads =
             futures::stream::iter(pages.iter().enumerate().map(|(i, page)| async move {
