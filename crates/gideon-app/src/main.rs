@@ -568,6 +568,13 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         return browse_screenshot(library, out);
     }
 
+    // Capture the executable path FIRST, before anything else can run: an
+    // in-session OTA update replaces the binary on disk, after which
+    // /proc/self/exe (what current_exe() reads) ends in " (deleted)" and
+    // exec'ing it fails. The path captured now stays valid — the update
+    // writes the new binary to the same place.
+    let restart_exe = std::env::current_exe().ok().map(sanitize_exe_path);
+
     // OTA updates only replace the binary: self-heal the launcher script
     // and NickelMenu entries on every browse startup, best-effort — the UI
     // must come up regardless.
@@ -659,11 +666,27 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         Ok(ui::Exit::Restart) => {
             // Replace this process with a fresh copy of the binary — the
             // launcher never sees an exit, so the device doesn't reboot.
+            // Use the path captured at startup: after an in-session OTA
+            // update, current_exe() reads "<path> (deleted)" and the exec
+            // would fail (this powers both the power-menu Restart and the
+            // post-update self-restart).
             use std::os::unix::process::CommandExt;
-            let exe = std::env::current_exe()?;
             let args: Vec<String> = std::env::args().skip(1).collect();
-            let err = std::process::Command::new(exe).args(args).exec();
-            eprintln!("gideon: restart failed: {err}");
+            let failure = match &restart_exe {
+                Some(exe) => {
+                    let err = std::process::Command::new(exe).args(args).exec();
+                    // exec only returns on failure.
+                    format!("restart failed:\nexec {} failed: {err}", exe.display())
+                }
+                None => "restart failed:\ncouldn't determine the executable path".to_string(),
+            };
+            // Don't fall through to the launcher's recovery path silently:
+            // put the reason on the panel first, where it can be read and
+            // photographed.
+            eprintln!("gideon: {failure}");
+            if let Ok(mut d) = KoboDisplay::open() {
+                show_fatal_on_display(&mut d, &failure);
+            }
         }
         Ok(ui::Exit::Close) => {}
     }
@@ -709,6 +732,20 @@ impl gideon_device::LightControl for PersistedLights {
     fn set_warmth(&mut self, percent: u8) {
         self.inner.set_warmth(percent);
         self.persist();
+    }
+}
+
+/// Strip the " (deleted)" marker the kernel appends to the /proc/self/exe
+/// symlink once the running binary has been replaced on disk — exactly
+/// what an OTA update does. Exec'ing the marked path fails; the unmarked
+/// path points at the new binary. Paths without the marker (the normal
+/// case) pass through untouched.
+#[cfg_attr(not(feature = "kobo"), allow(dead_code))]
+fn sanitize_exe_path(path: PathBuf) -> PathBuf {
+    const DELETED_SUFFIX: &str = " (deleted)";
+    match path.to_str().and_then(|s| s.strip_suffix(DELETED_SUFFIX)) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
     }
 }
 
@@ -844,4 +881,41 @@ fn run_reader<D: gideon_device::Display>(
     reader.save_progress(&mut store, &progress_key);
     store.save(&progress_file)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_exe_path_strips_the_deleted_marker() {
+        assert_eq!(
+            sanitize_exe_path(PathBuf::from(
+                "/mnt/onboard/.adds/gideon/bin/gideon (deleted)"
+            )),
+            PathBuf::from("/mnt/onboard/.adds/gideon/bin/gideon")
+        );
+    }
+
+    #[test]
+    fn sanitize_exe_path_keeps_normal_paths() {
+        for path in [
+            "/mnt/onboard/.adds/gideon/bin/gideon",
+            // The marker only counts at the very end.
+            "/opt/x (deleted)/gideon",
+            // A space-less suffix is not the marker.
+            "/opt/gideon(deleted)",
+        ] {
+            assert_eq!(sanitize_exe_path(PathBuf::from(path)), PathBuf::from(path));
+        }
+    }
+
+    #[test]
+    fn sanitize_exe_path_strips_only_the_final_marker() {
+        // Pathological but well-defined: strip exactly one suffix.
+        assert_eq!(
+            sanitize_exe_path(PathBuf::from("/opt/gideon (deleted) (deleted)")),
+            PathBuf::from("/opt/gideon (deleted)")
+        );
+    }
 }
