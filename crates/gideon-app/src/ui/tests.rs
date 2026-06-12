@@ -425,8 +425,9 @@ fn library_paginates_with_prev_next() {
     let lib = dir.path().join("Manga");
     let l = layout();
     let capacity = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS).capacity();
+    // One series per card: pagination counts cards, not chapters.
     for i in 0..capacity + 2 {
-        make_cbz(&lib.join(format!("Series/vol{i:02}.cbz")), 1);
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
     }
 
     let events = vec![tap_row(0), tap_nav_next(), tap_nav_next(), tap_nav_prev()];
@@ -434,10 +435,10 @@ fn library_paginates_with_prev_next() {
     app.run().unwrap();
 
     // Two pages: next, next (clamped), prev -> page 0.
-    let Screen::Library { page, entries } = app.screen() else {
+    let Screen::Library { page, items } = app.screen() else {
         panic!("expected library screen");
     };
-    assert_eq!(entries.len(), capacity + 2);
+    assert_eq!(items.len(), capacity + 2);
     assert_eq!(*page, 0);
     // Page flips within a screen are partial refreshes.
     let flushes = &app.display().flushes;
@@ -448,6 +449,154 @@ fn library_paginates_with_prev_next() {
             .count(),
         2
     );
+}
+
+// --- shelf grouping: one card per series ---
+
+#[test]
+fn three_chapters_of_one_series_make_one_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+    make_cbz(&lib.join("Series/vol3.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+
+    let Screen::Library { items, .. } = app.screen() else {
+        panic!("expected library screen");
+    };
+    assert_eq!(items.len(), 1, "chapters must not flood the shelf");
+    assert_eq!(items[0].title(), "Series");
+    assert_eq!(items[0].chapters.len(), 3);
+}
+
+#[test]
+fn tapping_a_series_card_resumes_the_in_progress_chapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 3);
+    make_cbz(&lib.join("Series/vol3.cbz"), 2);
+    // vol1 was finished more recently than vol2 was left half-read: the
+    // tap must reopen vol2 (most recently read UNFINISHED), not vol1 or
+    // vol3. Timestamps are hand-written — ProgressStore::update always
+    // stamps "now", which the test can't order.
+    let progress_file = progress_path(&lib);
+    std::fs::create_dir_all(progress_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &progress_file,
+        r#"{"progress":{
+            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":200},
+            "Series/vol2.cbz":{"current_page":1,"total_pages":3,"last_read_at":100}
+        }}"#,
+    )
+    .unwrap();
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(), // vol2: page 1 -> 2
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_file).unwrap();
+    assert_eq!(
+        store.get("Series/vol2.cbz").unwrap().current_page,
+        2,
+        "the in-progress chapter must be the one that opened"
+    );
+    assert_eq!(
+        store.get("Series/vol1.cbz").unwrap().current_page,
+        1,
+        "the finished chapter stays untouched"
+    );
+    assert!(
+        store.get("Series/vol3.cbz").is_none(),
+        "the unread chapter was not opened"
+    );
+}
+
+#[test]
+fn resuming_a_series_still_flows_into_the_next_chapter() {
+    // Continuous reading from a resumed chapter: finishing vol1 (the
+    // resume target — no progress yet means "start at the first") flows
+    // into vol2 within the same card.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(), // vol1 page 2 (last)
+        reader_tap_next(), // past the end -> vol2 opens
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Series/vol2.cbz").is_some(),
+        "reading continued into the card's next chapter"
+    );
+}
+
+#[test]
+fn sideloaded_loose_file_still_gets_a_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("loose.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    app.run().unwrap();
+
+    let Screen::Library { items, .. } = app.screen() else {
+        panic!("expected library screen");
+    };
+    let titles: Vec<String> = items.iter().map(|c| c.title()).collect();
+    assert_eq!(titles, vec!["loose".to_string(), "Series".to_string()]);
+    assert!(items[0].series.is_none(), "loose files are their own card");
+}
+
+#[test]
+fn book_menu_targets_the_chapter_a_tap_would_open() {
+    // Long press opens the BookMenu on the card's resume chapter, so
+    // "Delete this chapter" removes what a tap would show.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 3);
+    let progress_file = progress_path(&lib);
+    std::fs::create_dir_all(progress_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &progress_file,
+        r#"{"progress":{
+            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":200},
+            "Series/vol2.cbz":{"current_page":1,"total_pages":3,"last_read_at":100}
+        }}"#,
+    )
+    .unwrap();
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::BookMenu { entry, series_dir } = app.screen() else {
+        panic!("expected the book menu");
+    };
+    assert_eq!(entry.relative_path, "Series/vol2.cbz");
+    assert_eq!(series_dir, "Series");
 }
 
 /// Write a solid-red series cover where the shelf looks for it.
@@ -496,10 +645,11 @@ fn color_library_page_flips_stay_partial() {
     let lib = dir.path().join("Manga");
     let l = layout();
     let capacity = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS).capacity();
+    // One covered series per card, enough cards for a second shelf page.
     for i in 0..capacity + 1 {
-        make_cbz(&lib.join(format!("Series/vol{i:02}.cbz")), 1);
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
+        make_red_cover(&lib.join(format!("Series {i:02}")));
     }
-    make_red_cover(&lib.join("Series"));
 
     let events = vec![tap_row(0), tap_nav_next()];
     let mut app = app(&lib, FakeGateway::default(), events);
@@ -937,11 +1087,11 @@ fn switching_profile_shows_only_that_profiles_books() {
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
-    let Screen::Library { entries, .. } = app.screen() else {
+    let Screen::Library { items, .. } = app.screen() else {
         panic!("expected alex's library");
     };
-    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
-    assert_eq!(rel, vec!["Alexs Series/vol1.cbz"]);
+    let titles: Vec<String> = items.iter().map(|c| c.title()).collect();
+    assert_eq!(titles, vec!["Alexs Series".to_string()]);
     // The switch persisted for the next start.
     let settings = gideon_core::Settings::load(&settings_dir).unwrap();
     assert_eq!(settings.active_profile, "alex");
@@ -957,11 +1107,11 @@ fn default_profile_does_not_see_other_profiles_books() {
     let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
     app.run().unwrap();
 
-    let Screen::Library { entries, .. } = app.screen() else {
+    let Screen::Library { items, .. } = app.screen() else {
         panic!("expected the default library");
     };
-    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
-    assert_eq!(rel, vec!["Shared/vol1.cbz"]);
+    let titles: Vec<String> = items.iter().map(|c| c.title()).collect();
+    assert_eq!(titles, vec!["Shared".to_string()]);
 }
 
 #[test]
@@ -1045,10 +1195,10 @@ fn new_profile_keyboard_creates_and_switches() {
     assert_eq!(settings.active_profile, "bob");
     // The new profile's library exists and is empty.
     assert!(lib.join("@bob").is_dir());
-    let Screen::Library { entries, .. } = app.screen() else {
+    let Screen::Library { items, .. } = app.screen() else {
         panic!("expected the new profile's (empty) library");
     };
-    assert!(entries.is_empty());
+    assert!(items.is_empty());
 }
 
 #[test]
@@ -1686,10 +1836,15 @@ fn book_menu_deletes_a_chapter() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::Library { entries, .. } = app.screen() else {
+    let Screen::Library { items, .. } = app.screen() else {
         panic!("expected refreshed library");
     };
-    assert_eq!(entries.len(), 1, "one chapter deleted, one remains");
+    assert_eq!(items.len(), 1, "the series keeps its (single) card");
+    assert_eq!(
+        items[0].chapters.len(),
+        1,
+        "one chapter deleted, one remains"
+    );
     assert!(lib.join("Series").exists(), "series dir keeps the other");
 }
 
@@ -1708,10 +1863,10 @@ fn book_menu_deletes_the_whole_series() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::Library { entries, .. } = app.screen() else {
+    let Screen::Library { items, .. } = app.screen() else {
         panic!("expected refreshed library");
     };
-    assert!(entries.is_empty(), "whole series gone");
+    assert!(items.is_empty(), "whole series gone");
     assert!(!lib.join("Series").exists());
 }
 
@@ -2297,8 +2452,9 @@ fn page_buttons_flip_library_pages() {
     let lib = dir.path().join("Manga");
     let l = layout();
     let capacity = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS).capacity();
+    // One series per card: the buttons page through cards.
     for i in 0..capacity + 2 {
-        make_cbz(&lib.join(format!("Series/vol{i:02}.cbz")), 1);
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
     }
 
     let events = vec![

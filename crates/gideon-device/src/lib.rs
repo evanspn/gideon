@@ -58,6 +58,14 @@ pub trait Display {
         self.blit(&page.to_gray(), offset_y)
     }
 
+    /// Draw a small grayscale overlay (e.g. the reader's page indicator)
+    /// on top of whatever the backbuffer currently holds, at panel
+    /// coordinates (`x`, `y`), clipped to the screen. Unlike [`Self::blit`]
+    /// this never clears, centers or scrolls — the rest of the buffer is
+    /// untouched, so callers can blit a cached page zero-copy and stamp
+    /// chrome on top.
+    fn overlay(&mut self, page: &GrayPage, x: u32, y: u32) -> Result<()>;
+
     /// Push the backbuffer to the physical screen.
     fn flush(&mut self, mode: RefreshMode) -> Result<()>;
 }
@@ -79,6 +87,10 @@ impl<D: Display + ?Sized> Display for &mut D {
 
     fn blit_rgb(&mut self, page: &RgbPage, offset_y: u32) -> Result<()> {
         (**self).blit_rgb(page, offset_y)
+    }
+
+    fn overlay(&mut self, page: &GrayPage, x: u32, y: u32) -> Result<()> {
+        (**self).overlay(page, x, y)
     }
 
     fn flush(&mut self, mode: RefreshMode) -> Result<()> {
@@ -125,6 +137,11 @@ impl Display for MemoryDisplay {
         Ok(())
     }
 
+    fn overlay(&mut self, page: &GrayPage, x: u32, y: u32) -> Result<()> {
+        overlay_into(&mut self.buffer, self.width, self.height, page, x, y);
+        Ok(())
+    }
+
     fn flush(&mut self, mode: RefreshMode) -> Result<()> {
         self.flushes.push(mode);
         Ok(())
@@ -156,6 +173,29 @@ pub(crate) fn blit_into(
         let dst_start = (row * screen_w + dst_x) as usize;
         buffer[dst_start..dst_start + copy_w as usize]
             .copy_from_slice(&page.pixels[src_start..src_start + copy_w as usize]);
+    }
+}
+
+/// Shared overlay implementation: copy `page` on top of the backbuffer at
+/// (`x`, `y`), clipped to the screen, leaving everything else untouched.
+pub(crate) fn overlay_into(
+    buffer: &mut [u8],
+    screen_w: u32,
+    screen_h: u32,
+    page: &GrayPage,
+    x: u32,
+    y: u32,
+) {
+    let copy_w = page.width.min(screen_w.saturating_sub(x)) as usize;
+    let copy_h = page.height.min(screen_h.saturating_sub(y));
+    if copy_w == 0 {
+        return;
+    }
+    for row in 0..copy_h {
+        let src_start = (row * page.width) as usize;
+        let dst_start = ((y + row) * screen_w + x) as usize;
+        buffer[dst_start..dst_start + copy_w]
+            .copy_from_slice(&page.pixels[src_start..src_start + copy_w]);
     }
 }
 
@@ -257,6 +297,34 @@ mod tests {
         };
         d.blit_rgb(&page, 0).unwrap();
         assert_eq!(d.buffer, vec![76, 150, 29]);
+    }
+
+    #[test]
+    fn overlay_draws_on_top_without_clearing_the_rest() {
+        let mut d = MemoryDisplay::new(4, 4);
+        d.blit(&page_filled(4, 4, 0x80), 0).unwrap();
+        d.overlay(&page_filled(2, 2, 0x00), 1, 1).unwrap();
+        // The 2x2 box landed at (1,1); everything else kept the blit.
+        assert_eq!(d.pixel(1, 1), 0x00);
+        assert_eq!(d.pixel(2, 2), 0x00);
+        assert_eq!(d.pixel(0, 0), 0x80);
+        assert_eq!(d.pixel(3, 1), 0x80);
+        assert_eq!(d.pixel(1, 3), 0x80);
+    }
+
+    #[test]
+    fn overlay_is_clipped_at_the_screen_edges() {
+        let mut d = MemoryDisplay::new(4, 4);
+        d.blit(&page_filled(4, 4, 0x80), 0).unwrap();
+        d.overlay(&page_filled(3, 3, 0x00), 2, 3).unwrap();
+        // Only the on-screen sliver is drawn; nothing panics or wraps.
+        assert_eq!(d.pixel(2, 3), 0x00);
+        assert_eq!(d.pixel(3, 3), 0x00);
+        assert_eq!(d.pixel(1, 3), 0x80);
+        assert_eq!(d.pixel(2, 2), 0x80);
+        // Fully off-screen overlays are a no-op.
+        d.overlay(&page_filled(2, 2, 0x00), 9, 9).unwrap();
+        assert_eq!(d.pixel(0, 0), 0x80);
     }
 
     #[test]

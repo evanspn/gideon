@@ -69,11 +69,106 @@ impl SourceRow {
     }
 }
 
+/// One library shelf card: a series directory grouping every downloaded
+/// chapter inside it, or a single loose CBZ at the library root. Grouping
+/// happens here in the UI layer — `Library::scan` still returns one entry
+/// per file — so ten downloaded chapters of one series make ONE card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeriesCard {
+    /// The top-level series directory, or `None` for a loose root CBZ.
+    series: Option<String>,
+    /// The chapters in this card, in natural (reading) order. Never empty:
+    /// cards are only built by [`group_library`] from scanned files.
+    chapters: Vec<LibraryEntry>,
+}
+
+impl SeriesCard {
+    /// Card title: the series directory name, or the loose file's stem.
+    fn title(&self) -> String {
+        match &self.series {
+            Some(dir) => dir.clone(),
+            None => entry_title(&self.chapters[0].relative_path),
+        }
+    }
+
+    /// The chapter a tap opens: the most recently read unfinished chapter
+    /// (tapping the card resumes where the reader left off), else the
+    /// first chapter in natural order.
+    fn resume_chapter(&self, store: &ProgressStore) -> &LibraryEntry {
+        self.chapters
+            .iter()
+            .filter_map(|c| {
+                store
+                    .get(&c.relative_path)
+                    .filter(|p| !p.is_finished())
+                    .map(|p| (p.last_read_at, c))
+            })
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, c)| c)
+            .unwrap_or(&self.chapters[0])
+    }
+
+    /// The chapter after `current` within this card, for continuous
+    /// reading (entries keep their natural scan order).
+    fn next_after(&self, current: &LibraryEntry) -> Option<&LibraryEntry> {
+        self.chapters
+            .iter()
+            .skip_while(|c| c.relative_path != current.relative_path)
+            .nth(1)
+    }
+
+    /// Card progress: the most recently read chapter's progress (finished
+    /// or not) — "where is this series at?" at a glance.
+    fn progress(&self, store: &ProgressStore) -> Option<f32> {
+        self.chapters
+            .iter()
+            .filter_map(|c| store.get(&c.relative_path))
+            .max_by_key(|p| p.last_read_at)
+            .map(|p| {
+                if p.total_pages == 0 {
+                    0.0
+                } else {
+                    (p.current_page + 1) as f32 / p.total_pages as f32
+                }
+            })
+    }
+
+    /// The entry whose file supplies the card's cover fallback (the first
+    /// chapter's page 0); the series' `.cover.jpg` is preferred upstream.
+    fn cover_entry(&self) -> &LibraryEntry {
+        &self.chapters[0]
+    }
+}
+
+/// Group scanned library entries into shelf cards: one per top-level
+/// series directory and one per loose root CBZ. Cards keep the natural
+/// order of their first chapter; chapters keep their natural scan order.
+fn group_library(entries: Vec<LibraryEntry>) -> Vec<SeriesCard> {
+    let mut cards: Vec<SeriesCard> = Vec::new();
+    for entry in entries {
+        let series = entry
+            .relative_path
+            .split_once('/')
+            .map(|(dir, _)| dir.to_string());
+        let existing = series
+            .as_deref()
+            .and_then(|s| cards.iter().position(|c| c.series.as_deref() == Some(s)));
+        match existing {
+            Some(i) => cards[i].chapters.push(entry),
+            None => cards.push(SeriesCard {
+                series,
+                chapters: vec![entry],
+            }),
+        }
+    }
+    cards
+}
+
 #[derive(Debug, Clone)]
 enum Screen {
     Home,
     Library {
-        entries: Vec<LibraryEntry>,
+        items: Vec<SeriesCard>,
         page: usize,
     },
     Sources {
@@ -478,10 +573,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn handle_long_press(&mut self, x: u32, y: u32) -> Result<Flow> {
         let screen = self.stack.last().cloned().expect("stack never empty");
         match screen {
-            Screen::Library { entries, page } => {
-                let Some(entry) = self.library_cell_at(&entries, page, x, y) else {
+            Screen::Library { items, page } => {
+                let Some(card) = self.library_cell_at(&items, page, x, y) else {
                     return Ok(Flow::Continue);
                 };
+                // The menu targets the chapter a tap would open (the
+                // card's resume point), so "Delete this chapter" removes
+                // exactly what the user is looking at.
+                let store =
+                    ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
+                let entry = card.resume_chapter(&store).clone();
                 let series_dir = entry
                     .relative_path
                     .split('/')
@@ -539,10 +640,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Rebuild the Library screen beneath the book menu after a delete.
     fn refresh_library_after_delete(&mut self) -> Result<()> {
-        let entries = Library::new(&self.library_dir).scan()?;
+        let items = group_library(Library::new(&self.library_dir).scan()?);
         self.stack.pop(); // leave the book menu
         if let Some(screen @ Screen::Library { .. }) = self.stack.last_mut() {
-            *screen = Screen::Library { entries, page: 0 };
+            *screen = Screen::Library { items, page: 0 };
         }
         self.render_current(RefreshMode::Full)
     }
@@ -555,7 +656,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         };
         let (page, count) = match screen {
-            Screen::Library { entries, page } => (page, entries.len().div_ceil(shelf_capacity)),
+            Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
             Screen::SearchResults { results, page, .. } => (page, results.len().div_ceil(per_page)),
             Screen::MangaList { mangas, page, .. } => (page, mangas.len().div_ceil(per_page)),
@@ -598,7 +699,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 _ => Ok(Flow::Continue),
             },
-            Screen::Library { entries, page } => self.tap_library_cell(&entries, page, x, y),
+            Screen::Library { items, page } => self.tap_library_cell(&items, page, x, y),
             Screen::Sources { rows, page } => {
                 let index = page * self.layout.rows_per_page() + row;
                 match rows.get(index).cloned() {
@@ -757,8 +858,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 )
             })?;
         }
-        let entries = Library::new(&self.library_dir).scan()?;
-        self.push(Screen::Library { entries, page: 0 })
+        let items = group_library(Library::new(&self.library_dir).scan()?);
+        self.push(Screen::Library { items, page: 0 })
     }
 
     fn build_source_rows(&self) -> Result<Vec<SourceRow>> {
@@ -1240,18 +1341,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         )
     }
 
-    /// The library entry whose shelf cell contains the tap, if any.
+    /// The series card whose shelf cell contains the tap, if any.
     fn library_cell_at(
         &self,
-        entries: &[LibraryEntry],
+        items: &[SeriesCard],
         page: usize,
         x: u32,
         y: u32,
-    ) -> Option<LibraryEntry> {
+    ) -> Option<SeriesCard> {
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
         let local_y = y.saturating_sub(self.layout.content_top());
-        let visible = entries.len().saturating_sub(page * capacity).min(capacity);
+        let visible = items.len().saturating_sub(page * capacity).min(capacity);
         for cell in 0..visible {
             let (cx, cy) = shelf.cell_origin(cell);
             if x >= cx
@@ -1259,7 +1360,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 && local_y >= cy
                 && local_y < cy + shelf.cell_height()
             {
-                return Some(entries[page * capacity + cell].clone());
+                return Some(items[page * capacity + cell].clone());
             }
         }
         None
@@ -1267,18 +1368,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     fn tap_library_cell(
         &mut self,
-        entries: &[LibraryEntry],
+        items: &[SeriesCard],
         page: usize,
         x: u32,
         y: u32,
     ) -> Result<Flow> {
-        let Some(mut entry) = self.library_cell_at(entries, page, x, y) else {
+        let Some(card) = self.library_cell_at(items, page, x, y) else {
             return Ok(Flow::Continue);
         };
+        // Resume the series where it was left: the most recently read
+        // unfinished chapter, else its first chapter.
+        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
+        let mut entry = card.resume_chapter(&store).clone();
         loop {
-            // Continuation within the series: the next CBZ in the same
-            // directory (entries come naturally sorted from the scan).
-            let next = next_in_series(entries, &entry);
+            // Continuation within the series: the card's next chapter
+            // (chapters keep the scan's natural order).
+            let next = card.next_after(&entry).cloned();
             match self.run_reader(&entry.path, &entry.relative_path, next.is_some())? {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
                 ReaderOutcome::Back => return Ok(Flow::Continue),
@@ -1521,22 +1626,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// shelf with at least one visible downloaded cover (.cover.jpg).
     /// Everything else renders grayscale.
     fn compose_color_current(&self) -> Result<Option<RgbPage>> {
-        let Some(Screen::Library { entries, page }) = self.stack.last() else {
+        let Some(Screen::Library { items, page }) = self.stack.last() else {
             return Ok(None);
         };
         let l = &self.layout;
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
-        let visible = || entries.iter().skip(page * capacity).take(capacity);
-        if !visible().any(|e| self.cover_path(e).exists()) {
+        let visible = || items.iter().skip(page * capacity).take(capacity);
+        if !visible().any(|c| self.cover_path(c.cover_entry()).exists()) {
             return Ok(None);
         }
-        let page_count = entries.len().div_ceil(capacity).max(1);
+        let page_count = items.len().div_ceil(capacity).max(1);
         let chrome = compose_chrome(l, "Library", *page, page_count);
-        let grid = compose_shelf_rgb(
-            &self.shelf_entries_for_page(entries, *page, capacity),
-            &shelf,
-        );
+        let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, capacity), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
         Ok(Some(canvas))
@@ -1600,7 +1702,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ];
                 compose_list(l, "Power", &rows, 0, 1)
             }
-            Screen::Library { entries, page } => self.compose_library(entries, *page)?,
+            Screen::Library { items, page } => self.compose_library(items, *page)?,
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -1681,14 +1783,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
-    fn compose_library(&self, entries: &[LibraryEntry], page: usize) -> Result<GrayPage> {
+    fn compose_library(&self, items: &[SeriesCard], page: usize) -> Result<GrayPage> {
         let l = &self.layout;
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
-        let page_count = entries.len().div_ceil(capacity).max(1);
+        let page_count = items.len().div_ceil(capacity).max(1);
 
         let mut canvas = compose_chrome(l, "Library", page, page_count);
-        if entries.is_empty() {
+        if items.is_empty() {
             draw_text(
                 &mut canvas,
                 l.pad,
@@ -1710,10 +1812,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(canvas);
         }
 
-        let grid = compose_shelf(
-            &self.shelf_entries_for_page(entries, page, capacity),
-            &shelf,
-        );
+        let grid = compose_shelf(&self.shelf_entries_for_page(items, page, capacity), &shelf);
         copy_into(&mut canvas, &grid, 0, l.content_top());
         Ok(canvas)
     }
@@ -1729,31 +1828,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Build the shelf cards for one Library page, shared by the gray and
-    /// RGB compositors.
+    /// RGB compositors: one card per series, titled by the series, with
+    /// the most-recently-read chapter's progress.
     fn shelf_entries_for_page(
         &self,
-        entries: &[LibraryEntry],
+        items: &[SeriesCard],
         page: usize,
         capacity: usize,
     ) -> Vec<ShelfEntry> {
         let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
-        let mut shelf_entries = Vec::new();
-        for entry in entries.iter().skip(page * capacity).take(capacity) {
-            let cover = self.shelf_cover(entry, capacity);
-            let progress = store.get(&entry.relative_path).map(|p| {
-                if p.total_pages == 0 {
-                    0.0
-                } else {
-                    (p.current_page + 1) as f32 / p.total_pages as f32
-                }
-            });
-            shelf_entries.push(ShelfEntry {
-                cover,
-                title: entry_title(&entry.relative_path),
-                progress,
-            });
-        }
-        shelf_entries
+        items
+            .iter()
+            .skip(page * capacity)
+            .take(capacity)
+            .map(|card| ShelfEntry {
+                cover: self.shelf_cover(card.cover_entry(), capacity),
+                title: card.title(),
+                progress: card.progress(&store),
+            })
+            .collect()
     }
 
     /// The decoded cover for a library entry, through the cover cache.
@@ -2254,18 +2347,6 @@ fn next_chapter(chapters: &[ChapterEntry], current_id: &str) -> Option<ChapterEn
             .cloned();
     }
     index.checked_sub(1).map(|i| chapters[i].clone())
-}
-
-/// The next CBZ of the same series on the shelf (entries arrive naturally
-/// sorted from the library scan).
-fn next_in_series(entries: &[LibraryEntry], current: &LibraryEntry) -> Option<LibraryEntry> {
-    let series = current.relative_path.rsplit_once('/').map(|(dir, _)| dir);
-    entries
-        .iter()
-        .skip_while(|e| e.relative_path != current.relative_path)
-        .skip(1)
-        .find(|e| e.relative_path.rsplit_once('/').map(|(dir, _)| dir) == series)
-        .cloned()
 }
 
 /// Progress key for a document: its path relative to the library root.
