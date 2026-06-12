@@ -22,7 +22,7 @@
 use anyhow::Result;
 use gideon_core::{CbzDocument, ProgressStore};
 use gideon_device::{Display, RefreshMode};
-use gideon_render::{render_page, rotate_page, FitMode, GrayPage, RenderOptions};
+use gideon_render::{render_page, FitMode, GrayPage, PageBuf, RenderOptions};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -49,11 +49,12 @@ pub struct Reader<D: Display> {
     /// Vertical scroll within the current page, in reading orientation.
     scroll_y: u32,
     /// The current page rendered in reading orientation, keyed by index,
-    /// so scrolling never re-decodes.
-    rendered: Option<(usize, GrayPage)>,
+    /// so scrolling never re-decodes. Gray for B/W manga, RGB when the
+    /// page has real color (the Kaleido panel shows it).
+    rendered: Option<(usize, PageBuf)>,
     /// The previously shown page, kept rendered so `prev_page` is as fast
     /// as `next_page`.
-    spare: Option<(usize, GrayPage)>,
+    spare: Option<(usize, PageBuf)>,
     prefetcher: Prefetcher,
     turns_since_full_refresh: u32,
 }
@@ -134,7 +135,7 @@ impl<D: Display> Reader<D> {
         let (_, reading_h) = self.reading_dims();
         let max_scroll = match &self.rendered {
             Some((index, page)) if *index == self.current_page => {
-                page.height.saturating_sub(reading_h)
+                page.height().saturating_sub(reading_h)
             }
             _ => 0,
         };
@@ -195,14 +196,14 @@ impl<D: Display> Reader<D> {
                 page
             } else {
                 let image = self.doc.decode_page(self.current_page)?;
-                render_page(&image, &opts).into_gray()
+                render_page(&image, &opts)
             };
             // The outgoing page becomes the spare: going back is instant.
             self.spare = self.rendered.replace((self.current_page, page));
         }
 
         let page = &self.rendered.as_ref().expect("rendered above").1;
-        let max_scroll = page.height.saturating_sub(reading_h);
+        let max_scroll = page.height().saturating_sub(reading_h);
         self.scroll_y = self.scroll_y.min(max_scroll);
 
         let indicator = self.page_indicator_text();
@@ -211,10 +212,12 @@ impl<D: Display> Reader<D> {
             // scrolling natively, so the cached page goes straight to the
             // backbuffer with zero copies, and the page indicator is a
             // tiny (~few KB) box stamped onto the backbuffer afterwards —
-            // never a clone of the page or its visible window.
-            self.display.blit(page, self.scroll_y)?;
-            let visible_w = page.width.min(reading_w);
-            let visible_h = (page.height - self.scroll_y).min(reading_h);
+            // never a clone of the page or its visible window. Color pages
+            // dispatch to blit_rgb (Kaleido shows them in color, and the
+            // following flush picks the color waveforms).
+            blit_page(&mut self.display, page, self.scroll_y)?;
+            let visible_w = page.width().min(reading_w);
+            let visible_h = (page.height() - self.scroll_y).min(reading_h);
             if let Some(overlay) = render_page_indicator(&indicator, visible_w, visible_h) {
                 // Bottom-right corner of the blitted (centered) window.
                 let x = (reading_w - visible_w) / 2 + visible_w - overlay.width;
@@ -225,10 +228,10 @@ impl<D: Display> Reader<D> {
             // Rotated reading copies anyway (crop + rotate into the panel
             // orientation), so the indicator is drawn into the window
             // before rotating — it follows the reading direction.
-            let mut window = crop_rows(page, self.scroll_y, reading_h);
-            draw_page_indicator(&mut window, &indicator);
-            let rotated = rotate_page(&window, self.rotation);
-            self.display.blit(&rotated, 0)?;
+            let mut window = page.crop_rows(self.scroll_y, reading_h);
+            draw_page_indicator_buf(&mut window, &indicator);
+            let rotated = window.rotate(self.rotation);
+            blit_page(&mut self.display, &rotated, 0)?;
         }
 
         let mode = if self.turns_since_full_refresh == 0 {
@@ -242,12 +245,14 @@ impl<D: Display> Reader<D> {
         // in-flight render): tall FitWidth pages can be enormous —
         // 1680xN webtoon strips — so cap what stays resident. Past the
         // budget, drop the spare and skip the render-ahead; neighbors of
-        // a huge page are almost certainly huge too.
+        // a huge page are almost certainly huge too. The comparison is in
+        // PIXELS, not bytes: an RGB page is 3x the bytes at equal pixels,
+        // and a 1.33-screen color page must not be treated as "huge".
         let budget = (reading_w as usize) * (reading_h as usize) * CACHE_BUDGET_SCREENS;
         let huge = self
             .rendered
             .as_ref()
-            .is_some_and(|(_, p)| p.pixels.len() > budget);
+            .is_some_and(|(_, p)| p.pixel_count() > budget);
         if huge {
             self.spare = None;
         } else {
@@ -268,14 +273,14 @@ impl<D: Display> Reader<D> {
         }
         let (_, reading_h) = self.reading_dims();
         let page = &self.rendered.as_ref().expect("rendered above").1;
-        let offset = self.scroll_y.min(page.height.saturating_sub(1));
-        let mut window = crop_rows(page, offset, reading_h);
-        draw_banner(&mut window, text);
+        let offset = self.scroll_y.min(page.height().saturating_sub(1));
+        let mut window = page.crop_rows(offset, reading_h);
+        draw_banner_buf(&mut window, text);
         if self.rotation == 0 {
-            self.display.blit(&window, 0)?;
+            blit_page(&mut self.display, &window, 0)?;
         } else {
-            let rotated = rotate_page(&window, self.rotation);
-            self.display.blit(&rotated, 0)?;
+            let rotated = window.rotate(self.rotation);
+            blit_page(&mut self.display, &rotated, 0)?;
         }
         self.display.flush(RefreshMode::Partial)?;
         Ok(())
@@ -358,7 +363,18 @@ fn normalize_rotation(degrees: u32) -> u32 {
     }
 }
 
-/// Copy `height` rows of `page` starting at `offset_y` (clamped).
+/// Blit a rendered page of either depth onto the display: gray pages take
+/// [`Display::blit`] (the fast path B/W manga always stays on), color
+/// pages [`Display::blit_rgb`] — Kaleido panels show the color, every
+/// other backend collapses it to luma in the trait's default impl.
+fn blit_page<D: Display>(display: &mut D, page: &PageBuf, offset_y: u32) -> Result<()> {
+    match page {
+        PageBuf::Gray(page) => display.blit(page, offset_y)?,
+        PageBuf::Rgb(page) => display.blit_rgb(page, offset_y)?,
+    }
+    Ok(())
+}
+
 /// Draw a white banner strip with `text` along the top of `page`.
 fn draw_banner(page: &mut GrayPage, text: &str) {
     use gideon_render::text::draw_text;
@@ -378,6 +394,33 @@ fn draw_banner(page: &mut GrayPage, text: &str) {
         page.width.saturating_sub(32),
         true,
     );
+}
+
+/// [`draw_banner`] for a window of either depth. The text rasterizer is
+/// grayscale-only, so for RGB windows the banner is drawn into a gray
+/// strip and replicated channel-wise on top — convert the box, never the
+/// page.
+fn draw_banner_buf(page: &mut PageBuf, text: &str) {
+    match page {
+        PageBuf::Gray(page) => draw_banner(page, text),
+        PageBuf::Rgb(page) => {
+            let mut strip = GrayPage::new_white(page.width, 56.min(page.height));
+            draw_banner(&mut strip, text);
+            stamp_gray_onto_rgb(page, &strip, 0, 0);
+        }
+    }
+}
+
+/// Copy a small gray box on top of an RGB page at (`x0`, `y0`) by
+/// replicating its channels. Callers guarantee the box fits.
+fn stamp_gray_onto_rgb(page: &mut gideon_render::RgbPage, boxed: &GrayPage, x0: u32, y0: u32) {
+    for y in 0..boxed.height {
+        for x in 0..boxed.width {
+            let g = boxed.pixel(x, y);
+            let dst = (((y0 + y) * page.width + x0 + x) * 3) as usize;
+            page.pixels[dst..dst + 3].copy_from_slice(&[g, g, g]);
+        }
+    }
 }
 
 /// Render the compact page-indicator box ("13/187") as its own tiny page
@@ -422,15 +465,19 @@ fn draw_page_indicator(page: &mut GrayPage, text: &str) {
     }
 }
 
-fn crop_rows(page: &GrayPage, offset_y: u32, height: u32) -> GrayPage {
-    let offset_y = offset_y.min(page.height.saturating_sub(1));
-    let height = height.min(page.height - offset_y);
-    let start = (offset_y * page.width) as usize;
-    let end = start + (height * page.width) as usize;
-    GrayPage {
-        width: page.width,
-        height,
-        pixels: page.pixels[start..end].to_vec(),
+/// [`draw_page_indicator`] for a window of either depth: the same gray
+/// box, replicated channel-wise when the window is RGB.
+fn draw_page_indicator_buf(page: &mut PageBuf, text: &str) {
+    match page {
+        PageBuf::Gray(page) => draw_page_indicator(page, text),
+        PageBuf::Rgb(page) => {
+            let Some(overlay) = render_page_indicator(text, page.width, page.height) else {
+                return;
+            };
+            let x0 = page.width - overlay.width;
+            let y0 = page.height - overlay.height;
+            stamp_gray_onto_rgb(page, &overlay, x0, y0);
+        }
     }
 }
 
@@ -453,7 +500,7 @@ struct Prefetcher {
 struct Pending {
     index: usize,
     opts: RenderOptions,
-    rx: mpsc::Receiver<(CbzDocument, Option<GrayPage>)>,
+    rx: mpsc::Receiver<(CbzDocument, Option<PageBuf>)>,
     handle: JoinHandle<()>,
 }
 
@@ -490,7 +537,7 @@ impl Prefetcher {
             let page = doc
                 .decode_page(index)
                 .ok()
-                .map(|image| render_page(&image, &thread_opts).into_gray());
+                .map(|image| render_page(&image, &thread_opts));
             let _ = tx.send((doc, page));
         });
         self.pending = Some(Pending {
@@ -504,7 +551,7 @@ impl Prefetcher {
     /// Take the prefetched page if it was rendered for exactly `index`
     /// with exactly `opts`. Returns `None` (caller renders synchronously)
     /// when nothing matching is in flight or rendering failed.
-    fn take(&mut self, index: usize, opts: &RenderOptions) -> Option<GrayPage> {
+    fn take(&mut self, index: usize, opts: &RenderOptions) -> Option<PageBuf> {
         let wanted = self
             .pending
             .as_ref()
@@ -519,7 +566,7 @@ impl Prefetcher {
 
     /// Wait for any in-flight render, take the document handle back and
     /// return the rendered page (if any).
-    fn reclaim(&mut self) -> Option<GrayPage> {
+    fn reclaim(&mut self) -> Option<PageBuf> {
         let pending = self.pending.take()?;
         let received = pending.rx.recv().ok();
         let _ = pending.handle.join();
@@ -823,8 +870,8 @@ mod tests {
         prefetcher.start(1, &o);
         let page = prefetcher.take(1, &o).expect("rendered page for index 1");
         // The background render matches a synchronous one exactly.
-        let direct = render_page(&doc.decode_page(1).unwrap(), &o).into_gray();
-        assert_eq!(page.pixels, direct.pixels);
+        let direct = render_page(&doc.decode_page(1).unwrap(), &o);
+        assert_eq!(page, direct);
 
         // The prefetcher reclaimed its document and can go again.
         prefetcher.start(2, &o);
@@ -864,7 +911,7 @@ mod tests {
         // Still functional with the new options afterwards.
         prefetcher.start(1, &opts(32, 16));
         let page = prefetcher.take(1, &opts(32, 16)).expect("fresh render");
-        assert_eq!((page.width, page.height), (32, 16));
+        assert_eq!((page.width(), page.height()), (32, 16));
     }
 
     #[test]
@@ -1198,6 +1245,9 @@ mod tests {
         reader.show_current_page().unwrap();
         assert!(reader.display().pixel(295, 295) > 0xC0, "indicator shown");
         let (_, page) = reader.rendered.as_ref().expect("page cached");
+        let PageBuf::Gray(page) = page else {
+            panic!("B/W page must stay on the gray path");
+        };
         let corner = page.pixel(page.width - 5, page.height - 5);
         assert!(
             corner < 0x40,
@@ -1219,20 +1269,5 @@ mod tests {
             overlay.pixel(overlay.width - 2, overlay.height - 2) > 0xC0,
             "white interior"
         );
-    }
-
-    #[test]
-    fn crop_rows_extracts_the_window() {
-        let page = GrayPage {
-            width: 2,
-            height: 4,
-            pixels: vec![0, 0, 1, 1, 2, 2, 3, 3],
-        };
-        let window = crop_rows(&page, 1, 2);
-        assert_eq!((window.width, window.height), (2, 2));
-        assert_eq!(window.pixels, vec![1, 1, 2, 2]);
-        // Clamped at the bottom.
-        let tail = crop_rows(&page, 3, 5);
-        assert_eq!(tail.pixels, vec![3, 3]);
     }
 }
