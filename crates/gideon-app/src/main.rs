@@ -267,17 +267,27 @@ fn cmd_render(
         dither,
     };
     let rendered = render_page(&image, &opts);
+    let (width, height) = (rendered.width(), rendered.height());
 
-    let gray = image::GrayImage::from_raw(rendered.width, rendered.height, rendered.pixels)
-        .context("rendered page buffer has unexpected size")?;
-    gray.save(&out)?;
+    // Color pages save as RGB (what a Kaleido panel would show); B/W
+    // pages stay grayscale, exactly as before.
+    match rendered {
+        gideon_render::PageBuf::Gray(page) => {
+            image::GrayImage::from_raw(page.width, page.height, page.pixels)
+                .context("rendered page buffer has unexpected size")?
+                .save(&out)?;
+        }
+        gideon_render::PageBuf::Rgb(page) => {
+            image::RgbImage::from_raw(page.width, page.height, page.pixels)
+                .context("rendered page buffer has unexpected size")?
+                .save(&out)?;
+        }
+    }
     println!(
-        "Rendered page {page}/{} of '{}' to {} ({}x{})",
+        "Rendered page {page}/{} of '{}' to {} ({width}x{height})",
         doc.page_count(),
         doc.title(),
         out.display(),
-        rendered.width,
-        rendered.height,
     );
     Ok(())
 }

@@ -619,9 +619,9 @@ fn library_with_cover_art_renders_in_color() {
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
 
-    // The shelf went through blit_rgb: MemoryDisplay's default impl
-    // collapses with Rec.601 luma, so a red cover lands at ~76 — the
-    // grayscale path (the image crate's BT.709 weights) would give ~54.
+    // The shelf went through blit_rgb: MemoryDisplay collapses it with
+    // Rec.601 luma, so a red cover lands at ~76 — the grayscale path
+    // (the image crate's BT.709 weights) would give ~54.
     let l = layout();
     let shelf = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS);
     let (cx, cy) = shelf.cell_origin(0);
@@ -633,6 +633,11 @@ fn library_with_cover_art_renders_in_color() {
     assert!(
         (66..=86).contains(&px),
         "expected the Rec.601 luma of red (~76) from the RGB path, got {px}"
+    );
+    assert_eq!(
+        app.display().blits.last(),
+        Some(&true),
+        "the color shelf must arrive via blit_rgb"
     );
     // Color shelves always flush in full, so the Kaleido color waveform
     // (GCC16, FULL-only) can fire.

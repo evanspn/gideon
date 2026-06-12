@@ -117,13 +117,25 @@ fn download_and_render_pages_from_github_source() {
             .decode_page(page_index)
             .unwrap_or_else(|e| panic!("page {page_index} failed to decode: {e}"));
         let rendered = render_page(&image, &opts);
-        assert_eq!((rendered.width, rendered.height), (1072, 1448));
-        assert!(
-            rendered.pixels.iter().any(|&p| p != 0xFF),
-            "page {page_index} rendered fully white — decode or render is broken"
-        );
-        // Dithered output must respect the 16-level e-ink palette.
-        assert!(rendered.pixels.iter().all(|&p| p % 17 == 0));
+        assert_eq!((rendered.width(), rendered.height()), (1072, 1448));
+        match rendered {
+            gideon_render::PageBuf::Gray(page) => {
+                assert!(
+                    page.pixels.iter().any(|&p| p != 0xFF),
+                    "page {page_index} rendered fully white — decode or render is broken"
+                );
+                // Dithered output must respect the 16-level e-ink palette.
+                assert!(page.pixels.iter().all(|&p| p % 17 == 0));
+            }
+            // Source icons are usually color art: it keeps its RGB (and is
+            // hardware-dithered on the panel, never software-quantized).
+            gideon_render::PageBuf::Rgb(page) => {
+                assert!(
+                    page.pixels.iter().any(|&p| p != 0xFF),
+                    "page {page_index} rendered fully white — decode or render is broken"
+                );
+            }
+        }
     }
 }
 
@@ -248,7 +260,7 @@ fn wasm_source_end_to_end() {
                     dither: true,
                 },
             );
-            assert!(rendered.pixels.iter().any(|&p| p != 0xFF));
+            assert!(rendered.into_gray().pixels.iter().any(|&p| p != 0xFF));
             return; // full pipeline verified
         }
         panic!("no manga in the first 5 results had downloadable pages");
