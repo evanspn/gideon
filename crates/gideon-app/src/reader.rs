@@ -1256,6 +1256,250 @@ mod tests {
         );
     }
 
+    // --- color pages (the Kaleido RGB path) ---
+
+    /// Write a CBZ whose page `i` is a `width x height(i)` solid COLOR
+    /// image — strong red, well past the color-detection thresholds.
+    fn make_color_cbz_sized(path: &Path, dims: &[(u32, u32)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (i, (w, h)) in dims.iter().enumerate() {
+            let img = image::RgbImage::from_pixel(*w, *h, image::Rgb([200, 30, 30]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            zip.start_file(
+                format!("{:03}.png", i + 1),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(&buf.into_inner()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn bw_cbz_never_takes_the_rgb_path() {
+        // THE fast-path invariant: grayscale manga must never be promoted
+        // to RGB blits (3x the bytes, color waveforms, slower refreshes).
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = new_reader(dir.path(), 3);
+        reader.show_current_page().unwrap();
+        reader.next_page().unwrap();
+        reader.prev_page().unwrap();
+        assert!(
+            !reader.display().blits.is_empty()
+                && reader.display().blits.iter().all(|&color| !color),
+            "B/W pages must stay on the gray blit path: {:?}",
+            reader.display().blits
+        );
+    }
+
+    #[test]
+    fn color_cbz_page_blits_color() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("color.cbz");
+        make_color_cbz_sized(&path, &[(8, 8), (8, 8)]);
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(16, 16),
+            FitMode::Contain,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        assert_eq!(reader.display().blits, vec![true]);
+        // And the shown pixels are the page's Rec.601 luma, not white.
+        let center = reader.display().pixel(8, 8);
+        let expected = gideon_render::luma_rec601(200, 30, 30);
+        assert!(
+            center.abs_diff(expected) <= 2,
+            "expected ~{expected}, got {center}"
+        );
+    }
+
+    #[test]
+    fn color_pages_round_trip_rgb_through_resume_spare_and_prefetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("color.cbz");
+        make_color_cbz_sized(&path, &[(8, 8), (8, 8), (8, 8)]);
+
+        // Resume into the middle of the chapter: the warmed first paint
+        // (prefetcher render) must still be color.
+        let mut store = ProgressStore::default();
+        store.update("color.cbz", 1, 3);
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(16, 16),
+            FitMode::Contain,
+            0,
+        );
+        reader.resume_from(&store, "color.cbz");
+        reader.warm();
+        reader.show_current_page().unwrap(); // page 1: prefetched render
+        reader.next_page().unwrap(); // page 2: render-ahead result
+        assert!(
+            matches!(&reader.spare, Some((1, page)) if page.is_color()),
+            "the spare slot must keep the RGB render"
+        );
+        reader.prev_page().unwrap(); // page 1 again: spare-slot hit
+        assert_eq!(
+            reader.display().blits,
+            vec![true, true, true],
+            "resume, prefetch and spare paints must ALL stay color"
+        );
+    }
+
+    #[test]
+    fn rotation_90_color_page_keeps_orientation_and_color() {
+        // The RGB twin of rotation_90_shows_black_on_the_top: left half
+        // RED, right half white in reading orientation. Rotated 90° CW the
+        // red half lands at the panel top — and the blit carries color.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half_red.cbz");
+        let mut img = image::RgbImage::new(100, 100);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = if x < 50 {
+                image::Rgb([200, 30, 30])
+            } else {
+                image::Rgb([255, 255, 255])
+            };
+        }
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("001.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
+        zip.finish().unwrap();
+
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(100, 100),
+            FitMode::Contain,
+            90,
+        );
+        reader.show_current_page().unwrap();
+        assert_eq!(reader.display().blits, vec![true], "rotated blit is RGB");
+        // Red luma is ~76: the reading-left (red) half is at the panel
+        // top, the white half at the bottom.
+        let red_luma = gideon_render::luma_rec601(200, 30, 30);
+        assert!(reader.display().pixel(50, 10).abs_diff(red_luma) <= 8);
+        assert!(reader.display().pixel(50, 90) > 0xC0);
+    }
+
+    #[test]
+    fn fit_width_scrolling_works_on_color_pages() {
+        // A color page whose RED brightens with y: scrolling down must
+        // show measurably brighter pixels, all through RGB blits.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gradient_color.cbz");
+        let mut img = image::RgbImage::new(50, 200);
+        for (_x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([y as u8, 0, 0]);
+        }
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("001.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
+        zip.finish().unwrap();
+
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(100, 100),
+            FitMode::FitWidth,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        assert_eq!(reader.scroll_state(), (0, 300));
+        let top_avg: f64 = reader
+            .display()
+            .buffer
+            .iter()
+            .map(|&p| p as f64)
+            .sum::<f64>()
+            / reader.display().buffer.len() as f64;
+        reader.next_page().unwrap();
+        assert_eq!(reader.scroll_state(), (40, 300));
+        let scrolled_avg: f64 = reader
+            .display()
+            .buffer
+            .iter()
+            .map(|&p| p as f64)
+            .sum::<f64>()
+            / reader.display().buffer.len() as f64;
+        assert!(
+            scrolled_avg > top_avg + 3.0,
+            "scrolling down should show the brighter lower part \
+             (top {top_avg:.1}, scrolled {scrolled_avg:.1})"
+        );
+        assert_eq!(reader.display().blits, vec![true, true]);
+    }
+
+    #[test]
+    fn rgb_cache_budget_counts_pixels_not_bytes() {
+        // A 50x200 color page FitWidth on 100x100 renders to 100x400 —
+        // exactly CACHE_BUDGET_SCREENS (4) screenfuls of PIXELS, i.e. not
+        // "huge". Counting its 120000 BYTES against the 40000 budget would
+        // wrongly drop the spare and kill the render-ahead for every color
+        // page above a third of the budget.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tall_color.cbz");
+        make_color_cbz_sized(&path, &[(50, 200), (50, 200)]);
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(100, 100),
+            FitMode::FitWidth,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        while reader.scroll_state().0 < reader.scroll_state().1 {
+            reader.next_page().unwrap();
+        }
+        reader.next_page().unwrap(); // onto page 1
+        assert_eq!(reader.current_page(), 1);
+        assert!(
+            matches!(&reader.spare, Some((0, page)) if page.is_color()),
+            "a 4-screen color page is within the pixel budget: spare kept"
+        );
+    }
+
+    #[test]
+    fn banner_on_a_color_page_keeps_the_color_blit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("color.cbz");
+        make_color_cbz_sized(&path, &[(100, 100)]);
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(100, 100),
+            FitMode::Contain,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        reader.show_banner("Brightness 70%").unwrap();
+        assert_eq!(reader.display().blits, vec![true, true]);
+        // The banner strip itself is white chrome on top…
+        assert!(reader.display().pixel(50, 5) > 0xC0);
+        // …and the page below it is still the red page's luma.
+        let red_luma = gideon_render::luma_rec601(200, 30, 30);
+        assert!(reader.display().pixel(50, 80).abs_diff(red_luma) <= 8);
+        // The cached page is untouched by the banner (still pristine RGB).
+        let (_, page) = reader.rendered.as_ref().expect("page cached");
+        assert!(page.is_color());
+        let PageBuf::Rgb(rgb) = page else {
+            unreachable!()
+        };
+        assert_eq!(rgb.pixel(50, 5), [200, 30, 30], "banner never bakes in");
+    }
+
     #[test]
     fn page_indicator_overlay_box_matches_the_skip_rule() {
         // Too-small windows produce no box at all…

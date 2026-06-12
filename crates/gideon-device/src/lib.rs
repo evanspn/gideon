@@ -106,6 +106,10 @@ pub struct MemoryDisplay {
     pub buffer: Vec<u8>,
     /// Refresh modes recorded by `flush`, for assertions.
     pub flushes: Vec<RefreshMode>,
+    /// One entry per blit, recording whether it carried color (`blit_rgb`)
+    /// — so tests can pin that B/W pages never take the RGB path and that
+    /// color pages never silently fall back to gray.
+    pub blits: Vec<bool>,
 }
 
 impl MemoryDisplay {
@@ -115,6 +119,7 @@ impl MemoryDisplay {
             height,
             buffer: vec![0xFF; (width * height) as usize],
             flushes: Vec::new(),
+            blits: Vec::new(),
         }
     }
 
@@ -133,7 +138,22 @@ impl Display for MemoryDisplay {
     }
 
     fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
+        self.blits.push(false);
         blit_into(&mut self.buffer, self.width, self.height, page, offset_y);
+        Ok(())
+    }
+
+    fn blit_rgb(&mut self, page: &RgbPage, offset_y: u32) -> Result<()> {
+        // Identical pixels to the trait default (Rec.601 luma into the
+        // gray backbuffer) — overridden only to record `true` here.
+        self.blits.push(true);
+        blit_into(
+            &mut self.buffer,
+            self.width,
+            self.height,
+            &page.to_gray(),
+            offset_y,
+        );
         Ok(())
     }
 
@@ -287,16 +307,54 @@ mod tests {
 
     #[test]
     fn default_blit_rgb_collapses_with_rec601_luma() {
-        // MemoryDisplay doesn't override blit_rgb: the default impl must
-        // convert with Rec.601 (0.299 R + 0.587 G + 0.114 B) and blit.
-        let mut d = MemoryDisplay::new(3, 1);
+        // A backend that does NOT override blit_rgb: the trait default
+        // must convert with Rec.601 (0.299 R + 0.587 G + 0.114 B) and
+        // route through the plain gray blit.
+        struct GrayOnly(Vec<u8>);
+        impl Display for GrayOnly {
+            fn width(&self) -> u32 {
+                3
+            }
+            fn height(&self) -> u32 {
+                1
+            }
+            fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
+                blit_into(&mut self.0, 3, 1, page, offset_y);
+                Ok(())
+            }
+            fn overlay(&mut self, _page: &GrayPage, _x: u32, _y: u32) -> Result<()> {
+                Ok(())
+            }
+            fn flush(&mut self, _mode: RefreshMode) -> Result<()> {
+                Ok(())
+            }
+        }
+
         let page = RgbPage {
             width: 3,
             height: 1,
             pixels: vec![255, 0, 0, 0, 255, 0, 0, 0, 255],
         };
+        let mut plain = GrayOnly(vec![0xFF; 3]);
+        plain.blit_rgb(&page, 0).unwrap();
+        assert_eq!(plain.0, vec![76, 150, 29]);
+
+        // MemoryDisplay's override shows the same pixels…
+        let mut d = MemoryDisplay::new(3, 1);
         d.blit_rgb(&page, 0).unwrap();
         assert_eq!(d.buffer, vec![76, 150, 29]);
+        // …and records that the blit carried color.
+        assert_eq!(d.blits, vec![true]);
+    }
+
+    #[test]
+    fn memory_display_records_color_per_blit() {
+        let mut d = MemoryDisplay::new(2, 2);
+        d.blit(&page_filled(2, 2, 0x00), 0).unwrap();
+        let rgb = RgbPage::from_gray(&page_filled(2, 2, 0x80));
+        d.blit_rgb(&rgb, 0).unwrap();
+        d.blit(&page_filled(2, 2, 0xFF), 0).unwrap();
+        assert_eq!(d.blits, vec![false, true, false]);
     }
 
     #[test]
