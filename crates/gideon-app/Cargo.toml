@@ -27,9 +27,9 @@ gideon-aidoku = { path = "../gideon-aidoku" }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+zip.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-zip.workspace = true
-serde_json.workspace = true
 filetime = "0.2"

@@ -90,6 +90,21 @@ pub struct InstalledSource {
     pub broken: bool,
 }
 
+/// Read a source's manifest straight out of its `.aix` zip, without
+/// instantiating the WASM runtime — listing identities must stay cheap
+/// even with many installed sources (full `Source` loads happen lazily,
+/// per id, in `AidokuGateway`'s cache).
+fn read_manifest(path: &Path) -> Result<gideon_aidoku::SourceManifest> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("couldn't open source archive {}", path.display()))?;
+    let manifest = archive
+        .by_name("Payload/source.json")
+        .context("while loading source.json")?;
+    serde_json::from_reader(manifest).context("while parsing source.json")
+}
+
 /// List installed sources by scanning the sources directory.
 pub fn installed_sources(data_dir: &Path) -> Result<Vec<InstalledSource>> {
     let dir = sources_dir(data_dir);
@@ -108,21 +123,32 @@ pub fn installed_sources(data_dir: &Path) -> Result<Vec<InstalledSource>> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match Source::from_aix_file(&path, &settings_dir(data_dir)) {
-            Ok(source) => {
-                let m = source.manifest();
-                out.push(InstalledSource {
-                    id: m.info.id,
-                    name: m.info.name,
-                    broken: false,
-                });
-            }
-            Err(e) => out.push(InstalledSource {
-                id: stem.clone(),
-                name: format!("{stem} (broken: {e})"),
-                broken: true,
-            }),
-        }
+        // When the manifest doesn't even parse, fall back to a full WASM
+        // load: a source that loads anyway still shows up, and a truly
+        // broken one keeps its `broken` marking.
+        let source = match read_manifest(&path) {
+            Ok(m) => InstalledSource {
+                id: m.info.id,
+                name: m.info.name,
+                broken: false,
+            },
+            Err(_) => match Source::from_aix_file(&path, &settings_dir(data_dir)) {
+                Ok(source) => {
+                    let m = source.manifest();
+                    InstalledSource {
+                        id: m.info.id,
+                        name: m.info.name,
+                        broken: false,
+                    }
+                }
+                Err(e) => InstalledSource {
+                    id: stem.clone(),
+                    name: format!("{stem} (broken: {e})"),
+                    broken: true,
+                },
+            },
+        };
+        out.push(source);
     }
     Ok(out)
 }
@@ -773,6 +799,55 @@ mod download_tests {
                 .contains("referer: https://manga.example.com/reader"),
             "redirected request lost the Referer:\n{second}"
         );
+    }
+}
+
+#[cfg(test)]
+mod installed_sources_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn write_aix(data_dir: &Path, file: &str, manifest: &str) {
+        let dir = data_dir.join("sources");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = std::fs::File::create(dir.join(file)).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        zip.start_file(
+            "Payload/source.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn listing_reads_the_manifest_without_the_wasm_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        // No WASM payload at all: the identity must come straight from the
+        // zipped manifest — a full Source load would fail here.
+        write_aix(
+            dir.path(),
+            "en.demo.aix",
+            r#"{"info":{"id":"en.demo","name":"Demo","lang":"en","version":1}}"#,
+        );
+        let sources = installed_sources(dir.path()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "en.demo");
+        assert_eq!(sources[0].name, "Demo");
+        assert!(!sources[0].broken);
+    }
+
+    #[test]
+    fn unparseable_sources_are_still_marked_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sources")).unwrap();
+        std::fs::write(dir.path().join("sources/en.junk.aix"), b"not a zip").unwrap();
+        let sources = installed_sources(dir.path()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "en.junk");
+        assert!(sources[0].broken);
+        assert!(sources[0].name.contains("broken"));
     }
 }
 
