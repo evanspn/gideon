@@ -195,7 +195,7 @@ impl<D: Display> Reader<D> {
                 page
             } else {
                 let image = self.doc.decode_page(self.current_page)?;
-                render_page(&image, &opts)
+                render_page(&image, &opts).into_gray()
             };
             // The outgoing page becomes the spare: going back is instant.
             self.spare = self.rendered.replace((self.current_page, page));
@@ -490,7 +490,7 @@ impl Prefetcher {
             let page = doc
                 .decode_page(index)
                 .ok()
-                .map(|image| render_page(&image, &thread_opts));
+                .map(|image| render_page(&image, &thread_opts).into_gray());
             let _ = tx.send((doc, page));
         });
         self.pending = Some(Pending {
@@ -823,7 +823,7 @@ mod tests {
         prefetcher.start(1, &o);
         let page = prefetcher.take(1, &o).expect("rendered page for index 1");
         // The background render matches a synchronous one exactly.
-        let direct = render_page(&doc.decode_page(1).unwrap(), &o);
+        let direct = render_page(&doc.decode_page(1).unwrap(), &o).into_gray();
         assert_eq!(page.pixels, direct.pixels);
 
         // The prefetcher reclaimed its document and can go again.

@@ -195,12 +195,64 @@ pub fn compute_fit(
     (w, h)
 }
 
-/// Render a page image to a screen-sized grayscale canvas.
+/// A rendered page, in whichever depth the source content demanded:
+/// grayscale for B/W manga (the overwhelmingly common case — small,
+/// dithered, fast) or RGB for pages with real color (Kaleido panels show
+/// it; everyone else collapses it to luma at blit time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageBuf {
+    Gray(GrayPage),
+    Rgb(RgbPage),
+}
+
+impl PageBuf {
+    pub fn width(&self) -> u32 {
+        match self {
+            PageBuf::Gray(page) => page.width,
+            PageBuf::Rgb(page) => page.width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            PageBuf::Gray(page) => page.height,
+            PageBuf::Rgb(page) => page.height,
+        }
+    }
+
+    /// `width * height` regardless of variant. Cache budgets must compare
+    /// PIXEL counts, never byte lengths — an RGB page is 3x the bytes of
+    /// gray at equal pixels and must not look three times "bigger".
+    pub fn pixel_count(&self) -> usize {
+        self.width() as usize * self.height() as usize
+    }
+
+    pub fn is_color(&self) -> bool {
+        matches!(self, PageBuf::Rgb(_))
+    }
+
+    /// Collapse to grayscale: identity for gray pages, Rec.601 luma for
+    /// color ones.
+    pub fn into_gray(self) -> GrayPage {
+        match self {
+            PageBuf::Gray(page) => page,
+            PageBuf::Rgb(page) => page.to_gray(),
+        }
+    }
+}
+
+/// Render a page image to a screen-sized canvas: grayscale (dithered per
+/// `opts`) for B/W pages, RGB for pages [`page_is_color`] detects as color.
 ///
 /// For [`FitMode::Contain`] the page is centered with white margins. For the
 /// other modes the canvas grows beyond the screen in one dimension; the
 /// caller is responsible for scrolling/cropping when blitting.
-pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
+///
+/// Color pages keep their RGB samples through the resize (same filter
+/// choice as gray) and are NEVER software-dithered: the Kaleido refresh
+/// path dithers in hardware (HWTCON Y8→Y4), and pre-quantizing each
+/// channel would just band the color.
+pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> PageBuf {
     let (target_w, target_h) = compute_fit(
         page.width(),
         page.height(),
@@ -218,14 +270,28 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
     } else {
         FilterType::Triangle
     };
-    let scaled = page.resize_exact(target_w, target_h, filter).into_luma8();
 
     let canvas_w = opts.screen_width.max(target_w);
     let canvas_h = opts.screen_height.max(target_h);
-    let mut canvas = GrayPage::new_white(canvas_w, canvas_h);
-
     let off_x = (canvas_w - target_w) / 2;
     let off_y = (canvas_h - target_h) / 2;
+
+    if page_is_color(page) {
+        let scaled = page.resize_exact(target_w, target_h, filter).into_rgb8();
+        let mut canvas = RgbPage::new_white(canvas_w, canvas_h);
+        let src = scaled.as_raw();
+        for y in 0..target_h {
+            let dst_start = (((y + off_y) * canvas_w + off_x) * 3) as usize;
+            let src_start = (y * target_w * 3) as usize;
+            let row_len = (target_w * 3) as usize;
+            canvas.pixels[dst_start..dst_start + row_len]
+                .copy_from_slice(&src[src_start..src_start + row_len]);
+        }
+        return PageBuf::Rgb(canvas);
+    }
+
+    let scaled = page.resize_exact(target_w, target_h, filter).into_luma8();
+    let mut canvas = GrayPage::new_white(canvas_w, canvas_h);
 
     for y in 0..target_h {
         let canvas_row = ((y + off_y) * canvas_w + off_x) as usize;
@@ -238,7 +304,7 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
         dither_to_16_levels(&mut canvas);
     }
 
-    canvas
+    PageBuf::Gray(canvas)
 }
 
 /// Rotate a rendered page clockwise by `degrees` (0, 90, 180 or 270).
@@ -329,6 +395,14 @@ mod tests {
         DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, image::Rgb([gray, gray, gray])))
     }
 
+    /// Render a page the tests know is B/W and unwrap the gray buffer.
+    fn render_gray(page: &DynamicImage, opts: &RenderOptions) -> GrayPage {
+        match render_page(page, opts) {
+            PageBuf::Gray(page) => page,
+            PageBuf::Rgb(_) => panic!("B/W page took the RGB path"),
+        }
+    }
+
     #[test]
     fn contain_letterboxes_tall_screen() {
         // 1000x1000 page on a 600x800 screen → 600x600.
@@ -376,7 +450,7 @@ mod tests {
             fit: FitMode::Contain,
             dither: false,
         };
-        let out = render_page(&page, &opts);
+        let out = render_gray(&page, &opts);
         assert_eq!((out.width, out.height), (200, 100));
         // Margins are white, center is black.
         assert_eq!(out.pixel(0, 50), 0xFF);
@@ -393,9 +467,107 @@ mod tests {
             fit: FitMode::FitWidth,
             dither: false,
         };
-        let out = render_page(&page, &opts);
+        let out = render_gray(&page, &opts);
         assert_eq!(out.width, 200);
         assert_eq!(out.height, 800);
+    }
+
+    /// Parity pin: a B/W page through [`render_page`] must be
+    /// byte-identical to the historical grayscale-only pipeline
+    /// (resize → luma → centered white canvas → Floyd–Steinberg to 16
+    /// levels), replicated inline here. If this breaks, the gray fast
+    /// path changed — that is never an intended side effect of color work.
+    #[test]
+    fn gray_render_is_byte_identical_to_the_legacy_pipeline() {
+        // A gradient exercises resize filtering and error diffusion.
+        let mut img = RgbImage::new(96, 128);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let g = ((x * 2 + y) % 256) as u8;
+            *px = image::Rgb([g, g, g]);
+        }
+        let page = DynamicImage::ImageRgb8(img);
+        let opts = RenderOptions {
+            screen_width: 64,
+            screen_height: 64,
+            fit: FitMode::Contain,
+            dither: true,
+        };
+
+        // The legacy pipeline, verbatim.
+        let (target_w, target_h) = compute_fit(96, 128, 64, 64, FitMode::Contain);
+        let filter = if target_w > 96 || target_h > 128 {
+            FilterType::CatmullRom
+        } else {
+            FilterType::Triangle
+        };
+        let scaled = page.resize_exact(target_w, target_h, filter).into_luma8();
+        let canvas_w = 64.max(target_w);
+        let canvas_h = 64.max(target_h);
+        let mut expected = GrayPage::new_white(canvas_w, canvas_h);
+        let off_x = (canvas_w - target_w) / 2;
+        let off_y = (canvas_h - target_h) / 2;
+        for y in 0..target_h {
+            let row = ((y + off_y) * canvas_w + off_x) as usize;
+            for x in 0..target_w {
+                expected.pixels[row + x as usize] = scaled.get_pixel(x, y).0[0];
+            }
+        }
+        dither_to_16_levels(&mut expected);
+
+        assert_eq!(render_page(&page, &opts), PageBuf::Gray(expected));
+    }
+
+    #[test]
+    fn color_page_renders_rgb_centered_and_undithered() {
+        // A solid color page on a wider screen: centered, white margins,
+        // color preserved exactly (solid input → resize is lossless).
+        let red = image::Rgb([200, 30, 30]);
+        let page = DynamicImage::ImageRgb8(RgbImage::from_pixel(100, 100, red));
+        let opts = RenderOptions {
+            screen_width: 200,
+            screen_height: 100,
+            fit: FitMode::Contain,
+            dither: true, // requests gray dithering — color must SKIP it
+        };
+        let PageBuf::Rgb(out) = render_page(&page, &opts) else {
+            panic!("color page took the gray path");
+        };
+        assert_eq!((out.width, out.height), (200, 100));
+        // Margins are white, center keeps the exact color: 200 and 30 are
+        // not 17-multiples, so any sneaky quantization would change them.
+        assert_eq!(out.pixel(0, 50), [0xFF, 0xFF, 0xFF]);
+        assert_eq!(out.pixel(199, 50), [0xFF, 0xFF, 0xFF]);
+        assert_eq!(out.pixel(100, 50), [200, 30, 30]);
+    }
+
+    #[test]
+    fn color_fit_width_canvas_grows_vertically() {
+        let blue = image::Rgb([40, 60, 220]);
+        let page = DynamicImage::ImageRgb8(RgbImage::from_pixel(100, 400, blue));
+        let opts = RenderOptions {
+            screen_width: 200,
+            screen_height: 100,
+            fit: FitMode::FitWidth,
+            dither: true,
+        };
+        let out = render_page(&page, &opts);
+        assert!(out.is_color());
+        assert_eq!((out.width(), out.height()), (200, 800));
+        assert_eq!(out.pixel_count(), 200 * 800);
+    }
+
+    #[test]
+    fn page_buf_into_gray_collapses_color() {
+        let red = image::Rgb([255, 0, 0]);
+        let page = DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 10, red));
+        let opts = RenderOptions {
+            screen_width: 10,
+            screen_height: 10,
+            fit: FitMode::Contain,
+            dither: false,
+        };
+        let gray = render_page(&page, &opts).into_gray();
+        assert_eq!(gray.pixel(5, 5), 76, "Rec.601 red luma");
     }
 
     /// A 2x3 page with every pixel distinct, so rotations are fully
@@ -569,7 +741,7 @@ mod tests {
             fit: FitMode::Contain,
             dither: true,
         };
-        let out = render_page(&DynamicImage::ImageRgb8(img), &opts);
+        let out = render_gray(&DynamicImage::ImageRgb8(img), &opts);
         assert!(out.pixels.iter().all(|p| p % 17 == 0));
     }
 
@@ -582,7 +754,7 @@ mod tests {
             fit: FitMode::Contain,
             dither: true,
         };
-        let out = render_page(&page, &opts);
+        let out = render_gray(&page, &opts);
         let avg: f64 = out.pixels.iter().map(|&p| p as f64).sum::<f64>() / out.pixels.len() as f64;
         assert!(
             (avg - 100.0).abs() < 4.0,
