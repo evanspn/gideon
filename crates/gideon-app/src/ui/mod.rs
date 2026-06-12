@@ -27,7 +27,7 @@ use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{FitMode, GrayPage, RgbPage};
+use gideon_render::{rotate_page, rotate_page_rgb, FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
@@ -375,11 +375,41 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self
     }
 
-    /// Apply the reader-related settings (fit mode and rotation).
+    /// Apply the reader-related settings (fit mode and rotation). The
+    /// rotation is app-wide: menus follow it too, so the layout is rebuilt
+    /// against the rotated dimensions.
     pub fn with_reader_settings(mut self, fit: FitMode, rotation: u32) -> Self {
         self.reader_fit = fit;
         self.reader_rotation = rotation;
+        self.rebuild_layout();
         self
+    }
+
+    /// (Re)build the menu layout against the current reading orientation:
+    /// menus follow the reader rotation, so for 90/270 the layout uses the
+    /// swapped (reading-frame) dimensions and [`Self::render_current`]
+    /// rotates the composed page into the panel before blitting.
+    fn rebuild_layout(&mut self) {
+        let (w, h) = (self.display.width(), self.display.height());
+        self.layout = if self.reader_rotation % 180 == 90 {
+            UiLayout::new(h, w)
+        } else {
+            UiLayout::new(w, h)
+        };
+    }
+
+    /// Map a panel tap into menu (reading-frame) coordinates: menus are
+    /// composed against the rotated layout and rotated to the panel just
+    /// before blitting, so input inverts that rotation HERE — the single
+    /// chokepoint in [`Self::run`] that every screen inherits.
+    fn map_menu_point(&self, x: u32, y: u32) -> (u32, u32) {
+        layout::map_reader_tap(
+            x,
+            y,
+            self.display.width(),
+            self.display.height(),
+            self.reader_rotation,
+        )
     }
 
     /// Install the suspend hook (power button / sleep cover).
@@ -446,20 +476,29 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         loop {
             match self.input.next_event() {
                 Err(_) => return Ok(Exit::Close), // input source closed
-                Ok(UiEvent::Tap { x, y }) => match self.handle_tap(x, y) {
-                    Ok(Flow::Quit(exit)) => return Ok(exit),
-                    Ok(Flow::Continue) => {}
-                    // The UI must never die on an error: show it instead.
-                    Err(e) => self.show_error(&e)?,
-                },
+                // Every pointer event funnels through map_menu_point first
+                // (the one chokepoint), so taps land where the rotated
+                // menus drew their targets.
+                Ok(UiEvent::Tap { x, y }) => {
+                    let (x, y) = self.map_menu_point(x, y);
+                    match self.handle_tap(x, y) {
+                        Ok(Flow::Quit(exit)) => return Ok(exit),
+                        Ok(Flow::Continue) => {}
+                        // The UI must never die on an error: show it instead.
+                        Err(e) => self.show_error(&e)?,
+                    }
+                }
                 // Edge slides only matter in the reader; elsewhere a swipe
                 // is just an overshot tap — ignore it.
                 Ok(UiEvent::Swipe { .. }) => {}
-                Ok(UiEvent::LongPress { x, y }) => match self.handle_long_press(x, y) {
-                    Ok(Flow::Quit(exit)) => return Ok(exit),
-                    Ok(Flow::Continue) => {}
-                    Err(e) => self.show_error(&e)?,
-                },
+                Ok(UiEvent::LongPress { x, y }) => {
+                    let (x, y) = self.map_menu_point(x, y);
+                    match self.handle_long_press(x, y) {
+                        Ok(Flow::Quit(exit)) => return Ok(exit),
+                        Ok(Flow::Continue) => {}
+                        Err(e) => self.show_error(&e)?,
+                    }
+                }
                 // Physical page-turn buttons page through whatever list is
                 // on screen (library shelf, sources, results…).
                 Ok(UiEvent::PageForward) => {
@@ -1254,6 +1293,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.show_status(&[&format!("Downloading {label}…")])?;
 
         let layout = self.layout;
+        let rotation = self.reader_rotation;
         let manga_title = manga.title.clone();
         // Borrow the display for live progress while the gateway (a
         // disjoint field) does the download.
@@ -1271,6 +1311,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         &format!("Downloading… page {done}/{total}"),
                     ],
                 );
+                let page = rotate_for_panel(page, rotation);
                 let _ = display.blit(&page, 0);
                 let _ = display.flush(RefreshMode::Partial);
             }
@@ -1449,8 +1490,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let progress_file = progress_path(&self.library_dir);
         let mut store = ProgressStore::load(&progress_file).unwrap_or_default();
 
-        let layout = self.layout;
+        // The reader works in PANEL coordinates (self.layout may be the
+        // rotated menu layout): build its gesture geometry from the
+        // display itself, leaving the reader pipeline untouched.
+        let panel = UiLayout::new(self.display.width(), self.display.height());
         let mut rotation = self.reader_rotation;
+        // Orientation lock: rotation changes persist across sessions only
+        // while locked; "auto" keeps them session-only. Toggled from the
+        // controls sheet.
+        let mut rotation_locked = self.load_settings().reader_rotation_locked;
+        // The reader-controls sheet (Rotate 90° / Orientation / Close),
+        // opened by an up-swipe that starts in the bottom eighth of the
+        // reading frame.
+        let mut sheet_open = false;
         let mut outcome = ReaderOutcome::Back;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
@@ -1461,13 +1513,77 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             reader.warm();
             reader.show_current_page()?;
             loop {
-                match self.input.next_event() {
+                let event = self.input.next_event();
+                // While the controls sheet is up, taps go to its rows; any
+                // other event closes it (Sleep still suspends below).
+                if sheet_open {
+                    match &event {
+                        Err(_) => {}
+                        Ok(UiEvent::Tap { x, y }) | Ok(UiEvent::LongPress { x, y }) => {
+                            let (_, my) =
+                                layout::map_reader_tap(*x, *y, panel.width, panel.height, rotation);
+                            let reading_h = if rotation % 180 == 90 {
+                                panel.width
+                            } else {
+                                panel.height
+                            };
+                            match controls_sheet_row(reading_h, panel.row_h, my) {
+                                Some(SHEET_ROW_ROTATE) => {
+                                    sheet_open = false;
+                                    rotate_reader_90(
+                                        &mut reader,
+                                        &mut rotation,
+                                        self.settings_dir.as_deref(),
+                                        rotation_locked,
+                                    )?;
+                                    self.reader_rotation = rotation;
+                                }
+                                Some(SHEET_ROW_ORIENTATION) => {
+                                    rotation_locked = !rotation_locked;
+                                    let locked = rotation_locked;
+                                    persist_settings(self.settings_dir.as_deref(), |s| {
+                                        s.reader_rotation_locked = locked;
+                                        if locked {
+                                            // Locking captures the current
+                                            // orientation for next time.
+                                            s.reader_rotation = rotation;
+                                        }
+                                    });
+                                    // Redraw with the flipped label.
+                                    show_controls_sheet(
+                                        &mut reader,
+                                        &panel,
+                                        rotation,
+                                        rotation_locked,
+                                    )?;
+                                }
+                                _ => {
+                                    // Close, or a tap above the sheet.
+                                    sheet_open = false;
+                                    reader.show_current_page()?;
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(UiEvent::Sleep) => {
+                            // Fall through: the suspend handling below
+                            // repaints in full, wiping the sheet away.
+                            sheet_open = false;
+                        }
+                        Ok(_) => {
+                            sheet_open = false;
+                            reader.show_current_page()?;
+                            continue;
+                        }
+                    }
+                }
+                match event {
                     Err(_) => {
                         outcome = ReaderOutcome::Quit;
                         break;
                     }
                     // Tap zones follow the reading orientation, not the panel.
-                    Ok(UiEvent::Tap { x, y }) => match layout.reader_zone_rotated(x, y, rotation) {
+                    Ok(UiEvent::Tap { x, y }) => match panel.reader_zone_rotated(x, y, rotation) {
                         ReaderZone::NextPage => {
                             // Turning past the last page continues into
                             // the next chapter (when one exists).
@@ -1496,63 +1612,67 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // up increases; the full screen height is the full
                     // 0–100 range.
                     Ok(UiEvent::Swipe { x0, y0, x1, y1 }) => {
-                        let edge = (layout.width / 8).max(1);
-                        let on_right = x0 >= layout.width - edge && x1 >= layout.width - edge;
+                        let edge = (panel.width / 8).max(1);
+                        let on_right = x0 >= panel.width - edge && x1 >= panel.width - edge;
                         let on_left = x0 < edge && x1 < edge;
                         if !on_right && !on_left {
                             // Mid-screen gestures follow the READING
                             // orientation (taps already do): swipe down to
                             // leave the manga, swipe up to rotate 90°
-                            // clockwise and lock it (persisted) — for
-                            // reading on your side in bed. Both demand
-                            // deliberate travel (a quarter of the reading
-                            // height): a sloppy page-turn tap drifting past
-                            // the 30px slop must never exit, and certainly
-                            // never rotate-and-lock the whole reader.
-                            let (mx0, my0) = layout::map_reader_tap(
-                                x0,
-                                y0,
-                                layout.width,
-                                layout.height,
-                                rotation,
-                            );
-                            let (mx1, my1) = layout::map_reader_tap(
-                                x1,
-                                y1,
-                                layout.width,
-                                layout.height,
-                                rotation,
-                            );
+                            // clockwise — for reading on your side in bed.
+                            // Both demand deliberate travel (a quarter of
+                            // the reading height): a sloppy page-turn tap
+                            // drifting past the 30px slop must never exit,
+                            // and certainly never rotate the whole reader.
+                            let (mx0, my0) =
+                                layout::map_reader_tap(x0, y0, panel.width, panel.height, rotation);
+                            let (mx1, my1) =
+                                layout::map_reader_tap(x1, y1, panel.width, panel.height, rotation);
                             let reading_h = if rotation % 180 == 90 {
-                                layout.width
+                                panel.width
                             } else {
-                                layout.height
+                                panel.height
                             };
                             let min_travel = (reading_h / 4).max(1);
                             let vertical = my0.abs_diff(my1) > mx0.abs_diff(mx1);
+                            // An up-swipe STARTING in the bottom eighth of
+                            // the reading frame opens the controls sheet —
+                            // distinct from the mid-screen rotate gesture
+                            // below, which starts higher up. An eighth of
+                            // travel is enough: it's a flick off the bezel.
+                            let sheet_band = reading_h.saturating_sub((reading_h / 8).max(1));
+                            if my0 > my1
+                                && vertical
+                                && my0 > sheet_band
+                                && my0 - my1 >= (reading_h / 8).max(1)
+                            {
+                                sheet_open = true;
+                                show_controls_sheet(
+                                    &mut reader,
+                                    &panel,
+                                    rotation,
+                                    rotation_locked,
+                                )?;
+                                continue;
+                            }
                             if my1 > my0 && vertical && my1 - my0 >= min_travel {
                                 break;
                             }
                             if my0 > my1 && vertical && my0 - my1 >= min_travel {
-                                rotation = (rotation + 90) % 360;
-                                reader.set_rotation(rotation);
+                                rotate_reader_90(
+                                    &mut reader,
+                                    &mut rotation,
+                                    self.settings_dir.as_deref(),
+                                    rotation_locked,
+                                )?;
                                 self.reader_rotation = rotation;
-                                if let Some(dir) = &self.settings_dir {
-                                    let mut settings =
-                                        gideon_core::Settings::load(dir).unwrap_or_default();
-                                    settings.reader_rotation = rotation;
-                                    if let Err(e) = settings.save(dir) {
-                                        eprintln!("gideon: couldn't persist rotation: {e}");
-                                    }
-                                }
-                                reader.show_banner(&format!("Rotation {rotation}° — locked"))?;
                             }
                             continue;
                         }
                         let Some(lights) = self.lights.as_mut() else {
                             continue;
                         };
-                        let height = layout.height.max(1);
+                        let height = panel.height.max(1);
                         let delta = ((y0 as i64 - y1 as i64) * 100 / height as i64) as i32;
                         if delta == 0 {
                             continue;
@@ -1570,7 +1690,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                     // A slow tap is still a tap in the reader.
                     Ok(UiEvent::LongPress { x, y }) => {
-                        match layout.reader_zone_rotated(x, y, rotation) {
+                        match panel.reader_zone_rotated(x, y, rotation) {
                             ReaderZone::NextPage => {
                                 if !reader.next_page()? && next_available {
                                     outcome = ReaderOutcome::NextChapter;
@@ -1619,6 +1739,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         store.save(&progress_file)?;
         // The shelf's cached store is stale now — the session moved pages.
         self.invalidate_progress_cache();
+        // The session may have rotated the reading orientation: the menus
+        // follow it, so rebuild the layout before repainting them.
+        self.rebuild_layout();
 
         if outcome == ReaderOutcome::Back {
             // Repaint the screen the reader covered. (NextChapter goes
@@ -1651,18 +1774,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     fn show_status_mode(&mut self, lines: &[&str], mode: RefreshMode) -> Result<()> {
         let page = compose_status(&self.layout, lines);
+        let page = rotate_for_panel(page, self.reader_rotation);
         self.display.blit(&page, 0)?;
         self.display.flush(mode)?;
         Ok(())
     }
 
     fn render_current(&mut self, mode: RefreshMode) -> Result<()> {
+        // Menus are composed in reading orientation (the layout was built
+        // on the rotated dims) and rotated into the panel just before the
+        // blit, mirroring the reader's own pipeline.
+        let rotation = self.reader_rotation;
         // Color shelf: when a visible Library card has real cover art,
         // compose in RGB so Kaleido panels show it in color. The caller's
         // refresh mode passes through: the MTK driver has a non-flashing
         // color waveform (GLRC16) for partials, so shelf page flips don't
         // have to flash.
         if let Some(page) = self.compose_color_current()? {
+            let page = if rotation == 0 {
+                page
+            } else {
+                rotate_page_rgb(&page, rotation)
+            };
             self.display.blit_rgb(&page, 0)?;
             self.display.flush(mode)?;
             return Ok(());
@@ -1679,6 +1812,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.compose_current()?
             }
         };
+        let page = rotate_for_panel(page, rotation);
         self.display.blit(&page, 0)?;
         self.display.flush(mode)?;
         Ok(())
@@ -2004,6 +2138,141 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // file may become readable later (e.g. a finished copy).
             None => placeholder_cover(),
         }
+    }
+}
+
+// --- reader controls sheet ---
+
+/// Rows of the reader-controls sheet, top to bottom.
+const SHEET_ROW_ROTATE: usize = 0;
+const SHEET_ROW_ORIENTATION: usize = 1;
+const SHEET_ROW_CLOSE: usize = 2;
+const SHEET_ROW_COUNT: u32 = 3;
+
+fn controls_sheet_labels(locked: bool) -> [String; 3] {
+    [
+        "Rotate 90°".to_string(),
+        format!("Orientation: {}", if locked { "locked" } else { "auto" }),
+        "Close".to_string(),
+    ]
+}
+
+/// The controls sheet as a reading-frame strip (the caller rotates it
+/// into the panel): three full-width rows with a dark top border.
+fn compose_controls_sheet(
+    reading_w: u32,
+    row_h: u32,
+    text_px: f32,
+    pad: u32,
+    locked: bool,
+) -> GrayPage {
+    let mut sheet = GrayPage::new_white(reading_w, SHEET_ROW_COUNT * row_h.max(1));
+    hline(&mut sheet, 0, 0x00);
+    for (i, label) in controls_sheet_labels(locked).iter().enumerate() {
+        let top = i as u32 * row_h;
+        draw_text(
+            &mut sheet,
+            pad,
+            top + row_h.saturating_sub(text_px as u32 + 4) / 2,
+            text_px,
+            label,
+            reading_w.saturating_sub(2 * pad),
+            i == SHEET_ROW_ROTATE,
+        );
+        let sep_y = top + row_h - 1;
+        if sep_y + 1 < sheet.height {
+            hline(&mut sheet, sep_y, 0xAA);
+        }
+    }
+    sheet
+}
+
+/// The sheet row under a reading-frame tap at height `my`; `None` when the
+/// tap landed above the sheet (which closes it). The sheet hugs the bottom
+/// of the reading frame.
+fn controls_sheet_row(reading_h: u32, row_h: u32, my: u32) -> Option<usize> {
+    let row_h = row_h.max(1);
+    let top = reading_h.saturating_sub(SHEET_ROW_COUNT * row_h);
+    (my >= top).then(|| (((my - top) / row_h) as usize).min(SHEET_ROW_CLOSE))
+}
+
+/// Panel-frame origin of the (already rotated) controls sheet: the strip
+/// hugs the bottom edge of the READING frame, which lands on a different
+/// panel edge per rotation (left for 90, top for 180, right for 270).
+fn controls_sheet_origin(panel_w: u32, panel_h: u32, sheet_h: u32, rotation: u32) -> (u32, u32) {
+    match rotation % 360 {
+        90 | 180 => (0, 0),
+        270 => (panel_w.saturating_sub(sheet_h), 0),
+        _ => (0, panel_h.saturating_sub(sheet_h)),
+    }
+}
+
+/// Draw the controls sheet over the current page: composed in reading
+/// orientation, rotated into the panel and stamped via the reader's
+/// chrome overlay (a partial flush; the next page repaint wipes it).
+fn show_controls_sheet<D: Display>(
+    reader: &mut Reader<D>,
+    panel: &UiLayout,
+    rotation: u32,
+    locked: bool,
+) -> Result<()> {
+    let reading_w = if rotation % 180 == 90 {
+        panel.height
+    } else {
+        panel.width
+    };
+    let sheet = compose_controls_sheet(reading_w, panel.row_h, panel.text_px, panel.pad, locked);
+    let sheet_h = sheet.height;
+    let rotated = rotate_for_panel(sheet, rotation);
+    let (x, y) = controls_sheet_origin(panel.width, panel.height, sheet_h, rotation);
+    reader.overlay_chrome(&rotated, x, y)
+}
+
+/// Rotate the reading orientation 90° clockwise: the single code path
+/// behind the mid-screen up-swipe AND the controls sheet's "Rotate 90°"
+/// row. The new rotation persists only while the orientation is locked.
+fn rotate_reader_90<D: Display>(
+    reader: &mut Reader<D>,
+    rotation: &mut u32,
+    settings_dir: Option<&Path>,
+    locked: bool,
+) -> Result<()> {
+    *rotation = (*rotation + 90) % 360;
+    reader.set_rotation(*rotation);
+    if locked {
+        let degrees = *rotation;
+        persist_settings(settings_dir, |s| s.reader_rotation = degrees);
+    }
+    reader.show_banner(&rotation_banner(*rotation, locked))
+}
+
+fn rotation_banner(rotation: u32, locked: bool) -> String {
+    if locked {
+        format!("Rotation {rotation}° — locked")
+    } else {
+        format!("Rotation {rotation}°")
+    }
+}
+
+/// Persist a settings mutation (no-op without a settings dir); a failed
+/// save is logged, never fatal. A free function because reader sessions
+/// hold a partial borrow of the app and can't call `&self` methods.
+fn persist_settings(settings_dir: Option<&Path>, mutate: impl FnOnce(&mut gideon_core::Settings)) {
+    let Some(dir) = settings_dir else { return };
+    let mut settings = gideon_core::Settings::load(dir).unwrap_or_default();
+    mutate(&mut settings);
+    if let Err(e) = settings.save(dir) {
+        eprintln!("gideon: couldn't save settings: {e}");
+    }
+}
+
+/// Rotate a composed menu page into the panel orientation (identity at 0,
+/// where the menu path stays copy-free).
+fn rotate_for_panel(page: GrayPage, rotation: u32) -> GrayPage {
+    if rotation == 0 {
+        page
+    } else {
+        rotate_page(&page, rotation)
     }
 }
 

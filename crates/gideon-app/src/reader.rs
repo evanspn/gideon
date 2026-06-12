@@ -286,6 +286,16 @@ impl<D: Display> Reader<D> {
         Ok(())
     }
 
+    /// Stamp UI chrome (e.g. the reader-controls sheet) on top of the
+    /// current backbuffer at panel coordinates and flush partially. The
+    /// page cache stays untouched — the next page repaint wipes the
+    /// overlay away, exactly like the banner and the page indicator.
+    pub fn overlay_chrome(&mut self, chrome: &GrayPage, x: u32, y: u32) -> Result<()> {
+        self.display.overlay(chrome, x, y)?;
+        self.display.flush(RefreshMode::Partial)?;
+        Ok(())
+    }
+
     /// Repaint the current page with a guaranteed full refresh — for waking
     /// from suspend, when the panel contents can't be trusted.
     pub fn repaint_full(&mut self) -> Result<()> {

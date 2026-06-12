@@ -223,6 +223,47 @@ fn reader_tap_back() -> UiEvent {
     UiEvent::Tap { x: W / 2, y: 100 }
 }
 
+/// The menu layout the app builds at `rot`: rotated dims for 90/270.
+fn menu_layout(rot: u32) -> UiLayout {
+    if rot % 180 == 90 {
+        UiLayout::new(H, W)
+    } else {
+        UiLayout::new(W, H)
+    }
+}
+
+/// The panel coordinates whose menu mapping (map_reader_tap at `rot`)
+/// lands on reading-frame (`rx`, `ry`) — the inverse of the input
+/// chokepoint, for aiming taps at rotated menus.
+fn panel_point_for(rx: u32, ry: u32, rot: u32) -> (u32, u32) {
+    match rot % 360 {
+        90 => (W - 1 - ry, rx),
+        180 => (W - 1 - rx, H - 1 - ry),
+        270 => (ry, H - 1 - rx),
+        _ => (rx, ry),
+    }
+}
+
+/// [`tap_row`] aimed at a menu rendered at rotation `rot`.
+fn tap_row_rot(i: usize, rot: u32) -> UiEvent {
+    let l = menu_layout(rot);
+    let (x, y) = panel_point_for(l.width / 2, l.row_top(i) + l.row_h / 2, rot);
+    UiEvent::Tap { x, y }
+}
+
+/// [`tap_shelf_cell0`] aimed at a library shelf rendered at rotation `rot`.
+fn tap_shelf_cell0_rot(rot: u32) -> UiEvent {
+    let l = menu_layout(rot);
+    let shelf = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS);
+    let (cx, cy) = shelf.cell_origin(0);
+    let (x, y) = panel_point_for(
+        cx + shelf.cell_width() / 2,
+        l.content_top() + cy + shelf.cell_height() / 2,
+        rot,
+    );
+    UiEvent::Tap { x, y }
+}
+
 /// Like [`make_cbz`] but with one very tall page per entry, so FitWidth
 /// rendering produces a scrollable page (300x1600 → 600x3200 on a 600-wide
 /// display: max_scroll 2400, scroll step 800 - 60 = 740).
@@ -388,13 +429,14 @@ fn rotated_reader_taps_follow_reading_orientation() {
 
     // Rotation 90 (clockwise): reading-right is the panel bottom, so
     // "next" is a tap at the bottom of the panel, "prev" at the top, and
-    // the middle band is still "back".
+    // the middle band is still "back". The MENU taps that reach the
+    // reader are rotation-aimed too — menus now follow the rotation.
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_panel_top = UiEvent::Tap { x: W / 2, y: 0 };
     let tap_panel_middle = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        tap_row(0),
-        tap_shelf_cell0(),
+        tap_row_rot(0, 90),
+        tap_shelf_cell0_rot(90),
         tap_panel_bottom, // next -> page 1
         tap_panel_bottom, // next -> page 2
         tap_panel_top,    // prev -> page 1
@@ -407,6 +449,214 @@ fn rotated_reader_taps_follow_reading_orientation() {
     assert!(matches!(app.screen(), Screen::Library { .. }));
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
     assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+}
+
+// --- app-wide rotation: menus follow reader_rotation ---
+
+#[test]
+fn menu_taps_land_the_right_row_at_each_rotation() {
+    for rot in [90u32, 180, 270] {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Sample/vol1.cbz"), 2);
+
+        // Row 0 opens the Library…
+        let mut library_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(0, rot)])
+            .with_reader_settings(FitMode::Contain, rot);
+        library_app.run().unwrap();
+        assert!(
+            matches!(library_app.screen(), Screen::Library { .. }),
+            "rotation {rot}: the Library row tap must open the Library"
+        );
+
+        // …and row 3 opens Settings: per-row precision, not just "hit
+        // something".
+        let mut settings_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(3, rot)])
+            .with_reader_settings(FitMode::Contain, rot);
+        settings_app.run().unwrap();
+        assert!(
+            matches!(settings_app.screen(), Screen::Settings),
+            "rotation {rot}: the Settings row tap must open Settings"
+        );
+    }
+}
+
+#[test]
+fn menus_render_rotated_into_the_panel() {
+    // The title separator (the 0x55 hline under the title bar) must land
+    // exactly where the tap mapping expects it, at every rotation.
+    for rot in [0u32, 90, 180, 270] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path(), FakeGateway::default(), vec![])
+            .with_reader_settings(FitMode::Contain, rot);
+        app.run().unwrap();
+        let l = menu_layout(rot);
+        let (x, y) = panel_point_for(l.width / 2, l.title_h - 1, rot);
+        assert_eq!(
+            app.display().pixel(x, y),
+            0x55,
+            "rotation {rot}: title separator not where the tap mapping points"
+        );
+    }
+}
+
+// --- reader controls sheet ---
+
+/// An up-swipe starting in the bottom eighth of the (unrotated) panel.
+fn bottom_edge_swipe_up() -> UiEvent {
+    UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 20,
+        x1: W / 2,
+        y1: H - 320,
+    }
+}
+
+/// Tap row `i` of the controls sheet (rotation 0: panel == reading frame).
+fn tap_sheet_row(i: usize) -> UiEvent {
+    let l = layout();
+    let top = H - 3 * l.row_h;
+    UiEvent::Tap {
+        x: W / 2,
+        y: top + i as u32 * l.row_h + l.row_h / 2,
+    }
+}
+
+#[test]
+fn controls_sheet_opens_from_bottom_edge_swipe_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        bottom_edge_swipe_up(), // opens the sheet — must NOT rotate
+        tap_sheet_row(2),       // Close
+        reader_tap_next(),      // zones still unrotated -> page 1
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.reader_rotation, 0,
+        "a bottom-edge swipe opens the sheet, it never rotates"
+    );
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "Close must return to the page with unrotated tap zones"
+    );
+}
+
+#[test]
+fn controls_sheet_rotate_matches_the_swipe_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    // After the sheet's Rotate the zones follow the 90° orientation,
+    // exactly like the mid-screen up-swipe.
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        bottom_edge_swipe_up(),
+        tap_sheet_row(0), // Rotate 90°
+        tap_panel_bottom, // next page in the rotated orientation
+        tap_rotated_back,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.reader_rotation, 90, "locked (default) persists");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+}
+
+#[test]
+fn orientation_lock_toggle_persists_and_auto_keeps_rotation_session_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let mid_swipe_up = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H - 150,
+        x1: W / 2,
+        y1: 100,
+    };
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        bottom_edge_swipe_up(),
+        tap_sheet_row(1), // Orientation: locked -> auto (persisted)
+        tap_sheet_row(2), // Close
+        mid_swipe_up,     // rotate to 90 — session-only now
+        tap_panel_bottom, // the rotation still applies in-session
+        tap_rotated_back,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert!(
+        !settings.reader_rotation_locked,
+        "the toggle must persist immediately"
+    );
+    assert_eq!(
+        settings.reader_rotation, 0,
+        "unlocked (auto) rotation must not persist"
+    );
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "the session-only rotation still drives the tap zones"
+    );
+}
+
+#[test]
+fn controls_sheet_labels_show_lock_state() {
+    assert_eq!(controls_sheet_labels(true)[1], "Orientation: locked");
+    assert_eq!(controls_sheet_labels(false)[1], "Orientation: auto");
+    assert_eq!(controls_sheet_labels(true)[0], "Rotate 90°");
+    assert_eq!(controls_sheet_labels(true)[2], "Close");
+}
+
+#[test]
+fn controls_sheet_rows_resolve_from_reading_taps() {
+    // An 800-high reading frame with 48px rows: the sheet covers
+    // [656, 800); above it is None (closes the sheet).
+    assert_eq!(controls_sheet_row(800, 48, 655), None);
+    assert_eq!(controls_sheet_row(800, 48, 656), Some(SHEET_ROW_ROTATE));
+    assert_eq!(controls_sheet_row(800, 48, 703), Some(SHEET_ROW_ROTATE));
+    assert_eq!(
+        controls_sheet_row(800, 48, 704),
+        Some(SHEET_ROW_ORIENTATION)
+    );
+    assert_eq!(controls_sheet_row(800, 48, 752), Some(SHEET_ROW_CLOSE));
+    assert_eq!(controls_sheet_row(800, 48, 799), Some(SHEET_ROW_CLOSE));
+}
+
+#[test]
+fn controls_sheet_origin_follows_the_reading_bottom_edge() {
+    // The reading frame's bottom edge lands on a different panel edge per
+    // rotation: bottom at 0, left at 90, top at 180, right at 270.
+    assert_eq!(controls_sheet_origin(600, 800, 144, 0), (0, 656));
+    assert_eq!(controls_sheet_origin(600, 800, 144, 90), (0, 0));
+    assert_eq!(controls_sheet_origin(600, 800, 144, 180), (0, 0));
+    assert_eq!(controls_sheet_origin(600, 800, 144, 270), (456, 0));
 }
 
 #[test]
