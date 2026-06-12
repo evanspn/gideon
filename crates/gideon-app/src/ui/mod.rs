@@ -603,7 +603,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if let TapTarget::Row(row) = self.layout.tap_target(x, y) {
                     let index = page * self.layout.rows_per_page() + row;
                     if let Some(chapter) = chapters.get(index).cloned() {
-                        self.download_to_library(&source, &manga, &chapter)?;
+                        let cbz_path = self.download_to_library(&source, &manga, &chapter)?;
+                        // No reader session here — fetch the cover now.
+                        self.fetch_cover_if_missing(&manga, &cbz_path);
                         self.input.discard_taps();
                         self.render_current(RefreshMode::Full)?;
                     }
@@ -1281,19 +1283,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             if let Err(e) = index.save(&self.library_dir) {
                 eprintln!("gideon: couldn't save the series index: {e}");
             }
-
-            // Fetch the manga cover once per series: library cards show
-            // the real cover art instead of a chapter's first page.
-            let cover_path = self.library_dir.join(&dir).join(".cover.jpg");
-            if !cover_path.exists() {
-                if let Some(url) = manga.cover_url.as_deref() {
-                    if let Err(e) = self.gateway.download_cover(url, &cover_path) {
-                        eprintln!("gideon: couldn't fetch the cover: {e:#}");
-                    }
-                }
-            }
         }
         Ok(cbz_path)
+    }
+
+    /// Fetch the manga cover once per series (library cards show the real
+    /// cover art instead of a chapter's first page). Best-effort metadata,
+    /// deliberately kept OFF the chapter-open critical path: callers run it
+    /// after the reader session (or after a download-only long press),
+    /// never between the tap and the first page.
+    fn fetch_cover_if_missing(&mut self, manga: &MangaEntry, cbz_path: &Path) {
+        let Some(dir) = cbz_path.parent().and_then(|p| p.file_name()) else {
+            return;
+        };
+        let cover_path = self.library_dir.join(dir).join(".cover.jpg");
+        if cover_path.exists() {
+            return;
+        }
+        if let Some(url) = manga.cover_url.as_deref() {
+            if let Err(e) = self.gateway.download_cover(url, &cover_path) {
+                eprintln!("gideon: couldn't fetch the cover: {e:#}");
+            }
+        }
     }
 
     fn download_and_read(
@@ -1320,7 +1331,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
             let next = next_chapter(chapters, &chapter.id);
             let key = progress_key(&self.library_dir, &cbz_path);
-            match self.run_reader(&cbz_path, &key, next.is_some())? {
+            let outcome = self.run_reader(&cbz_path, &key, next.is_some())?;
+            // The cover fetch (a network round-trip) runs after the
+            // session, never between the tap and the first page.
+            if outcome != ReaderOutcome::Quit {
+                self.fetch_cover_if_missing(manga, &cbz_path);
+            }
+            match outcome {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
                 ReaderOutcome::Back => return Ok(Flow::Continue),
                 // Turning past the last page flows into the next chapter.
@@ -1416,6 +1433,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
             reader.resume_from(&store, key);
+            // Warm the render-ahead at the resume page before the first
+            // paint: the decode + scale + dither run on the prefetch
+            // thread, and the first paint just takes the finished render.
+            reader.warm();
             reader.show_current_page()?;
             loop {
                 match self.input.next_event() {
