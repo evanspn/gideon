@@ -239,6 +239,22 @@ impl PageBuf {
             PageBuf::Rgb(page) => page.to_gray(),
         }
     }
+
+    /// [`crop_rows`] / [`crop_rows_rgb`], keeping the variant.
+    pub fn crop_rows(&self, offset_y: u32, height: u32) -> PageBuf {
+        match self {
+            PageBuf::Gray(page) => PageBuf::Gray(crop_rows(page, offset_y, height)),
+            PageBuf::Rgb(page) => PageBuf::Rgb(crop_rows_rgb(page, offset_y, height)),
+        }
+    }
+
+    /// [`rotate_page`] / [`rotate_page_rgb`], keeping the variant.
+    pub fn rotate(&self, degrees: u32) -> PageBuf {
+        match self {
+            PageBuf::Gray(page) => PageBuf::Gray(rotate_page(page, degrees)),
+            PageBuf::Rgb(page) => PageBuf::Rgb(rotate_page_rgb(page, degrees)),
+        }
+    }
 }
 
 /// Render a page image to a screen-sized canvas: grayscale (dithered per
@@ -345,6 +361,79 @@ pub fn rotate_page(page: &GrayPage, degrees: u32) -> GrayPage {
             out
         }
         _ => page.clone(),
+    }
+}
+
+/// Rotate a rendered COLOR page clockwise by `degrees` (0, 90, 180 or 270).
+///
+/// Same coordinate mapping as [`rotate_page`], with x3 index math for the
+/// packed RGB triples.
+pub fn rotate_page_rgb(page: &RgbPage, degrees: u32) -> RgbPage {
+    let (w, h) = (page.width, page.height);
+    let copy_px = |out: &mut RgbPage, dst_idx: u32, x: u32, y: u32| {
+        let src = ((y * w + x) * 3) as usize;
+        let dst = (dst_idx * 3) as usize;
+        out.pixels[dst..dst + 3].copy_from_slice(&page.pixels[src..src + 3]);
+    };
+    match degrees % 360 {
+        // Clockwise 90: (x, y) → (h - 1 - y, x).
+        90 => {
+            let mut out = RgbPage::new_white(h, w);
+            for y in 0..h {
+                for x in 0..w {
+                    copy_px(&mut out, x * h + (h - 1 - y), x, y);
+                }
+            }
+            out
+        }
+        // 180: (x, y) → (w - 1 - x, h - 1 - y).
+        180 => {
+            let mut out = RgbPage::new_white(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    copy_px(&mut out, (h - 1 - y) * w + (w - 1 - x), x, y);
+                }
+            }
+            out
+        }
+        // Clockwise 270 (= counter-clockwise 90): (x, y) → (y, w - 1 - x).
+        270 => {
+            let mut out = RgbPage::new_white(h, w);
+            for y in 0..h {
+                for x in 0..w {
+                    copy_px(&mut out, (w - 1 - x) * h + y, x, y);
+                }
+            }
+            out
+        }
+        _ => page.clone(),
+    }
+}
+
+/// Copy `height` rows of `page` starting at `offset_y` (both clamped to
+/// the page) — the reader's vertical scroll window.
+pub fn crop_rows(page: &GrayPage, offset_y: u32, height: u32) -> GrayPage {
+    let offset_y = offset_y.min(page.height.saturating_sub(1));
+    let height = height.min(page.height - offset_y);
+    let start = (offset_y * page.width) as usize;
+    let end = start + (height * page.width) as usize;
+    GrayPage {
+        width: page.width,
+        height,
+        pixels: page.pixels[start..end].to_vec(),
+    }
+}
+
+/// [`crop_rows`] for COLOR pages: same clamping, x3 index math.
+pub fn crop_rows_rgb(page: &RgbPage, offset_y: u32, height: u32) -> RgbPage {
+    let offset_y = offset_y.min(page.height.saturating_sub(1));
+    let height = height.min(page.height - offset_y);
+    let start = (offset_y * page.width * 3) as usize;
+    let end = start + (height * page.width * 3) as usize;
+    RgbPage {
+        width: page.width,
+        height,
+        pixels: page.pixels[start..end].to_vec(),
     }
 }
 
@@ -634,6 +723,138 @@ mod tests {
         assert_eq!(through_90s, page);
         assert_eq!(rotate_page(&rotate_page(&page, 90), 270), page);
         assert_eq!(rotate_page(&rotate_page(&page, 180), 180), page);
+    }
+
+    // --- RGB rotation & crop (mirrors the gray pixel tests) ---
+
+    /// The RGB twin of [`asymmetric_page`]: a 2x3 page whose pixel at
+    /// gray-index `i` is the triple `[i, 10+i, 20+i]` — every channel of
+    /// every pixel distinct, so rotations are fully position- and
+    /// channel-sensitive.
+    fn asymmetric_page_rgb() -> RgbPage {
+        let mut pixels = Vec::new();
+        for i in 0..6u8 {
+            pixels.extend_from_slice(&[i, 10 + i, 20 + i]);
+        }
+        RgbPage {
+            width: 2,
+            height: 3,
+            pixels,
+        }
+    }
+
+    /// The pixel triples of `page` in row-major order, reduced to their
+    /// gray-index (first channel) for easy comparison with the gray tests.
+    fn rgb_indices(page: &RgbPage) -> Vec<u8> {
+        page.pixels.chunks_exact(3).map(|px| px[0]).collect()
+    }
+
+    #[test]
+    fn rotate_rgb_0_is_identity() {
+        let page = asymmetric_page_rgb();
+        assert_eq!(rotate_page_rgb(&page, 0), page);
+        assert_eq!(rotate_page_rgb(&page, 360), page);
+        assert_eq!(rotate_page_rgb(&page, 45), page);
+    }
+
+    #[test]
+    fn rotate_rgb_90_clockwise_exact_pixels() {
+        let out = rotate_page_rgb(&asymmetric_page_rgb(), 90);
+        assert_eq!((out.width, out.height), (3, 2));
+        // Same ordering as the gray test…
+        assert_eq!(rgb_indices(&out), vec![4, 2, 0, 5, 3, 1]);
+        // …and the triples travel whole: channels never shear apart.
+        assert_eq!(out.pixel(2, 0), [0, 10, 20]);
+        assert_eq!(out.pixel(2, 1), [1, 11, 21]);
+        assert_eq!(out.pixel(0, 0), [4, 14, 24]);
+    }
+
+    #[test]
+    fn rotate_rgb_180_exact_pixels() {
+        let out = rotate_page_rgb(&asymmetric_page_rgb(), 180);
+        assert_eq!((out.width, out.height), (2, 3));
+        assert_eq!(rgb_indices(&out), vec![5, 4, 3, 2, 1, 0]);
+        assert_eq!(out.pixel(0, 0), [5, 15, 25]);
+    }
+
+    #[test]
+    fn rotate_rgb_270_clockwise_exact_pixels() {
+        let out = rotate_page_rgb(&asymmetric_page_rgb(), 270);
+        assert_eq!((out.width, out.height), (3, 2));
+        assert_eq!(rgb_indices(&out), vec![1, 3, 5, 0, 2, 4]);
+        assert_eq!(out.pixel(0, 1), [0, 10, 20]);
+        assert_eq!(out.pixel(0, 0), [1, 11, 21]);
+        assert_eq!(out.pixel(2, 0), [5, 15, 25]);
+    }
+
+    #[test]
+    fn rgb_rotations_compose_back_to_identity() {
+        let page = asymmetric_page_rgb();
+        let through_90s = rotate_page_rgb(
+            &rotate_page_rgb(&rotate_page_rgb(&rotate_page_rgb(&page, 90), 90), 90),
+            90,
+        );
+        assert_eq!(through_90s, page);
+        assert_eq!(rotate_page_rgb(&rotate_page_rgb(&page, 90), 270), page);
+        assert_eq!(rotate_page_rgb(&rotate_page_rgb(&page, 180), 180), page);
+    }
+
+    #[test]
+    fn rgb_rotation_matches_gray_rotation_through_luma() {
+        // Rotating then collapsing must equal collapsing then rotating:
+        // the two index paths can never disagree.
+        let page = asymmetric_page_rgb();
+        for degrees in [0, 90, 180, 270] {
+            assert_eq!(
+                rotate_page_rgb(&page, degrees).to_gray(),
+                rotate_page(&page.to_gray(), degrees),
+                "mismatch at {degrees}°"
+            );
+        }
+    }
+
+    #[test]
+    fn crop_rows_extracts_the_window_gray_and_rgb() {
+        let page = GrayPage {
+            width: 2,
+            height: 4,
+            pixels: vec![0, 0, 1, 1, 2, 2, 3, 3],
+        };
+        let window = crop_rows(&page, 1, 2);
+        assert_eq!((window.width, window.height), (2, 2));
+        assert_eq!(window.pixels, vec![1, 1, 2, 2]);
+        // Clamped at the bottom.
+        assert_eq!(crop_rows(&page, 3, 5).pixels, vec![3, 3]);
+
+        // The RGB crop must select exactly the same rows.
+        let rgb = RgbPage::from_gray(&page);
+        let rgb_window = crop_rows_rgb(&rgb, 1, 2);
+        assert_eq!((rgb_window.width, rgb_window.height), (2, 2));
+        assert_eq!(rgb_window, RgbPage::from_gray(&window));
+        assert_eq!(
+            crop_rows_rgb(&rgb, 3, 5).pixels,
+            vec![3, 3, 3, 3, 3, 3],
+            "clamped RGB tail"
+        );
+    }
+
+    #[test]
+    fn page_buf_crop_and_rotate_keep_the_variant() {
+        let gray = PageBuf::Gray(asymmetric_page());
+        let rgb = PageBuf::Rgb(asymmetric_page_rgb());
+        assert!(!gray.crop_rows(1, 2).is_color());
+        assert!(rgb.crop_rows(1, 2).is_color());
+        assert!(!gray.rotate(90).is_color());
+        assert!(rgb.rotate(90).is_color());
+        // And dispatch to the exact same math as the direct calls.
+        assert_eq!(
+            rgb.rotate(90),
+            PageBuf::Rgb(rotate_page_rgb(&asymmetric_page_rgb(), 90))
+        );
+        assert_eq!(
+            gray.crop_rows(1, 2),
+            PageBuf::Gray(crop_rows(&asymmetric_page(), 1, 2))
+        );
     }
 
     #[test]
