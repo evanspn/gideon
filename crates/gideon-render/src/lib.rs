@@ -115,6 +115,42 @@ pub fn luma_rec601(r: u8, g: u8, b: u8) -> u8 {
     ((299 * r as u32 + 587 * g as u32 + 114 * b as u32 + 500) / 1000) as u8
 }
 
+/// A sample counts as colorful when its channel spread exceeds this.
+/// JPEG chroma noise on grayscale scans stays well below 20; real color
+/// art (skin tones, hair, spot color) is far above it.
+const COLOR_SPREAD_THRESHOLD: u8 = 20;
+
+/// Decide whether a decoded page holds real COLOR content (and should take
+/// the Kaleido RGB path) or is grayscale manga.
+///
+/// Pure and cheap: samples every 8th pixel in both directions (1/64th of
+/// the page). A sample is colorful when `max(|r-g|, |g-b|, |r-b|) > 20`,
+/// and the page is color when **more than 1%** of samples are colorful —
+/// so sepia-ish scan noise or a single tinted border can't drag a B/W
+/// page off the fast grayscale path.
+pub fn page_is_color(page: &DynamicImage) -> bool {
+    use image::GenericImageView;
+
+    // Buffers without color channels can't be color, whatever they hold.
+    if !page.color().has_color() {
+        return false;
+    }
+    let mut samples: u64 = 0;
+    let mut colorful: u64 = 0;
+    for y in (0..page.height()).step_by(8) {
+        for x in (0..page.width()).step_by(8) {
+            let [r, g, b, _] = page.get_pixel(x, y).0;
+            let spread = r.abs_diff(g).max(g.abs_diff(b)).max(r.abs_diff(b));
+            samples += 1;
+            if spread > COLOR_SPREAD_THRESHOLD {
+                colorful += 1;
+            }
+        }
+    }
+    // "> 1%" exactly: colorful / samples > 1/100.
+    colorful * 100 > samples
+}
+
 /// Rendering options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
@@ -456,6 +492,55 @@ mod tests {
             pixels: vec![255, 0, 0, 0, 255, 0, 0, 0, 255],
         };
         assert_eq!(color.to_gray().pixels, vec![76, 150, 29]);
+    }
+
+    // --- color detection ---
+
+    #[test]
+    fn gray_page_is_not_color() {
+        // Equal channels everywhere: zero spread, zero colorful samples.
+        assert!(!page_is_color(&solid_page(64, 64, 0x80)));
+        // A grayscale buffer (no color channels) is never color.
+        let luma =
+            DynamicImage::ImageLuma8(image::GrayImage::from_pixel(64, 64, image::Luma([0x80])));
+        assert!(!page_is_color(&luma));
+    }
+
+    #[test]
+    fn color_page_is_detected() {
+        // A solid red page: every sample has spread 255.
+        let red = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 64, image::Rgb([200, 30, 30])));
+        assert!(page_is_color(&red));
+        // A page that's mostly gray but with a real color panel (top
+        // quarter) is still a color page — way past the 1% of samples.
+        let mut img = RgbImage::from_pixel(64, 64, image::Rgb([0x80, 0x80, 0x80]));
+        for y in 0..16 {
+            for x in 0..64 {
+                img.put_pixel(x, y, image::Rgb([220, 60, 40]));
+            }
+        }
+        assert!(page_is_color(&DynamicImage::ImageRgb8(img)));
+    }
+
+    #[test]
+    fn tinted_noise_stays_grayscale() {
+        // JPEG-style chroma noise: small per-pixel channel spreads (≤ 20)
+        // on a gray scan must NOT count as color, however widespread.
+        let mut img = RgbImage::new(64, 64);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let g = 0x80u8;
+            let wobble = ((x + y) % 21) as u8; // spreads 0..=20, never > 20
+            *px = image::Rgb([g.saturating_add(wobble), g, g]);
+        }
+        assert!(!page_is_color(&DynamicImage::ImageRgb8(img)));
+
+        // And a tiny tinted region (a single sampled pixel out of 64 = ~1.5%
+        // would flip it, so keep it at exactly 1 of 100+ samples → ≤ 1%):
+        // an 80x80 page samples a 10x10 grid; one strong-color sample is
+        // exactly 1% — NOT more than 1% — and stays grayscale.
+        let mut img = RgbImage::from_pixel(80, 80, image::Rgb([0x80, 0x80, 0x80]));
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        assert!(!page_is_color(&DynamicImage::ImageRgb8(img)));
     }
 
     #[test]
