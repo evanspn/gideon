@@ -901,6 +901,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn open_sources(&mut self) -> Result<()> {
+        // The available-sources fetch hits the network: without feedback
+        // the tap looks dead for seconds on device WiFi.
+        self.show_status(&["Loading sources…"])?;
         let rows = self.build_source_rows()?;
         self.push(Screen::Sources { rows, page: 0 })
     }
