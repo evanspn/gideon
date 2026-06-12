@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -333,8 +334,9 @@ pub async fn download_chapter(
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
-    let width = pages.len().to_string().len().max(3);
-    let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(pages.len() + 1);
+    let total = pages.len();
+    let width = total.to_string().len().max(3);
+    let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(total + 1);
 
     // ComicInfo.xml so the library shows proper titles.
     let comic_info = format!(
@@ -350,32 +352,55 @@ pub async fn download_chapter(
     // A failed page must not abort the chapter (bobo's downloader inserts
     // an error placeholder and keeps going); a 40-page chapter with one
     // dead page must still be readable.
+    //
+    // Pages download [`PAGE_CONCURRENCY`] at a time: transfers overlap,
+    // while the source's WASM hooks (get_image_request, the page
+    // post-processing) stay serialized through the Source's internal
+    // Mutex. Every result is written into its index-keyed slot —
+    // file names and placeholders are derived from the page index, so
+    // page order in the CBZ never depends on completion order.
+    let mut slots: Vec<Option<(String, Vec<u8>)>> = Vec::with_capacity(total);
+    slots.resize_with(total, || None);
     let mut failed: Vec<String> = Vec::new();
     let mut downloaded = 0usize;
-    for (i, page) in pages.iter().enumerate() {
-        let Some(image_url) = page.image_url.clone() else {
-            // Skipped pages still advance the progress display.
-            progress(i + 1, pages.len());
-            continue;
-        };
-        match fetch_page_bytes(source, &client, &token, page, &image_url).await {
-            Ok(bytes) => {
-                let name = page_file_name(i, pages.len(), &image_url, &bytes);
-                cbz_pages.push((name, bytes));
-                downloaded += 1;
+    let mut completed = 0usize;
+    {
+        let client = &client;
+        let token = &token;
+        let mut downloads =
+            futures::stream::iter(pages.iter().enumerate().map(|(i, page)| async move {
+                let Some(image_url) = page.image_url.clone() else {
+                    // Pages without an image URL are skipped (no slot).
+                    return (i, None);
+                };
+                let fetched = fetch_page_bytes(source, client, token, page, &image_url).await;
+                (i, Some((image_url, fetched)))
+            }))
+            .buffered(PAGE_CONCURRENCY);
+        while let Some((i, fetched)) = downloads.next().await {
+            match fetched {
+                None => {}
+                Some((image_url, Ok(bytes))) => {
+                    slots[i] = Some((page_file_name(i, total, &image_url, &bytes), bytes));
+                    downloaded += 1;
+                }
+                Some((_, Err(error))) => {
+                    let reason = format!("{error:#}");
+                    eprintln!("gideon download: page {} failed: {reason}", i + 1);
+                    failed.push(format!("page {}: {reason}", i + 1));
+                    slots[i] = Some((
+                        format!("{:0width$}.png", i + 1, width = width),
+                        error_page_png(i + 1, total, &reason),
+                    ));
+                }
             }
-            Err(error) => {
-                let reason = format!("{error:#}");
-                eprintln!("gideon download: page {} failed: {reason}", i + 1);
-                failed.push(format!("page {}: {reason}", i + 1));
-                cbz_pages.push((
-                    format!("{:0width$}.png", i + 1, width = width),
-                    error_page_png(i + 1, pages.len(), &reason),
-                ));
-            }
+            // Progress counts completions (skipped pages included), so the
+            // display always reaches total regardless of fetch order.
+            completed += 1;
+            progress(completed, total);
         }
-        progress(i + 1, pages.len());
     }
+    cbz_pages.extend(slots.into_iter().flatten());
 
     if downloaded == 0 {
         match failed.first() {
@@ -470,6 +495,11 @@ async fn fetch_page_bytes(
         Ok(bytes.to_vec())
     }
 }
+
+/// How many pages download concurrently. Three keeps a chapter download
+/// pipelined without hammering CDNs (or the device's WiFi) — the WASM
+/// request hooks still run one at a time behind the Source's Mutex.
+const PAGE_CONCURRENCY: usize = 3;
 
 /// Maximum redirect hops followed manually.
 const MAX_REDIRECTS: usize = 10;
