@@ -609,10 +609,13 @@ impl Display for KoboDisplay {
                             &mut submitted,
                         )
                     };
-                    // …and for completion: every MTK send above is
-                    // UPDATE_MODE_FULL (REAGL requirement), and KOReader
-                    // waits for completion after FULL updates.
-                    {
+                    // …but for completion only on FLASHING refreshes
+                    // (GC16/GCC16). UPDATE_MODE_FULL is an MTK requirement
+                    // on every send and does NOT mean flashing; KOReader
+                    // never completion-waits on REAGL partials. Waiting
+                    // here on every page turn added ~500ms of synchronous
+                    // panel time per turn — the "laggy turns" bug.
+                    if mode == RefreshMode::Full {
                         let mut marker = hwtcon_update_marker_data {
                             update_marker: self.update_marker,
                             collision_test: 0,
