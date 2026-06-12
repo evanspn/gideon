@@ -60,6 +60,13 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_reader_rotation")]
     pub reader_rotation: u32,
 
+    /// Whether the reading orientation is locked: rotation changes (the
+    /// reader's rotate gesture / controls sheet) persist across sessions
+    /// when locked, and stay session-only otherwise ("auto"). Parsed
+    /// leniently — anything but a JSON bool means the default (locked).
+    #[serde(deserialize_with = "lenient_bool_locked")]
+    pub reader_rotation_locked: bool,
+
     /// Frontlight brightness percent (0–100), restored at startup and
     /// updated from the reader's right-edge slide. Parsed leniently.
     #[serde(deserialize_with = "lenient_percent")]
@@ -83,10 +90,20 @@ impl Default for Settings {
             auto_check_updates: true,
             reader_fit: "contain".to_string(),
             reader_rotation: 0,
+            reader_rotation_locked: true,
             frontlight_brightness: 20,
             frontlight_warmth: 0,
         }
     }
+}
+
+/// Lenient `reader_rotation_locked` parsing: only a JSON bool passes
+/// through; anything else (wrong type, missing) means locked.
+fn lenient_bool_locked<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(true))
 }
 
 /// Lenient percent parsing: numbers are clamped to 0–100; anything else
@@ -268,6 +285,7 @@ mod tests {
         assert_eq!(s.active_profile, "default");
         assert_eq!(s.reader_fit, "contain");
         assert_eq!(s.reader_rotation, 0);
+        assert!(s.reader_rotation_locked);
     }
 
     #[test]
@@ -290,6 +308,7 @@ mod tests {
             auto_check_updates: false,
             reader_fit: "fit-width".into(),
             reader_rotation: 90,
+            reader_rotation_locked: false,
             frontlight_brightness: 65,
             frontlight_warmth: 40,
         };
@@ -383,6 +402,22 @@ mod tests {
         assert_eq!(load(r#"{"reader_rotation": -90}"#).reader_rotation, 0);
         assert_eq!(load(r#"{"reader_rotation": "90"}"#).reader_rotation, 0);
         assert_eq!(load(r#"{"reader_rotation": null}"#).reader_rotation, 0);
+    }
+
+    #[test]
+    fn rotation_lock_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap()
+        };
+        assert!(!load(r#"{"reader_rotation_locked": false}"#).reader_rotation_locked);
+        assert!(load(r#"{"reader_rotation_locked": true}"#).reader_rotation_locked);
+        // Wrong types and missing values never error — they mean locked.
+        assert!(load(r#"{"reader_rotation_locked": "no"}"#).reader_rotation_locked);
+        assert!(load(r#"{"reader_rotation_locked": 0}"#).reader_rotation_locked);
+        assert!(load(r#"{"reader_rotation_locked": null}"#).reader_rotation_locked);
+        assert!(load(r#"{}"#).reader_rotation_locked);
     }
 
     #[test]
