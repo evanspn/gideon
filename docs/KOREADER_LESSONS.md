@@ -22,7 +22,7 @@ Status legend: ✅ implemented · 📋 documented/deferred · ⚠️ known risk.
 | MTK: wait for update *submission* after every send; wait for *completion* around flashes | ✅ both, best-effort |
 | MTK driver off-by-one: refresh regions must be expanded/aligned to 16px | 📋 gideon only refreshes the full screen today (1264 and 1680 are 16-aligned); enforce alignment when partial-rect refreshes are added |
 | Night mode inversion, A2/DU fast waveforms, hardware dithering, NXP EPDC power knob | 📋 quality features, not blockers |
-| Kaleido colour: CFA handling for color content | 📋 we render grayscale, which the colour panel displays fine; colour rendering is future work |
+| Kaleido colour: CFA handling for color content | ✅ color manga pages render in color end-to-end: `page_is_color` samples each decoded page (every 8th pixel, channel spread > 20, > 1% colorful) and `render_page` keeps detected pages RGB through the resize (`PageBuf::Rgb`, no software dithering — the hardware Y8→Y4 dither handles it); the reader caches/prefetches either depth and dispatches to `blit_rgb`, where `last_blit_color` picks KOReader's Kaleido waveforms (GCC16 fulls, GLRC16 partials, CFA flag 0x600 \| dither 1, dither_mode 0x102). B/W pages stay byte-identical on the gray fast path (parity-pinned), so ordinary manga pays nothing. The library shelf's covers already used the same blit |
 
 ## Touch input
 
