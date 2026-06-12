@@ -1023,6 +1023,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // The next opened book must use the new fit immediately.
                 self.reader_fit = FitMode::from_setting(&settings.reader_fit);
             }
+            // TODO: this toggle only persists the preference today —
+            // nothing reads auto_check_updates yet (see cmd_browse). Wire
+            // it to an idle-time update check, not startup.
             3 => settings.auto_check_updates = !settings.auto_check_updates,
             _ => return Ok(()),
         }
