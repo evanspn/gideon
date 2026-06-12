@@ -776,7 +776,7 @@ fn show_fatal_on_display(display: &mut impl gideon_device::Display, message: &st
         40,
         h - 70,
         24.0,
-        "Also logged to .adds/gideon/browse.log — device restarts shortly.",
+        "Also logged to .adds/gideon/browse.log — returning to the Kobo home screen.",
         w - 80,
         false,
     );

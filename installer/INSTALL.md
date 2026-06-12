@@ -55,6 +55,13 @@ is kept as `gideon.old` for manual rollback. Close and reopen gideon to
 run the new version. If anything goes wrong, the app log is at
 `.adds/gideon/browse.log`.
 
+## Leaving gideon
+
+Closing gideon (power menu → **Close gideon**) restarts the stock Kobo
+home screen **in place** — Nickel is back within a few seconds, no device
+reboot. If Nickel fails to reappear within ~10 seconds, the launcher falls
+back to a full reboot, which always recovers the device.
+
 ## Uninstall
 
 ```sh
