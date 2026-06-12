@@ -260,6 +260,15 @@ pub struct KoboDisplay {
     /// Whether the last blit carried real color: a FULL refresh then uses
     /// the Kaleido color waveform (GCC16) on MTK kernels.
     last_blit_color: bool,
+    /// Marker of the previous partial refresh, fenced lazily: KOReader
+    /// completion-waits after every REAGL turn (their partials are
+    /// promoted to UPDATE_MODE_FULL, which triggers their wait); paying
+    /// that ~500ms synchronously made turns laggy. Instead we wait for
+    /// the PREVIOUS partial at the top of the NEXT flush — during normal
+    /// reading the waveform finished long ago (≈0ms), and only rapid
+    /// back-to-back taps serialize, which is exactly the unsafe overlap
+    /// the fence exists to prevent.
+    pending_partial_marker: Option<u32>,
     /// Whether the framebuffer stores blue in byte 0 (BGRA, the monza
     /// norm): probed from the kernel's reported red-channel offset at open
     /// instead of hardcoding one channel order.
@@ -376,6 +385,7 @@ impl KoboDisplay {
             rotate: var.rotate,
             upright_rotate: wanted_rotate,
             last_blit_color: false,
+            pending_partial_marker: None,
             swap_rb,
         })
     }
@@ -503,6 +513,23 @@ impl Display for KoboDisplay {
         // device returns EINVAL on Kobo kernels (KOReader never syncs the
         // fb mapping either).
 
+        // Deferred REAGL fence: settle the previous partial before
+        // driving the glass again.
+        if let Some(previous) = self.pending_partial_marker.take() {
+            let mut marker = hwtcon_update_marker_data {
+                update_marker: previous,
+                collision_test: 0,
+            };
+            // SAFETY: fully initialized marker struct; best-effort.
+            let _ = unsafe {
+                ioctl(
+                    self.file.as_raw_fd(),
+                    HWTCON_WAIT_FOR_UPDATE_COMPLETE,
+                    &mut marker,
+                )
+            };
+        }
+
         self.update_marker = self.update_marker.wrapping_add(1).max(1);
         let region = mxcfb_rect {
             top: 0,
@@ -615,7 +642,10 @@ impl Display for KoboDisplay {
                     // never completion-waits on REAGL partials. Waiting
                     // here on every page turn added ~500ms of synchronous
                     // panel time per turn — the "laggy turns" bug.
-                    if mode == RefreshMode::Full {
+                    if mode != RefreshMode::Full {
+                        // Partial: fence lazily on the next flush.
+                        self.pending_partial_marker = Some(self.update_marker);
+                    } else {
                         let mut marker = hwtcon_update_marker_data {
                             update_marker: self.update_marker,
                             collision_test: 0,
