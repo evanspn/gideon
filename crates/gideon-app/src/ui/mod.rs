@@ -318,14 +318,28 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
     /// hides the percentage from the Home title and the sleep notice.
     battery: Option<Box<dyn Fn() -> Option<u8>>>,
-    /// Decoded shelf covers keyed by source path, with the file mtime that
-    /// was decoded: Library repaints (page flips, returning from the
-    /// reader) re-compose the shelf, and re-decoding every cover JPEG each
-    /// time made repaints visibly slow. Evicted wholesale past two shelf
-    /// pages of entries.
-    cover_cache: std::cell::RefCell<
-        std::collections::HashMap<PathBuf, (std::time::SystemTime, image::DynamicImage)>,
-    >,
+    /// Cell-sized cover thumbnails for the library shelf: Library repaints
+    /// (page flips, returning from the reader) re-compose the shelf, and
+    /// re-decoding every cover JPEG each time made repaints visibly slow.
+    /// Keyed by (source path, file mtime, cell size); evicted least
+    /// recently used — never wholesale, so flipping a shelf page back
+    /// stays warm.
+    cover_cache: std::cell::RefCell<CoverCache>,
+    /// The shelf's ProgressStore, loaded once and reused across repaints
+    /// (a disk read + JSON parse per shelf page flip was measurable).
+    /// Invalidated whenever the UI writes progress or switches profile.
+    progress_cache: std::cell::RefCell<Option<ProgressStore>>,
+}
+
+/// Cover-cache key: (source path, file mtime, target cell size).
+type CoverKey = (PathBuf, std::time::SystemTime, (u32, u32));
+
+/// LRU cache of cell-sized shelf thumbnails. `tick` is a logical clock:
+/// every lookup stamps its entry, evictions remove the stalest stamp.
+#[derive(Default)]
+struct CoverCache {
+    tick: u64,
+    entries: std::collections::HashMap<CoverKey, (u64, image::DynamicImage)>,
 }
 
 impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
@@ -348,7 +362,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             lights: None,
             settings_dir: None,
             battery: None,
-            cover_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            cover_cache: std::cell::RefCell::new(CoverCache::default()),
+            progress_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -580,9 +595,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // The menu targets the chapter a tap would open (the
                 // card's resume point), so "Delete this chapter" removes
                 // exactly what the user is looking at.
-                let store =
-                    ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
-                let entry = card.resume_chapter(&store).clone();
+                let entry = self.with_progress(|_, store| card.resume_chapter(store).clone());
                 let series_dir = entry
                     .relative_path
                     .split('/')
@@ -1052,6 +1065,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn switch_profile(&mut self, name: &str) -> Result<()> {
         self.active_profile = name.to_string();
         self.library_dir = profile_library_dir(&self.base_library, name);
+        // The progress cache belongs to the previous profile's library.
+        self.invalidate_progress_cache();
         std::fs::create_dir_all(&self.library_dir).with_context(|| {
             format!(
                 "couldn't create profile library {}",
@@ -1395,8 +1410,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         };
         // Resume the series where it was left: the most recently read
         // unfinished chapter, else its first chapter.
-        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
-        let mut entry = card.resume_chapter(&store).clone();
+        let mut entry = self.with_progress(|_, store| card.resume_chapter(store).clone());
         loop {
             // Continuation within the series: the card's next chapter
             // (chapters keep the scan's natural order).
@@ -1595,6 +1609,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             reader.save_progress(&mut store, key);
         }
         store.save(&progress_file)?;
+        // The shelf's cached store is stale now — the session moved pages.
+        self.invalidate_progress_cache();
 
         if outcome == ReaderOutcome::Back {
             // Repaint the screen the reader covered. (NextChapter goes
@@ -1659,7 +1675,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         let page_count = items.len().div_ceil(capacity).max(1);
         let chrome = compose_chrome(l, "Library", *page, page_count);
-        let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, capacity), &shelf);
+        let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, &shelf), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
         Ok(Some(canvas))
@@ -1833,7 +1849,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(canvas);
         }
 
-        let grid = compose_shelf(&self.shelf_entries_for_page(items, page, capacity), &shelf);
+        let grid = compose_shelf(&self.shelf_entries_for_page(items, page, &shelf), &shelf);
         copy_into(&mut canvas, &grid, 0, l.content_top());
         Ok(canvas)
     }
@@ -1855,27 +1871,62 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         &self,
         items: &[SeriesCard],
         page: usize,
-        capacity: usize,
+        shelf: &ShelfLayout,
     ) -> Vec<ShelfEntry> {
-        let store = ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
-        items
-            .iter()
-            .skip(page * capacity)
-            .take(capacity)
-            .map(|card| ShelfEntry {
-                cover: self.shelf_cover(card.cover_entry(), capacity),
-                title: card.title(),
-                progress: card.progress(&store),
-            })
-            .collect()
+        let capacity = shelf.capacity().max(1);
+        // The shelf only ever shows covers at cell size: decode (and
+        // cache) thumbnails at exactly that size.
+        let cell = (
+            shelf.cell_width(),
+            shelf
+                .cell_height()
+                .saturating_sub(shelf.title_height + shelf.progress_bar_height),
+        );
+        self.with_progress(|app, store| {
+            items
+                .iter()
+                .skip(page * capacity)
+                .take(capacity)
+                .map(|card| ShelfEntry {
+                    cover: app.shelf_cover(card.cover_entry(), cell, capacity),
+                    title: card.title(),
+                    progress: card.progress(store),
+                })
+                .collect()
+        })
     }
 
-    /// The decoded cover for a library entry, through the cover cache.
-    /// Prefers the manga's cover art (fetched at download time), falling
-    /// back to the chapter's first page, then a placeholder. Successful
-    /// decodes are cached by path + mtime; the cache is cleared once it
-    /// outgrows two shelf pages (`capacity`) of entries.
-    fn shelf_cover(&self, entry: &LibraryEntry, capacity: usize) -> image::DynamicImage {
+    /// Run `f` with the (cached) ProgressStore: the disk read + JSON parse
+    /// happen at most once between [`Self::invalidate_progress_cache`]
+    /// calls, not once per repaint.
+    fn with_progress<R>(&self, f: impl FnOnce(&Self, &ProgressStore) -> R) -> R {
+        let store = self.progress_cache.borrow_mut().take().unwrap_or_else(|| {
+            ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default()
+        });
+        let result = f(self, &store);
+        *self.progress_cache.borrow_mut() = Some(store);
+        result
+    }
+
+    /// Drop the cached ProgressStore — progress was just written, or the
+    /// library root changed (profile switch).
+    fn invalidate_progress_cache(&self) {
+        self.progress_cache.borrow_mut().take();
+    }
+
+    /// The decoded, cell-sized cover thumbnail for a library entry,
+    /// through the LRU cover cache. Prefers the manga's cover art
+    /// (fetched at download time), falling back to the chapter's first
+    /// page, then a placeholder. Thumbnails are keyed by (path, mtime,
+    /// cell size) and evicted least recently used past two shelf pages
+    /// (`capacity`) of entries — never cleared wholesale: flipping a
+    /// shelf page back must stay a cache hit.
+    fn shelf_cover(
+        &self,
+        entry: &LibraryEntry,
+        cell: (u32, u32),
+        capacity: usize,
+    ) -> image::DynamicImage {
         // Which file would supply the cover? Its mtime invalidates stale
         // cache entries (e.g. a re-fetched .cover.jpg).
         let cover_path = self.cover_path(entry);
@@ -1889,25 +1940,40 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             .unwrap_or(std::time::UNIX_EPOCH);
 
         let mut cache = self.cover_cache.borrow_mut();
-        if let Some((stamp, image)) = cache.get(&path) {
-            if *stamp == mtime {
-                return image.clone();
-            }
+        cache.tick += 1;
+        let tick = cache.tick;
+        let key = (path, mtime, cell);
+        if let Some((stamp, image)) = cache.entries.get_mut(&key) {
+            *stamp = tick;
+            return image.clone();
         }
-        let decoded = if path.extension().is_some_and(|e| e == "jpg") {
-            image::open(&path).ok()
+        let decoded = if key.0.extension().is_some_and(|e| e == "jpg") {
+            image::open(&key.0).ok()
         } else {
-            CbzDocument::open(&path)
+            CbzDocument::open(&key.0)
                 .and_then(|mut doc| doc.decode_page(0))
                 .ok()
         };
         match decoded {
             Some(image) => {
-                if cache.len() >= 2 * capacity.max(1) {
-                    cache.clear();
+                // Cache the cell-sized thumbnail, not the full decode: a
+                // page is megapixels, a shelf cell a few hundred KB. The
+                // resize stays a DynamicImage (RGB preserved), so Kaleido
+                // color covers are unregressed.
+                let thumb = image.resize(cell.0, cell.1, image::imageops::FilterType::Triangle);
+                while cache.entries.len() >= 2 * capacity.max(1) {
+                    let Some(oldest) = cache
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, (stamp, _))| *stamp)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    cache.entries.remove(&oldest);
                 }
-                cache.insert(path, (mtime, image.clone()));
-                image
+                cache.entries.insert(key, (tick, thumb.clone()));
+                thumb
             }
             // Failures aren't cached: they're cheap to re-hit, and the
             // file may become readable later (e.g. a finished copy).
