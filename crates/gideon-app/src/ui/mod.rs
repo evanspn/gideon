@@ -498,13 +498,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         lines.push("Press power or open the cover to wake.".to_string());
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-        self.show_status(&lines)?;
+        self.show_status_full(&lines)?;
         let result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
             // Pressing power while plugged in does nothing visible
             // otherwise — say why before restoring the screen.
-            self.show_status(&["Plugged in — staying awake."])?;
+            self.show_status_full(&["Plugged in — staying awake."])?;
             std::thread::sleep(SKIP_NOTICE_HOLD);
             self.render_current(RefreshMode::Full)?;
             return Ok(());
@@ -1138,10 +1138,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let sources = self.gateway.installed_sources()?;
         let mut results: Vec<(SourceEntry, MangaEntry)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        for source in &sources {
+        for (i, source) in sources.iter().enumerate() {
+            // One status screen for the whole search, partially updated
+            // per source — N full flashes made an N-source search strobe.
             self.show_status(&[
                 &format!("Searching for \"{query}\"…"),
-                &format!("{}…", source.name),
+                &format!("{}/{}: {}…", i + 1, sources.len(), source.name),
             ])?;
             match self.gateway.search_manga(&source.id, query) {
                 Ok(mangas) => {
@@ -1627,10 +1629,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     // --- rendering ---
 
+    /// Show a transient status ("Loading…", "Searching…") with a PARTIAL
+    /// refresh: a full e-ink flash per status doubled the perceived
+    /// latency of every network action. NOTE: partials can ghost — the
+    /// destination screens that replace a status deliberately stay Full
+    /// (`push`/`render_current`), flashing any ghosting away. Statuses
+    /// that *stay* on the panel (the sleep notice) use
+    /// [`Self::show_status_full`] instead.
     fn show_status(&mut self, lines: &[&str]) -> Result<()> {
+        self.show_status_mode(lines, RefreshMode::Partial)
+    }
+
+    /// A status that stays on the panel (suspend notices): full refresh,
+    /// so the held image is flashed clean.
+    fn show_status_full(&mut self, lines: &[&str]) -> Result<()> {
+        self.show_status_mode(lines, RefreshMode::Full)
+    }
+
+    fn show_status_mode(&mut self, lines: &[&str], mode: RefreshMode) -> Result<()> {
         let page = compose_status(&self.layout, lines);
         self.display.blit(&page, 0)?;
-        self.display.flush(RefreshMode::Full)?;
+        self.display.flush(mode)?;
         Ok(())
     }
 
