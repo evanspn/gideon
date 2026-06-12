@@ -158,6 +158,21 @@ impl<D: Display> Reader<D> {
         reading_h.saturating_sub(SCROLL_OVERLAP_PX).max(1)
     }
 
+    /// Start rendering the current page on the prefetch thread, so the
+    /// session's first paint takes a ready render instead of decoding on
+    /// the calling thread. Call between [`Self::resume_from`] and the
+    /// first [`Self::show_current_page`].
+    pub fn warm(&mut self) {
+        let (reading_w, reading_h) = self.reading_dims();
+        let opts = RenderOptions {
+            screen_width: reading_w,
+            screen_height: reading_h,
+            fit: self.fit,
+            dither: true,
+        };
+        self.prefetcher.start(self.current_page, &opts);
+    }
+
     /// Render the current page and push it to the display. The first paint
     /// and every [`FULL_REFRESH_INTERVAL`]th page turn use a full refresh.
     pub fn show_current_page(&mut self) -> Result<()> {

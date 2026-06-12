@@ -6,7 +6,7 @@
 //! WASM runtime (`gideon-aidoku`) and the source-list machinery
 //! (`gideon-sources`), reusing the same functions the CLI commands use.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -118,6 +118,13 @@ pub struct AidokuGateway {
     data_dir: PathBuf,
     /// Loaded WASM sources, cached per id — instantiating a source is slow.
     cache: RefCell<HashMap<String, Source>>,
+    /// One tokio runtime for the whole session: building a runtime (and
+    /// its thread pool) per gateway call added latency to every tap.
+    runtime: OnceCell<tokio::runtime::Runtime>,
+    /// One HTTP client (= connection pool) shared by every chapter and
+    /// cover download, so keep-alive connections and TLS sessions are
+    /// reused across calls.
+    client: OnceCell<reqwest::Client>,
 }
 
 impl AidokuGateway {
@@ -125,6 +132,8 @@ impl AidokuGateway {
         Self {
             data_dir,
             cache: RefCell::new(HashMap::new()),
+            runtime: OnceCell::new(),
+            client: OnceCell::new(),
         }
     }
 
@@ -139,8 +148,23 @@ impl AidokuGateway {
         Ok(source)
     }
 
-    fn runtime(&self) -> Result<tokio::runtime::Runtime> {
-        tokio::runtime::Runtime::new().context("failed to start async runtime")
+    /// The shared runtime, built on first use (fallible, so not
+    /// `get_or_init`).
+    fn runtime(&self) -> Result<&tokio::runtime::Runtime> {
+        if self.runtime.get().is_none() {
+            let runtime =
+                tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+            let _ = self.runtime.set(runtime);
+        }
+        Ok(self.runtime.get().expect("initialized above"))
+    }
+
+    /// The shared download client, built on first use.
+    fn client(&self) -> Result<&reqwest::Client> {
+        if self.client.get().is_none() {
+            let _ = self.client.set(manga::http_client()?);
+        }
+        Ok(self.client.get().expect("initialized above"))
     }
 }
 
@@ -219,7 +243,7 @@ impl SourceGateway for AidokuGateway {
 
     fn download_cover(&self, url: &str, dest: &Path) -> Result<()> {
         let runtime = self.runtime()?;
-        runtime.block_on(manga::download_cover(url, dest))
+        runtime.block_on(manga::download_cover(self.client()?, url, dest))
     }
 
     fn chapters(&self, source_id: &str, manga_id: &str) -> Result<Vec<ChapterEntry>> {
@@ -249,7 +273,12 @@ impl SourceGateway for AidokuGateway {
         let source = self.source(source_id)?;
         let runtime = self.runtime()?;
         runtime.block_on(manga::download_chapter(
-            &source, manga_id, chapter_id, library, progress,
+            &source,
+            self.client()?,
+            manga_id,
+            chapter_id,
+            library,
+            progress,
         ))
     }
 

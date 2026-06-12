@@ -599,11 +599,19 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
             return Err(e.into());
         }
     };
-    let gateway = ui::AidokuGateway::new(data_dir());
-    let (fit, rotation) = reader_settings();
+    let data_dir = data_dir();
+    let gateway = ui::AidokuGateway::new(data_dir.clone());
+    // One settings load feeds everything below: reader fit + rotation,
+    // frontlight levels and the active profile (settings.json was parsed
+    // three times here before).
+    let saved = gideon_core::Settings::load(&data_dir).unwrap_or_default();
+    let fit = FitMode::from_setting(&saved.reader_fit);
+    let rotation = saved.reader_rotation;
+    // TODO: `saved.auto_check_updates` is persisted by the Settings screen
+    // but nothing acts on it yet. When wiring it up, run the check on an
+    // idle Home repaint — a network call here would delay the first paint.
     // Frontlight: restore the saved levels, persist every change from the
     // reader's edge slides.
-    let saved = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
     let mut frontlight = gideon_device::KoboFrontlight::new(
         saved.frontlight_brightness.min(100) as u8,
         saved.frontlight_warmth.min(100) as u8,
@@ -611,7 +619,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     frontlight.apply();
     let lights = Box::new(PersistedLights {
         inner: frontlight,
-        data_dir: data_dir(),
+        data_dir: data_dir.clone(),
     });
     // Power button / sleep cover: suspend to RAM via the Nickel/KOReader
     // sysfs dance. The call blocks until the device wakes up.
@@ -628,7 +636,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         .with_reader_settings(fit, rotation)
         .with_sleeper(sleeper)
         .with_lights(lights)
-        .with_settings_dir(data_dir())
+        .with_settings_dir(data_dir)
         .with_battery(Box::new(gideon_device::power::battery_percent))
         .run();
     match &result {

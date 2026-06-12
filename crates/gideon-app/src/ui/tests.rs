@@ -674,7 +674,12 @@ fn shelf_covers_are_cached_across_repaints() {
         path: lib.join("Series/vol1.cbz"),
         relative_path: "Series/vol1.cbz".to_string(),
     };
-    let first = app.shelf_cover(&entry, 6);
+    let cell = (60, 80);
+    let first = app.shelf_cover(&entry, cell, 6);
+    assert!(
+        first.width() <= cell.0 && first.height() <= cell.1,
+        "the cache holds cell-sized thumbnails, not full decodes"
+    );
 
     // Replace the cover with garbage but keep its mtime: a cache hit keeps
     // serving the old pixels, a re-decode would fall back elsewhere.
@@ -683,7 +688,7 @@ fn shelf_covers_are_cached_across_repaints() {
     std::fs::write(&cover, b"not a jpeg").unwrap();
     filetime::set_file_mtime(&cover, mtime).unwrap();
     assert_eq!(
-        app.shelf_cover(&entry, 6),
+        app.shelf_cover(&entry, cell, 6),
         first,
         "an unchanged mtime must serve the cached cover, not re-decode"
     );
@@ -692,10 +697,43 @@ fn shelf_covers_are_cached_across_repaints() {
     // fails to decode and the cover falls back (here: the CBZ's page).
     filetime::set_file_mtime(&cover, filetime::FileTime::from_unix_time(99, 0)).unwrap();
     assert_ne!(
-        app.shelf_cover(&entry, 6),
+        app.shelf_cover(&entry, cell, 6),
         first,
         "a changed mtime must re-decode the cover"
     );
+}
+
+#[test]
+fn shelf_cover_cache_evicts_lru_not_wholesale() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    // Shelf capacity 2 → the cache budget is 4 entries (two pages).
+    for i in 0..5 {
+        make_cbz(&lib.join(format!("S{i}/vol1.cbz")), 1);
+        make_red_cover(&lib.join(format!("S{i}")));
+    }
+    let app = app(&lib, FakeGateway::default(), vec![]);
+    let entry = |i: usize| LibraryEntry {
+        path: lib.join(format!("S{i}/vol1.cbz")),
+        relative_path: format!("S{i}/vol1.cbz"),
+    };
+    let cell = (60, 80);
+    for i in 0..5 {
+        app.shelf_cover(&entry(i), cell, 2);
+    }
+
+    let cache = app.cover_cache.borrow();
+    assert_eq!(cache.entries.len(), 4, "budget is two shelf pages");
+    let cached = |i: usize| {
+        cache
+            .entries
+            .keys()
+            .any(|(path, ..)| path.ends_with(format!("S{i}/.cover.jpg")))
+    };
+    assert!(!cached(0), "only the least recently used entry is evicted");
+    for i in 1..5 {
+        assert!(cached(i), "recently used entry S{i} must stay warm");
+    }
 }
 
 #[test]

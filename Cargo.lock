@@ -1222,6 +1222,7 @@ dependencies = [
  "anyhow",
  "clap",
  "filetime",
+ "futures",
  "gideon-aidoku",
  "gideon-core",
  "gideon-device",

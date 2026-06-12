@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -90,6 +91,21 @@ pub struct InstalledSource {
     pub broken: bool,
 }
 
+/// Read a source's manifest straight out of its `.aix` zip, without
+/// instantiating the WASM runtime — listing identities must stay cheap
+/// even with many installed sources (full `Source` loads happen lazily,
+/// per id, in `AidokuGateway`'s cache).
+fn read_manifest(path: &Path) -> Result<gideon_aidoku::SourceManifest> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("couldn't open source archive {}", path.display()))?;
+    let manifest = archive
+        .by_name("Payload/source.json")
+        .context("while loading source.json")?;
+    serde_json::from_reader(manifest).context("while parsing source.json")
+}
+
 /// List installed sources by scanning the sources directory.
 pub fn installed_sources(data_dir: &Path) -> Result<Vec<InstalledSource>> {
     let dir = sources_dir(data_dir);
@@ -108,21 +124,32 @@ pub fn installed_sources(data_dir: &Path) -> Result<Vec<InstalledSource>> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match Source::from_aix_file(&path, &settings_dir(data_dir)) {
-            Ok(source) => {
-                let m = source.manifest();
-                out.push(InstalledSource {
-                    id: m.info.id,
-                    name: m.info.name,
-                    broken: false,
-                });
-            }
-            Err(e) => out.push(InstalledSource {
-                id: stem.clone(),
-                name: format!("{stem} (broken: {e})"),
-                broken: true,
-            }),
-        }
+        // When the manifest doesn't even parse, fall back to a full WASM
+        // load: a source that loads anyway still shows up, and a truly
+        // broken one keeps its `broken` marking.
+        let source = match read_manifest(&path) {
+            Ok(m) => InstalledSource {
+                id: m.info.id,
+                name: m.info.name,
+                broken: false,
+            },
+            Err(_) => match Source::from_aix_file(&path, &settings_dir(data_dir)) {
+                Ok(source) => {
+                    let m = source.manifest();
+                    InstalledSource {
+                        id: m.info.id,
+                        name: m.info.name,
+                        broken: false,
+                    }
+                }
+                Err(e) => InstalledSource {
+                    id: stem.clone(),
+                    name: format!("{stem} (broken: {e})"),
+                    broken: true,
+                },
+            },
+        };
+        out.push(source);
     }
     Ok(out)
 }
@@ -198,6 +225,7 @@ pub fn cmd_manga_download(
 
     let source = load_source(data_dir, source_id)?;
     let runtime = tokio::runtime::Runtime::new()?;
+    let client = http_client()?;
     let mut progress = |done: usize, total: usize| {
         if done == 0 {
             println!("Downloading {total} page(s)...");
@@ -208,6 +236,7 @@ pub fn cmd_manga_download(
     };
     let out_path = runtime.block_on(download_chapter(
         &source,
+        &client,
         manga_id,
         chapter_id,
         library,
@@ -220,17 +249,38 @@ pub fn cmd_manga_download(
     Ok(())
 }
 
-/// Download a manga cover image to `dest`. Cover art is metadata: callers
-/// treat failures as non-fatal (the shelf falls back to the first page).
-pub async fn download_cover(url: &str, dest: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
+/// The shared HTTP client for chapter pages and cover art. Its
+/// configuration mirrors bobo's proven downloader: redirects are followed
+/// manually (so a source-set Referer survives every hop, see
+/// `execute_with_forced_referer`) and broken CDN certificates are
+/// tolerated — manga mirrors routinely have invalid TLS. The user-agent
+/// is only a fallback: `get_image_request` always sets a browser UA.
+/// Timeouts are mandatory: a stalled TCP connection must surface as an
+/// error page, never freeze the device forever.
+///
+/// Build it ONCE and reuse it (the UI gateway keeps one for the whole
+/// session): a client is a connection pool, and rebuilding it per call
+/// threw away keep-alive connections and TLS sessions.
+pub fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let response = client.get(url).send().await?.error_for_status()?;
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("failed to build the HTTP client")
+}
+
+/// Download a manga cover image to `dest`. Cover art is metadata: callers
+/// treat failures as non-fatal (the shelf falls back to the first page).
+pub async fn download_cover(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+    // The shared client doesn't auto-follow redirects; walk them manually
+    // (no Referer set, so this is a plain follow).
+    let request = client.get(url).build()?;
+    let response = execute_with_forced_referer(client, request)
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
     // Only persist real images — an HTML error page is not a cover.
     image::guess_format(&bytes).map_err(|_| anyhow::anyhow!("cover at {url} is not an image"))?;
@@ -252,6 +302,7 @@ pub async fn download_cover(url: &str, dest: &Path) -> Result<()> {
 /// is an error.
 pub async fn download_chapter(
     source: &Source,
+    client: &reqwest::Client,
     manga_id: &str,
     chapter_id: &str,
     library: &Path,
@@ -293,22 +344,9 @@ pub async fn download_chapter(
     }
     progress(0, pages.len());
 
-    // Client configuration mirrors bobo's proven downloader: redirects are
-    // followed manually (so the source-set Referer survives every hop, see
-    // `execute_with_forced_referer`) and broken CDN certificates are
-    // tolerated — manga mirrors routinely have invalid TLS. The user-agent
-    // here is only a fallback: `get_image_request` always sets a browser UA.
-    // Timeouts are mandatory: a stalled TCP connection must surface as an
-    // error page, never freeze the device forever.
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(true)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-    let width = pages.len().to_string().len().max(3);
-    let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(pages.len() + 1);
+    let total = pages.len();
+    let width = total.to_string().len().max(3);
+    let mut cbz_pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(total + 1);
 
     // ComicInfo.xml so the library shows proper titles.
     let comic_info = format!(
@@ -324,32 +362,54 @@ pub async fn download_chapter(
     // A failed page must not abort the chapter (bobo's downloader inserts
     // an error placeholder and keeps going); a 40-page chapter with one
     // dead page must still be readable.
+    //
+    // Pages download [`PAGE_CONCURRENCY`] at a time: transfers overlap,
+    // while the source's WASM hooks (get_image_request, the page
+    // post-processing) stay serialized through the Source's internal
+    // Mutex. Every result is written into its index-keyed slot —
+    // file names and placeholders are derived from the page index, so
+    // page order in the CBZ never depends on completion order.
+    let mut slots: Vec<Option<(String, Vec<u8>)>> = Vec::with_capacity(total);
+    slots.resize_with(total, || None);
     let mut failed: Vec<String> = Vec::new();
     let mut downloaded = 0usize;
-    for (i, page) in pages.iter().enumerate() {
-        let Some(image_url) = page.image_url.clone() else {
-            // Skipped pages still advance the progress display.
-            progress(i + 1, pages.len());
-            continue;
-        };
-        match fetch_page_bytes(source, &client, &token, page, &image_url).await {
-            Ok(bytes) => {
-                let name = page_file_name(i, pages.len(), &image_url, &bytes);
-                cbz_pages.push((name, bytes));
-                downloaded += 1;
+    let mut completed = 0usize;
+    {
+        let token = &token;
+        let mut downloads =
+            futures::stream::iter(pages.iter().enumerate().map(|(i, page)| async move {
+                let Some(image_url) = page.image_url.clone() else {
+                    // Pages without an image URL are skipped (no slot).
+                    return (i, None);
+                };
+                let fetched = fetch_page_bytes(source, client, token, page, &image_url).await;
+                (i, Some((image_url, fetched)))
+            }))
+            .buffered(PAGE_CONCURRENCY);
+        while let Some((i, fetched)) = downloads.next().await {
+            match fetched {
+                None => {}
+                Some((image_url, Ok(bytes))) => {
+                    slots[i] = Some((page_file_name(i, total, &image_url, &bytes), bytes));
+                    downloaded += 1;
+                }
+                Some((_, Err(error))) => {
+                    let reason = format!("{error:#}");
+                    eprintln!("gideon download: page {} failed: {reason}", i + 1);
+                    failed.push(format!("page {}: {reason}", i + 1));
+                    slots[i] = Some((
+                        format!("{:0width$}.png", i + 1, width = width),
+                        error_page_png(i + 1, total, &reason),
+                    ));
+                }
             }
-            Err(error) => {
-                let reason = format!("{error:#}");
-                eprintln!("gideon download: page {} failed: {reason}", i + 1);
-                failed.push(format!("page {}: {reason}", i + 1));
-                cbz_pages.push((
-                    format!("{:0width$}.png", i + 1, width = width),
-                    error_page_png(i + 1, pages.len(), &reason),
-                ));
-            }
+            // Progress counts completions (skipped pages included), so the
+            // display always reaches total regardless of fetch order.
+            completed += 1;
+            progress(completed, total);
         }
-        progress(i + 1, pages.len());
     }
+    cbz_pages.extend(slots.into_iter().flatten());
 
     if downloaded == 0 {
         match failed.first() {
@@ -444,6 +504,11 @@ async fn fetch_page_bytes(
         Ok(bytes.to_vec())
     }
 }
+
+/// How many pages download concurrently. Three keeps a chapter download
+/// pipelined without hammering CDNs (or the device's WiFi) — the WASM
+/// request hooks still run one at a time behind the Source's Mutex.
+const PAGE_CONCURRENCY: usize = 3;
 
 /// Maximum redirect hops followed manually.
 const MAX_REDIRECTS: usize = 10;
@@ -773,6 +838,55 @@ mod download_tests {
                 .contains("referer: https://manga.example.com/reader"),
             "redirected request lost the Referer:\n{second}"
         );
+    }
+}
+
+#[cfg(test)]
+mod installed_sources_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn write_aix(data_dir: &Path, file: &str, manifest: &str) {
+        let dir = data_dir.join("sources");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = std::fs::File::create(dir.join(file)).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        zip.start_file(
+            "Payload/source.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn listing_reads_the_manifest_without_the_wasm_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        // No WASM payload at all: the identity must come straight from the
+        // zipped manifest — a full Source load would fail here.
+        write_aix(
+            dir.path(),
+            "en.demo.aix",
+            r#"{"info":{"id":"en.demo","name":"Demo","lang":"en","version":1}}"#,
+        );
+        let sources = installed_sources(dir.path()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "en.demo");
+        assert_eq!(sources[0].name, "Demo");
+        assert!(!sources[0].broken);
+    }
+
+    #[test]
+    fn unparseable_sources_are_still_marked_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sources")).unwrap();
+        std::fs::write(dir.path().join("sources/en.junk.aix"), b"not a zip").unwrap();
+        let sources = installed_sources(dir.path()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "en.junk");
+        assert!(sources[0].broken);
+        assert!(sources[0].name.contains("broken"));
     }
 }
 
