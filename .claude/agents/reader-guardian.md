@@ -41,6 +41,21 @@ even if everything else works. Review the given diff/commits adversarially.
    MTK sends are always UPDATE_MODE_FULL with GLR16 partials / GC16 fulls
    (GLRC16=11 / GCC16=10 + CFA flags 0x600|1 + dither 0x102 when the last
    blit was color). Grayscale reading must never pick color waveforms.
+6. **Color pages render through the RGB path end-to-end** — pages
+   `page_is_color` detects as color stay RGB the whole way:
+   `PageBuf::Rgb` through render/cache/prefetch → `Display::blit_rgb` →
+   GCC16 fulls / GLRC16 partials via `last_blit_color`. B/W pages stay on
+   the fast gray path (`PageBuf::Gray` → `blit`, gray waveforms, software
+   dither) — never promoted to RGB. THIS NEVER REGRESSES, in either
+   direction: a color manga rendering gray on a Libra Colour is a v1
+   blocker, and B/W manga taking the 3x-bytes RGB path is a perf
+   regression. Pinned by `bw_cbz_never_takes_the_rgb_path`,
+   `color_cbz_page_blits_color` and the `MemoryDisplay::blits` recorder;
+   the gray render itself is byte-pinned by
+   `gray_render_is_byte_identical_to_the_legacy_pipeline`. Color pages
+   skip SOFTWARE dithering only (hardware Y8→Y4 dithers on refresh);
+   chrome (indicator, banner) is drawn by converting the gray box onto
+   the RGB window, never by converting the page.
 
 ## Functional invariants (run `cargo test -p gideon-app` and read the tests pinned for each)
 
