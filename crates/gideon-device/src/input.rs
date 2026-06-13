@@ -64,6 +64,15 @@ pub trait InputSource {
     /// kernels can re-register input nodes across suspend, leaving old
     /// fds dead. Default: no-op (fakes have nothing to reopen).
     fn refresh_devices(&mut self) {}
+
+    /// Re-arm the accelerometer to the device's *current* physical
+    /// orientation, returning the rotation to apply right now (if known).
+    /// Called when auto-rotation is switched on, so the screen snaps to how
+    /// the device is held instead of waiting for the next physical move.
+    /// Default: `None` (fakes and headless have no accelerometer).
+    fn resync_orientation(&mut self) -> Option<UiEvent> {
+        None
+    }
 }
 
 /// Test input source: replays a fixed list of events, then errors.

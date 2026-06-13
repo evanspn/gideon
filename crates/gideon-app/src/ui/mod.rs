@@ -1585,6 +1585,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                                             s.reader_rotation = rotation;
                                         }
                                     });
+                                    // Switching to auto snaps to how the device
+                                    // is held right now (no need to physically
+                                    // move it first).
+                                    let snapped = if locked {
+                                        None
+                                    } else {
+                                        self.input.resync_orientation()
+                                    };
+                                    if let Some(UiEvent::Rotate { rotation: target }) = snapped {
+                                        let target = target % 360;
+                                        if target != rotation {
+                                            sheet_open = false;
+                                            reader.set_rotation(target);
+                                            rotation = target;
+                                            self.reader_rotation = target;
+                                            reader.show_current_page()?;
+                                            continue;
+                                        }
+                                    }
                                     // Redraw with the flipped label.
                                     show_controls_sheet(
                                         &mut reader,
