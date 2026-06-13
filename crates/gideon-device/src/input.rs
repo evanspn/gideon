@@ -34,6 +34,12 @@ pub enum UiEvent {
     /// blocks until wakeup, and the key that woke the device is consumed by
     /// the input drain that follows it.
     Sleep,
+    /// The accelerometer reported a new physical orientation: an *absolute*
+    /// reading rotation in degrees clockwise (0/90/180/270). Emitted by the
+    /// Kobo gyro (KOReader's `EV_MSC`/`MSC_RAW` gsensor codes). The UI only
+    /// acts on it when the orientation is unlocked ("auto"); a locked
+    /// orientation ignores it. Face-up / face-down report no rotation.
+    Rotate { rotation: u32 },
 }
 
 /// A blocking source of UI events.
