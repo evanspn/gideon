@@ -17,7 +17,7 @@ mod layout;
 mod tests;
 
 pub use gateway::{AidokuGateway, ChapterEntry, MangaEntry, SourceEntry, SourceGateway};
-pub use layout::{Key, ReaderZone, TapTarget, UiLayout};
+pub use layout::{page_button_advances, Key, ReaderZone, TapTarget, UiLayout};
 
 use std::path::{Path, PathBuf};
 
@@ -301,6 +301,12 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     reader_fit: FitMode,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
+    /// Whether the reading orientation is locked. Locked: the accelerometer
+    /// is ignored and manual rotations persist across sessions. Unlocked
+    /// ("auto"): the gyro drives rotation app-wide and manual rotations stay
+    /// session-only. Mirrors settings.json `reader_rotation_locked`; kept in
+    /// sync when the reader's controls sheet toggles it.
+    rotation_locked: bool,
     /// Suspend hook for [`UiEvent::Sleep`]; `None` (tests, headless) means
     /// sleep events are ignored.
     sleeper: Option<SleepFn>,
@@ -356,6 +362,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
             reader_rotation: 0,
+            rotation_locked: true,
             sleeper: None,
             last_wake: None,
             keyboard_paints: 0,
@@ -425,7 +432,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Persist in-reader setting changes (rotation lock) to this directory.
+    /// Also seeds the in-memory orientation-lock state, so the menus know
+    /// up front whether the accelerometer should drive auto-rotation.
     pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
+        self.rotation_locked = gideon_core::Settings::load(&dir)
+            .map(|s| s.reader_rotation_locked)
+            .unwrap_or(true);
         self.settings_dir = Some(dir);
         self
     }
@@ -516,8 +528,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.show_error(&e)?;
                     }
                 }
+                // The accelerometer reported a new orientation: in "auto"
+                // mode the whole app follows it; locked ignores it.
+                Ok(UiEvent::Rotate { rotation }) => {
+                    if let Err(e) = self.auto_rotate_menus(rotation) {
+                        self.show_error(&e)?;
+                    }
+                }
             }
         }
+    }
+
+    /// Apply a gyro-reported orientation to the menus (auto mode only):
+    /// rebuild the layout against the new reading frame and repaint. A
+    /// locked orientation, or no actual change, is a no-op.
+    fn auto_rotate_menus(&mut self, rotation: u32) -> Result<()> {
+        let rotation = rotation % 360;
+        if self.rotation_locked || rotation == self.reader_rotation {
+            return Ok(());
+        }
+        self.reader_rotation = rotation;
+        self.rebuild_layout();
+        self.render_current(RefreshMode::Full)
     }
 
     /// Suspend via the sleep hook (no-op without one), then repaint: the
@@ -1495,10 +1527,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // display itself, leaving the reader pipeline untouched.
         let panel = UiLayout::new(self.display.width(), self.display.height());
         let mut rotation = self.reader_rotation;
-        // Orientation lock: rotation changes persist across sessions only
-        // while locked; "auto" keeps them session-only. Toggled from the
-        // controls sheet.
-        let mut rotation_locked = self.load_settings().reader_rotation_locked;
+        // Orientation lock (kept in sync with the app-wide field): locked
+        // persists rotation across sessions and ignores the gyro; "auto"
+        // keeps manual rotation session-only AND lets the accelerometer
+        // drive it. Toggled from the controls sheet.
+        let mut rotation_locked = self.rotation_locked;
         // The reader-controls sheet (Rotate 90° / Orientation / Close),
         // opened by an up-swipe that starts in the bottom eighth of the
         // reading frame.
@@ -1540,6 +1573,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                                 }
                                 Some(SHEET_ROW_ORIENTATION) => {
                                     rotation_locked = !rotation_locked;
+                                    // Keep the app-wide field in sync so the
+                                    // menus know whether the gyro is live.
+                                    self.rotation_locked = rotation_locked;
                                     let locked = rotation_locked;
                                     persist_settings(self.settings_dir.as_deref(), |s| {
                                         s.reader_rotation_locked = locked;
@@ -1549,6 +1585,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                                             s.reader_rotation = rotation;
                                         }
                                     });
+                                    // Switching to auto snaps to how the device
+                                    // is held right now (no need to physically
+                                    // move it first).
+                                    let snapped = if locked {
+                                        None
+                                    } else {
+                                        self.input.resync_orientation()
+                                    };
+                                    if let Some(UiEvent::Rotate { rotation: target }) = snapped {
+                                        let target = target % 360;
+                                        if target != rotation {
+                                            sheet_open = false;
+                                            reader.set_rotation(target);
+                                            rotation = target;
+                                            self.reader_rotation = target;
+                                            reader.show_current_page()?;
+                                            continue;
+                                        }
+                                    }
                                     // Redraw with the flipped label.
                                     show_controls_sheet(
                                         &mut reader,
@@ -1569,6 +1624,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             // Fall through: the suspend handling below
                             // repaints in full, wiping the sheet away.
                             sheet_open = false;
+                        }
+                        Ok(UiEvent::Rotate { rotation: target }) => {
+                            // A gyro report with the sheet up: apply it (auto
+                            // mode) and repaint, which also wipes the sheet.
+                            sheet_open = false;
+                            let target = *target % 360;
+                            if !rotation_locked && target != rotation {
+                                reader.set_rotation(target);
+                                rotation = target;
+                                self.reader_rotation = target;
+                            }
+                            reader.show_current_page()?;
+                            continue;
                         }
                         Ok(_) => {
                             sheet_open = false;
@@ -1597,14 +1665,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                         ReaderZone::Back => break,
                     },
-                    Ok(UiEvent::PageForward) => {
-                        if !reader.next_page()? && next_available {
-                            outcome = ReaderOutcome::NextChapter;
-                            break;
+                    // Physical page-turn buttons follow the reading
+                    // orientation: held upside down (180°) the two keys have
+                    // swapped places, so the forward button goes back.
+                    Ok(ev @ (UiEvent::PageForward | UiEvent::PageBack)) => {
+                        let forward = matches!(ev, UiEvent::PageForward);
+                        if page_button_advances(forward, rotation) {
+                            if !reader.next_page()? && next_available {
+                                outcome = ReaderOutcome::NextChapter;
+                                break;
+                            }
+                        } else {
+                            reader.prev_page()?;
                         }
                     }
-                    Ok(UiEvent::PageBack) => {
-                        reader.prev_page()?;
+                    // The accelerometer reported a new orientation: in "auto"
+                    // mode rotate the reader to it; locked ignores it.
+                    Ok(UiEvent::Rotate { rotation: target }) => {
+                        let target = target % 360;
+                        if !rotation_locked && target != rotation {
+                            reader.set_rotation(target);
+                            rotation = target;
+                            self.reader_rotation = target;
+                            reader.show_current_page()?;
+                        }
                     }
                     // Edge slides (panel coordinates — the physical bezel
                     // edge, regardless of reading rotation): right edge is

@@ -34,8 +34,18 @@ use crate::{Error, Result};
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
+const EV_MSC: u16 = 0x04;
 
 const SYN_REPORT: u16 = 0x00;
+
+/// `MSC_RAW`: the Kobo accelerometer reports a new physical orientation as
+/// an `EV_MSC`/`MSC_RAW` event whose value is one of the gsensor codes
+/// below (KOReader's `frontend/device/input.lua`).
+const MSC_RAW: u16 = 0x03;
+const MSC_RAW_GSENSOR_PORTRAIT_DOWN: i32 = 0x17;
+const MSC_RAW_GSENSOR_PORTRAIT_UP: i32 = 0x18;
+const MSC_RAW_GSENSOR_LANDSCAPE_RIGHT: i32 = 0x19;
+const MSC_RAW_GSENSOR_LANDSCAPE_LEFT: i32 = 0x1a;
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
@@ -261,8 +271,131 @@ impl ButtonTracker {
     }
 }
 
+/// Map a Kobo gsensor code (the value of an `EV_MSC`/`MSC_RAW` event) to an
+/// absolute reading rotation in degrees clockwise. The two portrait codes
+/// are unambiguous (upright = 0°, upside-down = 180°); the framebuffer is
+/// already normalized to upright at startup, so reading rotation 0 matches
+/// the device held the right way up.
+///
+/// Which landscape is 90° vs 270° depends on the panel's mounting; the
+/// canonical mapping is landscape-right → 90°, landscape-left → 270°.
+/// `swap_landscape` (env `GIDEON_GYRO_SWAP_LANDSCAPE`) flips the two for
+/// panels mounted the other way. Face-up / face-down (codes 0x1b/0x1c) and
+/// anything unrecognized return `None` — keep the current rotation.
+fn gsensor_to_rotation(value: i32, swap_landscape: bool) -> Option<u32> {
+    let (landscape_right, landscape_left) = if swap_landscape { (270, 90) } else { (90, 270) };
+    match value {
+        MSC_RAW_GSENSOR_PORTRAIT_UP => Some(0),
+        MSC_RAW_GSENSOR_PORTRAIT_DOWN => Some(180),
+        MSC_RAW_GSENSOR_LANDSCAPE_RIGHT => Some(landscape_right),
+        MSC_RAW_GSENSOR_LANDSCAPE_LEFT => Some(landscape_left),
+        _ => None,
+    }
+}
+
+/// A new orientation must hold steady this long before it rotates the
+/// screen. Crossing a 45° boundary (or picking the device up) makes the
+/// driver alternate codes for a moment; without a settle window each
+/// alternation would queue a full-screen GC16 flash. KOReader uses a
+/// comparable hold.
+const GYRO_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// State machine for the accelerometer with a settle window: feed raw
+/// `input_event`s plus the current time, and a [`UiEvent::Rotate`] surfaces
+/// only once a *new* orientation has held steady for [`GYRO_SETTLE`]. Each
+/// distinct orientation that arrives restarts the timer, so waving the
+/// device near a boundary emits nothing until it comes to rest — the panel
+/// flips once, not per gsensor tick.
+///
+/// The emit fires on a *timeout*, not a follow-up event (the Kobo gsensor
+/// driver reports on change, so the orientation it finally rests at gets no
+/// confirming re-report): [`Self::time_until_settle`] tells the poll loop
+/// how long to wait, and [`Self::settled`] is checked when that wait ends.
+#[derive(Debug)]
+pub struct GyroTracker {
+    /// The last rotation we emitted, to suppress duplicate reports.
+    last: Option<u32>,
+    /// The most recent orientation the sensor reported, even if it was
+    /// deduplicated. Lets [`Self::resync`] snap to how the device is held
+    /// *right now* when auto-rotation is switched on.
+    observed: Option<u32>,
+    /// A new orientation awaiting the settle window: its rotation and the
+    /// instant it was first observed (restarted whenever it changes).
+    candidate: Option<(u32, std::time::Instant)>,
+    /// Whether landscape-right/left map to 270°/90° instead of 90°/270°.
+    swap_landscape: bool,
+}
+
+impl GyroTracker {
+    pub fn new() -> Self {
+        Self {
+            last: None,
+            observed: None,
+            candidate: None,
+            swap_landscape: std::env::var_os("GIDEON_GYRO_SWAP_LANDSCAPE").is_some(),
+        }
+    }
+
+    /// Note one event at time `now`. A gsensor report for a *new* orientation
+    /// (re)starts the settle timer; a report matching the last emitted
+    /// orientation cancels any pending change. Returns nothing directly — the
+    /// rotation surfaces later through [`Self::settled`].
+    pub fn observe(&mut self, ev: &libc::input_event, now: std::time::Instant) {
+        if ev.type_ != EV_MSC || ev.code != MSC_RAW {
+            return;
+        }
+        let Some(rotation) = gsensor_to_rotation(ev.value, self.swap_landscape) else {
+            return;
+        };
+        self.observed = Some(rotation);
+        if self.last == Some(rotation) {
+            // Already there (or back to it): drop any pending change.
+            self.candidate = None;
+        } else if self.candidate.map(|(r, _)| r) != Some(rotation) {
+            // A different target than we were settling on: restart the timer.
+            self.candidate = Some((rotation, now));
+        }
+    }
+
+    /// Re-arm to the device's current physical orientation: switching the
+    /// orientation lock to "auto" should snap immediately to how the device
+    /// is held, not wait for the next physical move. Returns the orientation
+    /// to apply now, if the sensor has reported one this session.
+    pub fn resync(&mut self) -> Option<UiEvent> {
+        self.candidate = None;
+        self.last = self.observed;
+        self.observed.map(|rotation| UiEvent::Rotate { rotation })
+    }
+
+    /// How long until the pending orientation settles, or `None` when nothing
+    /// is pending (the poll loop waits indefinitely). Zero means it is ready
+    /// now.
+    pub fn time_until_settle(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let (_, since) = self.candidate?;
+        Some(GYRO_SETTLE.saturating_sub(now.saturating_duration_since(since)))
+    }
+
+    /// Emit the pending rotation once it has held steady for [`GYRO_SETTLE`].
+    pub fn settled(&mut self, now: std::time::Instant) -> Option<UiEvent> {
+        let (rotation, since) = self.candidate?;
+        if now.saturating_duration_since(since) >= GYRO_SETTLE {
+            self.last = Some(rotation);
+            self.candidate = None;
+            Some(UiEvent::Rotate { rotation })
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for GyroTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Merged evdev input on Kobo hardware: the touch panel plus any nodes
-/// carrying the power button / sleep cover.
+/// carrying the power button / sleep cover / accelerometer.
 pub struct KoboTouch {
     /// All opened devices, polled together. Index `touch_idx` feeds the
     /// touch tracker; every device feeds the button tracker (touch nodes
@@ -271,6 +404,7 @@ pub struct KoboTouch {
     touch_idx: usize,
     tracker: TouchTracker,
     buttons: ButtonTracker,
+    gyro: GyroTracker,
     pending: VecDeque<UiEvent>,
     transform: TouchTransform,
     max_x: u32,
@@ -303,6 +437,7 @@ impl KoboTouch {
             touch_idx: scan.touch_idx,
             tracker: TouchTracker::new(),
             buttons: ButtonTracker::new(),
+            gyro: GyroTracker::new(),
             pending: VecDeque::new(),
             transform,
             max_x: scan.max_x,
@@ -331,6 +466,7 @@ impl KoboTouch {
                     self.max_y = scan.max_y;
                     self.tracker = TouchTracker::new();
                     self.buttons = ButtonTracker::new();
+                    self.gyro = GyroTracker::new();
                     self.pending.clear();
                     return;
                 }
@@ -351,6 +487,7 @@ impl KoboTouch {
         }
         self.tracker = TouchTracker::new();
         self.buttons = ButtonTracker::new();
+        self.gyro = GyroTracker::new();
         self.pending.clear();
     }
 }
@@ -403,7 +540,27 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
         let has_pages =
             key_ok && (bit_set(&key_bits, KEY_PAGE_FWD) || bit_set(&key_bits, KEY_PAGE_BACK));
 
-        if !is_touch && !has_power && !has_cover && !has_pages {
+        // Accelerometer (auto-rotation): a node advertising EV_MSC/MSC_RAW
+        // carries the gsensor orientation reports. On the Libra Colour those
+        // synthetic events ride the *main NTX node* (the one with KEY_POWER,
+        // already opened above) rather than the raw accel node — KOReader
+        // skips the dedicated accel device for the same reason. We don't gate
+        // on a device name (that node isn't named like an accelerometer);
+        // every opened node is fed to the gyro tracker, so an MSC_RAW carrier
+        // is what matters. This flag only decides whether to open a node that
+        // ISN'T already wanted for touch/power/pages. GIDEON_GYRO_DEVICE
+        // forces a specific node in; GIDEON_GYRO=0 disables it entirely.
+        let gyro_disabled = std::env::var("GIDEON_GYRO").is_ok_and(|v| v == "0");
+        let mut msc_bits = [0u8; 4];
+        // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
+        let msc_ok =
+            unsafe { ioctl(fd, eviocgbit(EV_MSC, msc_bits.len()), msc_bits.as_mut_ptr()) } >= 0;
+        let forced_gyro = std::env::var("GIDEON_GYRO_DEVICE")
+            .ok()
+            .is_some_and(|forced| forced == path);
+        let is_gyro = !gyro_disabled && (forced_gyro || (msc_ok && bit_set(&msc_bits, MSC_RAW)));
+
+        if !is_touch && !has_power && !has_cover && !has_pages && !is_gyro {
             continue;
         }
 
@@ -434,7 +591,7 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
             axes = Some((max_x, max_y));
         } else {
             eprintln!(
-                    "gideon input: using {path} for buttons (power={has_power} cover={has_cover} pages={has_pages})"
+                    "gideon input: using {path} for buttons/sensors (power={has_power} cover={has_cover} pages={has_pages} gyro={is_gyro})"
                 );
         }
         devices.push(file);
@@ -469,6 +626,7 @@ impl KoboTouch {
         }
         self.tracker = TouchTracker::new();
         self.buttons = ButtonTracker::new();
+        self.gyro = GyroTracker::new();
         self.pending.retain(|e| matches!(e, UiEvent::Sleep));
         if slept && self.pending.is_empty() {
             // Multiple presses/closes collapse to a single suspend.
@@ -491,8 +649,15 @@ impl KoboTouch {
                 revents: 0,
             })
             .collect();
+        // Wait indefinitely, unless the gyro has an orientation settling: then
+        // cap the wait at the remaining settle window so the rotation can fire
+        // on a timeout even though the driver sends no confirming re-report.
+        let timeout = match self.gyro.time_until_settle(std::time::Instant::now()) {
+            Some(d) => (d.as_millis().min(i32::MAX as u128) as libc::c_int).max(0),
+            None => -1,
+        };
         // SAFETY: fds points at a valid pollfd array of the given length.
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -502,6 +667,7 @@ impl KoboTouch {
         }
 
         let mut dead: Vec<usize> = Vec::new();
+        let now = std::time::Instant::now();
         for (i, pfd) in fds.iter().enumerate() {
             if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
                 continue;
@@ -509,6 +675,7 @@ impl KoboTouch {
             let is_touch = i == self.touch_idx;
             let tracker = &mut self.tracker;
             let buttons = &mut self.buttons;
+            let gyro = &mut self.gyro;
             let pending = &mut self.pending;
             let (transform, max_x, max_y) = (self.transform, self.max_x, self.max_y);
             let (screen_w, screen_h) = (self.screen_w, self.screen_h);
@@ -531,10 +698,19 @@ impl KoboTouch {
                 if let Some(event) = buttons.push(ev) {
                     pending.push_back(event);
                 }
+                gyro.observe(ev, now);
             });
             if matches!(drain, Drain::Dead) {
                 dead.push(i);
             }
+        }
+
+        // A pending orientation that has now held steady for the settle window
+        // surfaces here — this is also the path taken on a bare poll timeout
+        // (no device was readable), so the rotation fires without a confirming
+        // re-report from the driver.
+        if let Some(event) = self.gyro.settled(std::time::Instant::now()) {
+            self.pending.push_back(event);
         }
 
         let mut lost_touch = false;
@@ -630,6 +806,10 @@ impl InputSource for KoboTouch {
 
     fn refresh_devices(&mut self) {
         KoboTouch::reopen(self);
+    }
+
+    fn resync_orientation(&mut self) -> Option<UiEvent> {
+        self.gyro.resync()
     }
 }
 
@@ -802,6 +982,138 @@ mod tests {
             Some(UiEvent::PageBack)
         );
         assert_eq!(b.push(&ev(EV_KEY, KEY_PAGE_BACK, 2)), None, "repeat");
+    }
+
+    // --- GyroTracker (accelerometer auto-rotation) ---
+
+    fn msc(value: i32) -> libc::input_event {
+        ev(EV_MSC, MSC_RAW, value)
+    }
+
+    #[test]
+    fn gsensor_codes_map_to_reading_rotations() {
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_PORTRAIT_UP, false),
+            Some(0)
+        );
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_PORTRAIT_DOWN, false),
+            Some(180)
+        );
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT, false),
+            Some(90)
+        );
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_LEFT, false),
+            Some(270)
+        );
+        // Face up / face down (0x1b / 0x1c) and junk keep the rotation.
+        assert_eq!(gsensor_to_rotation(0x1b, false), None);
+        assert_eq!(gsensor_to_rotation(0x1c, false), None);
+        assert_eq!(gsensor_to_rotation(0, false), None);
+    }
+
+    #[test]
+    fn swap_landscape_flips_only_the_landscapes() {
+        // The two portraits are unambiguous; only 90/270 swap.
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_PORTRAIT_UP, true),
+            Some(0)
+        );
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_PORTRAIT_DOWN, true),
+            Some(180)
+        );
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT, true),
+            Some(270)
+        );
+        assert_eq!(
+            gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_LEFT, true),
+            Some(90)
+        );
+    }
+
+    fn gyro() -> GyroTracker {
+        GyroTracker {
+            last: None,
+            observed: None,
+            candidate: None,
+            swap_landscape: false,
+        }
+    }
+
+    #[test]
+    fn gyro_emits_rotate_once_after_the_settle_window() {
+        let mut g = gyro();
+        let t0 = std::time::Instant::now();
+        g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT), t0);
+        // Not yet: the orientation hasn't held long enough.
+        assert_eq!(g.settled(t0), None);
+        assert_eq!(g.settled(t0 + GYRO_SETTLE / 2), None);
+        // Past the window it fires exactly once.
+        assert_eq!(
+            g.settled(t0 + GYRO_SETTLE),
+            Some(UiEvent::Rotate { rotation: 90 })
+        );
+        assert_eq!(g.settled(t0 + GYRO_SETTLE * 2), None, "fires only once");
+        // A re-report of the same orientation does not fire again.
+        g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT), t0 + GYRO_SETTLE * 2);
+        assert_eq!(g.time_until_settle(t0 + GYRO_SETTLE * 2), None);
+    }
+
+    #[test]
+    fn gyro_thrash_near_a_boundary_restarts_the_timer() {
+        // Alternating codes (crossing a 45° boundary) must NOT each fire: the
+        // timer restarts on every distinct orientation, so only the one it
+        // finally rests on settles.
+        let mut g = gyro();
+        let t0 = std::time::Instant::now();
+        g.observe(&msc(MSC_RAW_GSENSOR_PORTRAIT_UP), t0);
+        g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT), t0 + ms(100));
+        g.observe(&msc(MSC_RAW_GSENSOR_PORTRAIT_UP), t0 + ms(200));
+        // 500ms after the FIRST report, but only 300ms after the last change:
+        // nothing has settled yet.
+        assert_eq!(g.settled(t0 + ms(500)), None);
+        // 600ms after the last change it settles on that final orientation.
+        assert_eq!(
+            g.settled(t0 + ms(200) + GYRO_SETTLE),
+            Some(UiEvent::Rotate { rotation: 0 })
+        );
+    }
+
+    #[test]
+    fn gyro_resync_snaps_to_the_current_orientation() {
+        // Turning auto-rotation on should apply how the device is held now,
+        // even though that orientation already settled earlier (and is deduped).
+        let mut g = gyro();
+        let t0 = std::time::Instant::now();
+        g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_LEFT), t0);
+        assert_eq!(
+            g.settled(t0 + GYRO_SETTLE),
+            Some(UiEvent::Rotate { rotation: 270 })
+        );
+        // No new physical movement, but resync re-applies the current pose.
+        assert_eq!(g.resync(), Some(UiEvent::Rotate { rotation: 270 }));
+        // With no orientation ever seen, resync has nothing to apply.
+        assert_eq!(gyro().resync(), None);
+    }
+
+    #[test]
+    fn gyro_ignores_non_gsensor_events() {
+        let mut g = gyro();
+        let t0 = std::time::Instant::now();
+        g.observe(&ev(EV_KEY, KEY_POWER, 1), t0);
+        g.observe(&ev(EV_ABS, ABS_MT_POSITION_X, 100), t0);
+        // EV_MSC with a different code (e.g. MSC_SCAN) is not a gsensor report.
+        g.observe(&ev(EV_MSC, 0x04, 0x18), t0);
+        assert_eq!(g.time_until_settle(t0), None, "nothing pending");
+        assert_eq!(g.settled(t0 + GYRO_SETTLE), None);
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
     }
 
     #[test]

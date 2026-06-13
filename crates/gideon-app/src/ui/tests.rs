@@ -659,6 +659,141 @@ fn controls_sheet_origin_follows_the_reading_bottom_edge() {
     assert_eq!(controls_sheet_origin(600, 800, 144, 270), (456, 0));
 }
 
+// --- accelerometer auto-rotation + physical page buttons ---
+
+/// Settings with the orientation unlocked ("auto"), saved to `dir` so
+/// `with_settings_dir` seeds the app into gyro-follow mode.
+fn auto_orientation_settings(dir: &Path) {
+    let settings = gideon_core::Settings {
+        reader_rotation_locked: false,
+        ..gideon_core::Settings::default()
+    };
+    settings.save(dir).unwrap();
+}
+
+#[test]
+fn gyro_rotates_menus_in_auto_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    auto_orientation_settings(&settings_dir);
+
+    let mut app = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![UiEvent::Rotate { rotation: 90 }],
+    )
+    .with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    // Home re-rendered rotated into the panel: the title separator lands
+    // where the 90° mapping expects it (cf. menus_render_rotated_into_the_panel).
+    let l = menu_layout(90);
+    let (x, y) = panel_point_for(l.width / 2, l.title_h - 1, 90);
+    assert_eq!(
+        app.display().pixel(x, y),
+        0x55,
+        "a gyro report must rotate the menus in auto mode"
+    );
+}
+
+#[test]
+fn gyro_is_ignored_when_orientation_locked() {
+    // No settings dir: orientation defaults to locked, so the gyro is off.
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![UiEvent::Rotate { rotation: 90 }],
+    );
+    app.run().unwrap();
+
+    // The menus stayed upright: the separator is at the unrotated location.
+    let l = menu_layout(0);
+    assert_eq!(
+        app.display().pixel(l.width / 2, l.title_h - 1),
+        0x55,
+        "a locked orientation must ignore the accelerometer"
+    );
+}
+
+#[test]
+fn gyro_rotates_the_reader_in_auto_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+    auto_orientation_settings(&settings_dir);
+
+    // Open the reader upright, then a gyro report rotates it to 90°, after
+    // which the tap zones follow the new orientation (bottom = next).
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        UiEvent::Rotate { rotation: 90 },
+        tap_panel_bottom,
+        tap_rotated_back,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "the reader must rotate to the gyro orientation and map taps to it"
+    );
+}
+
+#[test]
+fn physical_forward_button_advances_when_upright() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        UiEvent::PageForward, // upright: forward advances to page 1
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(store.get("Sample/vol1.cbz").unwrap().current_page, 1);
+}
+
+#[test]
+fn physical_page_buttons_swap_when_reading_upside_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+    // Resume mid-chapter so a "back" turn is observable.
+    let mut store = ProgressStore::default();
+    store.update("Sample/vol1.cbz", 2, 5);
+    store.save(&progress_path(&lib)).unwrap();
+
+    // Held upside down (180°), the forward button must page *back*.
+    let events = vec![
+        tap_row_rot(0, 180),
+        tap_shelf_cell0_rot(180),
+        UiEvent::PageForward,                // -> previous page (1), not 3
+        UiEvent::Tap { x: W / 2, y: H / 2 }, // center is Back at any rotation
+    ];
+    let mut app =
+        app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::Contain, 180);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "the forward button pages back when the reader is upside down"
+    );
+}
+
 #[test]
 fn empty_library_shows_hint_not_error() {
     let dir = tempfile::tempdir().unwrap();

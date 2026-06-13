@@ -36,6 +36,9 @@
 - [x] Semantic-versioned, tag-driven GitHub releases (scripts/release.sh + release workflow)
 - [x] Rotation support (landscape reading via `reader_rotation`
       0/90/180/270 with rotation-aware tap zones; two-page spreads later)
+- [x] Accelerometer auto-rotation (the "auto" orientation follows how the
+      device is physically held, via the Kobo gyro's `EV_MSC`/`MSC_RAW`
+      gsensor codes) with rotation-aware physical page-turn buttons
 
 ## v2 — online sources, end to end
 
