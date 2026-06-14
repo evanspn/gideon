@@ -296,9 +296,10 @@ fn gsensor_to_rotation(value: i32, swap_landscape: bool) -> Option<u32> {
 /// A new orientation must hold steady this long before it rotates the
 /// screen. Crossing a 45° boundary (or picking the device up) makes the
 /// driver alternate codes for a moment; without a settle window each
-/// alternation would queue a full-screen GC16 flash. KOReader uses a
-/// comparable hold.
-const GYRO_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
+/// alternation would queue a full-screen GC16 flash. Kept short so the flip
+/// feels responsive — long enough to swallow the transient alternation at a
+/// boundary, but not a perceptible wait (KOReader applies instantly).
+const GYRO_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// State machine for the accelerometer with a settle window: feed raw
 /// `input_event`s plus the current time, and a [`UiEvent::Rotate`] surfaces
@@ -1070,15 +1071,17 @@ mod tests {
         // finally rests on settles.
         let mut g = gyro();
         let t0 = std::time::Instant::now();
+        let last_change = t0 + ms(200);
         g.observe(&msc(MSC_RAW_GSENSOR_PORTRAIT_UP), t0);
         g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT), t0 + ms(100));
-        g.observe(&msc(MSC_RAW_GSENSOR_PORTRAIT_UP), t0 + ms(200));
-        // 500ms after the FIRST report, but only 300ms after the last change:
-        // nothing has settled yet.
-        assert_eq!(g.settled(t0 + ms(500)), None);
-        // 600ms after the last change it settles on that final orientation.
+        g.observe(&msc(MSC_RAW_GSENSOR_PORTRAIT_UP), last_change);
+        // The window is measured from the LAST change, not the first report:
+        // partway through it, nothing has settled yet.
+        assert_eq!(g.settled(last_change + GYRO_SETTLE / 2), None);
+        // A full window after the last change it settles on that final
+        // orientation.
         assert_eq!(
-            g.settled(t0 + ms(200) + GYRO_SETTLE),
+            g.settled(last_change + GYRO_SETTLE),
             Some(UiEvent::Rotate { rotation: 0 })
         );
     }
