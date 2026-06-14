@@ -80,6 +80,9 @@ pub struct FakeInput {
     events: std::vec::IntoIter<UiEvent>,
     /// How often `refresh_devices` ran (the post-wake reopen), for tests.
     pub refreshes: usize,
+    /// How often `discard_taps` ran (the post-slow-turn input flush), for
+    /// tests.
+    pub discard_taps_calls: usize,
 }
 
 impl FakeInput {
@@ -87,6 +90,7 @@ impl FakeInput {
         Self {
             events: events.into_iter(),
             refreshes: 0,
+            discard_taps_calls: 0,
         }
     }
 }
@@ -100,6 +104,10 @@ impl InputSource for FakeInput {
 
     fn refresh_devices(&mut self) {
         self.refreshes += 1;
+    }
+
+    fn discard_taps(&mut self) {
+        self.discard_taps_calls += 1;
     }
 }
 

@@ -794,6 +794,87 @@ fn physical_forward_button_advances_even_upside_down() {
     );
 }
 
+// --- slow-turn input debounce ---
+
+/// A display whose `flush` sleeps, to simulate a slow (big-page / full-flash)
+/// page render so the debounce path in `turn_reader_page` is exercised.
+struct SlowDisplay {
+    inner: MemoryDisplay,
+    delay: std::time::Duration,
+}
+
+impl gideon_device::Display for SlowDisplay {
+    fn width(&self) -> u32 {
+        self.inner.width()
+    }
+    fn height(&self) -> u32 {
+        self.inner.height()
+    }
+    fn blit(&mut self, page: &gideon_render::GrayPage, offset_y: u32) -> gideon_device::Result<()> {
+        self.inner.blit(page, offset_y)
+    }
+    fn blit_rgb(
+        &mut self,
+        page: &gideon_render::RgbPage,
+        offset_y: u32,
+    ) -> gideon_device::Result<()> {
+        self.inner.blit_rgb(page, offset_y)
+    }
+    fn overlay(
+        &mut self,
+        page: &gideon_render::GrayPage,
+        x: u32,
+        y: u32,
+    ) -> gideon_device::Result<()> {
+        self.inner.overlay(page, x, y)
+    }
+    fn flush(&mut self, mode: RefreshMode) -> gideon_device::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.flush(mode)
+    }
+}
+
+#[test]
+fn slow_page_turn_flushes_queued_presses() {
+    // A turn slower than SLOW_TURN drops whatever input queued while it
+    // rendered, so a frustrated multi-press doesn't cascade past the target.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slow.cbz");
+    make_cbz(&path, 3);
+    let doc = CbzDocument::open(&path).unwrap();
+    let mut display = SlowDisplay {
+        inner: MemoryDisplay::new(16, 16),
+        delay: SLOW_TURN + std::time::Duration::from_millis(50),
+    };
+    let mut reader = Reader::new(doc, &mut display, FitMode::Contain, 0);
+    let mut input = FakeInput::new(vec![]);
+
+    assert!(turn_reader_page(&mut reader, &mut input, true).unwrap());
+    assert_eq!(
+        input.discard_taps_calls, 1,
+        "a slow turn must flush the queued frustration-presses"
+    );
+}
+
+#[test]
+fn fast_page_turn_keeps_queued_presses() {
+    // A fast turn must NOT flush input, so deliberate quick paging still
+    // registers every press.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fast.cbz");
+    make_cbz(&path, 3);
+    let doc = CbzDocument::open(&path).unwrap();
+    let mut display = MemoryDisplay::new(16, 16);
+    let mut reader = Reader::new(doc, &mut display, FitMode::Contain, 0);
+    let mut input = FakeInput::new(vec![]);
+
+    assert!(turn_reader_page(&mut reader, &mut input, true).unwrap());
+    assert_eq!(
+        input.discard_taps_calls, 0,
+        "a fast turn must keep every press"
+    );
+}
+
 #[test]
 fn empty_library_shows_hint_not_error() {
     let dir = tempfile::tempdir().unwrap();

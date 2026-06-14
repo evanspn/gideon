@@ -283,6 +283,15 @@ const SKIP_NOTICE_HOLD: std::time::Duration = std::time::Duration::from_millis(1
 /// can't accumulate over a long editing session.
 const KEYBOARD_FULL_REFRESH_INTERVAL: u32 = 8;
 
+/// A reader page turn slower than this counts as "the user couldn't see the
+/// result yet". Presses that queued while such a turn rendered were made
+/// blind (a big page decoding, or a full-flash refresh) — almost always a
+/// frustrated multi-press — so they're dropped instead of cascading several
+/// pages past where the reader wanted to be. Fast turns (the common partial
+/// refresh, well under this) keep every press, so deliberate quick paging
+/// still works.
+const SLOW_TURN: std::time::Duration = std::time::Duration::from_millis(450);
+
 pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
@@ -1668,13 +1677,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         ReaderZone::NextPage => {
                             // Turning past the last page continues into
                             // the next chapter (when one exists).
-                            if !reader.next_page()? && next_available {
+                            if !turn_reader_page(&mut reader, &mut self.input, true)?
+                                && next_available
+                            {
                                 outcome = ReaderOutcome::NextChapter;
                                 break;
                             }
                         }
                         ReaderZone::PrevPage => {
-                            reader.prev_page()?;
+                            turn_reader_page(&mut reader, &mut self.input, false)?;
                         }
                         ReaderZone::Back => break,
                     },
@@ -1683,13 +1694,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // (Matching KOReader, which never inverts the keys by
                     // rotation — that's a separate, explicit user setting.)
                     Ok(UiEvent::PageForward) => {
-                        if !reader.next_page()? && next_available {
+                        if !turn_reader_page(&mut reader, &mut self.input, true)? && next_available
+                        {
                             outcome = ReaderOutcome::NextChapter;
                             break;
                         }
                     }
                     Ok(UiEvent::PageBack) => {
-                        reader.prev_page()?;
+                        turn_reader_page(&mut reader, &mut self.input, false)?;
                     }
                     // The accelerometer reported a new orientation: in "auto"
                     // mode rotate the reader to it; locked ignores it.
@@ -1788,13 +1800,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(UiEvent::LongPress { x, y }) => {
                         match panel.reader_zone_rotated(x, y, rotation) {
                             ReaderZone::NextPage => {
-                                if !reader.next_page()? && next_available {
+                                if !turn_reader_page(&mut reader, &mut self.input, true)?
+                                    && next_available
+                                {
                                     outcome = ReaderOutcome::NextChapter;
                                     break;
                                 }
                             }
                             ReaderZone::PrevPage => {
-                                reader.prev_page()?;
+                                turn_reader_page(&mut reader, &mut self.input, false)?;
                             }
                             ReaderZone::Back => break,
                         }
@@ -2348,6 +2362,35 @@ fn rotation_banner(rotation: u32, locked: bool) -> String {
     } else {
         format!("Rotation {rotation}°")
     }
+}
+
+/// Turn the reader one page (`forward` = next, else previous). If the render
+/// was slow — `>= SLOW_TURN`, e.g. a big page decoding synchronously or a
+/// full-flash refresh — drop any taps / button presses that queued *while it
+/// ran*: those were made before the user could see the new page, so a
+/// frustrated multi-press during the lag must not cascade several pages past
+/// the target. A free function because the reader session holds a partial
+/// borrow of the app (`self.display`), so it takes `input` by reference
+/// rather than calling an `&mut self` method. Returns whether a page turned
+/// (`false` at the end of the document, for the next-chapter handoff).
+fn turn_reader_page<D: Display, I: InputSource>(
+    reader: &mut Reader<D>,
+    input: &mut I,
+    forward: bool,
+) -> Result<bool> {
+    let start = std::time::Instant::now();
+    let advanced = if forward {
+        reader.next_page()?
+    } else {
+        reader.prev_page()?
+    };
+    if start.elapsed() >= SLOW_TURN {
+        // Non-blocking: drains only what already queued during the render
+        // (sleep requests survive), so a fast turn with an empty queue is a
+        // no-op and never costs a deliberate press.
+        input.discard_taps();
+    }
+    Ok(advanced)
 }
 
 /// Persist a settings mutation (no-op without a settings dir); a failed
