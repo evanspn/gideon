@@ -610,10 +610,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.render_current(RefreshMode::Full)?;
             return Ok(());
         }
-        // The kernel may have re-registered the input nodes across the
-        // suspend — reopen them, then drop the key press that woke us.
-        self.input.refresh_devices();
+        // Drop the key press that woke us, THEN reopen the (possibly
+        // re-registered) input nodes — in that order. Reopening can take up
+        // to ~3s on MTK while the nodes come back, and it hands us fresh,
+        // empty fds; draining *after* it would throw away a press the user
+        // made post-wake (e.g. the button that turns the last page into the
+        // next chapter). Draining first flushes the wake press on the old
+        // fds; input made after the reopen survives.
         self.input.discard_queued();
+        self.input.refresh_devices();
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -1874,10 +1879,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         if matches!(result, Ok(SleepResult::Skipped)) {
                             continue; // still awake, screen untouched
                         }
-                        // Reopen possibly re-registered input nodes, drop
-                        // the wake key press, relight, repaint in full.
-                        self.input.refresh_devices();
+                        // Drop the wake key press FIRST, then reopen the
+                        // possibly re-registered input nodes — reopening hands
+                        // us fresh fds and can take ~3s, so draining after it
+                        // would eat a press the user makes post-wake (e.g. the
+                        // button that advances the last page into the next
+                        // chapter, which "sometimes" failed after sleep).
                         self.input.discard_queued();
+                        self.input.refresh_devices();
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
                         }
