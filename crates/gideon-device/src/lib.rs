@@ -30,6 +30,45 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The Kaleido color-filter-array post-process applied to color refreshes.
+///
+/// The panel can run a hardware saturation boost over the color waveform.
+/// The strongest setting makes color pop but, stacked on the panel's Y8→Y4
+/// quantization, bands smooth gradients ("rainbow banding"). This mirrors
+/// KOReader's `noCFAPostProcess` escape hatch so the boost can be dialed
+/// down or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorPostProcess {
+    /// Strongest saturation boost (KOReader's default, `CFA_EINK_G2`):
+    /// vivid color, but can band gradients on the Kaleido panel.
+    #[default]
+    Vivid,
+    /// Standard CFA gain (`CFA_EINK_G1`): no extra boost, no banding.
+    Standard,
+    /// No CFA post-process at all: flattest color, never bands.
+    Off,
+}
+
+impl ColorPostProcess {
+    /// Parse the settings.json value leniently (defaults to `Vivid`).
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" => Self::Standard,
+            "off" | "none" => Self::Off,
+            _ => Self::Vivid,
+        }
+    }
+
+    /// The settings.json token for this mode.
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Vivid => "vivid",
+            Self::Standard => "standard",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// How the e-ink panel should refresh after a draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -68,6 +107,10 @@ pub trait Display {
 
     /// Push the backbuffer to the physical screen.
     fn flush(&mut self, mode: RefreshMode) -> Result<()>;
+
+    /// Set the Kaleido color post-process applied to color refreshes.
+    /// Default: no-op (only the Kobo color backend honors it).
+    fn set_color_post_process(&mut self, _mode: ColorPostProcess) {}
 }
 
 /// Allow driving a display through a mutable reference, so a UI can lend
@@ -95,6 +138,10 @@ impl<D: Display + ?Sized> Display for &mut D {
 
     fn flush(&mut self, mode: RefreshMode) -> Result<()> {
         (**self).flush(mode)
+    }
+
+    fn set_color_post_process(&mut self, mode: ColorPostProcess) {
+        (**self).set_color_post_process(mode)
     }
 }
 
@@ -383,6 +430,39 @@ mod tests {
         // Fully off-screen overlays are a no-op.
         d.overlay(&page_filled(2, 2, 0x00), 9, 9).unwrap();
         assert_eq!(d.pixel(0, 0), 0x80);
+    }
+
+    #[test]
+    fn color_post_process_parses_and_round_trips() {
+        assert_eq!(
+            ColorPostProcess::from_setting("vivid"),
+            ColorPostProcess::Vivid
+        );
+        assert_eq!(
+            ColorPostProcess::from_setting("standard"),
+            ColorPostProcess::Standard
+        );
+        assert_eq!(ColorPostProcess::from_setting("OFF"), ColorPostProcess::Off);
+        assert_eq!(
+            ColorPostProcess::from_setting(" none "),
+            ColorPostProcess::Off
+        );
+        // Unknown / empty fall back to the vivid default.
+        assert_eq!(
+            ColorPostProcess::from_setting("zzz"),
+            ColorPostProcess::Vivid
+        );
+        assert_eq!(ColorPostProcess::default(), ColorPostProcess::Vivid);
+        for mode in [
+            ColorPostProcess::Vivid,
+            ColorPostProcess::Standard,
+            ColorPostProcess::Off,
+        ] {
+            assert_eq!(ColorPostProcess::from_setting(mode.as_setting()), mode);
+        }
+        // The default Display impl ignores it (no panic, no state).
+        let mut d = MemoryDisplay::new(1, 1);
+        d.set_color_post_process(ColorPostProcess::Off);
     }
 
     #[test]

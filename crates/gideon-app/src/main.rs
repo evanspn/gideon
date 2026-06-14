@@ -648,6 +648,11 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
             SuspendOutcome::SkippedCharging => ui::SleepResult::Skipped,
         })
     });
+    // Apply the saved Kaleido color post-process before the first paint, so
+    // a banding-sensitive user's "standard"/"off" choice is live immediately.
+    display.set_color_post_process(gideon_device::ColorPostProcess::from_setting(
+        &saved.color_post_process,
+    ));
     let result = ui::UiApp::new(display, input, gateway, library)
         .with_profile(&saved.active_profile)
         .with_reader_settings(fit, rotation)

@@ -279,13 +279,18 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> PageBuf {
 
     // Downscales (the normal case) use Triangle: ~4x faster than Lanczos3
     // on the device's ARM core and indistinguishable for manga once
-    // dithered. Upscales (low-res sources) use CatmullRom — Triangle is
-    // visibly soft when enlarging.
-    let filter = if target_w > page.width() || target_h > page.height() {
+    // dithered. Grayscale upscales (low-res sources) use CatmullRom —
+    // Triangle is visibly soft when enlarging.
+    let is_upscale = target_w > page.width() || target_h > page.height();
+    let gray_filter = if is_upscale {
         FilterType::CatmullRom
     } else {
         FilterType::Triangle
     };
+    // Color always uses Triangle: CatmullRom's negative lobes overshoot
+    // when enlarging, and that ringing beats against the Kaleido panel's
+    // physical CFA stripe grid into rainbow moiré. Triangle never rings.
+    let color_filter = FilterType::Triangle;
 
     let canvas_w = opts.screen_width.max(target_w);
     let canvas_h = opts.screen_height.max(target_h);
@@ -293,7 +298,9 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> PageBuf {
     let off_y = (canvas_h - target_h) / 2;
 
     if page_is_color(page) {
-        let scaled = page.resize_exact(target_w, target_h, filter).into_rgb8();
+        let scaled = page
+            .resize_exact(target_w, target_h, color_filter)
+            .into_rgb8();
         let mut canvas = RgbPage::new_white(canvas_w, canvas_h);
         let src = scaled.as_raw();
         for y in 0..target_h {
@@ -306,7 +313,9 @@ pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> PageBuf {
         return PageBuf::Rgb(canvas);
     }
 
-    let scaled = page.resize_exact(target_w, target_h, filter).into_luma8();
+    let scaled = page
+        .resize_exact(target_w, target_h, gray_filter)
+        .into_luma8();
     let mut canvas = GrayPage::new_white(canvas_w, canvas_h);
 
     for y in 0..target_h {

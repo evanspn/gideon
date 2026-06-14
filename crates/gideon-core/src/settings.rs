@@ -67,6 +67,13 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_bool_locked")]
     pub reader_rotation_locked: bool,
 
+    /// Kaleido color post-process: "vivid" (the strongest saturation boost,
+    /// the default), "standard" (no boost — clears rainbow banding on
+    /// gradients) or "off". Parsed leniently — unknown values behave like
+    /// "vivid".
+    #[serde(deserialize_with = "lenient_color_post_process")]
+    pub color_post_process: String,
+
     /// Frontlight brightness percent (0–100), restored at startup and
     /// updated from the reader's right-edge slide. Parsed leniently.
     #[serde(deserialize_with = "lenient_percent")]
@@ -91,6 +98,7 @@ impl Default for Settings {
             reader_fit: "contain".to_string(),
             reader_rotation: 0,
             reader_rotation_locked: true,
+            color_post_process: "vivid".to_string(),
             frontlight_brightness: 20,
             frontlight_warmth: 0,
         }
@@ -160,6 +168,20 @@ fn lenient_reader_fit<'de, D: serde::Deserializer<'de>>(
         Some(s) => s.trim().to_ascii_lowercase(),
         None => "contain".to_string(),
     })
+}
+
+/// Lenient `color_post_process` parsing: known tokens pass through
+/// lowercased; anything else (wrong type, missing) means "vivid".
+fn lenient_color_post_process<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "standard" || s == "off" => s,
+            _ => "vivid".to_string(),
+        },
+    )
 }
 
 /// Lenient `reader_rotation` parsing: only 0/90/180/270 are kept; any other
@@ -286,6 +308,23 @@ mod tests {
         assert_eq!(s.reader_fit, "contain");
         assert_eq!(s.reader_rotation, 0);
         assert!(s.reader_rotation_locked);
+        assert_eq!(s.color_post_process, "vivid");
+    }
+
+    #[test]
+    fn color_post_process_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap().color_post_process
+        };
+        assert_eq!(load(r#"{"color_post_process": "standard"}"#), "standard");
+        assert_eq!(load(r#"{"color_post_process": "OFF"}"#), "off");
+        assert_eq!(load(r#"{"color_post_process": "vivid"}"#), "vivid");
+        // Unknown / wrong-typed / missing all fall back to vivid.
+        assert_eq!(load(r#"{"color_post_process": "nope"}"#), "vivid");
+        assert_eq!(load(r#"{"color_post_process": 5}"#), "vivid");
+        assert_eq!(load(r#"{}"#), "vivid");
     }
 
     #[test]
@@ -309,6 +348,7 @@ mod tests {
             reader_fit: "fit-width".into(),
             reader_rotation: 90,
             reader_rotation_locked: false,
+            color_post_process: "standard".into(),
             frontlight_brightness: 65,
             frontlight_warmth: 40,
         };
