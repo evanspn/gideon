@@ -64,6 +64,10 @@ pub struct Reader<D: Display> {
     /// Page turns between full (flashing) refreshes; see
     /// [`DEFAULT_FULL_REFRESH_INTERVAL`]. Settable from the reader settings.
     full_refresh_interval: u32,
+    /// Whether the most recent paint used a full (flashing) refresh. A full
+    /// refresh is slow by design (~0.5s GC16 flash), so the slow-turn input
+    /// debounce skips it — only decode-induced slowness should drop presses.
+    last_refresh_full: bool,
 }
 
 impl<D: Display> Reader<D> {
@@ -83,7 +87,15 @@ impl<D: Display> Reader<D> {
             prefetcher,
             turns_since_full_refresh: 0,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
+            last_refresh_full: false,
         }
+    }
+
+    /// Whether the most recent [`Self::show_current_page`] used a full
+    /// (flashing) refresh — the slow-turn debounce uses this to ignore the
+    /// expected periodic flash.
+    pub fn last_refresh_was_full(&self) -> bool {
+        self.last_refresh_full
     }
 
     /// Set how many page turns happen between full (flashing) refreshes. A
@@ -190,7 +202,8 @@ impl<D: Display> Reader<D> {
     }
 
     /// Render the current page and push it to the display. The first paint
-    /// and every [`FULL_REFRESH_INTERVAL`]th page turn use a full refresh.
+    /// and every [`DEFAULT_FULL_REFRESH_INTERVAL`]th page turn use a full
+    /// refresh.
     pub fn show_current_page(&mut self) -> Result<()> {
         let (reading_w, reading_h) = self.reading_dims();
 
@@ -254,6 +267,10 @@ impl<D: Display> Reader<D> {
         } else {
             RefreshMode::Partial
         };
+        // Remember it so callers can tell an expected full-flash turn (slow
+        // by design) from a turn that was slow because it had to decode —
+        // only the latter should trigger the frustration-mash debounce.
+        self.last_refresh_full = mode == RefreshMode::Full;
         self.display.flush(mode)?;
 
         // Cache policy AFTER the paint (never stall a blit on a stale

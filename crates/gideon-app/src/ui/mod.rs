@@ -2381,14 +2381,16 @@ fn rotation_banner(rotation: u32, locked: bool) -> String {
 }
 
 /// Turn the reader one page (`forward` = next, else previous). If the render
-/// was slow — `>= SLOW_TURN`, e.g. a big page decoding synchronously or a
-/// full-flash refresh — drop any taps / button presses that queued *while it
-/// ran*: those were made before the user could see the new page, so a
-/// frustrated multi-press during the lag must not cascade several pages past
-/// the target. A free function because the reader session holds a partial
-/// borrow of the app (`self.display`), so it takes `input` by reference
-/// rather than calling an `&mut self` method. Returns whether a page turned
-/// (`false` at the end of the document, for the next-chapter handoff).
+/// was slow *because it had to decode* — `>= SLOW_TURN` on a partial-refresh
+/// turn — drop any taps / button presses that queued *while it ran*: those
+/// were a frustrated multi-press during the lag and must not cascade several
+/// pages past the target. The expected periodic full-flash refresh (slow by
+/// design, ~0.5s) is explicitly NOT treated as frustration, so a deliberate
+/// tap landing during that flash still registers. A free function because the
+/// reader session holds a partial borrow of the app (`self.display`), so it
+/// takes `input` by reference rather than calling an `&mut self` method.
+/// Returns whether a page turned (`false` at the end of the document, for the
+/// next-chapter handoff).
 fn turn_reader_page<D: Display, I: InputSource>(
     reader: &mut Reader<D>,
     input: &mut I,
@@ -2400,7 +2402,10 @@ fn turn_reader_page<D: Display, I: InputSource>(
     } else {
         reader.prev_page()?
     };
-    if start.elapsed() >= SLOW_TURN {
+    // Skip the debounce on a full-refresh turn: its ~0.5s flash always
+    // exceeds SLOW_TURN, but it's expected slowness, not a lagging decode —
+    // flushing there would eat a real tap roughly every Nth turn.
+    if start.elapsed() >= SLOW_TURN && !reader.last_refresh_was_full() {
         // Non-blocking: drains only what already queued during the render
         // (sleep requests survive), so a fast turn with an empty queue is a
         // no-op and never costs a deliberate press.
