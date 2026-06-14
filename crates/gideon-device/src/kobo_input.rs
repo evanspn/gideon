@@ -633,7 +633,11 @@ impl KoboTouch {
         }
         self.tracker = TouchTracker::new();
         self.buttons = ButtonTracker::new();
-        self.gyro = GyroTracker::new();
+        // Deliberately NOT reset: the gyro tracker. Flushing a stale tap /
+        // page-button mash has nothing to do with the accelerometer, and
+        // this runs after every slow page turn — wiping it there would drop
+        // a rotation the user started mid-turn and stall the next auto-orient
+        // resync. Orientation state must survive an input flush.
         self.pending.retain(|e| matches!(e, UiEvent::Sleep));
         if slept && self.pending.is_empty() {
             // Multiple presses/closes collapse to a single suspend.

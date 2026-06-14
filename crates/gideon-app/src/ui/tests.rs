@@ -847,12 +847,48 @@ fn slow_page_turn_flushes_queued_presses() {
         delay: SLOW_TURN + std::time::Duration::from_millis(50),
     };
     let mut reader = Reader::new(doc, &mut display, FitMode::Contain, 0);
+    // Keep this turn a partial refresh (the decode-lag case the debounce is
+    // for), not the expected full flash.
+    reader.set_full_refresh_interval(8);
     let mut input = FakeInput::new(vec![]);
 
     assert!(turn_reader_page(&mut reader, &mut input, true).unwrap());
+    assert!(
+        !reader.last_refresh_was_full(),
+        "this turn is a partial refresh"
+    );
     assert_eq!(
         input.discard_taps_calls, 1,
-        "a slow turn must flush the queued frustration-presses"
+        "a slow partial turn must flush the queued frustration-presses"
+    );
+}
+
+#[test]
+fn slow_full_refresh_turn_keeps_input() {
+    // A full-refresh turn is slow by design (~0.5s flash). It must NOT be
+    // mistaken for a lagging decode and eat a deliberate press queued during
+    // the flash.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fullflash.cbz");
+    make_cbz(&path, 3);
+    let doc = CbzDocument::open(&path).unwrap();
+    let mut display = SlowDisplay {
+        inner: MemoryDisplay::new(16, 16),
+        delay: SLOW_TURN + std::time::Duration::from_millis(50),
+    };
+    let mut reader = Reader::new(doc, &mut display, FitMode::Contain, 0);
+    // Interval 1 => every turn is a full (flashing) refresh.
+    reader.set_full_refresh_interval(1);
+    let mut input = FakeInput::new(vec![]);
+
+    assert!(turn_reader_page(&mut reader, &mut input, true).unwrap());
+    assert!(
+        reader.last_refresh_was_full(),
+        "interval 1 makes every turn full"
+    );
+    assert_eq!(
+        input.discard_taps_calls, 0,
+        "a slow full-refresh turn must not flush input"
     );
 }
 
