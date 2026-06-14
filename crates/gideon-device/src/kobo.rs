@@ -58,8 +58,12 @@ const HWTCON_WAVEFORM_MODE_GLRC16: u32 = 11;
 // and the Kaleido G2 color-filter-array saturation post-process. KOReader
 // sets both on every color refresh of a Kaleido panel.
 const HWTCON_FLAG_USE_DITHERING: u32 = 1;
-// 1536 in KOReader's decimal bindings.
+// 1536 in KOReader's decimal bindings: the strongest CFA saturation boost.
 const HWTCON_FLAG_CFA_EINK_G2: u32 = 0x600;
+// CFA_EINK_G1 (256): standard gain — mtk-kobo.h notes it gives "the same
+// results as no flags", i.e. no extra saturation, so smooth color gradients
+// don't band the way they do under G2.
+const HWTCON_FLAG_CFA_EINK_G1: u32 = 0x100;
 // HWTCON dither mode for color content: Y8 -> Y4, "S" variant
 // (HWTCON_FLAG_USE_DITHERING_Y8_Y4_S in mxcfb_kobo_h.lua).
 const HWTCON_DITHER_Y8_Y4_S: i32 = 0x102;
@@ -260,6 +264,9 @@ pub struct KoboDisplay {
     /// Whether the last blit carried real color: a FULL refresh then uses
     /// the Kaleido color waveform (GCC16) on MTK kernels.
     last_blit_color: bool,
+    /// The CFA saturation flag OR'd into color refreshes (`CFA_EINK_G2`
+    /// boost by default; dialed down to G1/off to stop gradient banding).
+    cfa_flag: u32,
     /// Marker of the previous partial refresh, fenced lazily: KOReader
     /// completion-waits after every REAGL turn (their partials are
     /// promoted to UPDATE_MODE_FULL, which triggers their wait); paying
@@ -385,6 +392,7 @@ impl KoboDisplay {
             rotate: var.rotate,
             upright_rotate: wanted_rotate,
             last_blit_color: false,
+            cfa_flag: HWTCON_FLAG_CFA_EINK_G2,
             pending_partial_marker: None,
             swap_rb,
         })
@@ -449,6 +457,14 @@ impl Display for KoboDisplay {
 
     fn height(&self) -> u32 {
         self.height
+    }
+
+    fn set_color_post_process(&mut self, mode: crate::ColorPostProcess) {
+        self.cfa_flag = match mode {
+            crate::ColorPostProcess::Vivid => HWTCON_FLAG_CFA_EINK_G2,
+            crate::ColorPostProcess::Standard => HWTCON_FLAG_CFA_EINK_G1,
+            crate::ColorPostProcess::Off => 0,
+        };
     }
 
     fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
@@ -571,12 +587,12 @@ impl Display for KoboDisplay {
                     let (mtk_waveform, mtk_flags, mtk_dither) = match (mode, self.last_blit_color) {
                         (RefreshMode::Full, true) => (
                             HWTCON_WAVEFORM_MODE_GCC16,
-                            HWTCON_FLAG_CFA_EINK_G2 | HWTCON_FLAG_USE_DITHERING,
+                            self.cfa_flag | HWTCON_FLAG_USE_DITHERING,
                             HWTCON_DITHER_Y8_Y4_S,
                         ),
                         (RefreshMode::Partial, true) => (
                             HWTCON_WAVEFORM_MODE_GLRC16,
-                            HWTCON_FLAG_CFA_EINK_G2 | HWTCON_FLAG_USE_DITHERING,
+                            self.cfa_flag | HWTCON_FLAG_USE_DITHERING,
                             HWTCON_DITHER_Y8_Y4_S,
                         ),
                         (RefreshMode::Full, false) => (WAVEFORM_MODE_GC16, 0, 0),

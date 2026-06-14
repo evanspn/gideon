@@ -1098,6 +1098,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // nothing reads auto_check_updates yet (see cmd_browse). Wire
             // it to an idle-time update check, not startup.
             3 => settings.auto_check_updates = !settings.auto_check_updates,
+            4 => {
+                // Cycle the Kaleido color boost: vivid → standard → off.
+                // Dialing it down clears rainbow banding on color gradients.
+                use gideon_device::ColorPostProcess as Cpp;
+                let next = match Cpp::from_setting(&settings.color_post_process) {
+                    Cpp::Vivid => Cpp::Standard,
+                    Cpp::Standard => Cpp::Off,
+                    Cpp::Off => Cpp::Vivid,
+                };
+                settings.color_post_process = next.as_setting().to_string();
+                // Apply to the live panel so the next color refresh shows it.
+                self.display.set_color_post_process(next);
+            }
             _ => return Ok(()),
         }
         self.save_settings(&settings);
@@ -2758,6 +2771,7 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
         _ => "contain",
     };
     let auto = if s.auto_check_updates { "on" } else { "off" };
+    let color = gideon_device::ColorPostProcess::from_setting(&s.color_post_process).as_setting();
     vec![
         (
             format!("Pre-download ahead: {}", s.predownload_unread_chapters),
@@ -2766,6 +2780,7 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
         (format!("Storage limit: {}", s.storage_size_limit), true),
         (format!("Reader fit: {fit}"), true),
         (format!("Check updates automatically: {auto}"), true),
+        (format!("Color boost: {color}"), true),
     ]
 }
 
