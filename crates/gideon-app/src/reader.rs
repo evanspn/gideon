@@ -68,6 +68,11 @@ pub struct Reader<D: Display> {
     /// refresh is slow by design (~0.5s GC16 flash), so the slow-turn input
     /// debounce skips it — only decode-induced slowness should drop presses.
     last_refresh_full: bool,
+    /// Direction of the last turn: render-ahead follows it so sustained
+    /// *backward* paging is prefetched too, not just forward. Without this
+    /// the spare slot covers only one page back and every further back-turn
+    /// fell to a synchronous decode (going back felt slower than forward).
+    forward: bool,
 }
 
 impl<D: Display> Reader<D> {
@@ -88,6 +93,7 @@ impl<D: Display> Reader<D> {
             turns_since_full_refresh: 0,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             last_refresh_full: false,
+            forward: true,
         }
     }
 
@@ -96,6 +102,13 @@ impl<D: Display> Reader<D> {
     /// expected periodic flash.
     pub fn last_refresh_was_full(&self) -> bool {
         self.last_refresh_full
+    }
+
+    /// The page currently being rendered ahead, if any — for tests asserting
+    /// that render-ahead follows the direction of travel.
+    #[cfg(test)]
+    fn prefetch_target(&self) -> Option<usize> {
+        self.prefetcher.pending.as_ref().map(|p| p.index)
     }
 
     /// Set how many page turns happen between full (flashing) refreshes. A
@@ -223,8 +236,19 @@ impl<D: Display> Reader<D> {
             } else if let Some(page) = self.prefetcher.take(self.current_page, &opts) {
                 page
             } else {
-                let image = self.doc.decode_page(self.current_page)?;
-                render_page(&image, &opts)
+                // A single broken page (corrupt/truncated image, unsupported
+                // codec) must never drop the reader: render a placeholder in
+                // its place so the rest of the chapter stays readable.
+                match self.doc.decode_page(self.current_page) {
+                    Ok(image) => render_page(&image, &opts),
+                    Err(err) => {
+                        eprintln!(
+                            "reader: page {} failed to load: {err:#}",
+                            self.current_page + 1
+                        );
+                        render_error_page(reading_w, reading_h, self.current_page)
+                    }
+                }
             };
             // The outgoing page becomes the spare: going back is instant.
             self.spare = self.rendered.replace((self.current_page, page));
@@ -288,9 +312,19 @@ impl<D: Display> Reader<D> {
         if huge {
             self.spare = None;
         } else {
-            // Render the next page ahead, fully (scale + dither): the
-            // next turn is then just a blit + refresh.
-            self.prefetcher.start(self.current_page + 1, &opts);
+            // Render the page ahead in the direction of travel, fully (scale
+            // + dither): the next turn that way is then just a blit + refresh.
+            // Following the direction makes sustained back-paging as fast as
+            // forward (the spare slot alone only covers a single page back).
+            let ahead = if self.forward {
+                let next = self.current_page + 1;
+                (next < self.doc.page_count()).then_some(next)
+            } else {
+                self.current_page.checked_sub(1)
+            };
+            if let Some(index) = ahead {
+                self.prefetcher.start(index, &opts);
+            }
         }
         Ok(())
     }
@@ -339,6 +373,7 @@ impl<D: Display> Reader<D> {
     /// next page only from the bottom. Returns `false` at the end of the
     /// document.
     pub fn next_page(&mut self) -> Result<bool> {
+        self.forward = true;
         let (scroll, max_scroll) = self.scroll_state();
         if scroll < max_scroll {
             self.scroll_y = (scroll + self.scroll_step()).min(max_scroll);
@@ -360,6 +395,7 @@ impl<D: Display> Reader<D> {
     /// enter the previous page at its bottom. Returns `false` at the start
     /// of the document.
     pub fn prev_page(&mut self) -> Result<bool> {
+        self.forward = false;
         if self.scroll_y > 0 {
             self.scroll_y = self.scroll_y.saturating_sub(self.scroll_step());
             self.bump_refresh_counter();
@@ -404,6 +440,42 @@ fn normalize_rotation(degrees: u32) -> u32 {
         d @ (90 | 180 | 270) => d,
         _ => 0,
     }
+}
+
+/// A full-screen placeholder shown in place of a page that failed to decode
+/// (corrupt/truncated image, unsupported codec), so a single bad page can't
+/// drop the reader. A centered message on white; the user can simply turn
+/// past it. Always grayscale — an error page has no color content.
+fn render_error_page(width: u32, height: u32, index: usize) -> PageBuf {
+    use gideon_render::text::{draw_text, measure_text};
+
+    let mut page = GrayPage::new_white(width, height);
+    let title = format!("Page {} couldn't be loaded", index + 1);
+    let hint = "It may be corrupt — turn the page to continue.";
+
+    let (title_px, hint_px) = (34.0_f32, 22.0_f32);
+    let title_w = measure_text(title_px, &title, true).min(width);
+    let hint_w = measure_text(hint_px, hint, false).min(width);
+    let title_y = height / 2;
+    draw_text(
+        &mut page,
+        (width.saturating_sub(title_w)) / 2,
+        title_y,
+        title_px,
+        &title,
+        width,
+        true,
+    );
+    draw_text(
+        &mut page,
+        (width.saturating_sub(hint_w)) / 2,
+        title_y + title_px as u32 + 12,
+        hint_px,
+        hint,
+        width,
+        false,
+    );
+    PageBuf::Gray(page)
 }
 
 /// Blit a rendered page of either depth onto the display: gray pages take
@@ -666,6 +738,74 @@ mod tests {
             FitMode::Contain,
             0,
         )
+    }
+
+    #[test]
+    fn render_ahead_follows_the_direction_of_travel() {
+        // Forward reading prefetches the next page; backward reading must
+        // prefetch the PREVIOUS page, so a sustained back-run is as fast as
+        // forward instead of falling to a synchronous decode every turn.
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = new_reader(dir.path(), 6);
+
+        reader.show_current_page().unwrap(); // page 0
+        assert_eq!(
+            reader.prefetch_target(),
+            Some(1),
+            "forward: render-ahead is the next page"
+        );
+        reader.next_page().unwrap(); // page 1
+        reader.next_page().unwrap(); // page 2
+        assert_eq!(reader.prefetch_target(), Some(3));
+
+        reader.prev_page().unwrap(); // page 1, now travelling backward
+        assert_eq!(
+            reader.prefetch_target(),
+            Some(0),
+            "backward: render-ahead is the previous page"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_page_renders_a_placeholder_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.cbz");
+        // Page 0 and 2 are valid; page 1 is garbage (won't decode).
+        let valid = {
+            let img = image::RgbImage::from_pixel(8, 8, image::Rgb([10, 10, 10]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            buf.into_inner()
+        };
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("001.png", opts).unwrap();
+            zip.write_all(&valid).unwrap();
+            zip.start_file("002.png", opts).unwrap();
+            zip.write_all(b"this is not a valid image file").unwrap();
+            zip.start_file("003.png", opts).unwrap();
+            zip.write_all(&valid).unwrap();
+            zip.finish().unwrap();
+        }
+        let doc = CbzDocument::open(&path).unwrap();
+        let mut reader = Reader::new(doc, MemoryDisplay::new(16, 16), FitMode::Contain, 0);
+
+        // The good first page paints fine.
+        assert!(reader.show_current_page().is_ok());
+        // Turning onto the corrupt page must NOT drop the reader — it shows
+        // a placeholder and stays on that page.
+        assert!(
+            reader.next_page().is_ok(),
+            "a corrupt page must render a placeholder, not error out"
+        );
+        assert_eq!(reader.current_page(), 1);
+        // And the reader keeps working past it.
+        assert!(reader.next_page().is_ok());
+        assert_eq!(reader.current_page(), 2);
     }
 
     #[test]
