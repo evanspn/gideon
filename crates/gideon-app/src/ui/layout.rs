@@ -202,23 +202,6 @@ pub fn reader_zone_in_width(width: u32, x: u32) -> ReaderZone {
     }
 }
 
-/// Whether a physical page-turn button press should *advance* the reading
-/// (turn to the next page) given the current reading `rotation`.
-///
-/// The buttons sit on one bezel edge. Held upright (0°) or in either
-/// landscape (90°/270°) the forward button advances and the back button
-/// goes back — the same hand still reaches the same physical key. At 180°
-/// the device is upside down, so the two buttons have physically swapped
-/// places: forward now goes back and vice versa. `forward` is the
-/// page-forward button (`KEY_PAGE_FWD`); the return value is "advance".
-pub fn page_button_advances(forward: bool, rotation: u32) -> bool {
-    if rotation % 360 == 180 {
-        !forward
-    } else {
-        forward
-    }
-}
-
 /// Map a tap at panel coordinates `(x, y)` into reading-orientation
 /// coordinates for a reader rotated clockwise by `rotation` degrees.
 ///
@@ -368,18 +351,6 @@ mod tests {
         assert_eq!(l.reader_zone_rotated(450, 1199, 270), ReaderZone::PrevPage);
         assert_eq!(l.reader_zone_rotated(450, 600, 270), ReaderZone::Back);
         assert_eq!(l.reader_zone_rotated(450, 0, 270), ReaderZone::NextPage);
-    }
-
-    #[test]
-    fn page_buttons_swap_only_when_upside_down() {
-        // Upright and both landscapes: forward advances, back goes back.
-        for rot in [0u32, 90, 270] {
-            assert!(page_button_advances(true, rot), "forward advances at {rot}");
-            assert!(!page_button_advances(false, rot), "back goes back at {rot}");
-        }
-        // Upside down: the buttons have physically swapped places.
-        assert!(!page_button_advances(true, 180), "forward goes back at 180");
-        assert!(page_button_advances(false, 180), "back advances at 180");
     }
 
     #[test]

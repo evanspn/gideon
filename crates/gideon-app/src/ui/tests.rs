@@ -766,20 +766,20 @@ fn physical_forward_button_advances_when_upright() {
 }
 
 #[test]
-fn physical_page_buttons_swap_when_reading_upside_down() {
+fn physical_forward_button_advances_even_upside_down() {
+    // Matching KOReader: the physical page buttons never invert with
+    // rotation. Held upside down (180°) the forward button still advances.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
-    // Resume mid-chapter so a "back" turn is observable.
     let mut store = ProgressStore::default();
     store.update("Sample/vol1.cbz", 2, 5);
     store.save(&progress_path(&lib)).unwrap();
 
-    // Held upside down (180°), the forward button must page *back*.
     let events = vec![
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
-        UiEvent::PageForward,                // -> previous page (1), not 3
+        UiEvent::PageForward,                // -> next page (3), not back
         UiEvent::Tap { x: W / 2, y: H / 2 }, // center is Back at any rotation
     ];
     let mut app =
@@ -789,8 +789,8 @@ fn physical_page_buttons_swap_when_reading_upside_down() {
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
     assert_eq!(
         store.get("Sample/vol1.cbz").unwrap().current_page,
-        1,
-        "the forward button pages back when the reader is upside down"
+        3,
+        "the forward button advances regardless of rotation"
     );
 }
 
