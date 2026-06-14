@@ -24,6 +24,12 @@ pub use update::{apply_staged, check_update, stage_update, ReleaseInfo, DEFAULT_
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A transport failure that survived every retry — almost always "Wi-Fi
+    /// is off / out of range". Carries a plain, actionable message so the UI
+    /// can show it verbatim instead of a raw library error.
+    #[error("no network connection — check that Wi-Fi is on, then try again")]
+    Offline,
+
     #[error("failed to fetch {url}: {message}")]
     Fetch { url: String, message: String },
 
