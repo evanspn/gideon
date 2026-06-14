@@ -325,6 +325,11 @@ pub struct GyroTracker {
     candidate: Option<(u32, std::time::Instant)>,
     /// Whether landscape-right/left map to 270°/90° instead of 90°/270°.
     swap_landscape: bool,
+    /// The last raw `MSC_RAW` value logged, so the diagnostic prints each
+    /// distinct gsensor code the kernel emits exactly once per change (not
+    /// per event) — used to confirm on-device whether BOTH landscape codes
+    /// actually fire (some MTK units only report one).
+    last_logged_code: Option<i32>,
 }
 
 impl GyroTracker {
@@ -334,6 +339,7 @@ impl GyroTracker {
             observed: None,
             candidate: None,
             swap_landscape: std::env::var_os("GIDEON_GYRO_SWAP_LANDSCAPE").is_some(),
+            last_logged_code: None,
         }
     }
 
@@ -344,6 +350,19 @@ impl GyroTracker {
     pub fn observe(&mut self, ev: &libc::input_event, now: std::time::Instant) {
         if ev.type_ != EV_MSC || ev.code != MSC_RAW {
             return;
+        }
+        // Diagnostic: log each distinct gsensor code the kernel emits (once
+        // per change). If a unit's "landscape both ways feels the same", this
+        // shows whether both landscape codes (0x19 AND 0x1a) actually fire —
+        // some MTK kernels only report one, which no mapping can fix. Logs the
+        // raw value and how it maps, including codes gideon doesn't recognize.
+        if self.last_logged_code != Some(ev.value) {
+            self.last_logged_code = Some(ev.value);
+            eprintln!(
+                "gyro: MSC_RAW gsensor code {:#04x} -> rotation {:?}",
+                ev.value,
+                gsensor_to_rotation(ev.value, self.swap_landscape)
+            );
         }
         let Some(rotation) = gsensor_to_rotation(ev.value, self.swap_landscape) else {
             return;
@@ -1052,6 +1071,7 @@ mod tests {
             observed: None,
             candidate: None,
             swap_landscape: false,
+            last_logged_code: None,
         }
     }
 
