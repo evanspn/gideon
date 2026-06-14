@@ -295,6 +295,15 @@ const KEYBOARD_FULL_REFRESH_INTERVAL: u32 = 8;
 /// still works.
 const SLOW_TURN: std::time::Duration = std::time::Duration::from_millis(450);
 
+/// How long `ensure_online` waits for Wi-Fi to associate + get an address
+/// before giving up and letting the action surface the offline message.
+const WIFI_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// After a failed connect, skip the bring-up for this long so back-to-back
+/// network taps don't each freeze for the full timeout (no saved network,
+/// wrong password, captive portal).
+const WIFI_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(45);
+
 pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
@@ -314,6 +323,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Page turns between full (flashing) refreshes (settings.json
     /// `reader_full_refresh_interval`); higher = fewer flashes = smoother.
     full_refresh_interval: u32,
+    /// When the last Wi-Fi auto-connect attempt failed, to back off so every
+    /// network tap doesn't re-pay the full connect timeout.
+    last_wifi_fail: Option<std::time::Instant>,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
     /// Whether the reading orientation is locked. Locked: the accelerometer
@@ -377,6 +389,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
             full_refresh_interval: 8,
+            last_wifi_fail: None,
             reader_rotation: 0,
             rotation_locked: true,
             sleeper: None,
@@ -1250,6 +1263,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// errors is skipped (its name is noted) — one broken source must not
     /// kill the search.
     fn run_global_search(&mut self, query: &str) -> Result<()> {
+        self.ensure_online()?;
         let sources = self.gateway.installed_sources()?;
         let mut results: Vec<(SourceEntry, MangaEntry)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -1911,9 +1925,32 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if gideon_device::network::is_online() {
             return Ok(());
         }
-        self.show_status(&["Connecting to Wi-Fi…", "(up to 30 seconds)"])?;
+        // Don't make every tap pay a long connect when we just failed: a
+        // missing/wrong saved network or captive portal would otherwise
+        // freeze for the full timeout on every action. Within the backoff
+        // window, proceed straight to the action (which surfaces the clear
+        // offline message) instead of bringing the radio up again.
+        if self
+            .last_wifi_fail
+            .is_some_and(|t| t.elapsed() < WIFI_FAIL_BACKOFF)
+        {
+            return Ok(());
+        }
         gideon_device::network::bring_up_wifi();
-        gideon_device::network::wait_until_online(gideon_device::network::CONNECT_TIMEOUT);
+        // Poll with a visible per-second heartbeat so the e-ink panel doesn't
+        // look frozen (a motionless "Connecting…" reads as a crash and invites
+        // a force power-off). Repaint the elapsed-seconds counter each tick.
+        let start = std::time::Instant::now();
+        let mut online = gideon_device::network::is_online();
+        while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
+            self.show_status(&[
+                "Connecting to Wi-Fi…",
+                &format!("({}s)", start.elapsed().as_secs()),
+            ])?;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            online = gideon_device::network::is_online();
+        }
+        self.last_wifi_fail = (!online).then(std::time::Instant::now);
         Ok(())
     }
 
