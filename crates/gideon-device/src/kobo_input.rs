@@ -622,7 +622,13 @@ impl KoboTouch {
         let mut slept = false;
         for file in &self.devices {
             let _ = drain_events(file.as_raw_fd(), |ev| {
-                slept |= buttons.push(ev).is_some();
+                // Only a real power/cover press counts as a sleep request.
+                // Page-turn buttons also produce `Some(..)` here, so testing
+                // `.is_some()` would turn a flushed page-button mash into a
+                // spurious suspend — exactly what we're discarding.
+                if matches!(buttons.push(ev), Some(UiEvent::Sleep)) {
+                    slept = true;
+                }
             });
         }
         self.tracker = TouchTracker::new();
@@ -1197,6 +1203,40 @@ mod tests {
             }
         }
         assert_eq!(out, vec![UiEvent::Sleep, UiEvent::Tap { x: 100, y: 200 }]);
+    }
+
+    #[test]
+    fn flushing_a_page_button_mash_is_not_a_sleep_request() {
+        // Regression: `discard_taps` drains queued button events to decide if
+        // a real sleep happened during the flush, using the predicate below.
+        // A mashed page-turn button must NOT be mistaken for a power/cover
+        // press — otherwise flushing the mash after a slow page turn would
+        // synthesize a spurious suspend mid-read.
+        let mut buttons = ButtonTracker::new();
+        let mut slept = false;
+        let mash = [
+            ev(EV_KEY, KEY_PAGE_FWD, 1),
+            ev(EV_KEY, KEY_PAGE_FWD, 0),
+            ev(EV_KEY, KEY_PAGE_FWD, 1),
+            ev(EV_KEY, KEY_PAGE_BACK, 1),
+            ev(EV_KEY, KEY_PAGE_BACK, 0),
+        ];
+        for e in &mash {
+            if matches!(buttons.push(e), Some(UiEvent::Sleep)) {
+                slept = true;
+            }
+        }
+        assert!(!slept, "page-button presses must never count as a sleep");
+
+        // A genuine power press during the flush still counts as a sleep.
+        let mut buttons = ButtonTracker::new();
+        let mut slept = false;
+        for e in &[ev(EV_KEY, KEY_POWER, 1), ev(EV_KEY, KEY_POWER, 0)] {
+            if matches!(buttons.push(e), Some(UiEvent::Sleep)) {
+                slept = true;
+            }
+        }
+        assert!(slept, "a real power press during the flush still sleeps");
     }
 
     // --- gesture classification (tap vs swipe) ---
