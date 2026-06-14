@@ -38,7 +38,8 @@
       0/90/180/270 with rotation-aware tap zones; two-page spreads later)
 - [x] Accelerometer auto-rotation (the "auto" orientation follows how the
       device is physically held, via the Kobo gyro's `EV_MSC`/`MSC_RAW`
-      gsensor codes) with rotation-aware physical page-turn buttons
+      gsensor codes; settle window so the panel doesn't thrash at a tilt
+      boundary)
 
 ## v2 — online sources, end to end
 

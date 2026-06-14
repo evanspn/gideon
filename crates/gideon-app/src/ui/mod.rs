@@ -17,7 +17,7 @@ mod layout;
 mod tests;
 
 pub use gateway::{AidokuGateway, ChapterEntry, MangaEntry, SourceEntry, SourceGateway};
-pub use layout::{page_button_advances, Key, ReaderZone, TapTarget, UiLayout};
+pub use layout::{Key, ReaderZone, TapTarget, UiLayout};
 
 use std::path::{Path, PathBuf};
 
@@ -1665,19 +1665,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                         ReaderZone::Back => break,
                     },
-                    // Physical page-turn buttons follow the reading
-                    // orientation: held upside down (180°) the two keys have
-                    // swapped places, so the forward button goes back.
-                    Ok(ev @ (UiEvent::PageForward | UiEvent::PageBack)) => {
-                        let forward = matches!(ev, UiEvent::PageForward);
-                        if page_button_advances(forward, rotation) {
-                            if !reader.next_page()? && next_available {
-                                outcome = ReaderOutcome::NextChapter;
-                                break;
-                            }
-                        } else {
-                            reader.prev_page()?;
+                    // Physical page-turn buttons always page in the same
+                    // direction regardless of orientation: forward = next.
+                    // (Matching KOReader, which never inverts the keys by
+                    // rotation — that's a separate, explicit user setting.)
+                    Ok(UiEvent::PageForward) => {
+                        if !reader.next_page()? && next_available {
+                            outcome = ReaderOutcome::NextChapter;
+                            break;
                         }
+                    }
+                    Ok(UiEvent::PageBack) => {
+                        reader.prev_page()?;
                     }
                     // The accelerometer reported a new orientation: in "auto"
                     // mode rotate the reader to it; locked ignores it.
