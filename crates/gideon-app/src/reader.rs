@@ -27,8 +27,12 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 /// Do a full (flashing) e-ink refresh every N page turns to clear ghosting;
-/// partial refreshes in between keep page turns fast.
-const FULL_REFRESH_INTERVAL: u32 = 6;
+/// partial refreshes in between keep page turns fast. The full refresh is the
+/// slow, black-flashing one, so a larger interval = fewer flashes = smoother
+/// reading (at the cost of more ghosting between flashes). Manga line art
+/// ghosts little, so the default leans toward smoothness; the reader setting
+/// lets it be tuned further.
+const DEFAULT_FULL_REFRESH_INTERVAL: u32 = 8;
 
 /// Keep rendered pages cached only while each stays under this many
 /// screenfuls of pixels — webtoon-length FitWidth strips would otherwise
@@ -57,6 +61,9 @@ pub struct Reader<D: Display> {
     spare: Option<(usize, PageBuf)>,
     prefetcher: Prefetcher,
     turns_since_full_refresh: u32,
+    /// Page turns between full (flashing) refreshes; see
+    /// [`DEFAULT_FULL_REFRESH_INTERVAL`]. Settable from the reader settings.
+    full_refresh_interval: u32,
 }
 
 impl<D: Display> Reader<D> {
@@ -75,7 +82,15 @@ impl<D: Display> Reader<D> {
             spare: None,
             prefetcher,
             turns_since_full_refresh: 0,
+            full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
         }
+    }
+
+    /// Set how many page turns happen between full (flashing) refreshes. A
+    /// larger interval flashes less often (smoother) but lets ghosting build
+    /// up longer; clamped to at least 1 so a full refresh still happens.
+    pub fn set_full_refresh_interval(&mut self, interval: u32) {
+        self.full_refresh_interval = interval.max(1);
     }
 
     /// The current reading rotation in degrees.
@@ -347,7 +362,8 @@ impl<D: Display> Reader<D> {
     }
 
     fn bump_refresh_counter(&mut self) {
-        self.turns_since_full_refresh = (self.turns_since_full_refresh + 1) % FULL_REFRESH_INTERVAL;
+        self.turns_since_full_refresh =
+            (self.turns_since_full_refresh + 1) % self.full_refresh_interval.max(1);
     }
 
     /// The page-indicator label: "13/187", with the scroll position within
@@ -648,6 +664,8 @@ mod tests {
     fn page_turns_are_partial_until_interval() {
         let dir = tempfile::tempdir().unwrap();
         let mut reader = new_reader(dir.path(), 10);
+        // Pin a known interval so the test doesn't track the default.
+        reader.set_full_refresh_interval(6);
 
         reader.show_current_page().unwrap();
         for _ in 0..6 {
@@ -659,6 +677,26 @@ mod tests {
         assert_eq!(flushes[0], RefreshMode::Full);
         assert!(flushes[1..6].iter().all(|m| *m == RefreshMode::Partial));
         assert_eq!(flushes[6], RefreshMode::Full);
+    }
+
+    #[test]
+    fn full_refresh_interval_is_configurable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = new_reader(dir.path(), 20);
+        // A larger interval flashes less often: with 10, the first full
+        // refresh after the initial paint lands on turn 10, not before.
+        reader.set_full_refresh_interval(10);
+        reader.show_current_page().unwrap();
+        for _ in 0..10 {
+            reader.next_page().unwrap();
+        }
+        let flushes = &reader.display().flushes;
+        assert_eq!(flushes[0], RefreshMode::Full);
+        assert!(
+            flushes[1..10].iter().all(|m| *m == RefreshMode::Partial),
+            "turns 1..=9 stay partial at interval 10"
+        );
+        assert_eq!(flushes[10], RefreshMode::Full, "turn 10 wraps to full");
     }
 
     #[test]
