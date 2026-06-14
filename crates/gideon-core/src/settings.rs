@@ -74,6 +74,13 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_color_post_process")]
     pub color_post_process: String,
 
+    /// Page turns between full (flashing) e-ink refreshes. Higher flashes
+    /// less often (smoother reading) but lets ghosting build up longer.
+    /// Parsed leniently — out-of-range or wrong-typed values fall back to the
+    /// default (8); clamped to 4–24.
+    #[serde(deserialize_with = "lenient_full_refresh_interval")]
+    pub reader_full_refresh_interval: u32,
+
     /// Frontlight brightness percent (0–100), restored at startup and
     /// updated from the reader's right-edge slide. Parsed leniently.
     #[serde(deserialize_with = "lenient_percent")]
@@ -99,6 +106,7 @@ impl Default for Settings {
             reader_rotation: 0,
             reader_rotation_locked: true,
             color_post_process: "vivid".to_string(),
+            reader_full_refresh_interval: 8,
             frontlight_brightness: 20,
             frontlight_warmth: 0,
         }
@@ -182,6 +190,18 @@ fn lenient_color_post_process<'de, D: serde::Deserializer<'de>>(
             _ => "vivid".to_string(),
         },
     )
+}
+
+/// Lenient `reader_full_refresh_interval` parsing: a number clamped to
+/// 4–24; anything else (wrong type, missing, out of range) falls back to 8.
+fn lenient_full_refresh_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_u64() {
+        Some(n) if (4..=24).contains(&n) => n as u32,
+        _ => 8,
+    })
 }
 
 /// Lenient `reader_rotation` parsing: only 0/90/180/270 are kept; any other
@@ -309,6 +329,26 @@ mod tests {
         assert_eq!(s.reader_rotation, 0);
         assert!(s.reader_rotation_locked);
         assert_eq!(s.color_post_process, "vivid");
+        assert_eq!(s.reader_full_refresh_interval, 8);
+    }
+
+    #[test]
+    fn full_refresh_interval_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path())
+                .unwrap()
+                .reader_full_refresh_interval
+        };
+        assert_eq!(load(r#"{"reader_full_refresh_interval": 12}"#), 12);
+        assert_eq!(load(r#"{"reader_full_refresh_interval": 4}"#), 4);
+        assert_eq!(load(r#"{"reader_full_refresh_interval": 24}"#), 24);
+        // Out of range, wrong type and missing all fall back to 8.
+        assert_eq!(load(r#"{"reader_full_refresh_interval": 1}"#), 8);
+        assert_eq!(load(r#"{"reader_full_refresh_interval": 99}"#), 8);
+        assert_eq!(load(r#"{"reader_full_refresh_interval": "x"}"#), 8);
+        assert_eq!(load(r#"{}"#), 8);
     }
 
     #[test]
@@ -349,6 +389,7 @@ mod tests {
             reader_rotation: 90,
             reader_rotation_locked: false,
             color_post_process: "standard".into(),
+            reader_full_refresh_interval: 12,
             frontlight_brightness: 65,
             frontlight_warmth: 40,
         };

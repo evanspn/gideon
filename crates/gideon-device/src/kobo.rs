@@ -280,6 +280,12 @@ pub struct KoboDisplay {
     /// norm): probed from the kernel's reported red-channel offset at open
     /// instead of hardcoding one channel order.
     swap_rb: bool,
+    /// Reusable staging buffer for the per-blit "compose, then convert to
+    /// the framebuffer's pixel format" dance. Without it every page turn
+    /// allocated and filled a whole screen of bytes (2MB gray / 6MB RGB on
+    /// the Libra Colour); reusing it keeps the hot path allocation-free.
+    /// Grown on demand (gray vs RGB sizes), never shrunk.
+    scratch: Vec<u8>,
 }
 
 impl KoboDisplay {
@@ -395,6 +401,7 @@ impl KoboDisplay {
             cfa_flag: HWTCON_FLAG_CFA_EINK_G2,
             pending_partial_marker: None,
             swap_rb,
+            scratch: Vec::new(),
         })
     }
 
@@ -468,16 +475,18 @@ impl Display for KoboDisplay {
     }
 
     fn blit(&mut self, page: &GrayPage, offset_y: u32) -> Result<()> {
-        // Render into a contiguous grayscale buffer first, then convert to
-        // the framebuffer's pixel format row by row, honoring line stride.
-        let mut staging = vec![0xFFu8; (self.width * self.height) as usize];
-        blit_into(&mut staging, self.width, self.height, page, offset_y);
+        // Compose into the reusable staging buffer (blit_into re-clears it to
+        // white), then convert to the framebuffer's pixel format row by row,
+        // honoring line stride.
+        let (w, h, bpp) = (self.width, self.height, self.bytes_per_pixel as usize);
+        self.scratch.resize((w * h) as usize, 0xFF);
+        blit_into(&mut self.scratch, w, h, page, offset_y);
 
-        let bpp = self.bytes_per_pixel as usize;
-        for y in 0..self.height as usize {
-            let src_row = &staging[y * self.width as usize..(y + 1) * self.width as usize];
-            let dst = y * self.line_length as usize;
-            let dst_row = &mut self.map[dst..dst + self.width as usize * bpp];
+        let line = self.line_length as usize;
+        for y in 0..h as usize {
+            let src_row = &self.scratch[y * w as usize..(y + 1) * w as usize];
+            let dst = y * line;
+            let dst_row = &mut self.map[dst..dst + w as usize * bpp];
             write_gray_row(src_row, dst_row, bpp);
         }
         self.last_blit_color = false;
@@ -487,14 +496,15 @@ impl Display for KoboDisplay {
     fn blit_rgb(&mut self, page: &RgbPage, offset_y: u32) -> Result<()> {
         // Same staging dance as `blit`, but the color survives all the way
         // into the framebuffer (the Kaleido panel's CFA does the rest).
-        let mut staging = vec![0xFFu8; (self.width * self.height * 3) as usize];
-        blit_rgb_into(&mut staging, self.width, self.height, page, offset_y);
+        let (w, h, bpp) = (self.width, self.height, self.bytes_per_pixel as usize);
+        self.scratch.resize((w * h * 3) as usize, 0xFF);
+        blit_rgb_into(&mut self.scratch, w, h, page, offset_y);
 
-        let bpp = self.bytes_per_pixel as usize;
-        for y in 0..self.height as usize {
-            let src_row = &staging[y * self.width as usize * 3..(y + 1) * self.width as usize * 3];
-            let dst = y * self.line_length as usize;
-            let dst_row = &mut self.map[dst..dst + self.width as usize * bpp];
+        let line = self.line_length as usize;
+        for y in 0..h as usize {
+            let src_row = &self.scratch[y * w as usize * 3..(y + 1) * w as usize * 3];
+            let dst = y * line;
+            let dst_row = &mut self.map[dst..dst + w as usize * bpp];
             write_rgb_row(src_row, dst_row, bpp, self.swap_rb);
         }
         self.last_blit_color = true;

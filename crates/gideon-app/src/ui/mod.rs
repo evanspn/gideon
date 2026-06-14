@@ -42,6 +42,9 @@ const SHELF_COLUMNS: u32 = 3;
 
 /// Values the Settings screen cycles through per tap.
 const PREDOWNLOAD_STEPS: [u32; 5] = [0, 1, 2, 3, 5];
+/// Full-refresh interval choices (page turns between flashes); higher is
+/// smoother but ghosts more. Must stay within settings' 4–24 clamp.
+const FULL_REFRESH_STEPS: [u32; 4] = [6, 8, 12, 16];
 const STORAGE_LIMIT_STEPS: [u64; 4] = [
     500 * 1024 * 1024,
     1024 * 1024 * 1024,
@@ -308,6 +311,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     stack: Vec<Screen>,
     /// Reader fit mode (from settings.json `reader_fit`).
     reader_fit: FitMode,
+    /// Page turns between full (flashing) refreshes (settings.json
+    /// `reader_full_refresh_interval`); higher = fewer flashes = smoother.
+    full_refresh_interval: u32,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
     /// Whether the reading orientation is locked. Locked: the accelerometer
@@ -370,6 +376,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             layout,
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
+            full_refresh_interval: 8,
             reader_rotation: 0,
             rotation_locked: true,
             sleeper: None,
@@ -444,9 +451,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Also seeds the in-memory orientation-lock state, so the menus know
     /// up front whether the accelerometer should drive auto-rotation.
     pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
-        self.rotation_locked = gideon_core::Settings::load(&dir)
-            .map(|s| s.reader_rotation_locked)
-            .unwrap_or(true);
+        if let Ok(settings) = gideon_core::Settings::load(&dir) {
+            self.rotation_locked = settings.reader_rotation_locked;
+            self.full_refresh_interval = settings.reader_full_refresh_interval;
+        }
         self.settings_dir = Some(dir);
         self
     }
@@ -1120,6 +1128,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // Apply to the live panel so the next color refresh shows it.
                 self.display.set_color_post_process(next);
             }
+            5 => {
+                // Cycle the full-refresh interval: fewer flashes = smoother,
+                // more ghosting. Takes effect on the next opened book.
+                settings.reader_full_refresh_interval =
+                    cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
+                self.full_refresh_interval = settings.reader_full_refresh_interval;
+            }
             _ => return Ok(()),
         }
         self.save_settings(&settings);
@@ -1561,6 +1576,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut outcome = ReaderOutcome::Back;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
+            reader.set_full_refresh_interval(self.full_refresh_interval);
             reader.resume_from(&store, key);
             // Warm the render-ahead at the resume page before the first
             // paint: the decode + scale + dither run on the prefetch
@@ -2824,6 +2840,13 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
         (format!("Reader fit: {fit}"), true),
         (format!("Check updates automatically: {auto}"), true),
         (format!("Color boost: {color}"), true),
+        (
+            format!(
+                "Full refresh: every {} pages",
+                s.reader_full_refresh_interval
+            ),
+            true,
+        ),
     ]
 }
 
