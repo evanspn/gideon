@@ -14,6 +14,7 @@ pub mod kobo;
 #[cfg(feature = "kobo")]
 pub mod kobo_input;
 pub mod light;
+pub mod network;
 pub mod power;
 
 pub use input::{FakeInput, InputSource, TouchTransform, UiEvent};

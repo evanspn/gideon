@@ -989,6 +989,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn open_sources(&mut self) -> Result<()> {
+        self.ensure_online()?;
         // The available-sources fetch hits the network: without feedback
         // the tap looks dead for seconds on device WiFi.
         self.show_status(&["Loading sources…"])?;
@@ -997,6 +998,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn install_and_refresh(&mut self, source: &SourceEntry) -> Result<()> {
+        self.ensure_online()?;
         self.show_status(&[&format!("Installing {}…", source.name)])?;
         self.gateway
             .install_source(&source.id)
@@ -1010,6 +1012,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn open_manga_list(&mut self, source: &SourceEntry, listing: &str) -> Result<()> {
+        self.ensure_online()?;
         self.show_status(&[&format!("Loading {listing}…")])?;
         let mangas = self
             .gateway
@@ -1222,6 +1225,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Search one source; results open as a normal manga list.
     fn run_source_search(&mut self, source: &SourceEntry, query: &str) -> Result<()> {
+        self.ensure_online()?;
         self.show_status(&[&format!("Searching for \"{query}\"…")])?;
         let mangas = self
             .gateway
@@ -1285,6 +1289,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn open_chapter_list(&mut self, source: &SourceEntry, manga: &MangaEntry) -> Result<()> {
+        self.ensure_online()?;
         self.show_status(&[&format!("Loading chapters of {}…", manga.title)])?;
         let chapters = self
             .gateway
@@ -1299,6 +1304,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn check_updates(&mut self) -> Result<()> {
+        self.ensure_online()?;
         self.show_status(&["Checking for updates…"])?;
         let check = self
             .gateway
@@ -1359,6 +1365,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         chapter: &ChapterEntry,
     ) -> Result<PathBuf> {
         let label = chapter.label();
+        self.ensure_online()?;
         self.show_status(&[&format!("Downloading {label}…")])?;
 
         let layout = self.layout;
@@ -1890,6 +1897,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// [`Self::show_status_full`] instead.
     fn show_status(&mut self, lines: &[&str]) -> Result<()> {
         self.show_status_mode(lines, RefreshMode::Partial)
+    }
+
+    /// Bring Wi-Fi up if we're offline, before a network action. A user who
+    /// launched gideon with Wi-Fi off in Nickel (or whose lease dropped) is
+    /// recovered automatically — "it just fixes itself" — instead of only
+    /// seeing "no network". Best-effort and additive: when already connected
+    /// it returns instantly and changes nothing; when offline it paints a
+    /// "Connecting to Wi-Fi…" status, brings the radio up and waits for an
+    /// address. If it still can't connect, the action proceeds and surfaces
+    /// the clear offline message itself.
+    fn ensure_online(&mut self) -> Result<()> {
+        if gideon_device::network::is_online() {
+            return Ok(());
+        }
+        self.show_status(&["Connecting to Wi-Fi…", "(up to 30 seconds)"])?;
+        gideon_device::network::bring_up_wifi();
+        gideon_device::network::wait_until_online(gideon_device::network::CONNECT_TIMEOUT);
+        Ok(())
     }
 
     /// A status that stays on the panel (suspend notices): full refresh,
