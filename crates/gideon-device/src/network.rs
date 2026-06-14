@@ -11,9 +11,9 @@
 //!
 //! Everything here is **best-effort and additive**: it only acts when we are
 //! actually offline (the connected path returns instantly and untouched), and
-//! it only runs on a real device — off-device (desktop/CI) the interface
-//! sysfs dir is absent, so every call is a no-op and reports "online" so tests
-//! never try to manage Wi-Fi.
+//! it only runs on a real device — off-device (desktop/CI) the Kobo marker
+//! `/mnt/onboard` is absent, so every call is a no-op and reports "online" so
+//! tests never try to manage Wi-Fi.
 //!
 //! Device-specific facts are sourced from KOReader (`platform/kobo/
 //! enable-wifi.sh`, `obtain-ip.sh`; `frontend/ui/network/manager.lua`'s
@@ -48,11 +48,14 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
-/// Whether the interface exists in sysfs — i.e. we're on a device with this
-/// network interface. When it's absent we're not on a Kobo (desktop/CI), so
-/// every operation here becomes a no-op.
-fn on_device(iface: &str) -> bool {
-    Path::new(&format!("/sys/class/net/{iface}")).exists()
+/// Whether we're on a Kobo, independent of Wi-Fi state. We can't key this on
+/// the interface existing: with the radio fully off the MTK module may be
+/// unloaded and the interface absent — which is exactly the cold case we must
+/// still bring up. `/mnt/onboard` (Kobo's user partition) is present whatever
+/// the radio is doing; off-device (desktop/CI) it's absent and every op here
+/// no-ops. `GIDEON_WIFI_FORCE=1` forces on (for on-desktop testing).
+fn on_device() -> bool {
+    std::env::var("GIDEON_WIFI_FORCE").as_deref() == Ok("1") || Path::new("/mnt/onboard").is_dir()
 }
 
 /// `/sys/class/net/<iface>/operstate == "up"` — for Wi-Fi this means
@@ -65,29 +68,28 @@ fn operstate_up(iface: &str) -> bool {
 }
 
 /// Whether the interface has an IPv4 address assigned (KOReader's
-/// `ifHasAnAddress`, via busybox `ifconfig` rather than getifaddrs FFI).
-fn has_ipv4(iface: &str) -> bool {
-    Command::new("ifconfig")
-        .arg(iface)
-        .output()
-        .ok()
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            // busybox: "inet addr:192.168…"; iproute2/newer: "inet 192.168…".
-            out.contains("inet addr:") || out.contains("inet ")
-        })
-        .unwrap_or(false)
+/// `ifHasAnAddress`). `Some(false)` = ran the check and there's no address;
+/// `None` = couldn't determine (the `ifconfig` subprocess failed to run).
+/// The distinction matters: a fork failure must NOT be read as "offline" and
+/// trigger a disruptive bring-up on a working link.
+fn has_ipv4(iface: &str) -> Option<bool> {
+    let out = Command::new("ifconfig").arg(iface).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // busybox: "inet addr:192.168…"; iproute2/newer: "inet 192.168…".
+    Some(text.contains("inet addr:") || text.contains("inet "))
 }
 
-/// True when we have a usable connection: operstate up *and* an IPv4 address.
-/// Off-device (no such interface) we report online so nothing tries to manage
-/// Wi-Fi where there's none to manage.
+/// True when we have a usable connection. Off-device we report online so
+/// nothing tries to manage Wi-Fi where there's none. On-device: operstate
+/// must be `up` (a reliable sysfs read), AND the interface must have an IPv4
+/// — but if we *can't determine* the address (subprocess failed), we trust
+/// operstate and stay "online" rather than disturb a possibly-working link.
 pub fn is_online() -> bool {
-    let iface = interface();
-    if !on_device(&iface) {
+    if !on_device() {
         return true;
     }
-    operstate_up(&iface) && has_ipv4(&iface)
+    let iface = interface();
+    operstate_up(&iface) && has_ipv4(&iface).unwrap_or(true)
 }
 
 /// Fire the best-effort bring-up sequence (modules → power → ifup →
@@ -96,10 +98,10 @@ pub fn is_online() -> bool {
 /// shell script so the multi-step KOReader sequence stays legible; failures of
 /// individual steps are swallowed (the device may already be partway up).
 pub fn bring_up_wifi() {
-    let iface = interface();
-    if !on_device(&iface) || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
+    if !on_device() || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
         return;
     }
+    let iface = interface();
     let _ = Command::new("sh")
         .arg("-c")
         .arg(enable_script(&iface))
@@ -174,6 +176,11 @@ ifconfig {iface} up 2>/dev/null || :
 pkill -0 wpa_supplicant 2>/dev/null || \
   wpa_supplicant -D nl80211 -s -i {iface} -c {conf} -C /var/run/wpa_supplicant -B 2>/dev/null || :
 if command -v dhcpcd >/dev/null 2>&1; then
+  # Release any stale/contending lease first (Nickel's dhcpcd is left alive
+  # by the launcher, so a bare second dhcpcd would fight it and hang) — this
+  # mirrors KOReader's release-ip.sh before obtain-ip.sh. Only reached when
+  # we're already offline, so there's no good lease to protect.
+  dhcpcd -k {iface} 2>/dev/null || :
   dhcpcd -t 30 -w {iface} 2>/dev/null || :
 else
   udhcpc -i {iface} -t 5 -T 3 -n -q 2>/dev/null || :
@@ -199,13 +206,18 @@ mod tests {
 
     #[test]
     fn off_device_is_treated_as_online() {
-        // CI/desktop has no such interface, so management is skipped and we
-        // report online (never try to bring Wi-Fi up where there's none).
-        assert!(!on_device("definitely-not-a-real-iface-zzz"));
-        // is_online() short-circuits to true when the iface sysfs is absent.
-        std::env::set_var("GIDEON_WIFI_INTERFACE", "definitely-not-a-real-iface-zzz");
-        assert!(is_online());
-        std::env::remove_var("GIDEON_WIFI_INTERFACE");
+        // CI/desktop has no /mnt/onboard, so Wi-Fi management is skipped and
+        // we report online (never try to bring Wi-Fi up where there's none).
+        assert!(!on_device(), "CI/desktop must not be detected as a Kobo");
+        assert!(is_online(), "off-device short-circuits to online");
+    }
+
+    #[test]
+    fn has_ipv4_never_claims_an_address_for_a_bogus_interface() {
+        // Either Some(false) (ifconfig ran, no inet) or None (ifconfig absent
+        // in CI) — but never Some(true). The None case is precisely why
+        // is_online() trusts operstate instead of declaring offline.
+        assert_ne!(has_ipv4("definitely-not-a-real-iface-zzz"), Some(true));
     }
 
     #[test]
@@ -218,10 +230,17 @@ mod tests {
         assert!(s.contains("ifconfig eth0 up"));
         assert!(s.contains("wpa_supplicant -D nl80211 -s -i eth0"));
         assert!(s.contains("dhcpcd -t 30 -w eth0"));
+        // Release a stale/contending lease before re-acquiring (KOReader's
+        // release-ip.sh before obtain-ip.sh).
+        assert!(s.contains("dhcpcd -k eth0"));
         let drv = s.find("/dev/wmtWifi").unwrap();
         let ifup = s.find("ifconfig eth0 up").unwrap();
-        let dhcp = s.find("dhcpcd").unwrap();
-        assert!(drv < ifup && ifup < dhcp, "steps must be ordered");
+        let release = s.find("dhcpcd -k eth0").unwrap();
+        let acquire = s.find("dhcpcd -t 30 -w eth0").unwrap();
+        assert!(
+            drv < ifup && ifup < release && release < acquire,
+            "steps must be ordered: power, ifup, release, acquire"
+        );
     }
 
     #[test]
