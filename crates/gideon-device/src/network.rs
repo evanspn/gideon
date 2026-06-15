@@ -93,19 +93,24 @@ pub fn is_online() -> bool {
 }
 
 /// Fire the best-effort bring-up sequence (modules → power → ifup →
-/// wpa_supplicant → DHCP). Returns immediately if already online, off-device,
-/// or opted out via `GIDEON_WIFI_AUTOENABLE=0`. The work is delegated to a
-/// shell script so the multi-step KOReader sequence stays legible; failures of
-/// individual steps are swallowed (the device may already be partway up).
+/// wpa_supplicant → scan/re-associate → DHCP) and return **immediately**.
+/// Returns without doing anything if off-device or opted out via
+/// `GIDEON_WIFI_AUTOENABLE=0`. The sequence is run **detached in the
+/// background** (`( … ) &`) — its slow steps (the chip waking up, a DHCP
+/// wait of up to 30s) must NOT block the caller, so the UI can show a
+/// cancellable "Connecting…" status and poll [`is_online`] for the result.
+/// Failures of individual steps are swallowed (the device may already be
+/// partway up).
 pub fn bring_up_wifi() {
     if !on_device() || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
         return;
     }
     let iface = interface();
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(enable_script(&iface))
-        .status();
+    // Background the whole script and detach its I/O so `sh` returns at once;
+    // the work continues reparented to init. A lease that lands after the UI
+    // stops waiting still leaves the device online for the next action.
+    let detached = format!("( {} ) </dev/null >/dev/null 2>&1 &", enable_script(&iface));
+    let _ = Command::new("sh").arg("-c").arg(detached).status();
 }
 
 /// Poll until [`is_online`] or `timeout`. Returns whether we got online.
@@ -175,6 +180,15 @@ sleep 1
 ifconfig {iface} up 2>/dev/null || :
 pkill -0 wpa_supplicant 2>/dev/null || \
   wpa_supplicant -D nl80211 -s -i {iface} -c {conf} -C /var/run/wpa_supplicant -B 2>/dev/null || :
+# Actively kick a scan + (re)association instead of passively hoping the
+# radio reconnects on its own — the chip needs a moment to come up after
+# sleep, and a supplicant that's already running may be sitting idle. Give it
+# a beat to scan, then re-associate against the saved networks.
+if command -v wpa_cli >/dev/null 2>&1; then
+  wpa_cli -i {iface} -p /var/run/wpa_supplicant scan 2>/dev/null || :
+  sleep 2
+  wpa_cli -i {iface} -p /var/run/wpa_supplicant reassociate 2>/dev/null || :
+fi
 if command -v dhcpcd >/dev/null 2>&1; then
   # Release any stale/contending lease first (Nickel's dhcpcd is left alive
   # by the launcher, so a bare second dhcpcd would fight it and hang) — this
@@ -230,6 +244,9 @@ mod tests {
         assert!(s.contains("ifconfig eth0 up"));
         assert!(s.contains("wpa_supplicant -D nl80211 -s -i eth0"));
         assert!(s.contains("dhcpcd -t 30 -w eth0"));
+        // Actively kicks a scan + re-association rather than passively waiting.
+        assert!(s.contains("wpa_cli -i eth0"));
+        assert!(s.contains("reassociate"));
         // Release a stale/contending lease before re-acquiring (KOReader's
         // release-ip.sh before obtain-ip.sh).
         assert!(s.contains("dhcpcd -k eth0"));

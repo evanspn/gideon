@@ -671,6 +671,13 @@ impl KoboTouch {
     /// suspend/resume cycle) are dropped; losing the touch panel is fatal,
     /// so the app exits to the launcher instead of spinning on a dead fd.
     fn poll_and_read(&mut self) -> Result<()> {
+        self.poll_and_read_until(None)
+    }
+
+    /// As [`Self::poll_and_read`], but cap the `poll(2)` wait at `max_wait`
+    /// (in addition to any pending gyro-settle deadline) so a caller can poll
+    /// for input with a timeout.
+    fn poll_and_read_until(&mut self, max_wait: Option<std::time::Duration>) -> Result<()> {
         let mut fds: Vec<libc::pollfd> = self
             .devices
             .iter()
@@ -680,10 +687,11 @@ impl KoboTouch {
                 revents: 0,
             })
             .collect();
-        // Wait indefinitely, unless the gyro has an orientation settling: then
-        // cap the wait at the remaining settle window so the rotation can fire
-        // on a timeout even though the driver sends no confirming re-report.
-        let timeout = match self.gyro.time_until_settle(std::time::Instant::now()) {
+        // Wait indefinitely, unless the gyro has an orientation settling or the
+        // caller capped the wait: then poll only that long, so a rotation fires
+        // on its timeout and a caller-supplied timeout is honored.
+        let settle = self.gyro.time_until_settle(std::time::Instant::now());
+        let timeout = match settle.into_iter().chain(max_wait).min() {
             Some(d) => (d.as_millis().min(i32::MAX as u128) as libc::c_int).max(0),
             None => -1,
         };
@@ -825,6 +833,14 @@ impl InputSource for KoboTouch {
             }
             self.poll_and_read()?;
         }
+    }
+
+    fn poll_event(&mut self, timeout: std::time::Duration) -> Result<Option<UiEvent>> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
+        self.poll_and_read_until(Some(timeout))?;
+        Ok(self.pending.pop_front())
     }
 
     fn discard_queued(&mut self) {
