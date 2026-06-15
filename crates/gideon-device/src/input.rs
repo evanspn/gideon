@@ -47,6 +47,16 @@ pub trait InputSource {
     /// Block until the next event arrives.
     fn next_event(&mut self) -> crate::Result<UiEvent>;
 
+    /// Wait up to `timeout` for the next event: `Some(event)` if one arrived,
+    /// `None` on timeout. Lets a caller poll for input while doing something
+    /// else (e.g. show a cancellable "Connecting to Wi-Fi…" status without
+    /// blocking the whole screen). Default: sleep the timeout and report no
+    /// event — only the real hardware backend can poll mid-wait.
+    fn poll_event(&mut self, timeout: std::time::Duration) -> crate::Result<Option<UiEvent>> {
+        std::thread::sleep(timeout);
+        Ok(None)
+    }
+
     /// Drop any events that queued up while the UI was busy (e.g. taps made
     /// during a long download) so they don't fire stale actions. Default:
     /// no-op — test inputs replay their script unaffected.
@@ -100,6 +110,11 @@ impl InputSource for FakeInput {
         self.events
             .next()
             .ok_or_else(|| crate::Error::Display("fake input exhausted".to_string()))
+    }
+
+    fn poll_event(&mut self, _timeout: std::time::Duration) -> crate::Result<Option<UiEvent>> {
+        // Replay the script without sleeping: the next event if any, else None.
+        Ok(self.events.next())
     }
 
     fn refresh_devices(&mut self) {
@@ -303,6 +318,19 @@ mod tests {
         assert_eq!(input.next_event().unwrap(), UiEvent::Tap { x: 1, y: 2 });
         assert_eq!(input.next_event().unwrap(), UiEvent::Tap { x: 3, y: 4 });
         assert!(input.next_event().is_err());
+    }
+
+    #[test]
+    fn poll_event_returns_a_pending_event_then_none() {
+        // The cancellable-connect poll: a queued event surfaces (would cancel
+        // the wait), and an empty queue reports no event without blocking.
+        let mut input = FakeInput::new(vec![UiEvent::Tap { x: 5, y: 6 }]);
+        let t = std::time::Duration::from_millis(10);
+        assert_eq!(
+            input.poll_event(t).unwrap(),
+            Some(UiEvent::Tap { x: 5, y: 6 })
+        );
+        assert_eq!(input.poll_event(t).unwrap(), None);
     }
 
     // Raw panel: 0..=1000 both axes. Screen: 101x201 so scaled coordinates

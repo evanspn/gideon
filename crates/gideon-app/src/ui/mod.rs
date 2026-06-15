@@ -1950,20 +1950,38 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         gideon_device::network::bring_up_wifi();
-        // Poll with a visible per-second heartbeat so the e-ink panel doesn't
-        // look frozen (a motionless "Connecting…" reads as a crash and invites
-        // a force power-off). Repaint the elapsed-seconds counter each tick.
+        // Wait for association with a live per-second heartbeat (a motionless
+        // "Connecting…" reads as a crash) — but the screen is NOT locked: each
+        // tick we poll input for up to a second, and ANY tap/button/cover
+        // cancels the wait instead of holding the whole UI hostage. The radio
+        // needs a moment to come up after sleep, so we keep scanning until the
+        // timeout or the user gives up.
         let start = std::time::Instant::now();
         let mut online = gideon_device::network::is_online();
+        let mut cancelled = false;
         while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
             self.show_status(&[
                 "Connecting to Wi-Fi…",
-                &format!("({}s)", start.elapsed().as_secs()),
+                &format!("({}s) · tap to cancel", start.elapsed().as_secs()),
             ])?;
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            // Poll input for ~1s rather than sleeping blind: a deliberate
+            // press means "stop waiting, I'll deal with it".
+            if self
+                .input
+                .poll_event(std::time::Duration::from_secs(1))?
+                .is_some()
+            {
+                cancelled = true;
+                break;
+            }
             online = gideon_device::network::is_online();
         }
+        // Back off after a failure OR a cancel, so the next tap doesn't
+        // immediately re-enter a long wait the user just dismissed.
         self.last_wifi_fail = (!online).then(std::time::Instant::now);
+        if cancelled {
+            self.show_status(&["Wi-Fi cancelled."])?;
+        }
         Ok(())
     }
 
