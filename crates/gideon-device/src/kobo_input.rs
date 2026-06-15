@@ -277,13 +277,14 @@ impl ButtonTracker {
 /// already normalized to upright at startup, so reading rotation 0 matches
 /// the device held the right way up.
 ///
-/// Which landscape is 90° vs 270° depends on the panel's mounting; the
-/// canonical mapping is landscape-right → 90°, landscape-left → 270°.
-/// `swap_landscape` (env `GIDEON_GYRO_SWAP_LANDSCAPE`) flips the two for
-/// panels mounted the other way. Face-up / face-down (codes 0x1b/0x1c) and
-/// anything unrecognized return `None` — keep the current rotation.
+/// Which landscape is 90° vs 270° depends on the panel's mounting; on the
+/// Libra Colour the orientation that reads right-side-up is landscape-right
+/// → 270°, landscape-left → 90°. `swap_landscape` (env
+/// `GIDEON_GYRO_SWAP_LANDSCAPE`) flips the two back for panels mounted the
+/// other way. Face-up / face-down (codes 0x1b/0x1c) and anything
+/// unrecognized return `None` — keep the current rotation.
 fn gsensor_to_rotation(value: i32, swap_landscape: bool) -> Option<u32> {
-    let (landscape_right, landscape_left) = if swap_landscape { (270, 90) } else { (90, 270) };
+    let (landscape_right, landscape_left) = if swap_landscape { (90, 270) } else { (270, 90) };
     match value {
         MSC_RAW_GSENSOR_PORTRAIT_UP => Some(0),
         MSC_RAW_GSENSOR_PORTRAIT_DOWN => Some(180),
@@ -1032,11 +1033,11 @@ mod tests {
         );
         assert_eq!(
             gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT, false),
-            Some(90)
+            Some(270)
         );
         assert_eq!(
             gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_LEFT, false),
-            Some(270)
+            Some(90)
         );
         // Face up / face down (0x1b / 0x1c) and junk keep the rotation.
         assert_eq!(gsensor_to_rotation(0x1b, false), None);
@@ -1057,11 +1058,11 @@ mod tests {
         );
         assert_eq!(
             gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_RIGHT, true),
-            Some(270)
+            Some(90)
         );
         assert_eq!(
             gsensor_to_rotation(MSC_RAW_GSENSOR_LANDSCAPE_LEFT, true),
-            Some(90)
+            Some(270)
         );
     }
 
@@ -1086,7 +1087,7 @@ mod tests {
         // Past the window it fires exactly once.
         assert_eq!(
             g.settled(t0 + GYRO_SETTLE),
-            Some(UiEvent::Rotate { rotation: 90 })
+            Some(UiEvent::Rotate { rotation: 270 })
         );
         assert_eq!(g.settled(t0 + GYRO_SETTLE * 2), None, "fires only once");
         // A re-report of the same orientation does not fire again.
@@ -1125,10 +1126,10 @@ mod tests {
         g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_LEFT), t0);
         assert_eq!(
             g.settled(t0 + GYRO_SETTLE),
-            Some(UiEvent::Rotate { rotation: 270 })
+            Some(UiEvent::Rotate { rotation: 90 })
         );
         // No new physical movement, but resync re-applies the current pose.
-        assert_eq!(g.resync(), Some(UiEvent::Rotate { rotation: 270 }));
+        assert_eq!(g.resync(), Some(UiEvent::Rotate { rotation: 90 }));
         // With no orientation ever seen, resync has nothing to apply.
         assert_eq!(gyro().resync(), None);
     }
