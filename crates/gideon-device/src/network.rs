@@ -140,6 +140,183 @@ pub fn disable_wifi() {
     let _ = Command::new("sh").arg("-c").arg(script).status();
 }
 
+/// A nearby Wi-Fi network discovered by a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    /// Signal strength in dBm (closer to 0 = stronger).
+    pub signal: i32,
+    /// Needs a password (WPA/WPA2/WEP).
+    pub secured: bool,
+    /// wpa_supplicant already has saved credentials for it.
+    pub saved: bool,
+    /// Currently associated with it.
+    pub connected: bool,
+}
+
+impl WifiNetwork {
+    /// Signal as 0–4 bars, for the UI.
+    pub fn bars(&self) -> u8 {
+        match self.signal {
+            s if s >= -55 => 4,
+            s if s >= -65 => 3,
+            s if s >= -75 => 2,
+            s if s >= -85 => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// The wpa_supplicant control socket path (matches [`enable_script`]).
+const WPA_CTRL: &str = "/var/run/wpa_supplicant";
+
+/// Run `wpa_cli` against the supplicant on `iface`; stdout, or `None` if it
+/// couldn't run.
+fn wpa_cli(iface: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("wpa_cli")
+        .args(["-i", iface, "-p", WPA_CTRL])
+        .args(args)
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Parse `wpa_cli scan_results` (tab-separated `bssid / freq / signal / flags
+/// / ssid`, with a header line) into `(ssid, signal_dbm, secured)`. Header,
+/// blank and hidden (SSID-less) rows are dropped. Pure, for testing.
+fn parse_scan_results(output: &str) -> Vec<(String, i32, bool)> {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut f = line.split('\t');
+            let _bssid = f.next()?;
+            let _freq = f.next()?;
+            let signal = f.next()?.trim().parse::<i32>().ok()?;
+            let flags = f.next()?;
+            let ssid = f.next()?.trim();
+            if ssid.is_empty() {
+                return None;
+            }
+            let secured = flags.contains("WPA") || flags.contains("WEP") || flags.contains("RSN");
+            Some((ssid.to_string(), signal, secured))
+        })
+        .collect()
+}
+
+/// The currently-associated SSID, if any (`wpa_cli status`).
+fn current_ssid(iface: &str) -> Option<String> {
+    wpa_cli(iface, &["status"])?
+        .lines()
+        .find_map(|l| l.strip_prefix("ssid=").map(str::to_string))
+}
+
+/// SSIDs wpa_supplicant has saved (`wpa_cli list_networks`, tab `id / ssid`).
+fn saved_ssids(iface: &str) -> Vec<String> {
+    wpa_cli(iface, &["list_networks"])
+        .into_iter()
+        .flat_map(|out| {
+            out.lines()
+                .skip(1)
+                .filter_map(|l| l.split('\t').nth(1).map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The saved-network id for `ssid`, if wpa_supplicant has it.
+fn saved_network_id(iface: &str, ssid: &str) -> Option<String> {
+    wpa_cli(iface, &["list_networks"])?
+        .lines()
+        .skip(1)
+        .find_map(|l| {
+            let mut f = l.split('\t');
+            let id = f.next()?.trim();
+            let s = f.next()?.trim();
+            (s == ssid).then(|| id.to_string())
+        })
+}
+
+/// Scan for nearby networks: trigger a scan, wait briefly, parse the results
+/// and annotate each with saved/connected state — strongest signal per SSID,
+/// connected one first. Best-effort: empty off-device or when wpa_cli is
+/// unavailable.
+pub fn scan_networks() -> Vec<WifiNetwork> {
+    if !on_device() {
+        return Vec::new();
+    }
+    let iface = interface();
+    let _ = wpa_cli(&iface, &["scan"]);
+    std::thread::sleep(Duration::from_secs(3));
+    let results = wpa_cli(&iface, &["scan_results"]).unwrap_or_default();
+    let saved = saved_ssids(&iface);
+    let connected = current_ssid(&iface);
+
+    let mut best: std::collections::BTreeMap<String, (i32, bool)> =
+        std::collections::BTreeMap::new();
+    for (ssid, signal, secured) in parse_scan_results(&results) {
+        let e = best.entry(ssid).or_insert((i32::MIN, secured));
+        if signal > e.0 {
+            *e = (signal, secured);
+        }
+    }
+    let mut nets: Vec<WifiNetwork> = best
+        .into_iter()
+        .map(|(ssid, (signal, secured))| WifiNetwork {
+            saved: saved.iter().any(|s| s == &ssid),
+            connected: connected.as_deref() == Some(ssid.as_str()),
+            ssid,
+            signal,
+            secured,
+        })
+        .collect();
+    nets.sort_by(|a, b| b.connected.cmp(&a.connected).then(b.signal.cmp(&a.signal)));
+    nets
+}
+
+/// Connect to `ssid` (`password = None` for an open or already-saved network):
+/// reuse the saved network or add a fresh one, save it, and kick DHCP in the
+/// background. The caller polls [`is_online`] for the result. No-op off-device.
+pub fn connect_network(ssid: &str, password: Option<&str>) -> bool {
+    if !on_device() {
+        return false;
+    }
+    let iface = interface();
+    // wpa_cli wants string values in their quoted form ("ssid"); args are
+    // passed literally (no shell), so the quotes are part of the value.
+    let id = match saved_network_id(&iface, ssid) {
+        Some(id) => id,
+        None => {
+            let Some(id) = wpa_cli(&iface, &["add_network"]).map(|s| s.trim().to_string()) else {
+                return false;
+            };
+            wpa_cli(
+                &iface,
+                &["set_network", &id, "ssid", &format!("\"{ssid}\"")],
+            );
+            match password {
+                Some(p) => {
+                    wpa_cli(&iface, &["set_network", &id, "psk", &format!("\"{p}\"")]);
+                }
+                None => {
+                    wpa_cli(&iface, &["set_network", &id, "key_mgmt", "NONE"]);
+                }
+            }
+            id
+        }
+    };
+    wpa_cli(&iface, &["enable_network", &id]);
+    wpa_cli(&iface, &["select_network", &id]);
+    wpa_cli(&iface, &["save_config"]);
+    // Background DHCP so the UI stays responsive and can poll for the lease.
+    let dhcp = format!(
+        "( dhcpcd -k {iface} 2>/dev/null || : ; dhcpcd -t 30 -w {iface} 2>/dev/null \
+         || udhcpc -i {iface} -t 5 -n -q 2>/dev/null || : ) </dev/null >/dev/null 2>&1 &"
+    );
+    Command::new("sh").arg("-c").arg(dhcp).status().is_ok()
+}
+
 /// Poll until [`is_online`] or `timeout`. Returns whether we got online.
 pub fn wait_until_online(timeout: Duration) -> bool {
     let start = Instant::now();
@@ -294,5 +471,44 @@ mod tests {
         assert!(s.contains("moal"));
         assert!(s.contains("ifconfig wlan0 up"));
         std::env::remove_var("GIDEON_WIFI_MODULE");
+    }
+
+    #[test]
+    fn parse_scan_results_extracts_networks() {
+        // Real `wpa_cli scan_results` shape: header + tab-separated rows.
+        let out = "bssid / frequency / signal level / flags / ssid\n\
+            00:11:22:33:44:55\t2412\t-45\t[WPA2-PSK-CCMP][ESS]\tHomeNet\n\
+            66:77:88:99:aa:bb\t5180\t-72\t[ESS]\tCoffeeShop\n\
+            cc:dd:ee:ff:00:11\t2437\t-60\t[WEP][ESS]\tOldRouter\n\
+            22:33:44:55:66:77\t2462\t-80\t[WPA2-PSK-CCMP][ESS]\t\n";
+        let nets = parse_scan_results(out);
+        assert_eq!(nets.len(), 3, "the hidden (SSID-less) row is dropped");
+        assert_eq!(nets[0], ("HomeNet".to_string(), -45, true));
+        assert_eq!(
+            nets[1],
+            ("CoffeeShop".to_string(), -72, false),
+            "open network"
+        );
+        assert_eq!(
+            nets[2],
+            ("OldRouter".to_string(), -60, true),
+            "WEP counts as secured"
+        );
+    }
+
+    #[test]
+    fn signal_maps_to_bars() {
+        let net = |dbm| WifiNetwork {
+            ssid: "x".into(),
+            signal: dbm,
+            secured: false,
+            saved: false,
+            connected: false,
+        };
+        assert_eq!(net(-40).bars(), 4);
+        assert_eq!(net(-60).bars(), 3);
+        assert_eq!(net(-70).bars(), 2);
+        assert_eq!(net(-80).bars(), 1);
+        assert_eq!(net(-95).bars(), 0);
     }
 }
