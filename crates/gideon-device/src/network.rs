@@ -113,6 +113,20 @@ pub fn bring_up_wifi() {
     let _ = Command::new("sh").arg("-c").arg(detached).status();
 }
 
+/// Proactively rejoin a known network after the device wakes from sleep. If
+/// we're not online — the usual state after a suspend, where the radio came
+/// back but isn't re-associated or its lease lapsed — fire the (detached,
+/// non-blocking) scan + re-associate so Wi-Fi is back *before* the user does
+/// anything, instead of only reconnecting lazily on the next network action.
+/// No-op when already connected (never disturb a working link) or off-device.
+/// Cheap and instant: a single `is_online` probe plus, at most, the detached
+/// bring-up.
+pub fn reconnect_after_wake() {
+    if !is_online() {
+        bring_up_wifi();
+    }
+}
+
 /// Poll until [`is_online`] or `timeout`. Returns whether we got online.
 pub fn wait_until_online(timeout: Duration) -> bool {
     let start = Instant::now();

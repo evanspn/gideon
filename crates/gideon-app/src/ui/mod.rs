@@ -619,6 +619,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // fds; input made after the reopen survives.
         self.input.discard_queued();
         self.input.refresh_devices();
+        // Proactively rejoin Wi-Fi: a suspend usually leaves the radio
+        // un-associated / lease-less, so kick a (detached, non-blocking) scan
+        // + re-associate now rather than waiting for the next network action.
+        gideon_device::network::reconnect_after_wake();
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -1887,6 +1891,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // chapter, which "sometimes" failed after sleep).
                         self.input.discard_queued();
                         self.input.refresh_devices();
+                        // Proactively rejoin Wi-Fi after the suspend (detached,
+                        // non-blocking; no-op if still connected) so a download
+                        // at the end of the chapter just works.
+                        gideon_device::network::reconnect_after_wake();
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
                         }
