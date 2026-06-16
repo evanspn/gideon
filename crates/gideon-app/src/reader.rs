@@ -73,6 +73,9 @@ pub struct Reader<D: Display> {
     /// the spare slot covers only one page back and every further back-turn
     /// fell to a synchronous decode (going back felt slower than forward).
     forward: bool,
+    /// When set, a horizontal double-page spread (width > height) is rotated
+    /// 270° to fill the screen, while the device orientation stays locked.
+    auto_rotate_spreads: bool,
 }
 
 impl<D: Display> Reader<D> {
@@ -94,6 +97,18 @@ impl<D: Display> Reader<D> {
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             last_refresh_full: false,
             forward: true,
+            auto_rotate_spreads: false,
+        }
+    }
+
+    /// Toggle the "rotate wide spreads" mode: a horizontal double-page spread
+    /// is auto-rotated 270° to fill the screen; portrait pages are untouched.
+    /// Clears the cache so the change takes effect on the current page.
+    pub fn set_auto_rotate_spreads(&mut self, on: bool) {
+        if self.auto_rotate_spreads != on {
+            self.auto_rotate_spreads = on;
+            self.rendered = None;
+            self.spare = None;
         }
     }
 
@@ -210,6 +225,7 @@ impl<D: Display> Reader<D> {
             screen_height: reading_h,
             fit: self.fit,
             dither: true,
+            rotate_wide_spreads: self.auto_rotate_spreads,
         };
         self.prefetcher.start(self.current_page, &opts);
     }
@@ -225,6 +241,7 @@ impl<D: Display> Reader<D> {
             screen_height: reading_h,
             fit: self.fit,
             dither: true,
+            rotate_wide_spreads: self.auto_rotate_spreads,
         };
         let cached = matches!(&self.rendered, Some((index, _)) if *index == self.current_page);
         if !cached {
@@ -1059,6 +1076,7 @@ mod tests {
             screen_height: h,
             fit: FitMode::Contain,
             dither: true,
+            rotate_wide_spreads: false,
         }
     }
 

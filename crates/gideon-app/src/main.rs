@@ -265,6 +265,7 @@ fn cmd_render(
         screen_height: height,
         fit: FitMode::Contain,
         dither,
+        rotate_wide_spreads: false,
     };
     let rendered = render_page(&image, &opts);
     let (width, height) = (rendered.width(), rendered.height());
