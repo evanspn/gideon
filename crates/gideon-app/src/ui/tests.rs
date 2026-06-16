@@ -304,6 +304,41 @@ fn home_renders_rows_and_is_not_blank() {
 }
 
 #[test]
+fn offline_home_shows_reconnect_row_and_offsets_taps() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    // Offline (forced): content row 0 is the reconnect button — tapping it
+    // attempts a reconnect and stays on Home (off-device that's a no-op).
+    let mut a = app(&lib, FakeGateway::default(), vec![]);
+    a.home_offline = true;
+    a.activate(0, 10, 10).unwrap();
+    assert!(
+        matches!(a.screen(), Screen::Home),
+        "offline row 0 reconnects, stays on Home"
+    );
+
+    // Offline: the standard entries are offset past the reconnect row, so the
+    // first real entry (Library) is row 1.
+    let mut b = app(&lib, FakeGateway::default(), vec![]);
+    b.home_offline = true;
+    b.activate(1, 10, 10).unwrap();
+    assert!(
+        matches!(b.screen(), Screen::Library { .. }),
+        "offline row 1 is Library"
+    );
+
+    // Online (the default): no reconnect row, so Library is row 0.
+    let mut c = app(&lib, FakeGateway::default(), vec![]);
+    c.activate(0, 10, 10).unwrap();
+    assert!(
+        matches!(c.screen(), Screen::Library { .. }),
+        "online row 0 is Library"
+    );
+}
+
+#[test]
 fn home_to_library_to_reader_page_turns_and_back() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");

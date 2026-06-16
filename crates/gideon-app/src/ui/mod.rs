@@ -38,6 +38,10 @@ const HOME_ROWS: [&str; 5] = [
     "Settings",
     "Check for updates",
 ];
+/// A tappable top row shown on Home ONLY when offline (device only): a manual
+/// "scan + reconnect" for the roam-while-idle case, without a battery-draining
+/// background connectivity poll.
+const HOME_RECONNECT_ROW: &str = "No Wi-Fi - tap to reconnect";
 const SHELF_COLUMNS: u32 = 3;
 
 /// Values the Settings screen cycles through per tap.
@@ -326,6 +330,11 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// When the last Wi-Fi auto-connect attempt failed, to back off so every
     /// network tap doesn't re-pay the full connect timeout.
     last_wifi_fail: Option<std::time::Instant>,
+    /// Whether the last Home paint showed the offline "reconnect" row. Cached
+    /// at render time (one `is_online` probe per Home paint) so tap dispatch
+    /// uses the same offset that was drawn, even if connectivity flips between
+    /// the paint and the tap.
+    home_offline: bool,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
     /// Whether the reading orientation is locked. Locked: the accelerometer
@@ -390,6 +399,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             reader_fit: FitMode::Contain,
             full_refresh_interval: 8,
             last_wifi_fail: None,
+            home_offline: false,
             reader_rotation: 0,
             rotation_locked: true,
             sleeper: None,
@@ -798,32 +808,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Activate whatever sits at content row `row` (tap at `x`, `y`).
-    fn activate(&mut self, row: usize, x: u32, y: u32) -> Result<Flow> {
+    fn activate(&mut self, mut row: usize, x: u32, y: u32) -> Result<Flow> {
         let screen = self.stack.last().cloned().expect("stack never empty");
         match screen {
-            Screen::Home => match row {
-                0 => {
-                    self.open_library()?;
-                    Ok(Flow::Continue)
+            Screen::Home => {
+                // Row 0 is the offline "reconnect Wi-Fi" button when shown;
+                // the standard rows are offset past it. The offset comes from
+                // the cached paint-time state, so it matches what was drawn.
+                if self.home_offline {
+                    if row == 0 {
+                        self.reconnect_wifi()?;
+                        return Ok(Flow::Continue);
+                    }
+                    row -= 1;
                 }
-                1 => {
-                    self.open_global_search()?;
-                    Ok(Flow::Continue)
+                match row {
+                    0 => self.open_library()?,
+                    1 => self.open_global_search()?,
+                    2 => self.open_sources()?,
+                    3 => self.push(Screen::Settings)?,
+                    4 => self.check_updates()?,
+                    _ => {}
                 }
-                2 => {
-                    self.open_sources()?;
-                    Ok(Flow::Continue)
-                }
-                3 => {
-                    self.push(Screen::Settings)?;
-                    Ok(Flow::Continue)
-                }
-                4 => {
-                    self.check_updates()?;
-                    Ok(Flow::Continue)
-                }
-                _ => Ok(Flow::Continue),
-            },
+                Ok(Flow::Continue)
+            }
             Screen::Library { items, page } => self.tap_library_cell(&items, page, x, y),
             Screen::Sources { rows, page } => {
                 let index = page * self.layout.rows_per_page() + row;
@@ -1942,6 +1950,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// "Connecting to Wi-Fi…" status, brings the radio up and waits for an
     /// address. If it still can't connect, the action proceeds and surfaces
     /// the clear offline message itself.
+    /// Manual reconnect from Home's offline row: an explicit user request, so
+    /// ignore the failure-backoff and force a scan + connect (with the same
+    /// tap-to-cancel status as the automatic path), then repaint Home — the
+    /// reconnect row disappears if we're back online.
+    fn reconnect_wifi(&mut self) -> Result<()> {
+        self.last_wifi_fail = None;
+        self.ensure_online()?;
+        self.render_current(RefreshMode::Full)
+    }
+
     fn ensure_online(&mut self) -> Result<()> {
         if gideon_device::network::is_online() {
             return Ok(());
@@ -2012,6 +2030,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // on the rotated dims) and rotated into the panel just before the
         // blit, mirroring the reader's own pipeline.
         let rotation = self.reader_rotation;
+        // Refresh Home's offline state once per paint (one is_online probe),
+        // so the "reconnect" row and the tap dispatch agree on the offset.
+        if matches!(self.stack.last(), Some(Screen::Home)) {
+            self.home_offline = !gideon_device::network::is_online();
+        }
         // Color shelf: when a visible Library card has real cover art,
         // compose in RGB so Kaleido panels show it in color. The caller's
         // refresh mode passes through: the MTK driver has a non-flashing
@@ -2073,8 +2096,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let screen = self.stack.last().expect("stack never empty");
         Ok(match screen {
             Screen::Home => {
-                let rows: Vec<(String, bool)> =
-                    HOME_ROWS.iter().map(|r| (r.to_string(), true)).collect();
+                // When offline (device only), a "reconnect Wi-Fi" row sits at
+                // the very top; the standard entries follow.
+                let mut rows: Vec<(String, bool)> = Vec::new();
+                if self.home_offline {
+                    rows.push((HOME_RECONNECT_ROW.to_string(), true));
+                }
+                rows.extend(HOME_ROWS.iter().map(|r| (r.to_string(), true)));
                 // The version in the title answers "did the update take?"
                 // at a glance; the profile name after it says whose library
                 // this is (tapping the left half switches); the battery
