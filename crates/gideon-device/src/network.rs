@@ -127,6 +127,19 @@ pub fn reconnect_after_wake() {
     }
 }
 
+/// Turn Wi-Fi off to save battery: drop the interface and power the chip
+/// down. Best-effort and no-op off-device. The module is left loaded (a warm
+/// re-enable is then fast). The user re-enables from the Wi-Fi controls.
+pub fn disable_wifi() {
+    if !on_device() {
+        return;
+    }
+    let iface = interface();
+    let script =
+        format!("ifconfig {iface} down 2>/dev/null || :; echo 0 > /dev/wmtWifi 2>/dev/null || :");
+    let _ = Command::new("sh").arg("-c").arg(script).status();
+}
+
 /// Poll until [`is_online`] or `timeout`. Returns whether we got online.
 pub fn wait_until_online(timeout: Duration) -> bool {
     let start = Instant::now();
