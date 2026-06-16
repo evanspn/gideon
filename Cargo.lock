@@ -1288,6 +1288,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gideon-sync"
+version = "0.1.0"
+dependencies = [
+ "gideon-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
