@@ -291,6 +291,30 @@ fn make_tall_cbz(path: &Path, pages: usize) {
 // --- tests ---
 
 #[test]
+fn chapter_status_prefix_shows_downloaded_and_read_state() {
+    use gideon_core::ReadingProgress;
+    let prog = |cur: usize, total: usize| ReadingProgress {
+        current_page: cur,
+        total_pages: total,
+        last_read_at: 0,
+    };
+    // Not downloaded, no progress → nothing.
+    assert_eq!(super::chapter_status_prefix(false, None), "");
+    // Downloaded, unread → just the check.
+    assert_eq!(super::chapter_status_prefix(true, None), "✓ ");
+    // Downloaded + finished → check + filled dot.
+    assert_eq!(
+        super::chapter_status_prefix(true, Some(prog(19, 20))),
+        "✓● "
+    );
+    // Downloaded + in progress → check + percent (page 10 of 20 ≈ 55%).
+    assert_eq!(
+        super::chapter_status_prefix(true, Some(prog(10, 20))),
+        "✓·55% "
+    );
+}
+
+#[test]
 fn home_renders_rows_and_is_not_blank() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
