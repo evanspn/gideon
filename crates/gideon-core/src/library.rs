@@ -140,6 +140,12 @@ impl ProgressStore {
         self.progress.get(key).copied()
     }
 
+    /// Iterate every `(chapter_key, progress)` pair — used by sync to push
+    /// the device's local progress to the backend.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, ReadingProgress)> {
+        self.progress.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
     /// Record that the user is on `current_page` of `total_pages`.
     pub fn update(&mut self, key: &str, current_page: usize, total_pages: usize) {
         let last_read_at = SystemTime::now()

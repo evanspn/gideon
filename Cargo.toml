@@ -4,6 +4,7 @@ members = [
     "crates/gideon-core",
     "crates/gideon-render",
     "crates/gideon-sources",
+    "crates/gideon-sync",
     "crates/gideon-device",
     "crates/gideon-app",
     "crates/gideon-aidoku",

@@ -1,0 +1,13 @@
+[package]
+name = "gideon-sync"
+description = "Cross-platform reading-progress sync (furthest-page-wins) for gideon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gideon-core = { path = "../gideon-core" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
