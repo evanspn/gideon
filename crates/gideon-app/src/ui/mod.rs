@@ -327,6 +327,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Page turns between full (flashing) refreshes (settings.json
     /// `reader_full_refresh_interval`); higher = fewer flashes = smoother.
     full_refresh_interval: u32,
+    /// Auto-rotate wide double-page spreads 270° (settings.json
+    /// `auto_rotate_spreads`), applied to a reader session at open.
+    auto_rotate_spreads: bool,
     /// When the last Wi-Fi auto-connect attempt failed, to back off so every
     /// network tap doesn't re-pay the full connect timeout.
     last_wifi_fail: Option<std::time::Instant>,
@@ -403,6 +406,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             stack: vec![Screen::Home],
             reader_fit: FitMode::Contain,
             full_refresh_interval: 8,
+            auto_rotate_spreads: false,
             last_wifi_fail: None,
             wifi_auto_connect: true,
             home_offline: false,
@@ -483,6 +487,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if let Ok(settings) = gideon_core::Settings::load(&dir) {
             self.rotation_locked = settings.reader_rotation_locked;
             self.full_refresh_interval = settings.reader_full_refresh_interval;
+            self.auto_rotate_spreads = settings.auto_rotate_spreads;
             self.wifi_auto_connect = settings.wifi_auto_connect;
         }
         self.settings_dir = Some(dir);
@@ -1197,6 +1202,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 settings.wifi_auto_connect = !settings.wifi_auto_connect;
                 self.wifi_auto_connect = settings.wifi_auto_connect;
             }
+            8 => {
+                // Rotate wide spreads on/off — applies to the next opened book.
+                settings.auto_rotate_spreads = !settings.auto_rotate_spreads;
+                self.auto_rotate_spreads = settings.auto_rotate_spreads;
+            }
             _ => return Ok(()),
         }
         self.save_settings(&settings);
@@ -1644,6 +1654,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
             reader.set_full_refresh_interval(self.full_refresh_interval);
+            reader.set_auto_rotate_spreads(self.auto_rotate_spreads);
             reader.resume_from(&store, key);
             // Warm the render-ahead at the resume page before the first
             // paint: the decode + scale + dither run on the prefetch
@@ -3036,6 +3047,13 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
         ),
         (wifi, true),
         (format!("Auto-connect Wi-Fi: {auto_connect}"), true),
+        (
+            format!(
+                "Rotate wide spreads: {}",
+                if s.auto_rotate_spreads { "on" } else { "off" }
+            ),
+            true,
+        ),
     ]
 }
 

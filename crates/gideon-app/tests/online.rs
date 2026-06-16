@@ -111,6 +111,7 @@ fn download_and_render_pages_from_github_source() {
         screen_height: 1448,
         fit: FitMode::Contain,
         dither: true,
+        rotate_wide_spreads: false,
     };
     for page_index in 0..doc.page_count() {
         let image = doc
@@ -268,6 +269,7 @@ fn wasm_source_end_to_end() {
                     screen_height: 1448,
                     fit: FitMode::Contain,
                     dither: true,
+                    rotate_wide_spreads: false,
                 },
             );
             assert!(rendered.into_gray().pixels.iter().any(|&p| p != 0xFF));

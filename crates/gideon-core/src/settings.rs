@@ -81,6 +81,12 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_full_refresh_interval")]
     pub reader_full_refresh_interval: u32,
 
+    /// Auto-rotate a horizontal double-page spread (a page wider than it is
+    /// tall) by 270° so it fills the screen, while the device orientation
+    /// stays locked. Parsed leniently — non-bool means the default (off).
+    #[serde(deserialize_with = "lenient_bool_false")]
+    pub auto_rotate_spreads: bool,
+
     /// Whether gideon may bring Wi-Fi up on its own (before a network action
     /// and on wake). Off = never auto-connect; the user connects manually from
     /// the Wi-Fi controls. Parsed leniently — non-bool means the default
@@ -114,11 +120,21 @@ impl Default for Settings {
             reader_rotation_locked: true,
             color_post_process: "vivid".to_string(),
             reader_full_refresh_interval: 8,
+            auto_rotate_spreads: false,
             wifi_auto_connect: true,
             frontlight_brightness: 20,
             frontlight_warmth: 0,
         }
     }
+}
+
+/// Lenient bool defaulting to `false`: a JSON bool passes through; anything
+/// else (wrong type, missing) means `false`.
+fn lenient_bool_false<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(false))
 }
 
 /// Lenient bool defaulting to `true`: a JSON bool passes through; anything
@@ -348,6 +364,21 @@ mod tests {
         assert_eq!(s.color_post_process, "vivid");
         assert_eq!(s.reader_full_refresh_interval, 8);
         assert!(s.wifi_auto_connect);
+        assert!(!s.auto_rotate_spreads);
+    }
+
+    #[test]
+    fn auto_rotate_spreads_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap().auto_rotate_spreads
+        };
+        assert!(load(r#"{"auto_rotate_spreads": true}"#));
+        assert!(!load(r#"{"auto_rotate_spreads": false}"#));
+        // Wrong-typed / missing default to false.
+        assert!(!load(r#"{"auto_rotate_spreads": "yes"}"#));
+        assert!(!load(r#"{}"#));
     }
 
     #[test]
@@ -422,6 +453,7 @@ mod tests {
             reader_rotation_locked: false,
             color_post_process: "standard".into(),
             reader_full_refresh_interval: 12,
+            auto_rotate_spreads: true,
             wifi_auto_connect: false,
             frontlight_brightness: 65,
             frontlight_warmth: 40,

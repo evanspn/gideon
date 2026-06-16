@@ -159,6 +159,10 @@ pub struct RenderOptions {
     pub fit: FitMode,
     /// Dither to 16 gray levels for e-ink panels. Disable for desktop preview.
     pub dither: bool,
+    /// Auto-rotate a wide page (a horizontal double-page spread, where
+    /// width > height) by 270° so it fills the screen; the reader's
+    /// "rotate spreads" mode. Normal portrait pages are untouched.
+    pub rotate_wide_spreads: bool,
 }
 
 impl RenderOptions {
@@ -168,6 +172,7 @@ impl RenderOptions {
             screen_height,
             fit: FitMode::default(),
             dither: true,
+            rotate_wide_spreads: false,
         }
     }
 }
@@ -269,6 +274,16 @@ impl PageBuf {
 /// path dithers in hardware (HWTCON Y8→Y4), and pre-quantizing each
 /// channel would just band the color.
 pub fn render_page(page: &DynamicImage, opts: &RenderOptions) -> PageBuf {
+    // Auto-rotate a horizontal double-page spread (width > height) by 270° so
+    // it fills the screen; the rest of the pipeline then treats it as an
+    // ordinary portrait page. Only when the reader's spread mode is on.
+    let rotated;
+    let page = if opts.rotate_wide_spreads && page.width() > page.height() {
+        rotated = page.rotate270();
+        &rotated
+    } else {
+        page
+    };
     let (target_w, target_h) = compute_fit(
         page.width(),
         page.height(),
@@ -547,6 +562,7 @@ mod tests {
             screen_height: 100,
             fit: FitMode::Contain,
             dither: false,
+            rotate_wide_spreads: false,
         };
         let out = render_gray(&page, &opts);
         assert_eq!((out.width, out.height), (200, 100));
@@ -564,6 +580,7 @@ mod tests {
             screen_height: 100,
             fit: FitMode::FitWidth,
             dither: false,
+            rotate_wide_spreads: false,
         };
         let out = render_gray(&page, &opts);
         assert_eq!(out.width, 200);
@@ -589,6 +606,7 @@ mod tests {
             screen_height: 64,
             fit: FitMode::Contain,
             dither: true,
+            rotate_wide_spreads: false,
         };
 
         // The legacy pipeline, verbatim.
@@ -626,6 +644,7 @@ mod tests {
             screen_height: 100,
             fit: FitMode::Contain,
             dither: true, // requests gray dithering — color must SKIP it
+            rotate_wide_spreads: false,
         };
         let PageBuf::Rgb(out) = render_page(&page, &opts) else {
             panic!("color page took the gray path");
@@ -647,6 +666,7 @@ mod tests {
             screen_height: 100,
             fit: FitMode::FitWidth,
             dither: true,
+            rotate_wide_spreads: false,
         };
         let out = render_page(&page, &opts);
         assert!(out.is_color());
@@ -663,6 +683,7 @@ mod tests {
             screen_height: 10,
             fit: FitMode::Contain,
             dither: false,
+            rotate_wide_spreads: false,
         };
         let gray = render_page(&page, &opts).into_gray();
         assert_eq!(gray.pixel(5, 5), 76, "Rec.601 red luma");
@@ -909,6 +930,46 @@ mod tests {
     }
 
     #[test]
+    fn wide_spread_rotates_to_fill_only_when_enabled() {
+        use image::GrayImage;
+        // A wide (landscape) double-page spread: 200x100, solid ink.
+        let spread = DynamicImage::ImageLuma8(GrayImage::from_pixel(200, 100, image::Luma([40])));
+        let base = RenderOptions {
+            screen_width: 100,
+            screen_height: 200,
+            fit: FitMode::Contain,
+            dither: false,
+            rotate_wide_spreads: false,
+        };
+        let enabled = RenderOptions {
+            rotate_wide_spreads: true,
+            ..base
+        };
+        let ink = |p: &PageBuf| match p {
+            PageBuf::Gray(g) => g.pixels.iter().filter(|&&v| v != 0xFF).count(),
+            _ => 0,
+        };
+        // Off: the wide spread is letterboxed small on the portrait screen.
+        // On: it's rotated 270° to portrait and fills far more of the screen.
+        let off = render_page(&spread, &base);
+        let on = render_page(&spread, &enabled);
+        assert!(
+            ink(&on) > ink(&off) * 2,
+            "rotated spread should cover much more of the screen ({} vs {})",
+            ink(&on),
+            ink(&off)
+        );
+
+        // A normal portrait page (100x200) is never rotated, on or off.
+        let portrait = DynamicImage::ImageLuma8(GrayImage::from_pixel(100, 200, image::Luma([40])));
+        assert_eq!(
+            render_page(&portrait, &base),
+            render_page(&portrait, &enabled),
+            "portrait pages are untouched by the spread mode"
+        );
+    }
+
+    #[test]
     fn color_page_is_detected() {
         // A solid red page: every sample has spread 255.
         let red = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 64, image::Rgb([200, 30, 30])));
@@ -970,6 +1031,7 @@ mod tests {
             screen_height: 64,
             fit: FitMode::Contain,
             dither: true,
+            rotate_wide_spreads: false,
         };
         let out = render_gray(&DynamicImage::ImageRgb8(img), &opts);
         assert!(out.pixels.iter().all(|p| p % 17 == 0));
@@ -983,6 +1045,7 @@ mod tests {
             screen_height: 64,
             fit: FitMode::Contain,
             dither: true,
+            rotate_wide_spreads: false,
         };
         let out = render_gray(&page, &opts);
         let avg: f64 = out.pixels.iter().map(|&p| p as f64).sum::<f64>() / out.pixels.len() as f64;
