@@ -81,6 +81,13 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_full_refresh_interval")]
     pub reader_full_refresh_interval: u32,
 
+    /// Whether gideon may bring Wi-Fi up on its own (before a network action
+    /// and on wake). Off = never auto-connect; the user connects manually from
+    /// the Wi-Fi controls. Parsed leniently — non-bool means the default
+    /// (true). (`GIDEON_WIFI_AUTOENABLE=0` is a separate hard override.)
+    #[serde(deserialize_with = "lenient_bool_true")]
+    pub wifi_auto_connect: bool,
+
     /// Frontlight brightness percent (0–100), restored at startup and
     /// updated from the reader's right-edge slide. Parsed leniently.
     #[serde(deserialize_with = "lenient_percent")]
@@ -107,10 +114,20 @@ impl Default for Settings {
             reader_rotation_locked: true,
             color_post_process: "vivid".to_string(),
             reader_full_refresh_interval: 8,
+            wifi_auto_connect: true,
             frontlight_brightness: 20,
             frontlight_warmth: 0,
         }
     }
+}
+
+/// Lenient bool defaulting to `true`: a JSON bool passes through; anything
+/// else (wrong type, missing) means `true`.
+fn lenient_bool_true<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(true))
 }
 
 /// Lenient `reader_rotation_locked` parsing: only a JSON bool passes
@@ -330,6 +347,21 @@ mod tests {
         assert!(s.reader_rotation_locked);
         assert_eq!(s.color_post_process, "vivid");
         assert_eq!(s.reader_full_refresh_interval, 8);
+        assert!(s.wifi_auto_connect);
+    }
+
+    #[test]
+    fn wifi_auto_connect_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap().wifi_auto_connect
+        };
+        assert!(!load(r#"{"wifi_auto_connect": false}"#));
+        assert!(load(r#"{"wifi_auto_connect": true}"#));
+        // Wrong-typed / missing default to true.
+        assert!(load(r#"{"wifi_auto_connect": "no"}"#));
+        assert!(load(r#"{}"#));
     }
 
     #[test]
@@ -390,6 +422,7 @@ mod tests {
             reader_rotation_locked: false,
             color_post_process: "standard".into(),
             reader_full_refresh_interval: 12,
+            wifi_auto_connect: false,
             frontlight_brightness: 65,
             frontlight_warmth: 40,
         };

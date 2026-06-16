@@ -330,6 +330,11 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// When the last Wi-Fi auto-connect attempt failed, to back off so every
     /// network tap doesn't re-pay the full connect timeout.
     last_wifi_fail: Option<std::time::Instant>,
+    /// Whether gideon may bring Wi-Fi up automatically (before a network
+    /// action and on wake). From settings.json `wifi_auto_connect`; the
+    /// Settings "Auto-connect Wi-Fi" toggle flips it. Manual reconnect ignores
+    /// it.
+    wifi_auto_connect: bool,
     /// Whether the last Home paint showed the offline "reconnect" row. Cached
     /// at render time (one `is_online` probe per Home paint) so tap dispatch
     /// uses the same offset that was drawn, even if connectivity flips between
@@ -399,6 +404,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             reader_fit: FitMode::Contain,
             full_refresh_interval: 8,
             last_wifi_fail: None,
+            wifi_auto_connect: true,
             home_offline: false,
             reader_rotation: 0,
             rotation_locked: true,
@@ -477,6 +483,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if let Ok(settings) = gideon_core::Settings::load(&dir) {
             self.rotation_locked = settings.reader_rotation_locked;
             self.full_refresh_interval = settings.reader_full_refresh_interval;
+            self.wifi_auto_connect = settings.wifi_auto_connect;
         }
         self.settings_dir = Some(dir);
         self
@@ -629,10 +636,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // fds; input made after the reopen survives.
         self.input.discard_queued();
         self.input.refresh_devices();
-        // Proactively rejoin Wi-Fi: a suspend usually leaves the radio
-        // un-associated / lease-less, so kick a (detached, non-blocking) scan
-        // + re-associate now rather than waiting for the next network action.
-        gideon_device::network::reconnect_after_wake();
+        // Proactively rejoin Wi-Fi (unless auto-connect is off): a suspend
+        // usually leaves the radio un-associated / lease-less, so kick a
+        // (detached, non-blocking) scan + re-associate now rather than waiting
+        // for the next network action.
+        if self.wifi_auto_connect {
+            gideon_device::network::reconnect_after_wake();
+        }
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -1123,6 +1133,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Cycle the setting on row `row` to its next value, persist
     /// settings.json immediately (atomic save) and repaint in place.
     fn tap_setting(&mut self, row: usize) -> Result<()> {
+        // Row 6 is the Wi-Fi on/off control — an action, not a stored field:
+        // turn the radio off to save battery, or connect (cancellable) when
+        // off. Then repaint Settings so the live status updates.
+        if row == 6 {
+            if gideon_device::network::is_online() {
+                gideon_device::network::disable_wifi();
+                self.show_status(&["Wi-Fi turned off."])?;
+            } else {
+                self.last_wifi_fail = None;
+                self.connect_wifi()?;
+            }
+            return self.render_current(RefreshMode::Full);
+        }
         let mut settings = self.load_settings();
         match row {
             0 => {
@@ -1167,6 +1190,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 settings.reader_full_refresh_interval =
                     cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
                 self.full_refresh_interval = settings.reader_full_refresh_interval;
+            }
+            7 => {
+                // Auto-connect Wi-Fi on/off: whether gideon brings the radio
+                // up on its own before actions and on wake.
+                settings.wifi_auto_connect = !settings.wifi_auto_connect;
+                self.wifi_auto_connect = settings.wifi_auto_connect;
             }
             _ => return Ok(()),
         }
@@ -1901,8 +1930,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.input.refresh_devices();
                         // Proactively rejoin Wi-Fi after the suspend (detached,
                         // non-blocking; no-op if still connected) so a download
-                        // at the end of the chapter just works.
-                        gideon_device::network::reconnect_after_wake();
+                        // at the end of the chapter just works — unless the
+                        // user turned auto-connect off.
+                        if self.wifi_auto_connect {
+                            gideon_device::network::reconnect_after_wake();
+                        }
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
                         }
@@ -1956,11 +1988,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// reconnect row disappears if we're back online.
     fn reconnect_wifi(&mut self) -> Result<()> {
         self.last_wifi_fail = None;
-        self.ensure_online()?;
+        self.connect_wifi()?;
         self.render_current(RefreshMode::Full)
     }
 
+    /// Automatic connectivity check before a network action: respects the
+    /// `wifi_auto_connect` preference (off = never auto-connect; the user
+    /// connects manually from the Wi-Fi controls).
     fn ensure_online(&mut self) -> Result<()> {
+        if !self.wifi_auto_connect {
+            return Ok(());
+        }
+        self.connect_wifi()
+    }
+
+    /// Bring Wi-Fi up and wait for an address (cancellable), if offline. The
+    /// shared core of the automatic and manual paths; does NOT consult
+    /// `wifi_auto_connect` (a manual reconnect must work even with auto off).
+    fn connect_wifi(&mut self) -> Result<()> {
         if gideon_device::network::is_online() {
             return Ok(());
         }
@@ -2965,6 +3010,14 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
     };
     let auto = if s.auto_check_updates { "on" } else { "off" };
     let color = gideon_device::ColorPostProcess::from_setting(&s.color_post_process).as_setting();
+    // Live Wi-Fi status (one probe per Settings paint); off-device this reads
+    // "connected" and the controls no-op.
+    let wifi = if gideon_device::network::is_online() {
+        "Wi-Fi: connected (tap to turn off)".to_string()
+    } else {
+        "Wi-Fi: off (tap to connect)".to_string()
+    };
+    let auto_connect = if s.wifi_auto_connect { "on" } else { "off" };
     vec![
         (
             format!("Pre-download ahead: {}", s.predownload_unread_chapters),
@@ -2981,6 +3034,8 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
             ),
             true,
         ),
+        (wifi, true),
+        (format!("Auto-connect Wi-Fi: {auto_connect}"), true),
     ]
 }
 
