@@ -986,8 +986,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Screen::PowerMenu => match row {
-                0 => Ok(Flow::Quit(Exit::Restart)),
-                1 => Ok(Flow::Quit(Exit::Close)),
+                // Device-level Wi-Fi toggle sits at the top of the Power menu.
+                0 => {
+                    self.toggle_wifi()?;
+                    Ok(Flow::Continue)
+                }
+                1 => Ok(Flow::Quit(Exit::Restart)),
+                2 => Ok(Flow::Quit(Exit::Close)),
                 _ => Ok(Flow::Continue),
             },
             Screen::UpdatePrompt { .. } => self.install_update(),
@@ -1142,14 +1147,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // turn the radio off to save battery, or connect (cancellable) when
         // off. Then repaint Settings so the live status updates.
         if row == 6 {
-            if gideon_device::network::is_online() {
-                gideon_device::network::disable_wifi();
-                self.show_status(&["Wi-Fi turned off."])?;
-            } else {
-                self.last_wifi_fail = None;
-                self.connect_wifi()?;
-            }
-            return self.render_current(RefreshMode::Full);
+            return self.toggle_wifi();
         }
         let mut settings = self.load_settings();
         match row {
@@ -1993,6 +1991,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// "Connecting to Wi-Fi…" status, brings the radio up and waits for an
     /// address. If it still can't connect, the action proceeds and surfaces
     /// the clear offline message itself.
+    /// Toggle Wi-Fi on/off — the device-level control shared by the Settings
+    /// row and the Power menu. Connected → turn the radio off (battery). Off
+    /// → force a scan + connect (cancellable, ignoring the failure backoff).
+    /// Repaints the current screen so its live Wi-Fi status updates.
+    fn toggle_wifi(&mut self) -> Result<()> {
+        if gideon_device::network::is_online() {
+            gideon_device::network::disable_wifi();
+            self.show_status(&["Wi-Fi turned off."])?;
+        } else {
+            self.last_wifi_fail = None;
+            self.connect_wifi()?;
+        }
+        self.render_current(RefreshMode::Full)
+    }
+
     /// Manual reconnect from Home's offline row: an explicit user request, so
     /// ignore the failure-backoff and force a scan + connect (with the same
     /// tap-to-cancel status as the automatic path), then repaint Home — the
@@ -2203,7 +2216,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Settings", &rows, 0, 1)
             }
             Screen::PowerMenu => {
+                // Live Wi-Fi status + on/off at the top — a device-level
+                // control without digging into Settings.
+                let wifi = if gideon_device::network::is_online() {
+                    "Wi-Fi: connected (tap to turn off)"
+                } else {
+                    "Wi-Fi: off (tap to connect)"
+                };
                 let rows = vec![
+                    (wifi.to_string(), true),
                     ("Restart gideon".to_string(), true),
                     ("Close gideon".to_string(), true),
                 ];
