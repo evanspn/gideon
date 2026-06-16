@@ -1614,7 +1614,8 @@ fn power_icon_opens_the_menu_and_back_returns() {
 #[test]
 fn power_menu_close_quits() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_power_icon(), tap_row(1)];
+    // Row 0 is the Wi-Fi toggle now; Restart is 1, Close is 2.
+    let events = vec![tap_power_icon(), tap_row(2)];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Close);
 }
@@ -1622,7 +1623,7 @@ fn power_menu_close_quits() {
 #[test]
 fn power_menu_restart_requests_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_power_icon(), tap_row(0)];
+    let events = vec![tap_power_icon(), tap_row(1)];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Restart);
 }
