@@ -246,6 +246,16 @@ enum Screen {
     Settings,
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
+    /// Wi-Fi networks from a scan: tap one to connect (or enter a password).
+    WifiList {
+        networks: Vec<gideon_device::network::WifiNetwork>,
+    },
+    /// On-screen keyboard for a secured network's password; the action key
+    /// connects.
+    WifiPassword {
+        ssid: String,
+        password: String,
+    },
     /// Update available; any content tap installs, Back declines.
     UpdatePrompt {
         body: String,
@@ -1003,15 +1013,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Screen::PowerMenu => match row {
-                // Device-level Wi-Fi toggle sits at the top of the Power menu.
+                // Wi-Fi networks (scan/connect) at the top of the Power menu.
                 0 => {
-                    self.toggle_wifi()?;
+                    self.open_wifi()?;
                     Ok(Flow::Continue)
                 }
                 1 => Ok(Flow::Quit(Exit::Restart)),
                 2 => Ok(Flow::Quit(Exit::Close)),
                 _ => Ok(Flow::Continue),
             },
+            Screen::WifiList { networks } => {
+                let n = networks.len();
+                if row < n {
+                    let net = networks[row].clone();
+                    self.tap_wifi_network(&net)?;
+                } else if row == n {
+                    self.refresh_wifi_list()?; // "Scan again"
+                } else if row == n + 1 {
+                    // "Turn Wi-Fi off"
+                    gideon_device::network::disable_wifi();
+                    self.show_status(&["Wi-Fi turned off."])?;
+                    self.pop()?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::WifiPassword { ssid, password } => {
+                self.tap_wifi_password(&ssid, &password, x, y)?;
+                Ok(Flow::Continue)
+            }
             Screen::UpdatePrompt { .. } => self.install_update(),
             Screen::Message { .. } => self.pop(),
         }
@@ -1160,11 +1189,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Cycle the setting on row `row` to its next value, persist
     /// settings.json immediately (atomic save) and repaint in place.
     fn tap_setting(&mut self, row: usize) -> Result<()> {
-        // Row 6 is the Wi-Fi on/off control — an action, not a stored field:
-        // turn the radio off to save battery, or connect (cancellable) when
-        // off. Then repaint Settings so the live status updates.
+        // Row 6 opens the Wi-Fi screen (scan + connect) — an action, not a
+        // stored field.
         if row == 6 {
-            return self.toggle_wifi();
+            return self.open_wifi();
         }
         let mut settings = self.load_settings();
         match row {
@@ -2008,17 +2036,87 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// "Connecting to Wi-Fi…" status, brings the radio up and waits for an
     /// address. If it still can't connect, the action proceeds and surfaces
     /// the clear offline message itself.
-    /// Toggle Wi-Fi on/off — the device-level control shared by the Settings
-    /// row and the Power menu. Connected → turn the radio off (battery). Off
-    /// → force a scan + connect (cancellable, ignoring the failure backoff).
-    /// Repaints the current screen so its live Wi-Fi status updates.
-    fn toggle_wifi(&mut self) -> Result<()> {
-        if gideon_device::network::is_online() {
-            gideon_device::network::disable_wifi();
-            self.show_status(&["Wi-Fi turned off."])?;
+    /// Open the Wi-Fi screen: scan for nearby networks (the radio is brought
+    /// up first if it's off, so a scan always has something to find) and show
+    /// the list.
+    fn open_wifi(&mut self) -> Result<()> {
+        self.show_status(&["Scanning for Wi-Fi…"])?;
+        if !gideon_device::network::is_online() {
+            gideon_device::network::bring_up_wifi();
+        }
+        let networks = gideon_device::network::scan_networks();
+        self.push(Screen::WifiList { networks })
+    }
+
+    /// Tapping a network: already connected → nothing; a saved or open network
+    /// connects directly; a new secured one asks for a password first.
+    fn tap_wifi_network(&mut self, net: &gideon_device::network::WifiNetwork) -> Result<()> {
+        if net.connected {
+            return Ok(());
+        }
+        if net.saved || !net.secured {
+            self.connect_to_network(&net.ssid, None)
         } else {
-            self.last_wifi_fail = None;
-            self.connect_wifi()?;
+            self.keyboard_paints = 0;
+            self.push(Screen::WifiPassword {
+                ssid: net.ssid.clone(),
+                password: String::new(),
+            })
+        }
+    }
+
+    /// Keyboard tap on the password screen: edit the password in place, or
+    /// (action key) connect with it.
+    fn tap_wifi_password(&mut self, ssid: &str, password: &str, x: u32, y: u32) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            return self.connect_to_network(ssid, Some(password));
+        }
+        if let Some(p) = key.and_then(|key| apply_key_edit(password, key)) {
+            if let Some(Screen::WifiPassword { password, .. }) = self.stack.last_mut() {
+                *password = p;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
+    }
+
+    /// Connect to `ssid` (`password = None` for open/saved), waiting for an
+    /// address with a cancellable heartbeat, then refresh the Wi-Fi list in
+    /// place (dropping the password keyboard if we came from it).
+    fn connect_to_network(&mut self, ssid: &str, password: Option<&str>) -> Result<()> {
+        self.last_wifi_fail = None;
+        gideon_device::network::connect_network(ssid, password);
+        let start = std::time::Instant::now();
+        let mut online = gideon_device::network::is_online();
+        while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
+            self.show_status(&[
+                &format!("Connecting to {ssid}…"),
+                &format!("({}s) · tap to cancel", start.elapsed().as_secs()),
+            ])?;
+            if self
+                .input
+                .poll_event(std::time::Duration::from_secs(1))?
+                .is_some()
+            {
+                break;
+            }
+            online = gideon_device::network::is_online();
+        }
+        if matches!(self.stack.last(), Some(Screen::WifiPassword { .. })) {
+            self.stack.pop();
+        }
+        self.refresh_wifi_list()
+    }
+
+    /// Re-scan and replace the Wi-Fi list in place (or push one if we're not
+    /// already on it), then repaint.
+    fn refresh_wifi_list(&mut self) -> Result<()> {
+        self.show_status(&["Scanning for Wi-Fi…"])?;
+        let networks = gideon_device::network::scan_networks();
+        match self.stack.last_mut() {
+            Some(s @ Screen::WifiList { .. }) => *s = Screen::WifiList { networks },
+            _ => self.stack.push(Screen::WifiList { networks }),
         }
         self.render_current(RefreshMode::Full)
     }
@@ -2233,12 +2331,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Settings", &rows, 0, 1)
             }
             Screen::PowerMenu => {
-                // Live Wi-Fi status + on/off at the top — a device-level
-                // control without digging into Settings.
+                // Wi-Fi networks at the top — scan/connect without digging into
+                // Settings; the live status hints at what tapping does.
                 let wifi = if gideon_device::network::is_online() {
-                    "Wi-Fi: connected (tap to turn off)"
+                    "Wi-Fi: connected (tap to manage)"
                 } else {
-                    "Wi-Fi: off (tap to connect)"
+                    "Wi-Fi: off (tap to scan)"
                 };
                 let rows = vec![
                     (wifi.to_string(), true),
@@ -2246,6 +2344,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("Close gideon".to_string(), true),
                 ];
                 compose_list(l, "Power", &rows, 0, 1)
+            }
+            Screen::WifiList { networks } => {
+                let mut rows: Vec<(String, bool)> = networks
+                    .iter()
+                    .map(|n| {
+                        let prefix = if n.connected {
+                            "● "
+                        } else if n.saved {
+                            "✓ "
+                        } else {
+                            ""
+                        };
+                        let open = if n.secured { "" } else { " (open)" };
+                        (format!("{prefix}{}{open}", n.ssid), true)
+                    })
+                    .collect();
+                rows.push(("Scan again".to_string(), true));
+                rows.push(("Turn Wi-Fi off".to_string(), true));
+                let title = if networks.is_empty() {
+                    "Wi-Fi — no networks found"
+                } else {
+                    "Wi-Fi"
+                };
+                compose_list(l, title, &rows, 0, 1)
+            }
+            Screen::WifiPassword { ssid, password } => {
+                compose_keyboard(l, &format!("Password — {ssid}"), password, "Connect")
             }
             Screen::Library { items, page } => self.compose_library(items, *page)?,
             Screen::Sources { rows, page } => {
@@ -3065,9 +3190,9 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
     // Live Wi-Fi status (one probe per Settings paint); off-device this reads
     // "connected" and the controls no-op.
     let wifi = if gideon_device::network::is_online() {
-        "Wi-Fi: connected (tap to turn off)".to_string()
+        "Wi-Fi: connected (tap to manage)".to_string()
     } else {
-        "Wi-Fi: off (tap to connect)".to_string()
+        "Wi-Fi: off (tap to scan)".to_string()
     };
     let auto_connect = if s.wifi_auto_connect { "on" } else { "off" };
     vec![
