@@ -147,6 +147,23 @@ impl SeriesCard {
     }
 }
 
+/// The status prefix for a chapter row: `✓` downloaded, `●` finished,
+/// `·NN%` in progress — e.g. `✓●` (downloaded + read), `✓·45%`, `✓`
+/// (downloaded, unread), `●` (read), or empty for neither.
+fn chapter_status_prefix(downloaded: bool, read: Option<gideon_core::ReadingProgress>) -> String {
+    let dl = if downloaded { "✓" } else { "" };
+    let r = match read {
+        Some(p) if p.is_finished() => "●".to_string(),
+        Some(p) => format!("·{}%", p.percent().round() as u32),
+        None => String::new(),
+    };
+    if dl.is_empty() && r.is_empty() {
+        String::new()
+    } else {
+        format!("{dl}{r} ")
+    }
+}
+
 /// Group scanned library entries into shelf cards: one per top-level
 /// series directory and one per loose root CBZ. Cards keep the natural
 /// order of their first chapter; chapters keep their natural scan order.
@@ -2265,24 +2282,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 chapters,
                 page,
             } => {
-                // Mark chapters that are already on disk: they open
-                // instantly, and a check tells the user what's stocked up.
+                // Mark each chapter with what's on disk and what's been read:
+                // "✓" downloaded, "●" finished, "·NN%" in progress. Downloaded
+                // chapters open instantly; the read marks show what's left.
                 let index = gideon_core::SeriesIndex::load(&self.library_dir);
-                let downloaded = index
-                    .find_manga(&source.id, &manga.id)
-                    .map(|(_, series)| series.downloaded.clone())
-                    .unwrap_or_default();
-                let rows: Vec<(String, bool)> = paged(chapters, *page, per_page)
-                    .iter()
-                    .map(|c| {
-                        let mark = if downloaded.contains_key(&c.id) {
-                            "✓ "
-                        } else {
-                            ""
-                        };
-                        (format!("{mark}{}", c.label()), true)
-                    })
-                    .collect();
+                let (dir, downloaded) = match index.find_manga(&source.id, &manga.id) {
+                    Some((dir, series)) => (dir.to_string(), series.downloaded.clone()),
+                    None => (String::new(), Default::default()),
+                };
+                let rows: Vec<(String, bool)> = self.with_progress(|_, store| {
+                    paged(chapters, *page, per_page)
+                        .iter()
+                        .map(|c| {
+                            let read = downloaded
+                                .get(&c.id)
+                                .and_then(|file| store.get(&format!("{dir}/{file}")));
+                            let prefix =
+                                chapter_status_prefix(downloaded.contains_key(&c.id), read);
+                            (format!("{prefix}{}", c.label()), true)
+                        })
+                        .collect()
+                });
                 compose_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
             }
             Screen::UpdatePrompt { body } => compose_message(l, "Update available", body),
