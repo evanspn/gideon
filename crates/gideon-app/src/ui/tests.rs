@@ -1822,7 +1822,8 @@ fn wifi_list_tap_secured_network_asks_for_password() {
     app.stack.push(Screen::WifiList {
         networks: vec![wifi_net("HomeNet", true, false)],
     });
-    app.activate(0, 10, 10).unwrap();
+    // Row 0 is the Wi-Fi toggle now; the first network is row 1.
+    app.activate(1, 10, 10).unwrap();
     assert!(
         matches!(app.screen(), Screen::WifiPassword { ssid, .. } if ssid.as_str() == "HomeNet"),
         "tapping a new secured network opens the password keyboard"
@@ -1830,17 +1831,17 @@ fn wifi_list_tap_secured_network_asks_for_password() {
 }
 
 #[test]
-fn wifi_list_turn_off_returns_to_previous_screen() {
+fn wifi_list_toggle_off_returns_to_previous_screen() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
-    // [Home, WifiList]; rows: net(0), "Scan again"(1), "Turn Wi-Fi off"(2).
+    // [Home, WifiList]; rows: Wi-Fi toggle(0), net(1), "Scan again"(2).
     app.stack.push(Screen::WifiList {
         networks: vec![wifi_net("X", true, false)],
     });
-    app.activate(2, 10, 10).unwrap();
+    app.activate(0, 10, 10).unwrap();
     assert!(
         matches!(app.screen(), Screen::Home),
-        "turning Wi-Fi off pops back to the previous screen"
+        "flipping the Wi-Fi toggle off pops back to the previous screen"
     );
 }
 
