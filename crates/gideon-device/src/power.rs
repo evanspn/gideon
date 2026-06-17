@@ -271,7 +271,10 @@ pub fn lower_current_thread_to_idle() {
     // (pid/tid 0); failures are ignored (best-effort niceness).
     unsafe {
         // CPU: SCHED_IDLE — scheduled only when no other task is runnable.
-        let param = libc::sched_param { sched_priority: 0 };
+        // `sched_param` carries extra POSIX sporadic-server fields on musl, so
+        // zero it (priority 0 is exactly what SCHED_IDLE wants) instead of a
+        // field-by-field literal that wouldn't compile across libcs.
+        let param: libc::sched_param = std::mem::zeroed();
         libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
         // Belt and suspenders for schedulers that still time-slice IDLE tasks.
         libc::setpriority(libc::PRIO_PROCESS, 0, 19);
