@@ -1079,9 +1079,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             self.show_status(&["Marked as read."])?;
                         }
                         1 => {
-                            if self.mark_unread(&key)? {
-                                self.show_status(&["Marked as unread."])?;
-                            }
+                            self.mark_unread(&key)?;
+                            self.show_status(&["Marked as unread."])?;
                         }
                         _ => {}
                     }
