@@ -2070,7 +2070,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if !gideon_device::network::is_online() {
             gideon_device::network::bring_up_wifi();
         }
-        let networks = gideon_device::network::scan_networks();
+        let networks = scan_wifi_sorted();
         self.push(Screen::WifiList { networks })
     }
 
@@ -2139,7 +2139,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// already on it), then repaint.
     fn refresh_wifi_list(&mut self) -> Result<()> {
         self.show_status(&["Scanning for Wi-Fi…"])?;
-        let networks = gideon_device::network::scan_networks();
+        let networks = scan_wifi_sorted();
         match self.stack.last_mut() {
             Some(s @ Screen::WifiList { .. }) => *s = Screen::WifiList { networks },
             _ => self.stack.push(Screen::WifiList { networks }),
@@ -2372,28 +2372,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Power", &rows, 0, 1)
             }
             Screen::WifiList { networks } => {
-                let mut rows: Vec<(String, bool)> = networks
+                let nets: Vec<WifiRow> = networks
                     .iter()
-                    .map(|n| {
-                        let prefix = if n.connected {
-                            "● "
-                        } else if n.saved {
-                            "✓ "
-                        } else {
-                            ""
-                        };
-                        let open = if n.secured { "" } else { " (open)" };
-                        (format!("{prefix}{}{open}", n.ssid), true)
+                    .map(|n| WifiRow {
+                        ssid: n.ssid.clone(),
+                        secured: n.secured,
+                        saved: n.saved,
+                        connected: n.connected,
+                        bars: n.bars(),
                     })
                     .collect();
-                rows.push(("Scan again".to_string(), true));
-                rows.push(("Turn Wi-Fi off".to_string(), true));
                 let title = if networks.is_empty() {
                     "Wi-Fi — no networks found"
                 } else {
                     "Wi-Fi"
                 };
-                compose_list(l, title, &rows, 0, 1)
+                compose_wifi_list(l, title, &nets, &["Scan again", "Turn Wi-Fi off"])
             }
             Screen::WifiPassword { ssid, password } => {
                 compose_keyboard(l, &format!("Password — {ssid}"), password, "Connect")
@@ -2982,6 +2976,90 @@ fn compose_chapter_list(
     canvas
 }
 
+/// Scan for Wi-Fi and order the results for the list: the connected network
+/// first, then saved ones, then the rest by signal strength — so the network
+/// you're on (and the ones you'll likely want) sit at the top.
+fn scan_wifi_sorted() -> Vec<gideon_device::network::WifiNetwork> {
+    let mut nets = gideon_device::network::scan_networks();
+    nets.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then(b.saved.cmp(&a.saved))
+            .then(b.signal.cmp(&a.signal))
+    });
+    nets
+}
+
+/// One network as the Wi-Fi list needs to draw it: label, plus the flags that
+/// pick the row's glyphs. Kept as a plain tuple-struct so the renderer doesn't
+/// depend on `gideon_device`.
+struct WifiRow {
+    ssid: String,
+    secured: bool,
+    saved: bool,
+    connected: bool,
+    bars: u8,
+}
+
+/// The Wi-Fi list, styled like a phone's Wi-Fi settings: a **checkmark** on the
+/// connected network (a faint dot on a saved one), the SSID, then a **lock** for
+/// secured networks and **signal bars** on the right. Trailing `actions` ("Scan
+/// again", "Turn Wi-Fi off") render as plain rows. Row order here must match the
+/// order stored on the screen so taps map to the right network.
+fn compose_wifi_list(l: &UiLayout, title: &str, nets: &[WifiRow], actions: &[&str]) -> GrayPage {
+    let mut canvas = compose_chrome_opts(l, title, 0, 1, true);
+    let icon = (l.row_h as f32 * 0.5) as u32;
+    let gap = 6u32;
+    let text_x = l.pad + icon + gap;
+    let bars_w = icon;
+    let bars_x = l.width.saturating_sub(l.pad + bars_w);
+    let lock_x = bars_x.saturating_sub(gap + icon);
+    let text_w = lock_x.saturating_sub(gap).saturating_sub(text_x);
+    let text_y = |top: u32| top + l.row_h.saturating_sub(l.text_px as u32 + 4) / 2;
+    let total = nets.len() + actions.len();
+    for i in 0..total.min(l.rows_per_page()) {
+        let top = l.row_top(i);
+        let icon_y = top + l.row_h.saturating_sub(icon) / 2;
+        if i < nets.len() {
+            let n = &nets[i];
+            if n.connected {
+                draw_check_icon(&mut canvas, l.pad, icon_y, icon, 0x00);
+            } else if n.saved {
+                draw_dot_icon(&mut canvas, l.pad, icon_y, icon, 0x66);
+            }
+            draw_text(
+                &mut canvas,
+                text_x,
+                text_y(top),
+                l.text_px,
+                &n.ssid,
+                text_w,
+                n.connected,
+            );
+            if n.secured {
+                draw_lock_icon(&mut canvas, lock_x, icon_y, icon, 0x00);
+            }
+            draw_wifi_bars(&mut canvas, bars_x, icon_y, bars_w, n.bars, 0x00);
+        } else {
+            let label = actions[i - nets.len()];
+            draw_text(
+                &mut canvas,
+                l.pad,
+                text_y(top),
+                l.text_px,
+                label,
+                l.width.saturating_sub(2 * l.pad),
+                true,
+            );
+        }
+        let sep_y = top + l.row_h - 1;
+        if sep_y < l.nav_top() {
+            hline(&mut canvas, sep_y, 0xDD);
+        }
+    }
+    canvas
+}
+
 /// Apply an edit key to a keyboard buffer; `None` means no change (the
 /// action key is handled by the caller). Shared by the search and
 /// new-profile keyboards.
@@ -3276,6 +3354,71 @@ fn draw_book_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
     // A couple of page lines per side.
     line(canvas, l + s / 8, t + s / 4, cx - s / 12, t + s / 4, value);
     line(canvas, cx + s / 12, t + s / 4, r - s / 8, t + s / 4, value);
+}
+
+/// Signal-strength bars (4 ascending) in the `s`×`s` box at (`x`, `y`): the
+/// first `bars` are filled solid, the rest faint — like a phone's Wi-Fi meter.
+fn draw_wifi_bars(canvas: &mut GrayPage, x: u32, y: u32, s: u32, bars: u8, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    let bw = (s / 6).max(1);
+    let gap = (s / 12).max(1);
+    let base = y + s;
+    for i in 0..4i32 {
+        let h = (s * (i + 1) / 4).max(2);
+        let bx = x + i * (bw + gap);
+        let v = if (i as u8) < bars { value } else { 0xCC };
+        for xx in bx..bx + bw {
+            line(canvas, xx, base - h, xx, base, v);
+        }
+    }
+}
+
+/// A padlock in the `s`×`s` box at (`x`, `y`): the network is secured.
+fn draw_lock_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    let (bl, br) = (x + s / 4, x + (s * 3) / 4);
+    let (bt, bb) = (y + s / 2, y + (s * 5) / 6);
+    // Body.
+    line(canvas, bl, bt, br, bt, value);
+    line(canvas, bl, bb, br, bb, value);
+    line(canvas, bl, bt, bl, bb, value);
+    line(canvas, br, bt, br, bb, value);
+    // Shackle.
+    let (sl, sr, st) = (x + s / 3, x + (s * 2) / 3, y + s / 4);
+    line(canvas, sl, bt, sl, st, value);
+    line(canvas, sr, bt, sr, st, value);
+    line(canvas, sl, st, sr, st, value);
+}
+
+/// A checkmark in the `s`×`s` box at (`x`, `y`): the connected network.
+fn draw_check_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    line(
+        canvas,
+        x + s / 6,
+        y + s / 2,
+        x + (s * 2) / 5,
+        y + (s * 2) / 3,
+        value,
+    );
+    line(
+        canvas,
+        x + (s * 2) / 5,
+        y + (s * 2) / 3,
+        x + (s * 5) / 6,
+        y + s / 4,
+        value,
+    );
+}
+
+/// A small filled dot in the `s`×`s` box at (`x`, `y`): a saved (but not
+/// currently connected) network.
+fn draw_dot_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    let (cx, cy, r) = (x + s / 2, y + s / 2, s / 8);
+    for yy in cy - r..=cy + r {
+        line(canvas, cx - r, yy, cx + r, yy, value);
+    }
 }
 
 /// Copy `src` into `dst` at (`off_x`, `off_y`), clipped to `dst`.
