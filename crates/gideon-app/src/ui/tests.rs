@@ -1130,11 +1130,20 @@ fn book_menu_targets_the_chapter_a_tap_would_open() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { entry, series_dir } = app.screen() else {
+    let Screen::BookMenu {
+        entry,
+        series_dir,
+        read_key,
+    } = app.screen()
+    else {
         panic!("expected the book menu");
     };
+    // vol1 is finished (and read latest, at=200), so the resume target is the
+    // next chapter, vol2 — but "mark as unread" should clear vol1, the chapter
+    // actually read.
     assert_eq!(entry.relative_path, "Series/vol2.cbz");
     assert_eq!(series_dir, "Series");
+    assert_eq!(read_key.as_deref(), Some("Series/vol1.cbz"));
 }
 
 /// Write a solid-red series cover where the shelf looks for it.
@@ -2517,7 +2526,8 @@ fn book_menu_deletes_a_chapter() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
+    // Row 2 is "Delete this chapter" (row 1 is now "Mark as unread").
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -2544,7 +2554,8 @@ fn book_menu_deletes_the_whole_series() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    // Row 3 is "Delete whole series" (shifted by the new "Mark as unread" row).
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(3)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -2553,6 +2564,45 @@ fn book_menu_deletes_the_whole_series() {
     };
     assert!(items.is_empty(), "whole series gone");
     assert!(!lib.join("Series").exists());
+}
+
+#[test]
+fn book_menu_marks_the_latest_read_chapter_unread() {
+    // "I clicked the wrong thing" undo: vol1 was read (and finished); the menu's
+    // "Mark as unread" (row 1) forgets vol1's progress, leaving vol2 untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 3);
+    let progress_file = progress_path(&lib);
+    std::fs::create_dir_all(progress_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &progress_file,
+        r#"{"progress":{
+            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":200},
+            "Series/vol2.cbz":{"current_page":1,"total_pages":3,"last_read_at":100}
+        }}"#,
+    )
+    .unwrap();
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    // Long press → BookMenu, then row 1 = "Mark as unread".
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_file).unwrap();
+    assert!(
+        store.get("Series/vol1.cbz").is_none(),
+        "the latest-read chapter is now unread"
+    );
+    assert!(
+        store.get("Series/vol2.cbz").is_some(),
+        "the other chapter's progress is untouched"
+    );
 }
 
 #[test]
