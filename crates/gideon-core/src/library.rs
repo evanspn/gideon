@@ -166,6 +166,14 @@ impl ProgressStore {
         self.progress.len()
     }
 
+    /// Forget a chapter's progress entirely — used to "mark as unread" when the
+    /// user opened/finished something by accident. Returns whether anything was
+    /// removed. A later sync may pull the row back from another device, which is
+    /// the correct furthest-page-wins behaviour; this clears it locally now.
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.progress.remove(key).is_some()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.progress.is_empty()
     }
@@ -240,6 +248,18 @@ mod tests {
         assert!(p.last_read_at > 0);
         assert!(!p.is_finished());
         assert!((p.percent() - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn remove_forgets_a_chapters_progress() {
+        let mut store = ProgressStore::default();
+        store.update("Series/vol1.cbz", 1, 2);
+        assert!(store.remove("Series/vol1.cbz"), "removed an existing key");
+        assert!(store.get("Series/vol1.cbz").is_none());
+        assert!(
+            !store.remove("Series/vol1.cbz"),
+            "removing again is a no-op"
+        );
     }
 
     #[test]

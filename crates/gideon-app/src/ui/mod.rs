@@ -98,21 +98,33 @@ impl SeriesCard {
         }
     }
 
-    /// The chapter a tap opens: the most recently read unfinished chapter
-    /// (tapping the card resumes where the reader left off), else the
-    /// first chapter in natural order.
+    /// The chapter a tap opens: take the **latest** chapter the user touched
+    /// (most recent `last_read_at`, finished or not). If it's unfinished, resume
+    /// it where they left off; if they finished it, jump to the **next** chapter
+    /// so the card always lands on "what to read now" rather than re-opening a
+    /// chapter they've completed. With nothing read yet, start at the first
+    /// chapter in natural order.
     fn resume_chapter(&self, store: &ProgressStore) -> &LibraryEntry {
+        let latest = self
+            .chapters
+            .iter()
+            .filter_map(|c| store.get(&c.relative_path).map(|p| (p.last_read_at, p, c)))
+            .max_by_key(|(at, _, _)| *at);
+        match latest {
+            Some((_, p, c)) if p.is_finished() => self.next_after(c).unwrap_or(c),
+            Some((_, _, c)) => c,
+            None => &self.chapters[0],
+        }
+    }
+
+    /// The chapter the user most recently read in this card (finished or not),
+    /// i.e. the one a "mark as unread" should clear. `None` when nothing's read.
+    fn latest_read(&self, store: &ProgressStore) -> Option<&LibraryEntry> {
         self.chapters
             .iter()
-            .filter_map(|c| {
-                store
-                    .get(&c.relative_path)
-                    .filter(|p| !p.is_finished())
-                    .map(|p| (p.last_read_at, c))
-            })
+            .filter_map(|c| store.get(&c.relative_path).map(|p| (p.last_read_at, c)))
             .max_by_key(|(at, _)| *at)
             .map(|(_, c)| c)
-            .unwrap_or(&self.chapters[0])
     }
 
     /// The chapter after `current` within this card, for continuous
@@ -214,6 +226,12 @@ enum Screen {
     BookMenu {
         entry: LibraryEntry,
         series_dir: String,
+        /// The chapter to "mark as unread": the most recently read one in this
+        /// card (which may differ from `entry`, the resume target — if you
+        /// finished a chapter, the card resumes at the *next* one but unread
+        /// should clear the chapter you actually read). `None` when nothing in
+        /// the card has been read yet.
+        read_key: Option<String>,
     },
     /// Profile picker, opened from the left half of Home's title bar.
     ProfileMenu {
@@ -740,14 +758,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // The menu targets the chapter a tap would open (the
                 // card's resume point), so "Delete this chapter" removes
                 // exactly what the user is looking at.
-                let entry = self.with_progress(|_, store| card.resume_chapter(store).clone());
+                let (entry, read_key) = self.with_progress(|_, store| {
+                    (
+                        card.resume_chapter(store).clone(),
+                        card.latest_read(store).map(|c| c.relative_path.clone()),
+                    )
+                });
                 let series_dir = entry
                     .relative_path
                     .split('/')
                     .next()
                     .unwrap_or(&entry.relative_path)
                     .to_string();
-                self.push(Screen::BookMenu { entry, series_dir })?;
+                self.push(Screen::BookMenu {
+                    entry,
+                    series_dir,
+                    read_key,
+                })?;
                 Ok(Flow::Continue)
             }
             Screen::ChapterList {
@@ -927,10 +954,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
-            Screen::BookMenu { entry, series_dir } => {
+            Screen::BookMenu {
+                entry,
+                series_dir,
+                read_key,
+            } => {
                 match row {
                     0 => self.open_series_chapters(&series_dir)?,
                     1 => {
+                        // Mark as unread: forget the latest-read chapter's
+                        // progress (an "I tapped the wrong thing" undo). The
+                        // card's resume point falls back to the prior read.
+                        if let Some(key) = read_key {
+                            if self.mark_unread(&key)? {
+                                self.show_status(&["Marked as unread."])?;
+                            }
+                        }
+                        self.pop()?;
+                    }
+                    2 => {
                         // Delete this chapter's file; drop it from the
                         // series' download history.
                         std::fs::remove_file(&entry.path)
@@ -952,7 +994,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                         self.refresh_library_after_delete()?;
                     }
-                    2 => {
+                    3 => {
                         // Delete the whole series directory.
                         let target = entry
                             .path
@@ -2328,9 +2370,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 draw_power_icon(&mut canvas, l);
                 canvas
             }
-            Screen::BookMenu { series_dir, .. } => {
+            Screen::BookMenu {
+                series_dir,
+                read_key,
+                ..
+            } => {
+                let unread = match read_key {
+                    Some(key) => format!("Mark \"{}\" as unread", entry_title(key)),
+                    None => "Mark as unread".to_string(),
+                };
                 let rows = vec![
                     ("All chapters (from source)".to_string(), true),
+                    (unread, read_key.is_some()),
                     ("Delete this chapter".to_string(), true),
                     ("Delete whole series".to_string(), true),
                 ];
@@ -2562,6 +2613,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let result = f(self, &store);
         *self.progress_cache.borrow_mut() = Some(store);
         result
+    }
+
+    /// Forget a chapter's reading progress ("mark as unread"), persist it, and
+    /// drop the cache. Returns whether anything was actually cleared.
+    fn mark_unread(&self, key: &str) -> Result<bool> {
+        let path = progress_path(&self.library_dir);
+        let mut store = ProgressStore::load(&path).unwrap_or_default();
+        let removed = store.remove(key);
+        if removed {
+            store.save(&path)?;
+            self.invalidate_progress_cache();
+        }
+        Ok(removed)
     }
 
     /// Drop the cached ProgressStore — progress was just written, or the
