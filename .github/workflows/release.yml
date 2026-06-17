@@ -58,11 +58,18 @@ jobs:
 
       - name: Determine release version
         id: version
+        # The commit message is untrusted free text — pass it through the
+        # environment, never interpolate ${{ }} into the shell, or quotes /
+        # parens / backticks in a merge message break the script (and are an
+        # injection vector).
+        env:
+          BUMP_INPUT: ${{ github.event.inputs.bump }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          level="${{ github.event.inputs.bump }}"
+          level="$BUMP_INPUT"
           if [ -z "$level" ]; then
             level=patch
-            case "${{ github.event.head_commit.message }}" in
+            case "$COMMIT_MSG" in
               *"[major]"*) level=major ;;
               *"[minor]"*) level=minor ;;
             esac
