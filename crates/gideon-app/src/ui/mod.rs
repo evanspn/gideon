@@ -1707,13 +1707,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             match outcome {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
-                ReaderOutcome::Back => {
-                    // Re-queue the look-ahead (a no-op for chapters already
-                    // queued/stored) — still queue-only, never a foreground fetch.
-                    self.predownload_ahead(source, manga, chapters, &chapter.id);
-                    return Ok(Flow::Continue);
-                }
-                // Turning past the last page flows into the next chapter.
+                // Leaving the chapter does NOT kick off more downloading — the
+                // look-ahead window was already queued when the reader opened.
+                // (Re-triggering here is what made it feel like it "kept
+                // downloading every time you leave".)
+                ReaderOutcome::Back => return Ok(Flow::Continue),
+                // Turning past the last page flows into the next chapter; the
+                // loop re-queues the window from the new chapter.
                 ReaderOutcome::NextChapter => {
                     chapter = next.expect("NextChapter only with a next");
                 }
@@ -1721,10 +1721,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    /// The next not-yet-stored chapters ahead of `after_id`, up to the
-    /// "Pre-download ahead" setting — what to stock up so they're ready
-    /// offline. Skips chapters already on disk and walks forward in reading
-    /// order until it has `count` of them (or the list ends).
+    /// The chapters to pre-fetch: a **fixed window** of the next `count`
+    /// chapters (by position) after `after_id`, minus any already on disk.
+    ///
+    /// The window is bounded to `count` *positions* — NOT "the next `count`
+    /// missing chapters". That distinction is the whole point: if it walked
+    /// past downloaded chapters hunting for `count` missing ones, then every
+    /// time the look-ahead re-fired from the same chapter it would march one
+    /// window further into the series (c2,c3 → c4,c5 → c6,c7 …) and eventually
+    /// download everything. Anchored positionally, re-firing from the same
+    /// chapter yields the same window — all already stored — so it does nothing.
     fn predownload_targets(
         &self,
         source: &SourceEntry,
@@ -1738,18 +1744,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         let mut id = after_id.to_string();
         let mut out = Vec::new();
-        while out.len() < count {
+        for _ in 0..count {
             let Some(next) = next_chapter(chapters, &id) else {
                 break; // reached the end of the chapter list
             };
             id = next.id.clone();
             if self
                 .downloaded_chapter_path(source, manga, &next.id)
-                .is_some()
+                .is_none()
             {
-                continue; // already stored — look further ahead
+                out.push(next.clone()); // in-window and not yet stored
             }
-            out.push(next.clone());
         }
         out
     }
