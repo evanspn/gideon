@@ -239,6 +239,14 @@ enum Screen {
         entries: Vec<LibraryEntry>,
         page: usize,
     },
+    /// Per-chapter read-status menu, opened from the ⋮ button on a chapter row.
+    /// `key` is the chapter's progress key (its on-disk path); `None` when the
+    /// chapter isn't downloaded, so there's nothing to mark yet.
+    ChapterMenu {
+        title: String,
+        key: Option<String>,
+        finished: bool,
+    },
     /// Context menu for a library book (long press on its card).
     BookMenu {
         entry: LibraryEntry,
@@ -1039,15 +1047,45 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             } => {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(chapter) = chapters.get(index).cloned() {
+                    // Tap on the ⋮ button opens the read-status menu; the rest of
+                    // the row opens/downloads the chapter.
+                    if chapter_kebab_tapped(&self.layout, x) {
+                        let key = self
+                            .downloaded_chapter_path(&source, &manga, &chapter.id)
+                            .map(|p| progress_key(&self.library_dir, &p));
+                        return self.open_chapter_menu(chapter.label(), key);
+                    }
                     return self.download_and_read(&source, &manga, &chapter, &chapters);
                 }
                 Ok(Flow::Continue)
             }
             Screen::DownloadedChapters { entries, page, .. } => {
                 let index = page * self.layout.rows_per_page() + row;
-                if index < entries.len() {
+                if let Some(entry) = entries.get(index) {
+                    if chapter_kebab_tapped(&self.layout, x) {
+                        let title = chapter_label(&entry.relative_path);
+                        let key = Some(entry.relative_path.clone());
+                        return self.open_chapter_menu(title, key);
+                    }
                     return self.read_downloaded_chain(&entries, index);
                 }
+                Ok(Flow::Continue)
+            }
+            Screen::ChapterMenu { key, .. } => {
+                if let Some(key) = key {
+                    match row {
+                        0 => {
+                            self.mark_read(&key)?;
+                            self.show_status(&["Marked as read."])?;
+                        }
+                        1 => {
+                            self.mark_unread(&key)?;
+                            self.show_status(&["Marked as unread."])?;
+                        }
+                        _ => {}
+                    }
+                }
+                self.pop()?; // back to the chapter list (repaints the new state)
                 Ok(Flow::Continue)
             }
             Screen::BookMenu {
@@ -2521,6 +2559,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 draw_power_icon(&mut canvas, l);
                 canvas
             }
+            Screen::ChapterMenu {
+                title,
+                key,
+                finished,
+            } => {
+                let rows = if key.is_some() {
+                    vec![
+                        ("Mark as read".to_string(), !*finished),
+                        ("Mark as unread".to_string(), *finished),
+                    ]
+                } else {
+                    // Nothing to track until it's downloaded.
+                    vec![("Download to track read status".to_string(), false)]
+                };
+                compose_list(l, title, &rows, 0, 1)
+            }
             Screen::BookMenu {
                 series_dir,
                 read_key,
@@ -2798,6 +2852,39 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.invalidate_progress_cache();
         }
         Ok(removed)
+    }
+
+    /// Mark a downloaded chapter as read (finished): record progress at its last
+    /// page so it shows the read icon and the shelf skips it when resuming. Page
+    /// count comes from the CBZ (a local zip-directory read) so `percent()` and
+    /// resume are honest.
+    fn mark_read(&self, key: &str) -> Result<()> {
+        let file = self.library_dir.join(key);
+        let total = CbzDocument::open(&file)
+            .map(|d| d.page_count())
+            .unwrap_or(1)
+            .max(1);
+        let path = progress_path(&self.library_dir);
+        let mut store = ProgressStore::load(&path).unwrap_or_default();
+        store.update(key, total - 1, total);
+        store.save(&path)?;
+        self.invalidate_progress_cache();
+        Ok(())
+    }
+
+    /// Open the per-chapter read-status menu (the ⋮ button). `key` is the
+    /// chapter's progress key when it's downloaded, else `None`.
+    fn open_chapter_menu(&mut self, title: String, key: Option<String>) -> Result<Flow> {
+        let finished = key
+            .as_ref()
+            .map(|k| self.with_progress(|_, s| s.get(k).is_some_and(|p| p.is_finished())))
+            .unwrap_or(false);
+        self.push(Screen::ChapterMenu {
+            title,
+            key,
+            finished,
+        })?;
+        Ok(Flow::Continue)
     }
 
     /// Drop the cached ProgressStore — progress was just written, or the
@@ -3185,7 +3272,9 @@ fn compose_chapter_list(
     let gap = 5u32;
     let gutter = 2 * icon + 2 * gap;
     let text_x = l.pad + gutter;
-    let text_w = l.width.saturating_sub(text_x + l.pad);
+    // Reserve the right edge for the ⋮ (kebab) read-status button.
+    let kebab_x = chapter_kebab_x(l);
+    let text_w = kebab_x.saturating_sub(gap).saturating_sub(text_x);
     for (i, (text, downloaded, read)) in rows.iter().take(l.rows_per_page()).enumerate() {
         let top = l.row_top(i);
         let icon_y = top + l.row_h.saturating_sub(icon) / 2;
@@ -3204,12 +3293,27 @@ fn compose_chapter_list(
             text_w,
             false,
         );
+        draw_kebab_icon(&mut canvas, kebab_x, icon_y, icon, 0x00);
         let sep_y = top + l.row_h - 1;
         if sep_y < l.nav_top() {
             hline(&mut canvas, sep_y, 0xDD);
         }
     }
     canvas
+}
+
+/// The x where a chapter row's ⋮ (kebab) read-status button sits — shared by
+/// the renderer (to draw it) and the tap handler (to detect a hit on it).
+fn chapter_kebab_x(l: &UiLayout) -> u32 {
+    let icon = (l.row_h as f32 * 0.5) as u32;
+    l.width.saturating_sub(l.pad + icon)
+}
+
+/// Whether a tap at `x` landed on a chapter row's ⋮ button (its right-edge
+/// zone, made generous for fat fingers) rather than the row body.
+fn chapter_kebab_tapped(l: &UiLayout, x: u32) -> bool {
+    let icon = (l.row_h as f32 * 0.5) as u32;
+    x >= chapter_kebab_x(l).saturating_sub(icon)
 }
 
 /// Scan for Wi-Fi and order the results for the list: the connected network
@@ -3606,6 +3710,21 @@ fn draw_book_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
     // A couple of page lines per side.
     line(canvas, l + s / 8, t + s / 4, cx - s / 12, t + s / 4, value);
     line(canvas, cx + s / 12, t + s / 4, r - s / 8, t + s / 4, value);
+}
+
+/// A vertical "kebab" (⋮ — three stacked dots) in the `s`×`s` box at (`x`, `y`):
+/// the per-chapter overflow/read-status button.
+fn draw_kebab_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    let cx = x + s / 2;
+    let r = (s / 12).max(1);
+    for k in 0..3 {
+        let cy = y + s / 4 + k * (s / 4);
+        for dy in -r..=r {
+            let dx = ((r * r - dy * dy) as f32).sqrt().round() as i32;
+            line(canvas, cx - dx, cy + dy, cx + dx, cy + dy, value);
+        }
+    }
 }
 
 /// Signal-strength bars (4 ascending) in the `s`×`s` box at (`x`, `y`): the
