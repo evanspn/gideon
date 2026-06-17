@@ -1684,6 +1684,56 @@ fn predownload_targets_picks_the_next_unread_chapters() {
     assert_eq!(ids, vec!["c2", "c3"], "two ahead of c1, not c1 or c4");
 }
 
+#[test]
+fn predownload_window_does_not_march_through_the_series() {
+    // The infinite-download bug: re-triggering the look-ahead from the same
+    // chapter must NOT walk further into the series as chapters get stored.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let app = app(&lib, FakeGateway::default(), vec![]);
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+    let chapters: Vec<ChapterEntry> = (1..=6)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: Some("en".into()),
+        })
+        .collect();
+
+    // From c1, the window (2) is c2, c3.
+    let first = app.predownload_targets(&source, &manga, &chapters, "c1");
+    let ids: Vec<&str> = first.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, vec!["c2", "c3"]);
+
+    // Those two get stored.
+    let guard = std::sync::Mutex::new(());
+    for id in ["c2", "c3"] {
+        let path = lib.join(format!("Manga One/{id}.cbz"));
+        make_cbz(&path, 2);
+        record_chapter_in_index(&lib, &guard, &source, &manga, id, &path);
+    }
+
+    // Re-trigger from the SAME chapter: the window is satisfied, so nothing new
+    // — it must NOT march on to c4, c5.
+    let second = app.predownload_targets(&source, &manga, &chapters, "c1");
+    assert!(
+        second.is_empty(),
+        "window stays anchored at c1; it never marches to c4/c5 (got {:?})",
+        second.iter().map(|c| &c.id).collect::<Vec<_>>()
+    );
+}
+
 /// A minimal `Send + Clone` gateway whose `background_clone` returns a working
 /// copy — so the background pre-download worker actually runs. `download_chapter`
 /// writes a CBZ named after the chapter id under the manga's directory.
