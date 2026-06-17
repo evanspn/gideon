@@ -1694,13 +1694,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.input.discard_taps();
 
             let next = next_chapter(chapters, &chapter.id);
-            // Kick off background pre-downloading of the next chapters *before*
-            // the reader opens, so they fetch while the user reads this one. The
-            // worker is non-blocking; we only do this when one's available, so
-            // the foreground fallback never stalls ahead of the first page.
-            if self.ensure_predownloader() {
-                self.predownload_ahead(source, manga, chapters, &chapter.id);
-            }
+            // Queue background pre-downloading of the next chapters *before* the
+            // reader opens, so they fetch (at idle priority) while the user
+            // reads this one. Queue-only — never blocks the first page.
+            self.predownload_ahead(source, manga, chapters, &chapter.id);
             let key = progress_key(&self.library_dir, &cbz_path);
             let outcome = self.run_reader(&cbz_path, &key, next.is_some())?;
             // The cover fetch (a network round-trip) runs after the
@@ -1711,10 +1708,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             match outcome {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
                 ReaderOutcome::Back => {
-                    // Stock up the next few chapters so they're ready offline.
-                    // With a background worker this was already kicked off when
-                    // the reader opened (a no-op re-queue here); the foreground
-                    // fallback path does the actual fetch on the way out.
+                    // Re-queue the look-ahead (a no-op for chapters already
+                    // queued/stored) — still queue-only, never a foreground fetch.
                     self.predownload_ahead(source, manga, chapters, &chapter.id);
                     return Ok(Flow::Continue);
                 }
@@ -1777,11 +1772,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Stock up the next few chapters ahead of `after_id` so they're ready
-    /// offline. With a background pre-downloader this just **queues** them and
-    /// returns immediately — the chapters download on a worker thread while the
-    /// user reads, never blocking the UI. Without one (tests / a gateway with
-    /// no background support) it falls back to a foreground download, skipping
-    /// chapters already on disk and stopping quietly at the first failure.
+    /// offline. This **only ever queues** onto the background worker and returns
+    /// immediately — pre-download must never block the UI. If the gateway has no
+    /// background worker (some tests), it's simply a no-op: pre-download is a
+    /// nicety, never something the user waits on.
     fn predownload_ahead(
         &mut self,
         source: &SourceEntry,
@@ -1789,27 +1783,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         chapters: &[ChapterEntry],
         after_id: &str,
     ) {
-        let targets = self.predownload_targets(source, manga, chapters, after_id);
-        if targets.is_empty() {
-            return;
+        if !self.ensure_predownloader() {
+            return; // no background worker → no foreground stalling, ever
         }
-        if self.ensure_predownloader() {
-            let worker = self.predownloader.as_mut().expect("just ensured");
-            let epoch = worker.epoch();
-            for chapter in &targets {
-                worker.queue(PreloadJob {
-                    source: source.clone(),
-                    manga: manga.clone(),
-                    chapter_id: chapter.id.clone(),
-                    epoch,
-                });
-            }
-        } else {
-            for chapter in &targets {
-                if self.download_to_library(source, manga, chapter).is_err() {
-                    break; // offline / source error — stop quietly
-                }
-            }
+        let targets = self.predownload_targets(source, manga, chapters, after_id);
+        let worker = self.predownloader.as_mut().expect("just ensured");
+        let epoch = worker.epoch();
+        for chapter in &targets {
+            worker.queue(PreloadJob {
+                source: source.clone(),
+                manga: manga.clone(),
+                chapter_id: chapter.id.clone(),
+                epoch,
+            });
         }
     }
 
@@ -3780,6 +3766,9 @@ impl Predownloader {
         let _ = std::thread::Builder::new()
             .name("gideon-predownload".into())
             .spawn(move || {
+                // Run at idle CPU/IO priority: the reader must never stutter
+                // because chapters are pre-fetching behind it.
+                gideon_device::power::lower_current_thread_to_idle();
                 // Ends when the sender (and thus the app) is dropped.
                 for job in rx {
                     // The user left this manga after the job was queued — drop it
