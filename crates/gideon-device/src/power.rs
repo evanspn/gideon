@@ -260,6 +260,34 @@ pub fn battery_percent_at(root: &Path) -> Option<u8> {
     None
 }
 
+/// Drop the **calling thread** to idle CPU and IO priority, so a background
+/// worker (e.g. chapter pre-download) physically cannot steal cycles or flash
+/// bandwidth from the reader on the device's modest CPU — it runs only when
+/// nothing else wants the core, and its writes yield to the reader's page
+/// reads. Off-device (no `kobo` feature) this is a no-op.
+#[cfg(feature = "kobo")]
+pub fn lower_current_thread_to_idle() {
+    // SAFETY: all three are plain scheduler syscalls on the *current* thread
+    // (pid/tid 0); failures are ignored (best-effort niceness).
+    unsafe {
+        // CPU: SCHED_IDLE — scheduled only when no other task is runnable.
+        let param = libc::sched_param { sched_priority: 0 };
+        libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+        // Belt and suspenders for schedulers that still time-slice IDLE tasks.
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        // IO: idle class, so large CBZ writes defer to the reader's reads.
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+        const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+        let ioprio = IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT;
+        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio);
+    }
+}
+
+/// Off-device stub — there's no scheduler to tune.
+#[cfg(not(feature = "kobo"))]
+pub fn lower_current_thread_to_idle() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

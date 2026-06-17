@@ -1653,29 +1653,13 @@ fn power_menu_restart_requests_restart() {
 }
 
 #[test]
-fn predownload_ahead_fetches_the_next_unread_chapters() {
+fn predownload_targets_picks_the_next_unread_chapters() {
+    // The selection logic (run on the UI thread, then handed to the worker):
+    // the default "Pre-download ahead" is 2, so from c1 the targets are c2, c3.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     std::fs::create_dir_all(&lib).unwrap();
-
-    // The fake gateway ignores the chapter id, so write a distinct CBZ per
-    // call (download_to_library records the correct id -> file mapping).
-    let n = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let nn = n.clone();
-    let gateway = FakeGateway {
-        download: Some(Box::new(
-            move |library: &Path, progress: &mut dyn FnMut(usize, usize)| {
-                let i = nn.get();
-                nn.set(i + 1);
-                let path = library.join(format!("Manga One/ch{i}.cbz"));
-                make_cbz(&path, 3);
-                progress(3, 3);
-                Ok(path)
-            },
-        )),
-        ..FakeGateway::default()
-    };
-    let mut app = app(&lib, gateway, vec![]);
+    let app = app(&lib, FakeGateway::default(), vec![]);
 
     let source = SourceEntry {
         id: "src".into(),
@@ -1695,25 +1679,9 @@ fn predownload_ahead_fetches_the_next_unread_chapters() {
         })
         .collect();
 
-    // The default "Pre-download ahead" is 2: from c1, that's c2 and c3.
-    app.predownload_ahead(&source, &manga, &chapters, "c1");
-
-    assert!(
-        app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
-        "c2 predownloaded"
-    );
-    assert!(
-        app.downloaded_chapter_path(&source, &manga, "c3").is_some(),
-        "c3 predownloaded"
-    );
-    assert!(
-        app.downloaded_chapter_path(&source, &manga, "c4").is_none(),
-        "only 2 ahead"
-    );
-    assert!(
-        app.downloaded_chapter_path(&source, &manga, "c1").is_none(),
-        "the chapter just read is not re-fetched"
-    );
+    let targets = app.predownload_targets(&source, &manga, &chapters, "c1");
+    let ids: Vec<&str> = targets.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, vec!["c2", "c3"], "two ahead of c1, not c1 or c4");
 }
 
 /// A minimal `Send + Clone` gateway whose `background_clone` returns a working
