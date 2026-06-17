@@ -2012,6 +2012,51 @@ fn tapping_a_downloaded_chapter_opens_it_offline() {
     assert!(matches!(app.screen(), Screen::DownloadedChapters { .. }));
 }
 
+/// A tap on the ⋮ button of chapter row `i` (right edge of the row).
+fn tap_row_kebab(i: usize) -> (u32, u32) {
+    let l = layout();
+    (l.width - 2, l.row_top(i) + l.row_h / 2)
+}
+
+#[test]
+fn chapter_kebab_opens_read_menu_and_toggles_read_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 3);
+    let key = "Series/vol1.cbz";
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.open_downloaded_chapters("Series").unwrap();
+
+    // ⋮ on row 0 opens the read-status menu (does NOT open the reader).
+    let (kx, ky) = tap_row_kebab(0);
+    app.activate(0, kx, ky).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::ChapterMenu { .. }),
+        "the ⋮ button opens the read menu"
+    );
+
+    // Row 0 = "Mark as read" → finished.
+    let UiEvent::Tap { x, y } = tap_row(0) else {
+        unreachable!()
+    };
+    app.activate(0, x, y).unwrap();
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get(key).is_some_and(|p| p.is_finished()),
+        "Mark as read records the chapter as finished"
+    );
+    assert!(matches!(app.screen(), Screen::DownloadedChapters { .. }));
+
+    // ⋮ again, then row 1 = "Mark as unread" → progress cleared.
+    app.activate(0, kx, ky).unwrap();
+    app.activate(1, x, y).unwrap();
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get(key).is_none(),
+        "Mark as unread clears the chapter's progress"
+    );
+}
+
 fn wifi_net(ssid: &str, secured: bool, saved: bool) -> gideon_device::network::WifiNetwork {
     gideon_device::network::WifiNetwork {
         ssid: ssid.into(),
