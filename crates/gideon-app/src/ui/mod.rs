@@ -1148,16 +1148,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             },
             Screen::WifiList { networks } => {
                 let n = networks.len();
-                if row < n {
-                    let net = networks[row].clone();
-                    self.tap_wifi_network(&net)?;
-                } else if row == n {
-                    self.refresh_wifi_list()?; // "Scan again"
-                } else if row == n + 1 {
-                    // "Turn Wi-Fi off"
+                if row == 0 {
+                    // The Wi-Fi toggle (currently on): flip it off.
                     gideon_device::network::disable_wifi();
                     self.show_status(&["Wi-Fi turned off."])?;
                     self.pop()?;
+                } else if row <= n {
+                    let net = networks[row - 1].clone();
+                    self.tap_wifi_network(&net)?;
+                } else if row == n + 1 {
+                    self.refresh_wifi_list()?; // "Scan again"
                 }
                 Ok(Flow::Continue)
             }
@@ -2598,7 +2598,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 } else {
                     "Wi-Fi"
                 };
-                compose_wifi_list(l, title, &nets, &["Scan again", "Turn Wi-Fi off"])
+                // On this screen Wi-Fi is up (we scanned), so the toggle reads
+                // on; tapping it turns Wi-Fi off.
+                compose_wifi_list(l, title, &nets, true)
             }
             Screen::WifiPassword { ssid, password } => {
                 compose_keyboard(l, &format!("Password — {ssid}"), password, "Connect")
@@ -3244,12 +3246,12 @@ struct WifiRow {
     bars: u8,
 }
 
-/// The Wi-Fi list, styled like a phone's Wi-Fi settings: a **checkmark** on the
-/// connected network (a faint dot on a saved one), the SSID, then a **lock** for
-/// secured networks and **signal bars** on the right. Trailing `actions` ("Scan
-/// again", "Turn Wi-Fi off") render as plain rows. Row order here must match the
-/// order stored on the screen so taps map to the right network.
-fn compose_wifi_list(l: &UiLayout, title: &str, nets: &[WifiRow], actions: &[&str]) -> GrayPage {
+/// The Wi-Fi list, styled like a phone's Wi-Fi settings. **Row 0** is a "Wi-Fi"
+/// row with an on/off **toggle switch** on the right; then the networks — a
+/// **checkmark** on the connected one (a faint dot on a saved one), the SSID, a
+/// **lock** for secured networks and **signal bars** on the right; then a final
+/// **Scan again** row. Row order here must match the screen's tap mapping.
+fn compose_wifi_list(l: &UiLayout, title: &str, nets: &[WifiRow], wifi_on: bool) -> GrayPage {
     let mut canvas = compose_chrome_opts(l, title, 0, 1, true);
     let icon = (l.row_h as f32 * 0.5) as u32;
     let gap = 6u32;
@@ -3259,12 +3261,29 @@ fn compose_wifi_list(l: &UiLayout, title: &str, nets: &[WifiRow], actions: &[&st
     let lock_x = bars_x.saturating_sub(gap + icon);
     let text_w = lock_x.saturating_sub(gap).saturating_sub(text_x);
     let text_y = |top: u32| top + l.row_h.saturating_sub(l.text_px as u32 + 4) / 2;
-    let total = nets.len() + actions.len();
+    // Row 0 (toggle) + networks + a "Scan again" row.
+    let total = nets.len() + 2;
     for i in 0..total.min(l.rows_per_page()) {
         let top = l.row_top(i);
         let icon_y = top + l.row_h.saturating_sub(icon) / 2;
-        if i < nets.len() {
-            let n = &nets[i];
+        if i == 0 {
+            // The Wi-Fi on/off toggle.
+            draw_text(
+                &mut canvas,
+                l.pad,
+                text_y(top),
+                l.text_px,
+                "Wi-Fi",
+                text_w,
+                true,
+            );
+            let sw_w = 2 * icon + gap;
+            let sw_h = icon.min(l.row_h.saturating_sub(8));
+            let sw_x = l.width.saturating_sub(l.pad + sw_w);
+            let sw_y = top + l.row_h.saturating_sub(sw_h) / 2;
+            draw_toggle_switch(&mut canvas, sw_x, sw_y, sw_w, sw_h, wifi_on, 0x00);
+        } else if i <= nets.len() {
+            let n = &nets[i - 1];
             if n.connected {
                 draw_check_icon(&mut canvas, l.pad, icon_y, icon, 0x00);
             } else if n.saved {
@@ -3284,13 +3303,12 @@ fn compose_wifi_list(l: &UiLayout, title: &str, nets: &[WifiRow], actions: &[&st
             }
             draw_wifi_bars(&mut canvas, bars_x, icon_y, bars_w, n.bars, 0x00);
         } else {
-            let label = actions[i - nets.len()];
             draw_text(
                 &mut canvas,
                 l.pad,
                 text_y(top),
                 l.text_px,
-                label,
+                "Scan again",
                 l.width.saturating_sub(2 * l.pad),
                 true,
             );
@@ -3661,6 +3679,37 @@ fn draw_dot_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
     let (cx, cy, r) = (x + s / 2, y + s / 2, s / 8);
     for yy in cy - r..=cy + r {
         line(canvas, cx - r, yy, cx + r, yy, value);
+    }
+}
+
+/// A toggle switch in a `w`×`h` pill at (`x`, `y`): the knob sits **right** and
+/// the track is filled when `on`, **left** on an open track when off — like a
+/// phone settings toggle.
+fn draw_toggle_switch(canvas: &mut GrayPage, x: u32, y: u32, w: u32, h: u32, on: bool, value: u8) {
+    let (x, y, w, h) = (x as i32, y as i32, w as i32, h as i32);
+    let r = h / 2;
+    // Pill outline: straight top/bottom between the rounded ends, plus end caps.
+    line(canvas, x + r, y, x + w - r, y, value);
+    line(canvas, x + r, y + h, x + w - r, y + h, value);
+    for (cx, sweep) in [(x + r, (90i32, 270i32)), (x + w - r, (-90i32, 90i32))] {
+        let cy = y + r;
+        for d in sweep.0..=sweep.1 {
+            let a = (d as f32).to_radians();
+            plot(
+                canvas,
+                cx + (a.cos() * r as f32).round() as i32,
+                cy + (a.sin() * r as f32).round() as i32,
+                value,
+            );
+        }
+    }
+    // Knob: a filled disc at the on/off end.
+    let cx = if on { x + w - r } else { x + r };
+    let cy = y + r;
+    let kr = r - 2;
+    for dy in -kr..=kr {
+        let dx = ((kr * kr - dy * dy) as f32).sqrt().round() as i32;
+        line(canvas, cx - dx, cy + dy, cx + dx, cy + dy, value);
     }
 }
 
