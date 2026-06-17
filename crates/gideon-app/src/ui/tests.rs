@@ -1105,8 +1105,10 @@ fn sideloaded_loose_file_still_gets_a_card() {
 
 #[test]
 fn book_menu_targets_the_chapter_a_tap_would_open() {
-    // Long press opens the BookMenu on the card's resume chapter, so
-    // "Delete this chapter" removes what a tap would show.
+    // Long press opens the BookMenu on the card's resume chapter, so "Delete
+    // this chapter" removes what a tap would show. vol1 is finished (read most
+    // recently, at=200), so the resume target is the most-recent UNFINISHED
+    // chapter, vol2 — while "mark as unread" clears vol1, the latest read.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
@@ -1138,12 +1140,49 @@ fn book_menu_targets_the_chapter_a_tap_would_open() {
     else {
         panic!("expected the book menu");
     };
-    // vol1 is finished (and read latest, at=200), so the resume target is the
-    // next chapter, vol2 — but "mark as unread" should clear vol1, the chapter
-    // actually read.
     assert_eq!(entry.relative_path, "Series/vol2.cbz");
     assert_eq!(series_dir, "Series");
     assert_eq!(read_key.as_deref(), Some("Series/vol1.cbz"));
+}
+
+#[test]
+fn cover_tap_resumes_the_last_opened_chapter_not_an_earlier_one() {
+    // The user's complaint: a cover tap must open the chapter they last had
+    // open, never a "random earlier" one. Here vol2 was opened most recently
+    // (at=300) even though vol1 and vol3 are finished and surround it — the
+    // resume target is vol2, full stop.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 5);
+    make_cbz(&lib.join("Series/vol3.cbz"), 4);
+    let progress_file = progress_path(&lib);
+    std::fs::create_dir_all(progress_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &progress_file,
+        r#"{"progress":{
+            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":100},
+            "Series/vol3.cbz":{"current_page":3,"total_pages":4,"last_read_at":200},
+            "Series/vol2.cbz":{"current_page":2,"total_pages":5,"last_read_at":300}
+        }}"#,
+    )
+    .unwrap();
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    let Screen::BookMenu { entry, .. } = app.screen() else {
+        panic!("expected the book menu");
+    };
+    assert_eq!(
+        entry.relative_path, "Series/vol2.cbz",
+        "resumes the last-opened chapter, not an earlier or later finished one"
+    );
 }
 
 /// Write a solid-red series cover where the shelf looks for it.
@@ -1680,10 +1719,27 @@ fn predownload_ahead_fetches_the_next_unread_chapters() {
 /// A minimal `Send + Clone` gateway whose `background_clone` returns a working
 /// copy — so the background pre-download worker actually runs. `download_chapter`
 /// writes a CBZ named after the chapter id under the manga's directory.
+///
+/// `started` (if set) is signalled with the chapter id as each download begins,
+/// and `delay_ms` holds the download open afterward — together they let a test
+/// catch the worker mid-chapter (e.g. to cancel the rest of the queue).
 #[derive(Clone)]
 struct BgGateway {
     manga_dir: String,
     pages: usize,
+    delay_ms: u64,
+    started: Option<std::sync::mpsc::Sender<String>>,
+}
+
+impl BgGateway {
+    fn new(manga_dir: &str, pages: usize) -> Self {
+        Self {
+            manga_dir: manga_dir.into(),
+            pages,
+            delay_ms: 0,
+            started: None,
+        }
+    }
 }
 
 impl SourceGateway for BgGateway {
@@ -1716,6 +1772,12 @@ impl SourceGateway for BgGateway {
         library: &Path,
         progress: &mut dyn FnMut(usize, usize),
     ) -> Result<PathBuf> {
+        if let Some(tx) = &self.started {
+            let _ = tx.send(chapter_id.to_string());
+        }
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
         let path = library
             .join(&self.manga_dir)
             .join(format!("{chapter_id}.cbz"));
@@ -1743,10 +1805,7 @@ fn predownload_runs_in_the_background_without_blocking() {
     let lib = dir.path().join("Manga");
     std::fs::create_dir_all(&lib).unwrap();
 
-    let gateway = BgGateway {
-        manga_dir: "Manga One".into(),
-        pages: 3,
-    };
+    let gateway = BgGateway::new("Manga One", 3);
     let mut app = UiApp::new(
         MemoryDisplay::new(W, H),
         FakeInput::new(vec![]),
@@ -1803,6 +1862,136 @@ fn predownload_runs_in_the_background_without_blocking() {
         app.downloaded_chapter_path(&source, &manga, "c1").is_none(),
         "the current chapter is not re-fetched"
     );
+}
+
+#[test]
+fn leaving_a_manga_cancels_its_queued_pre_downloads() {
+    // The bug: after you leave a manga, its queued look-ahead kept downloading
+    // in the background. Now popping the chapter list cancels everything not yet
+    // started. We catch the worker mid-c2, cancel, and assert c3/c4 never land.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<String>();
+    let gateway = BgGateway {
+        manga_dir: "Manga One".into(),
+        pages: 2,
+        delay_ms: 300, // hold c2 open long enough to cancel the rest
+        started: Some(started_tx),
+    };
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(vec![]),
+        gateway,
+        lib.clone(),
+    );
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+
+    // Stand inside the manga's chapter list, then queue c2, c3, c4 ahead.
+    assert!(app.ensure_predownloader());
+    let epoch = app.predownloader.as_ref().unwrap().epoch();
+    for id in ["c2", "c3", "c4"] {
+        app.predownloader.as_mut().unwrap().queue(PreloadJob {
+            source: source.clone(),
+            manga: manga.clone(),
+            chapter_id: id.into(),
+            epoch,
+        });
+    }
+    app.stack.push(Screen::ChapterList {
+        source: source.clone(),
+        manga: manga.clone(),
+        chapters: vec![],
+        page: 0,
+    });
+
+    // The worker has begun c2 — leave the manga while it's still downloading.
+    assert_eq!(
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        "c2"
+    );
+    app.pop().unwrap(); // pops the chapter list → cancels the queued rest
+
+    // c2 (already in flight) finishes; c3/c4 are dropped. Wait for c2 to land,
+    // then give the worker ample time to (not) fetch the cancelled ones.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline
+        && app.downloaded_chapter_path(&source, &manga, "c2").is_none()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
+        "the chapter already downloading when you left still completes"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c3").is_none(),
+        "leaving the manga cancels the not-yet-started look-ahead"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c4").is_none(),
+        "leaving the manga cancels the not-yet-started look-ahead"
+    );
+}
+
+#[test]
+fn series_without_a_source_link_shows_downloaded_chapters() {
+    // Side-loaded files (no SeriesIndex origin): opening the series must list
+    // what's on disk instead of reaching for a source — the offline path.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 3);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.open_series_chapters("Series").unwrap();
+
+    let Screen::DownloadedChapters { entries, title, .. } = app.screen() else {
+        panic!("expected the downloaded-chapters list");
+    };
+    assert_eq!(title, "Series");
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Series/vol1.cbz", "Series/vol2.cbz"]);
+}
+
+#[test]
+fn tapping_a_downloaded_chapter_opens_it_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    // Read vol1: one page forward, then back out (no source involved).
+    let events = vec![reader_tap_next(), reader_tap_back()];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.open_downloaded_chapters("Series").unwrap();
+
+    let UiEvent::Tap { x, y } = tap_row(0) else {
+        unreachable!()
+    };
+    app.activate(0, x, y).unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Series/vol1.cbz").is_some(),
+        "tapping a downloaded chapter opened it and recorded progress"
+    );
+    // Still on the offline list afterward (the reader returned Back).
+    assert!(matches!(app.screen(), Screen::DownloadedChapters { .. }));
 }
 
 fn wifi_net(ssid: &str, secured: bool, saved: bool) -> gideon_device::network::WifiNetwork {
@@ -2621,9 +2810,10 @@ fn long_press_opens_the_book_menu() {
 }
 
 #[test]
-fn unlinked_book_chapters_falls_back_to_prefilled_search() {
-    // A book downloaded before origins were recorded (or sideloaded):
-    // "All chapters" drops into global search with the series name typed.
+fn unlinked_book_chapters_shows_downloaded_list() {
+    // A book downloaded before origins were recorded (or sideloaded) has no
+    // source to fetch — "All chapters" shows the downloaded chapters instead of
+    // stranding the reader, so it works offline.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Sideload/vol1.cbz"), 2);
@@ -2636,11 +2826,11 @@ fn unlinked_book_chapters_falls_back_to_prefilled_search() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::Search { source, query } = app.screen() else {
-        panic!("expected prefilled search");
+    let Screen::DownloadedChapters { entries, .. } = app.screen() else {
+        panic!("expected the downloaded-chapters list");
     };
-    assert!(source.is_none());
-    assert_eq!(query, "sideload");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].relative_path, "Sideload/vol1.cbz");
 }
 
 #[test]
