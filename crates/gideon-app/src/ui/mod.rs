@@ -19,7 +19,10 @@ mod tests;
 pub use gateway::{AidokuGateway, ChapterEntry, MangaEntry, SourceEntry, SourceGateway};
 pub use layout::{page_button_advances, Key, ReaderZone, TapTarget, UiLayout};
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -407,6 +410,15 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// (a disk read + JSON parse per shelf page flip was measurable).
     /// Invalidated whenever the UI writes progress or switches profile.
     progress_cache: std::cell::RefCell<Option<ProgressStore>>,
+    /// Serializes whole-file `SeriesIndex` rewrites so the background
+    /// pre-download thread and the foreground download path never clobber
+    /// each other's entries.
+    index_guard: Arc<Mutex<()>>,
+    /// Background chapter pre-downloader, built lazily on first use from
+    /// [`SourceGateway::background_clone`]. `None` until then — and stays
+    /// `None` for gateways without background support (tests), which fall
+    /// back to a foreground pre-download.
+    predownloader: Option<Predownloader>,
 }
 
 /// Cover-cache key: (source path, file mtime, target cell size).
@@ -448,6 +460,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             battery: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
             progress_cache: std::cell::RefCell::new(None),
+            index_guard: Arc::new(Mutex::new(())),
+            predownloader: None,
         }
     }
 
@@ -1544,27 +1558,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Remember where this series came from (long press on its card
         // reopens the chapter list) and which chapters are on disk (they
         // open instantly, get a check mark, and survive re-listing).
-        if let Some(dir) = cbz_path.parent().and_then(|p| p.file_name()) {
-            let dir = dir.to_string_lossy().to_string();
-            let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
-            index.record(
-                &dir,
-                gideon_core::SeriesRef {
-                    source_id: source.id.clone(),
-                    source_name: source.name.clone(),
-                    manga_id: manga.id.clone(),
-                    manga_title: manga.title.clone(),
-                    cover_url: manga.cover_url.clone(),
-                    ..gideon_core::SeriesRef::default()
-                },
-            );
-            if let Some(file) = cbz_path.file_name() {
-                index.record_download(&dir, &chapter.id, &file.to_string_lossy());
-            }
-            if let Err(e) = index.save(&self.library_dir) {
-                eprintln!("gideon: couldn't save the series index: {e}");
-            }
-        }
+        record_chapter_in_index(
+            &self.library_dir,
+            &self.index_guard,
+            source,
+            manga,
+            &chapter.id,
+            &cbz_path,
+        );
         Ok(cbz_path)
     }
 
@@ -1611,6 +1612,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.input.discard_taps();
 
             let next = next_chapter(chapters, &chapter.id);
+            // Kick off background pre-downloading of the next chapters *before*
+            // the reader opens, so they fetch while the user reads this one. The
+            // worker is non-blocking; we only do this when one's available, so
+            // the foreground fallback never stalls ahead of the first page.
+            if self.ensure_predownloader() {
+                self.predownload_ahead(source, manga, chapters, &chapter.id);
+            }
             let key = progress_key(&self.library_dir, &cbz_path);
             let outcome = self.run_reader(&cbz_path, &key, next.is_some())?;
             // The cover fetch (a network round-trip) runs after the
@@ -1622,6 +1630,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
                 ReaderOutcome::Back => {
                     // Stock up the next few chapters so they're ready offline.
+                    // With a background worker this was already kicked off when
+                    // the reader opened (a no-op re-queue here); the foreground
+                    // fallback path does the actual fetch on the way out.
                     self.predownload_ahead(source, manga, chapters, &chapter.id);
                     return Ok(Flow::Continue);
                 }
@@ -1633,25 +1644,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    /// Download the next not-yet-stored chapters ahead of `after_id`, up to
-    /// the "Pre-download ahead" setting, so they're ready offline. Best-effort
-    /// and foreground: it shows each download's progress, skips chapters
-    /// already on disk, and stops quietly at the first failure (e.g. going
-    /// offline) without failing the caller.
-    fn predownload_ahead(
-        &mut self,
+    /// The next not-yet-stored chapters ahead of `after_id`, up to the
+    /// "Pre-download ahead" setting — what to stock up so they're ready
+    /// offline. Skips chapters already on disk and walks forward in reading
+    /// order until it has `count` of them (or the list ends).
+    fn predownload_targets(
+        &self,
         source: &SourceEntry,
         manga: &MangaEntry,
         chapters: &[ChapterEntry],
         after_id: &str,
-    ) {
-        let count = self.load_settings().predownload_unread_chapters;
+    ) -> Vec<ChapterEntry> {
+        let count = self.load_settings().predownload_unread_chapters as usize;
         if count == 0 || chapters.is_empty() {
-            return;
+            return Vec::new();
         }
         let mut id = after_id.to_string();
-        let mut done = 0;
-        while done < count {
+        let mut out = Vec::new();
+        while out.len() < count {
             let Some(next) = next_chapter(chapters, &id) else {
                 break; // reached the end of the chapter list
             };
@@ -1662,10 +1672,60 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             {
                 continue; // already stored — look further ahead
             }
-            if self.download_to_library(source, manga, &next).is_err() {
-                break; // offline / source error — stop quietly
+            out.push(next.clone());
+        }
+        out
+    }
+
+    /// Build the background pre-downloader on first use, if the gateway
+    /// supports it. Returns whether one is available now.
+    fn ensure_predownloader(&mut self) -> bool {
+        if self.predownloader.is_some() {
+            return true;
+        }
+        if let Some(gateway) = self.gateway.background_clone() {
+            self.predownloader = Some(Predownloader::spawn(
+                gateway,
+                self.library_dir.clone(),
+                Arc::clone(&self.index_guard),
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// Stock up the next few chapters ahead of `after_id` so they're ready
+    /// offline. With a background pre-downloader this just **queues** them and
+    /// returns immediately — the chapters download on a worker thread while the
+    /// user reads, never blocking the UI. Without one (tests / a gateway with
+    /// no background support) it falls back to a foreground download, skipping
+    /// chapters already on disk and stopping quietly at the first failure.
+    fn predownload_ahead(
+        &mut self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapters: &[ChapterEntry],
+        after_id: &str,
+    ) {
+        let targets = self.predownload_targets(source, manga, chapters, after_id);
+        if targets.is_empty() {
+            return;
+        }
+        if self.ensure_predownloader() {
+            let worker = self.predownloader.as_mut().expect("just ensured");
+            for chapter in &targets {
+                worker.queue(PreloadJob {
+                    source: source.clone(),
+                    manga: manga.clone(),
+                    chapter_id: chapter.id.clone(),
+                });
             }
-            done += 1;
+        } else {
+            for chapter in &targets {
+                if self.download_to_library(source, manga, chapter).is_err() {
+                    break; // offline / source error — stop quietly
+                }
+            }
         }
     }
 
@@ -3506,6 +3566,145 @@ fn copy_into_rgb(dst: &mut RgbPage, src: &RgbPage, off_x: u32, off_y: u32) {
         let dst_start = (((off_y + y) * dst.width + off_x) * 3) as usize;
         dst.pixels[dst_start..dst_start + copy_w as usize * 3]
             .copy_from_slice(&src.pixels[src_start..src_start + copy_w as usize * 3]);
+    }
+}
+
+/// A chapter queued for background pre-download. Carries owned, `Send` data so
+/// it can cross to the worker thread (the gateway there is a separate instance).
+struct PreloadJob {
+    source: SourceEntry,
+    manga: MangaEntry,
+    chapter_id: String,
+}
+
+/// Background chapter pre-downloader: a single worker thread that owns its own
+/// [`SourceGateway`] and drains a queue of [`PreloadJob`]s, downloading each
+/// chapter that isn't already on disk and recording it in the series index.
+/// Single-threaded by design — chapters fetch one at a time in queue order, and
+/// re-queued or already-stored chapters are cheap no-ops.
+struct Predownloader {
+    tx: mpsc::Sender<PreloadJob>,
+    /// Chapter keys already handed to the worker, so repeated kicks (every
+    /// reader open / page advance) don't enqueue the same chapter twice.
+    queued: HashSet<String>,
+}
+
+impl Predownloader {
+    fn spawn(
+        gateway: Box<dyn SourceGateway + Send>,
+        library_dir: PathBuf,
+        index_guard: Arc<Mutex<()>>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<PreloadJob>();
+        let _ = std::thread::Builder::new()
+            .name("gideon-predownload".into())
+            .spawn(move || {
+                // Ends when the sender (and thus the app) is dropped.
+                for job in rx {
+                    if chapter_on_disk(
+                        &library_dir,
+                        &index_guard,
+                        &job.source.id,
+                        &job.manga.id,
+                        &job.chapter_id,
+                    ) {
+                        continue; // already stored — nothing to do
+                    }
+                    let mut noop = |_done: usize, _total: usize| {};
+                    match gateway.download_chapter(
+                        &job.source.id,
+                        &job.manga.id,
+                        &job.chapter_id,
+                        &library_dir,
+                        &mut noop,
+                    ) {
+                        Ok(cbz) => record_chapter_in_index(
+                            &library_dir,
+                            &index_guard,
+                            &job.source,
+                            &job.manga,
+                            &job.chapter_id,
+                            &cbz,
+                        ),
+                        // Offline / source error: skip quietly and take the next
+                        // job — the chapter just stays un-stocked.
+                        Err(_) => continue,
+                    }
+                }
+            });
+        Self {
+            tx,
+            queued: HashSet::new(),
+        }
+    }
+
+    /// Enqueue a chapter, unless it's already been queued this session.
+    fn queue(&mut self, job: PreloadJob) {
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            job.source.id, job.manga.id, job.chapter_id
+        );
+        if self.queued.insert(key) {
+            // If the worker is gone the send just fails; nothing else to do.
+            let _ = self.tx.send(job);
+        }
+    }
+}
+
+/// Whether a chapter's CBZ is recorded in the series index *and* present on
+/// disk. Guarded so it never races a concurrent index rewrite.
+fn chapter_on_disk(
+    library_dir: &Path,
+    guard: &Mutex<()>,
+    source_id: &str,
+    manga_id: &str,
+    chapter_id: &str,
+) -> bool {
+    let _g = guard.lock().unwrap_or_else(|e| e.into_inner());
+    let index = gideon_core::SeriesIndex::load(library_dir);
+    if let Some((dir, series)) = index.find_manga(source_id, manga_id) {
+        if let Some(file) = series.downloaded.get(chapter_id) {
+            return library_dir.join(dir).join(file).exists();
+        }
+    }
+    false
+}
+
+/// Record a freshly-downloaded chapter in the series index: where the series
+/// came from (so its card relinks to the source) and which file holds the
+/// chapter (so it opens instantly and shows as downloaded). Guarded by
+/// `index_guard` so the foreground and background download paths serialize
+/// their whole-file index rewrites instead of clobbering each other.
+fn record_chapter_in_index(
+    library_dir: &Path,
+    guard: &Mutex<()>,
+    source: &SourceEntry,
+    manga: &MangaEntry,
+    chapter_id: &str,
+    cbz_path: &Path,
+) {
+    let Some(dir) = cbz_path.parent().and_then(|p| p.file_name()) else {
+        return;
+    };
+    let dir = dir.to_string_lossy().to_string();
+    let _g = guard.lock().unwrap_or_else(|e| e.into_inner());
+    let mut index = gideon_core::SeriesIndex::load(library_dir);
+    index.record(
+        &dir,
+        gideon_core::SeriesRef {
+            source_id: source.id.clone(),
+            source_name: source.name.clone(),
+            manga_id: manga.id.clone(),
+            manga_title: manga.title.clone(),
+            cover_url: manga.cover_url.clone(),
+            ..gideon_core::SeriesRef::default()
+        },
+    );
+    if let Some(file) = cbz_path.file_name() {
+        index.record_download(&dir, chapter_id, &file.to_string_lossy());
+    }
+    if let Err(e) = index.save(library_dir) {
+        eprintln!("gideon: couldn't save the series index: {e}");
     }
 }
 

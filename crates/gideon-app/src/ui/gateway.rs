@@ -100,6 +100,15 @@ pub trait SourceGateway {
         progress: &mut dyn FnMut(usize, usize),
     ) -> Result<PathBuf>;
 
+    /// A standalone copy of this gateway that can run on a background thread,
+    /// for pre-downloading chapters while the user reads. `None` (the default)
+    /// means "no background pre-download" — callers fall back to a foreground
+    /// download. The clone shares no mutable state with `self`; it builds its
+    /// own HTTP client / runtime / source cache lazily on first use.
+    fn background_clone(&self) -> Option<Box<dyn SourceGateway + Send>> {
+        None
+    }
+
     /// Check for app updates.
     fn check_updates(&self) -> Result<UpdateCheck>;
 
@@ -323,6 +332,13 @@ impl SourceGateway for AidokuGateway {
             "Updated to {}.\nClose gideon and reopen it to use the new version.",
             release.version
         ))
+    }
+
+    fn background_clone(&self) -> Option<Box<dyn SourceGateway + Send>> {
+        // A fresh gateway over the same data dir: it loads its own WASM
+        // sources and HTTP client lazily, sharing no mutable state with the
+        // foreground one — safe to move onto the pre-download thread.
+        Some(Box::new(AidokuGateway::new(self.data_dir.clone())))
     }
 }
 

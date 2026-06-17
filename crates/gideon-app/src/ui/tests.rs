@@ -1677,6 +1677,134 @@ fn predownload_ahead_fetches_the_next_unread_chapters() {
     );
 }
 
+/// A minimal `Send + Clone` gateway whose `background_clone` returns a working
+/// copy — so the background pre-download worker actually runs. `download_chapter`
+/// writes a CBZ named after the chapter id under the manga's directory.
+#[derive(Clone)]
+struct BgGateway {
+    manga_dir: String,
+    pages: usize,
+}
+
+impl SourceGateway for BgGateway {
+    fn installed_sources(&self) -> Result<Vec<SourceEntry>> {
+        Ok(vec![])
+    }
+    fn available_sources(&self) -> Result<Vec<SourceEntry>> {
+        Ok(vec![])
+    }
+    fn install_source(&self, _source_id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
+        Ok(vec![])
+    }
+    fn search_manga(&self, _source_id: &str, _query: &str) -> Result<Vec<MangaEntry>> {
+        Ok(vec![])
+    }
+    fn download_cover(&self, _url: &str, _dest: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn chapters(&self, _source_id: &str, _manga_id: &str) -> Result<Vec<ChapterEntry>> {
+        Ok(vec![])
+    }
+    fn download_chapter(
+        &self,
+        _source_id: &str,
+        _manga_id: &str,
+        chapter_id: &str,
+        library: &Path,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PathBuf> {
+        let path = library
+            .join(&self.manga_dir)
+            .join(format!("{chapter_id}.cbz"));
+        make_cbz(&path, self.pages);
+        progress(self.pages, self.pages);
+        Ok(path)
+    }
+    fn background_clone(&self) -> Option<Box<dyn SourceGateway + Send>> {
+        Some(Box::new(self.clone()))
+    }
+    fn check_updates(&self) -> Result<super::gateway::UpdateCheck> {
+        Ok(super::gateway::UpdateCheck {
+            message: String::new(),
+            available: false,
+        })
+    }
+    fn install_update(&self) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
+#[test]
+fn predownload_runs_in_the_background_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let gateway = BgGateway {
+        manga_dir: "Manga One".into(),
+        pages: 3,
+    };
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(vec![]),
+        gateway,
+        lib.clone(),
+    );
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+    let chapters: Vec<ChapterEntry> = (1..=4)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: Some("en".into()),
+        })
+        .collect();
+
+    // Returns immediately — the next two chapters (c2, c3) are queued onto the
+    // worker thread, not downloaded inline.
+    app.predownload_ahead(&source, &manga, &chapters, "c1");
+
+    // The worker fetches them on its own thread; give it a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if app.downloaded_chapter_path(&source, &manga, "c2").is_some()
+            && app.downloaded_chapter_path(&source, &manga, "c3").is_some()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
+        "c2 was pre-downloaded in the background"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c3").is_some(),
+        "c3 was pre-downloaded in the background"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c4").is_none(),
+        "only 2 chapters ahead are fetched"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c1").is_none(),
+        "the current chapter is not re-fetched"
+    );
+}
+
 fn wifi_net(ssid: &str, secured: bool, saved: bool) -> gideon_device::network::WifiNetwork {
     gideon_device::network::WifiNetwork {
         ssid: ssid.into(),
