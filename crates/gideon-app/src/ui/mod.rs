@@ -147,23 +147,6 @@ impl SeriesCard {
     }
 }
 
-/// The status prefix for a chapter row: `✓` downloaded, `●` finished,
-/// `·NN%` in progress — e.g. `✓●` (downloaded + read), `✓·45%`, `✓`
-/// (downloaded, unread), `●` (read), or empty for neither.
-fn chapter_status_prefix(downloaded: bool, read: Option<gideon_core::ReadingProgress>) -> String {
-    let dl = if downloaded { "✓" } else { "" };
-    let r = match read {
-        Some(p) if p.is_finished() => "●".to_string(),
-        Some(p) => format!("·{}%", p.percent().round() as u32),
-        None => String::new(),
-    };
-    if dl.is_empty() && r.is_empty() {
-        String::new()
-    } else {
-        format!("{dl}{r} ")
-    }
-}
-
 /// Group scanned library entries into shelf cards: one per top-level
 /// series directory and one per loose root CBZ. Cards keep the natural
 /// order of their first chapter; chapters keep their natural scan order.
@@ -781,6 +764,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         let cbz_path = self.download_to_library(&source, &manga, &chapter)?;
                         // No reader session here — fetch the cover now.
                         self.fetch_cover_if_missing(&manga, &cbz_path);
+                        // Stock up the next few chapters too (the whole point
+                        // of a long-press download is going offline).
+                        self.predownload_ahead(&source, &manga, &chapters, &chapter.id);
                         self.input.discard_taps();
                         self.render_current(RefreshMode::Full)?;
                     }
@@ -1592,12 +1578,52 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             match outcome {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
-                ReaderOutcome::Back => return Ok(Flow::Continue),
+                ReaderOutcome::Back => {
+                    // Stock up the next few chapters so they're ready offline.
+                    self.predownload_ahead(source, manga, chapters, &chapter.id);
+                    return Ok(Flow::Continue);
+                }
                 // Turning past the last page flows into the next chapter.
                 ReaderOutcome::NextChapter => {
                     chapter = next.expect("NextChapter only with a next");
                 }
             }
+        }
+    }
+
+    /// Download the next not-yet-stored chapters ahead of `after_id`, up to
+    /// the "Pre-download ahead" setting, so they're ready offline. Best-effort
+    /// and foreground: it shows each download's progress, skips chapters
+    /// already on disk, and stops quietly at the first failure (e.g. going
+    /// offline) without failing the caller.
+    fn predownload_ahead(
+        &mut self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapters: &[ChapterEntry],
+        after_id: &str,
+    ) {
+        let count = self.load_settings().predownload_unread_chapters;
+        if count == 0 || chapters.is_empty() {
+            return;
+        }
+        let mut id = after_id.to_string();
+        let mut done = 0;
+        while done < count {
+            let Some(next) = next_chapter(chapters, &id) else {
+                break; // reached the end of the chapter list
+            };
+            id = next.id.clone();
+            if self
+                .downloaded_chapter_path(source, manga, &next.id)
+                .is_some()
+            {
+                continue; // already stored — look further ahead
+            }
+            if self.download_to_library(source, manga, &next).is_err() {
+                break; // offline / source error — stop quietly
+            }
+            done += 1;
         }
     }
 
@@ -2428,28 +2454,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 chapters,
                 page,
             } => {
-                // Mark each chapter with what's on disk and what's been read:
-                // "✓" downloaded, "●" finished, "·NN%" in progress. Downloaded
-                // chapters open instantly; the read marks show what's left.
+                // A download icon marks what's on disk; a book icon marks
+                // what's been read (finished). Downloaded chapters open
+                // instantly.
                 let index = gideon_core::SeriesIndex::load(&self.library_dir);
                 let (dir, downloaded) = match index.find_manga(&source.id, &manga.id) {
                     Some((dir, series)) => (dir.to_string(), series.downloaded.clone()),
                     None => (String::new(), Default::default()),
                 };
-                let rows: Vec<(String, bool)> = self.with_progress(|_, store| {
+                let rows: Vec<(String, bool, bool)> = self.with_progress(|_, store| {
                     paged(chapters, *page, per_page)
                         .iter()
                         .map(|c| {
-                            let read = downloaded
+                            let on_disk = downloaded.contains_key(&c.id);
+                            let finished = downloaded
                                 .get(&c.id)
-                                .and_then(|file| store.get(&format!("{dir}/{file}")));
-                            let prefix =
-                                chapter_status_prefix(downloaded.contains_key(&c.id), read);
-                            (format!("{prefix}{}", c.label()), true)
+                                .and_then(|file| store.get(&format!("{dir}/{file}")))
+                                .is_some_and(|p| p.is_finished());
+                            (c.label(), on_disk, finished)
                         })
                         .collect()
                 });
-                compose_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
+                compose_chapter_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
             }
             Screen::UpdatePrompt { body } => compose_message(l, "Update available", body),
             Screen::Message { title, body } => compose_message(l, title, body),
@@ -2914,6 +2940,48 @@ fn compose_list_opts(
     canvas
 }
 
+/// The chapter list: like [`compose_list`] but each row carries a **download**
+/// icon when it's on disk and a **book** icon when it's been read, in a left
+/// gutter (instead of cryptic text marks).
+fn compose_chapter_list(
+    l: &UiLayout,
+    title: &str,
+    rows: &[(String, bool, bool)],
+    page: usize,
+    page_count: usize,
+) -> GrayPage {
+    let mut canvas = compose_chrome_opts(l, title, page, page_count, true);
+    let icon = (l.row_h as f32 * 0.5) as u32;
+    let gap = 5u32;
+    let gutter = 2 * icon + 2 * gap;
+    let text_x = l.pad + gutter;
+    let text_w = l.width.saturating_sub(text_x + l.pad);
+    for (i, (text, downloaded, read)) in rows.iter().take(l.rows_per_page()).enumerate() {
+        let top = l.row_top(i);
+        let icon_y = top + l.row_h.saturating_sub(icon) / 2;
+        if *downloaded {
+            draw_download_icon(&mut canvas, l.pad, icon_y, icon, 0x00);
+        }
+        if *read {
+            draw_book_icon(&mut canvas, l.pad + icon + gap, icon_y, icon, 0x00);
+        }
+        draw_text(
+            &mut canvas,
+            text_x,
+            top + l.row_h.saturating_sub(l.text_px as u32 + 4) / 2,
+            l.text_px,
+            text,
+            text_w,
+            false,
+        );
+        let sep_y = top + l.row_h - 1;
+        if sep_y < l.nav_top() {
+            hline(&mut canvas, sep_y, 0xDD);
+        }
+    }
+    canvas
+}
+
 /// Apply an edit key to a keyboard buffer; `None` means no change (the
 /// action key is handled by the caller). Shared by the search and
 /// new-profile keyboards.
@@ -3124,6 +3192,90 @@ fn hline(canvas: &mut GrayPage, y: u32, value: u8) {
     }
     let start = (y * canvas.width) as usize;
     canvas.pixels[start..start + canvas.width as usize].fill(value);
+}
+
+/// Plot a single pixel, bounds-checked.
+fn plot(canvas: &mut GrayPage, x: i32, y: i32, value: u8) {
+    if x >= 0 && y >= 0 && (x as u32) < canvas.width && (y as u32) < canvas.height {
+        canvas.pixels[(y as u32 * canvas.width + x as u32) as usize] = value;
+    }
+}
+
+/// A 2px-ish line between two points (Bresenham, thickened vertically by 1).
+fn line(canvas: &mut GrayPage, x0: i32, y0: i32, x1: i32, y1: i32, value: u8) {
+    let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
+    let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+    let (mut x, mut y, mut err) = (x0, y0, dx + dy);
+    loop {
+        plot(canvas, x, y, value);
+        plot(canvas, x + 1, y, value);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+/// A download icon (arrow into a tray) in the `s`×`s` box at (`x`, `y`):
+/// what's stocked on disk.
+fn draw_download_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    let cx = x + s / 2;
+    // Down-arrow shaft.
+    line(canvas, cx, y + s / 6, cx, y + (s * 3) / 5, value);
+    // Arrowhead.
+    line(
+        canvas,
+        cx,
+        y + (s * 2) / 3,
+        x + s / 4,
+        y + (s * 2) / 5,
+        value,
+    );
+    line(
+        canvas,
+        cx,
+        y + (s * 2) / 3,
+        x + (s * 3) / 4,
+        y + (s * 2) / 5,
+        value,
+    );
+    // Tray.
+    let tray_y = y + (s * 5) / 6;
+    line(canvas, x + s / 6, tray_y, x + (s * 5) / 6, tray_y, value);
+    line(canvas, x + s / 6, tray_y, x + s / 6, tray_y - s / 6, value);
+    line(
+        canvas,
+        x + (s * 5) / 6,
+        tray_y,
+        x + (s * 5) / 6,
+        tray_y - s / 6,
+        value,
+    );
+}
+
+/// A book icon in the `s`×`s` box at (`x`, `y`): the chapter's been read.
+fn draw_book_icon(canvas: &mut GrayPage, x: u32, y: u32, s: u32, value: u8) {
+    let (x, y, s) = (x as i32, y as i32, s as i32);
+    let (l, t, r, b) = (x + s / 6, y + s / 6, x + (s * 5) / 6, y + (s * 5) / 6);
+    let cx = x + s / 2;
+    // Cover outline + central spine (an open book).
+    line(canvas, l, t, r, t, value);
+    line(canvas, l, b, r, b, value);
+    line(canvas, l, t, l, b, value);
+    line(canvas, r, t, r, b, value);
+    line(canvas, cx, t, cx, b, value);
+    // A couple of page lines per side.
+    line(canvas, l + s / 8, t + s / 4, cx - s / 12, t + s / 4, value);
+    line(canvas, cx + s / 12, t + s / 4, r - s / 8, t + s / 4, value);
 }
 
 /// Copy `src` into `dst` at (`off_x`, `off_y`), clipped to `dst`.

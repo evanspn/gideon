@@ -291,30 +291,6 @@ fn make_tall_cbz(path: &Path, pages: usize) {
 // --- tests ---
 
 #[test]
-fn chapter_status_prefix_shows_downloaded_and_read_state() {
-    use gideon_core::ReadingProgress;
-    let prog = |cur: usize, total: usize| ReadingProgress {
-        current_page: cur,
-        total_pages: total,
-        last_read_at: 0,
-    };
-    // Not downloaded, no progress → nothing.
-    assert_eq!(super::chapter_status_prefix(false, None), "");
-    // Downloaded, unread → just the check.
-    assert_eq!(super::chapter_status_prefix(true, None), "✓ ");
-    // Downloaded + finished → check + filled dot.
-    assert_eq!(
-        super::chapter_status_prefix(true, Some(prog(19, 20))),
-        "✓● "
-    );
-    // Downloaded + in progress → check + percent (page 10 of 20 ≈ 55%).
-    assert_eq!(
-        super::chapter_status_prefix(true, Some(prog(10, 20))),
-        "✓·55% "
-    );
-}
-
-#[test]
 fn home_renders_rows_and_is_not_blank() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
@@ -1626,6 +1602,70 @@ fn power_menu_restart_requests_restart() {
     let events = vec![tap_power_icon(), tap_row(1)];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Restart);
+}
+
+#[test]
+fn predownload_ahead_fetches_the_next_unread_chapters() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    // The fake gateway ignores the chapter id, so write a distinct CBZ per
+    // call (download_to_library records the correct id -> file mapping).
+    let n = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let nn = n.clone();
+    let gateway = FakeGateway {
+        download: Some(Box::new(
+            move |library: &Path, progress: &mut dyn FnMut(usize, usize)| {
+                let i = nn.get();
+                nn.set(i + 1);
+                let path = library.join(format!("Manga One/ch{i}.cbz"));
+                make_cbz(&path, 3);
+                progress(3, 3);
+                Ok(path)
+            },
+        )),
+        ..FakeGateway::default()
+    };
+    let mut app = app(&lib, gateway, vec![]);
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+    let chapters: Vec<ChapterEntry> = (1..=4)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: Some("en".into()),
+        })
+        .collect();
+
+    // The default "Pre-download ahead" is 2: from c1, that's c2 and c3.
+    app.predownload_ahead(&source, &manga, &chapters, "c1");
+
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
+        "c2 predownloaded"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c3").is_some(),
+        "c3 predownloaded"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c4").is_none(),
+        "only 2 ahead"
+    );
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c1").is_none(),
+        "the chapter just read is not re-fetched"
+    );
 }
 
 fn wifi_net(ssid: &str, secured: bool, saved: bool) -> gideon_device::network::WifiNetwork {
