@@ -21,6 +21,7 @@ pub use layout::{page_button_advances, Key, ReaderZone, TapTarget, UiLayout};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -101,23 +102,29 @@ impl SeriesCard {
         }
     }
 
-    /// The chapter a tap opens: take the **latest** chapter the user touched
-    /// (most recent `last_read_at`, finished or not). If it's unfinished, resume
-    /// it where they left off; if they finished it, jump to the **next** chapter
-    /// so the card always lands on "what to read now" rather than re-opening a
-    /// chapter they've completed. With nothing read yet, start at the first
-    /// chapter in natural order.
+    /// The chapter a tap opens. Predictable and order-independent — it never
+    /// guesses a "next" chapter by file order (that was sending taps to a random
+    /// earlier chapter):
+    /// 1. the most recently read chapter you **haven't finished** — resume where
+    ///    you left off;
+    /// 2. else the most recently read chapter (everything's finished) — reopen
+    ///    it rather than dumping you back at chapter 1;
+    /// 3. else the first chapter (nothing read yet).
     fn resume_chapter(&self, store: &ProgressStore) -> &LibraryEntry {
-        let latest = self
+        let most_recent_unfinished = self
             .chapters
             .iter()
-            .filter_map(|c| store.get(&c.relative_path).map(|p| (p.last_read_at, p, c)))
-            .max_by_key(|(at, _, _)| *at);
-        match latest {
-            Some((_, p, c)) if p.is_finished() => self.next_after(c).unwrap_or(c),
-            Some((_, _, c)) => c,
-            None => &self.chapters[0],
-        }
+            .filter_map(|c| {
+                store
+                    .get(&c.relative_path)
+                    .filter(|p| !p.is_finished())
+                    .map(|p| (p.last_read_at, c))
+            })
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, c)| c);
+        most_recent_unfinished
+            .or_else(|| self.latest_read(store))
+            .unwrap_or(&self.chapters[0])
     }
 
     /// The chapter the user most recently read in this card (finished or not),
@@ -223,6 +230,13 @@ enum Screen {
         source: SourceEntry,
         manga: MangaEntry,
         chapters: Vec<ChapterEntry>,
+        page: usize,
+    },
+    /// Offline list of a series' **downloaded** chapters — built from local
+    /// files, never the source. Tapping a row opens it in the reader.
+    DownloadedChapters {
+        title: String,
+        entries: Vec<LibraryEntry>,
         page: usize,
     },
     /// Context menu for a library book (long press on its card).
@@ -717,6 +731,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // Home has no Back: quitting goes through the power menu.
             return Ok(Flow::Continue);
         }
+        // Leaving a manga's chapter list: stop pre-downloading its chapters in
+        // the background — the user has moved on and shouldn't keep fetching.
+        if matches!(self.stack.last(), Some(Screen::ChapterList { .. })) {
+            if let Some(worker) = self.predownloader.as_mut() {
+                worker.cancel_pending();
+            }
+        }
         self.stack.pop();
         self.render_current(RefreshMode::Full)?;
         Ok(Flow::Continue)
@@ -823,23 +844,74 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// with the series name so one download can re-link it.
     fn open_series_chapters(&mut self, series_dir: &str) -> Result<()> {
         let index = gideon_core::SeriesIndex::load(&self.library_dir);
-        let Some(origin) = index.get(series_dir) else {
-            self.keyboard_paints = 0;
-            return self.push(Screen::Search {
-                source: None,
-                query: series_dir.to_ascii_lowercase(),
+        // With a recorded source and a live connection, fetch the full chapter
+        // list (so you can grab chapters you don't have yet). Otherwise — no
+        // source link, offline, or the source errors — fall back to what's
+        // already on disk so reading downloaded chapters never needs the network.
+        if let Some(origin) = index.get(series_dir) {
+            let source = SourceEntry {
+                id: origin.source_id.clone(),
+                name: origin.source_name.clone(),
+            };
+            let manga = MangaEntry {
+                id: origin.manga_id.clone(),
+                title: origin.manga_title.clone(),
+                cover_url: origin.cover_url.clone(),
+            };
+            self.ensure_online()?;
+            if gideon_device::network::is_online() {
+                match self.try_open_chapter_list(&source, &manga) {
+                    Ok(()) => return Ok(()),
+                    // Source reachable check passed but the fetch failed — don't
+                    // strand the user; show their downloads instead.
+                    Err(_) => return self.open_downloaded_chapters(series_dir),
+                }
+            }
+        }
+        self.open_downloaded_chapters(series_dir)
+    }
+
+    /// Like [`Self::open_chapter_list`] but assumes we're already online (the
+    /// caller decides) and returns the fetch error instead of propagating, so a
+    /// source failure can fall back to the offline downloaded list.
+    fn try_open_chapter_list(&mut self, source: &SourceEntry, manga: &MangaEntry) -> Result<()> {
+        self.show_status(&[&format!("Loading chapters of {}…", manga.title)])?;
+        let chapters = self.gateway.chapters(&source.id, &manga.id)?;
+        self.push(Screen::ChapterList {
+            source: source.clone(),
+            manga: manga.clone(),
+            chapters,
+            page: 0,
+        })
+    }
+
+    /// Show the series' downloaded chapters from local files — no source fetch,
+    /// so it works fully offline. Tapping a row opens that CBZ in the reader.
+    fn open_downloaded_chapters(&mut self, series_dir: &str) -> Result<()> {
+        let entries = self.downloaded_entries(series_dir);
+        if entries.is_empty() {
+            return self.push(Screen::Message {
+                title: "Nothing downloaded".to_string(),
+                body: "This series has no chapters saved on the device yet.".to_string(),
             });
-        };
-        let source = SourceEntry {
-            id: origin.source_id.clone(),
-            name: origin.source_name.clone(),
-        };
-        let manga = MangaEntry {
-            id: origin.manga_id.clone(),
-            title: origin.manga_title.clone(),
-            cover_url: origin.cover_url.clone(),
-        };
-        self.open_chapter_list(&source, &manga)
+        }
+        self.push(Screen::DownloadedChapters {
+            title: series_dir.to_string(),
+            entries,
+            page: 0,
+        })
+    }
+
+    /// The downloaded chapters belonging to a series directory (or a single
+    /// loose CBZ), in natural reading order.
+    fn downloaded_entries(&self, series_dir: &str) -> Vec<LibraryEntry> {
+        let prefix = format!("{series_dir}/");
+        Library::new(&self.library_dir)
+            .scan()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.relative_path == series_dir || e.relative_path.starts_with(&prefix))
+            .collect()
     }
 
     /// Rebuild the Library screen beneath the book menu after a delete.
@@ -865,6 +937,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::SearchResults { results, page, .. } => (page, results.len().div_ceil(per_page)),
             Screen::MangaList { mangas, page, .. } => (page, mangas.len().div_ceil(per_page)),
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
+            Screen::DownloadedChapters { entries, page, .. } => {
+                (page, entries.len().div_ceil(per_page))
+            }
             _ => return Ok(()),
         };
         let count = count.max(1);
@@ -965,6 +1040,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(chapter) = chapters.get(index).cloned() {
                     return self.download_and_read(&source, &manga, &chapter, &chapters);
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::DownloadedChapters { entries, page, .. } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if index < entries.len() {
+                    return self.read_downloaded_chain(&entries, index);
                 }
                 Ok(Flow::Continue)
             }
@@ -1713,11 +1795,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if self.ensure_predownloader() {
             let worker = self.predownloader.as_mut().expect("just ensured");
+            let epoch = worker.epoch();
             for chapter in &targets {
                 worker.queue(PreloadJob {
                     source: source.clone(),
                     manga: manga.clone(),
                     chapter_id: chapter.id.clone(),
+                    epoch,
                 });
             }
         } else {
@@ -1787,6 +1871,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ReaderOutcome::NextChapter => {
                     entry = next.expect("NextChapter only with a next");
                 }
+            }
+        }
+    }
+
+    /// Read downloaded chapters starting at `entries[start]`, continuing to the
+    /// next in the list when the reader turns past the last page. Fully local —
+    /// the offline counterpart to [`Self::download_and_read`].
+    fn read_downloaded_chain(&mut self, entries: &[LibraryEntry], start: usize) -> Result<Flow> {
+        let mut i = start;
+        loop {
+            let entry = &entries[i];
+            let next_available = i + 1 < entries.len();
+            match self.run_reader(&entry.path, &entry.relative_path, next_available)? {
+                ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
+                ReaderOutcome::Back => return Ok(Flow::Continue),
+                ReaderOutcome::NextChapter => i += 1,
             }
         }
     }
@@ -2581,6 +2681,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         .collect()
                 });
                 compose_chapter_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
+            }
+            Screen::DownloadedChapters {
+                title,
+                entries,
+                page,
+            } => {
+                // Everything here is on disk by definition; the book icon still
+                // marks what's been read (finished).
+                let rows: Vec<(String, bool, bool)> = self.with_progress(|_, store| {
+                    paged(entries, *page, per_page)
+                        .iter()
+                        .map(|e| {
+                            let finished =
+                                store.get(&e.relative_path).is_some_and(|p| p.is_finished());
+                            (chapter_label(&e.relative_path), true, finished)
+                        })
+                        .collect()
+                });
+                compose_chapter_list(l, title, &rows, *page, l.page_count(entries.len()))
             }
             Screen::UpdatePrompt { body } => compose_message(l, "Update available", body),
             Screen::Message { title, body } => compose_message(l, title, body),
@@ -3575,6 +3694,9 @@ struct PreloadJob {
     source: SourceEntry,
     manga: MangaEntry,
     chapter_id: String,
+    /// The cancellation epoch this job was queued under. The worker drops the
+    /// job if the epoch has since moved on (the user left the manga).
+    epoch: u64,
 }
 
 /// Background chapter pre-downloader: a single worker thread that owns its own
@@ -3582,11 +3704,19 @@ struct PreloadJob {
 /// chapter that isn't already on disk and recording it in the series index.
 /// Single-threaded by design — chapters fetch one at a time in queue order, and
 /// re-queued or already-stored chapters are cheap no-ops.
+///
+/// Leaving a manga bumps `epoch`, so chapters queued for it that haven't started
+/// yet are skipped instead of trickling down in the background after you've
+/// moved on. The chapter already mid-download finishes (it can't be torn out
+/// from under the source), then the worker stops.
 struct Predownloader {
     tx: mpsc::Sender<PreloadJob>,
     /// Chapter keys already handed to the worker, so repeated kicks (every
     /// reader open / page advance) don't enqueue the same chapter twice.
     queued: HashSet<String>,
+    /// The current cancellation epoch, shared with the worker. Queueing stamps
+    /// jobs with it; [`Self::cancel_pending`] bumps it.
+    epoch: Arc<AtomicU64>,
 }
 
 impl Predownloader {
@@ -3596,11 +3726,18 @@ impl Predownloader {
         index_guard: Arc<Mutex<()>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PreloadJob>();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = Arc::clone(&epoch);
         let _ = std::thread::Builder::new()
             .name("gideon-predownload".into())
             .spawn(move || {
                 // Ends when the sender (and thus the app) is dropped.
                 for job in rx {
+                    // The user left this manga after the job was queued — drop it
+                    // instead of downloading chapters they've navigated away from.
+                    if job.epoch != worker_epoch.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     if chapter_on_disk(
                         &library_dir,
                         &index_guard,
@@ -3635,6 +3772,7 @@ impl Predownloader {
         Self {
             tx,
             queued: HashSet::new(),
+            epoch,
         }
     }
 
@@ -3648,6 +3786,21 @@ impl Predownloader {
             // If the worker is gone the send just fails; nothing else to do.
             let _ = self.tx.send(job);
         }
+    }
+
+    /// The epoch new jobs should be stamped with.
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Abandon everything queued so far: bump the epoch (so jobs still sitting in
+    /// the channel are dropped when the worker reaches them) and clear the
+    /// dedup set so a later visit can re-queue. Call this when the user leaves
+    /// the manga — they shouldn't keep downloading its chapters in the
+    /// background once they've moved on.
+    fn cancel_pending(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.queued.clear();
     }
 }
 
@@ -3721,6 +3874,16 @@ fn entry_title(relative_path: &str) -> String {
         Some(series) if !series.is_empty() => format!("{series} — {stem}"),
         _ => stem.to_string(),
     }
+}
+
+/// Just the chapter's file stem ("Chapter 5"), without the series prefix —
+/// for rows inside a single series' downloaded list.
+fn chapter_label(relative_path: &str) -> String {
+    let file = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    file.strip_suffix(".cbz")
+        .or_else(|| file.strip_suffix(".CBZ"))
+        .unwrap_or(file)
+        .to_string()
 }
 
 fn placeholder_cover() -> image::DynamicImage {
