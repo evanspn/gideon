@@ -597,8 +597,14 @@ mod tests {
         // The on-demand path reuses a running radio: no chip power-off, no
         // supplicant kill, and the firmware init stays gated on a cold node.
         let s = enable_script("eth0", Mode::Warm);
-        assert!(!s.contains("echo 0 > /dev/wmtWifi"), "warm must not power off");
-        assert!(!s.contains("pkill wpa_supplicant"), "warm must not kill supplicant");
+        assert!(
+            !s.contains("echo 0 > /dev/wmtWifi"),
+            "warm must not power off"
+        );
+        assert!(
+            !s.contains("pkill wpa_supplicant"),
+            "warm must not kill supplicant"
+        );
         assert!(
             s.contains("[ ! -e /dev/wmtWifi ] || false"),
             "warm only inits a truly cold node"
@@ -613,7 +619,10 @@ mod tests {
         let s = enable_script("eth0", Mode::Cold);
         assert!(s.contains("ifconfig eth0 down"));
         assert!(s.contains("echo 0 > /dev/wmtWifi"), "powers the chip off");
-        assert!(s.contains("pkill wpa_supplicant"), "kills the stale supplicant");
+        assert!(
+            s.contains("pkill wpa_supplicant"),
+            "kills the stale supplicant"
+        );
         assert!(
             s.contains("rm -f /var/run/wpa_supplicant/eth0"),
             "clears the stale control socket"
