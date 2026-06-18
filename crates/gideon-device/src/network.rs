@@ -497,6 +497,19 @@ if command -v wpa_cli >/dev/null 2>&1; then
   # already. Run both, like KOReader, so either state recovers.
   wpa_cli -i {iface} -p /var/run/wpa_supplicant reconnect 2>/dev/null || :
   wpa_cli -i {iface} -p /var/run/wpa_supplicant reassociate 2>/dev/null || :
+  # Wait for association to actually COMPLETE before asking for a lease —
+  # KOReader's restore-wifi-async.sh does the same. Otherwise dhcpcd broadcasts
+  # DISCOVERs into a still-unassociated link and burns its timeout before the
+  # radio is even up. Bounded (~10s) so the detached campaign can't wedge; an
+  # attempt that never associates falls through to DHCP (which then times out)
+  # and the outer retry re-kicks.
+  i=0
+  while [ $i -lt 40 ]; do
+    wpa_cli -i {iface} -p /var/run/wpa_supplicant status 2>/dev/null \
+      | grep -q "wpa_state=COMPLETED" && break
+    sleep_ms 250
+    i=$((i + 1))
+  done
 fi
 if command -v dhcpcd >/dev/null 2>&1; then
   # Release any stale/contending lease first (Nickel's dhcpcd is left alive
@@ -561,13 +574,21 @@ mod tests {
         // Release a stale/contending lease before re-acquiring (KOReader's
         // release-ip.sh before obtain-ip.sh).
         assert!(s.contains("dhcpcd -k eth0"));
+        // Wait for association to COMPLETE before DHCP (KOReader's
+        // restore-wifi-async.sh), so dhcpcd doesn't broadcast into a dead link.
+        assert!(s.contains("wpa_state=COMPLETED"));
         let drv = s.find("/dev/wmtWifi").unwrap();
         let ifup = s.find("ifconfig eth0 up").unwrap();
         let release = s.find("dhcpcd -k eth0").unwrap();
         let acquire = s.find("dhcpcd -t 30 -w eth0").unwrap();
+        let associated = s.find("wpa_state=COMPLETED").unwrap();
         assert!(
             drv < ifup && ifup < release && release < acquire,
             "steps must be ordered: power, ifup, release, acquire"
+        );
+        assert!(
+            associated < acquire,
+            "must wait for association before acquiring a lease"
         );
     }
 
