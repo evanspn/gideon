@@ -140,7 +140,10 @@ impl KoboSuspend {
         Err(last_err.unwrap_or_else(|| Error::Display("suspend failed".to_string())))
     }
 
-    /// Best-effort `ifconfig wlan0 up|down` on hardware. wpa_supplicant and
+    /// Best-effort `ifconfig <iface> up|down` on hardware, on the **real**
+    /// Wi-Fi interface (the Kobo's is `eth0`, NOT `wlan0` — using the wrong
+    /// name silently no-ops, which left the radio "up" with a stale address
+    /// across suspend so nothing reconnected on wake). wpa_supplicant and
     /// dhcpcd keep running across this (gideon never kills them), so the
     /// interface coming back up reassociates and renews the lease without
     /// our help. `GIDEON_SUSPEND_WIFI=0` opts out entirely.
@@ -149,11 +152,12 @@ impl KoboSuspend {
             return;
         }
         if self.root == Path::new("/") {
+            let iface = crate::network::interface();
             let status = std::process::Command::new("ifconfig")
-                .args(["wlan0", direction])
+                .args([iface.as_str(), direction])
                 .status();
             if !matches!(status, Ok(s) if s.success()) {
-                self.step(format!("ifconfig wlan0 {direction} failed (ignored)"));
+                self.step(format!("ifconfig {iface} {direction} failed (ignored)"));
                 return;
             }
         }

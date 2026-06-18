@@ -23,6 +23,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long to wait for association + a DHCP lease before giving up. KOReader
@@ -32,6 +33,17 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connectivity poll cadence while waiting (KOReader's `scheduleConnectivityCheck`).
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Post-wake reconnect: how many full bring-up attempts, and how long to give
+/// each one to associate + get a lease before re-kicking. The chip can take a
+/// few seconds to come back after suspend and the first associate often misses,
+/// so a single shot isn't enough — keep trying for roughly a minute.
+const WAKE_RECONNECT_ATTEMPTS: u32 = 4;
+const WAKE_RECONNECT_ATTEMPT: Duration = Duration::from_secs(15);
+
+/// Guards against stacking reconnect campaigns when several wakes land close
+/// together — only one background reconnect runs at a time.
+static RECONNECTING: AtomicBool = AtomicBool::new(false);
 
 /// The Wi-Fi interface name. KOReader resolves this from Nickel's environment
 /// (`INTERFACE`), defaulting to `eth0` — the Kobo convention, including on the
@@ -122,8 +134,41 @@ pub fn bring_up_wifi() {
 /// Cheap and instant: a single `is_online` probe plus, at most, the detached
 /// bring-up.
 pub fn reconnect_after_wake() {
-    if !is_online() {
-        bring_up_wifi();
+    if !on_device() {
+        return;
+    }
+    // Only one reconnect campaign at a time (back-to-back wakes, debounce).
+    if RECONNECTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("gideon-wifi-reconnect".into())
+        .spawn(|| {
+            // The first associate after a suspend often misses (the chip is
+            // still coming back), so don't fire once and hope — re-run the full
+            // bring-up a few times, giving each attempt time to scan, associate
+            // and pull a lease before judging it.
+            'campaign: for _ in 0..WAKE_RECONNECT_ATTEMPTS {
+                if is_online() {
+                    break;
+                }
+                bring_up_wifi();
+                let start = Instant::now();
+                while start.elapsed() < WAKE_RECONNECT_ATTEMPT {
+                    std::thread::sleep(POLL_INTERVAL);
+                    if is_online() {
+                        break 'campaign;
+                    }
+                }
+            }
+            RECONNECTING.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        // Couldn't spawn — fall back to a single inline kick.
+        RECONNECTING.store(false, Ordering::SeqCst);
+        if !is_online() {
+            bring_up_wifi();
+        }
     }
 }
 
