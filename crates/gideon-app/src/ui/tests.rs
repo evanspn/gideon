@@ -2098,6 +2098,23 @@ fn wifi_list_toggle_off_returns_to_previous_screen() {
 }
 
 #[test]
+fn wifi_toggle_off_closes_the_whole_menu_from_the_power_menu() {
+    // Opened via Power → Wi-Fi, toggling off should return all the way to the
+    // library, not leave you sitting on the Power menu.
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![]);
+    app.stack.push(Screen::PowerMenu);
+    app.stack.push(Screen::WifiList {
+        networks: vec![wifi_net("X", true, false)],
+    });
+    app.activate(0, 10, 10).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::Home),
+        "the Wi-Fi toggle closes the entire menu stack back to Home"
+    );
+}
+
+#[test]
 fn title_taps_off_the_power_icon_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
     // Between the profile zone (left half) and the power zone (right

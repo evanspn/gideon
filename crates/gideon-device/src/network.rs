@@ -391,6 +391,10 @@ pkill -0 wpa_supplicant 2>/dev/null || \
 if command -v wpa_cli >/dev/null 2>&1; then
   wpa_cli -i {iface} -p /var/run/wpa_supplicant scan 2>/dev/null || :
   sleep 2
+  # `reconnect` re-enables every saved network and connects to the best one
+  # (the disconnected case); `reassociate` re-associates if it's idling on one
+  # already. Run both, like KOReader, so either state recovers.
+  wpa_cli -i {iface} -p /var/run/wpa_supplicant reconnect 2>/dev/null || :
   wpa_cli -i {iface} -p /var/run/wpa_supplicant reassociate 2>/dev/null || :
 fi
 if command -v dhcpcd >/dev/null 2>&1; then
@@ -448,8 +452,10 @@ mod tests {
         assert!(s.contains("ifconfig eth0 up"));
         assert!(s.contains("wpa_supplicant -D nl80211 -s -i eth0"));
         assert!(s.contains("dhcpcd -t 30 -w eth0"));
-        // Actively kicks a scan + re-association rather than passively waiting.
+        // Actively kicks a scan + reconnect + re-association rather than
+        // passively waiting.
         assert!(s.contains("wpa_cli -i eth0"));
+        assert!(s.contains("reconnect"));
         assert!(s.contains("reassociate"));
         // Release a stale/contending lease before re-acquiring (KOReader's
         // release-ip.sh before obtain-ip.sh).
