@@ -34,12 +34,32 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connectivity poll cadence while waiting (KOReader's `scheduleConnectivityCheck`).
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Post-wake reconnect: how many full bring-up attempts, and how long to give
-/// each one to associate + get a lease before re-kicking. The chip can take a
-/// few seconds to come back after suspend and the first associate often misses,
-/// so a single shot isn't enough — keep trying for roughly a minute.
+/// Post-wake reconnect: how many bring-up attempts, and how long to give each
+/// one to associate + get a lease before re-kicking. The chip can take a few
+/// seconds to come back after suspend and the first associate often misses, so
+/// a single shot isn't enough — keep trying for roughly a minute. The first
+/// attempt is a full power-cycle (see [`Mode::Cold`]) which needs more headroom
+/// than a warm re-associate.
 const WAKE_RECONNECT_ATTEMPTS: u32 = 4;
-const WAKE_RECONNECT_ATTEMPT: Duration = Duration::from_secs(15);
+const WAKE_RECONNECT_ATTEMPT: Duration = Duration::from_secs(20);
+
+/// How hard a bring-up tries. The on-demand path reuses whatever Nickel/our
+/// previous bring-up left running; the post-wake path power-cycles from scratch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Reuse a loaded module, a powered chip and a live wpa_supplicant: just
+    /// re-scan / re-associate / renew the lease. Cheap; the on-demand path.
+    Warm,
+    /// A genuine radio power-cycle — interface down, chip *off*, supplicant
+    /// killed, lease released, then the full firmware init and a fresh
+    /// supplicant on the way back up. This is exactly the off→on that Nickel's
+    /// Wi-Fi toggle performs, and the only thing that reliably recovers the
+    /// link after a suspend: a warm re-associate leaves the MTK chip powered
+    /// but with stale firmware/association state (the control node persists
+    /// across suspend, so the warm path's `[ ! -e /dev/wmtWifi ]` guard skips
+    /// the re-init the chip actually needs). Used as the first post-wake try.
+    Cold,
+}
 
 /// Guards against stacking reconnect campaigns when several wakes land close
 /// together — only one background reconnect runs at a time.
@@ -117,24 +137,31 @@ pub fn bring_up_wifi() {
     if !on_device() || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
         return;
     }
-    let iface = interface();
-    // Background the whole script and detach its I/O so `sh` returns at once;
-    // the work continues reparented to init. A lease that lands after the UI
-    // stops waiting still leaves the device online for the next action.
-    let detached = format!("( {} ) </dev/null >/dev/null 2>&1 &", enable_script(&iface));
+    run_enable_detached(&interface(), Mode::Warm);
+}
+
+/// Run a bring-up [`enable_script`] **detached in the background** so `sh`
+/// returns at once and the slow steps (chip wake, a DHCP wait of up to 30s)
+/// continue reparented to init. A lease that lands after the UI stops waiting
+/// still leaves the device online for the next action.
+fn run_enable_detached(iface: &str, mode: Mode) {
+    let detached = format!(
+        "( {} ) </dev/null >/dev/null 2>&1 &",
+        enable_script(iface, mode)
+    );
     let _ = Command::new("sh").arg("-c").arg(detached).status();
 }
 
-/// Proactively rejoin a known network after the device wakes from sleep. If
-/// we're not online — the usual state after a suspend, where the radio came
-/// back but isn't re-associated or its lease lapsed — fire the (detached,
-/// non-blocking) scan + re-associate so Wi-Fi is back *before* the user does
-/// anything, instead of only reconnecting lazily on the next network action.
-/// No-op when already connected (never disturb a working link) or off-device.
-/// Cheap and instant: a single `is_online` probe plus, at most, the detached
-/// bring-up.
+/// Rejoin a known network after the device wakes from sleep. A suspend leaves
+/// the MTK radio dead-but-powered, so the first thing we do is a full cold
+/// power-cycle ([`Mode::Cold`]) — the same off→on as Nickel's Wi-Fi toggle,
+/// the one recovery the user can see working — rather than a warm re-associate
+/// against a half-dead chip. Runs in a detached background thread (the campaign
+/// can span ~a minute) so the UI is responsive immediately; subsequent attempts
+/// are warm and stop the instant the link is genuinely back. No-op off-device
+/// or when auto-enable is opted out (`GIDEON_WIFI_AUTOENABLE=0`).
 pub fn reconnect_after_wake() {
-    if !on_device() {
+    if !on_device() || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
         return;
     }
     // Only one reconnect campaign at a time (back-to-back wakes, debounce).
@@ -144,15 +171,20 @@ pub fn reconnect_after_wake() {
     let spawned = std::thread::Builder::new()
         .name("gideon-wifi-reconnect".into())
         .spawn(|| {
-            // The first associate after a suspend often misses (the chip is
-            // still coming back), so don't fire once and hope — re-run the full
-            // bring-up a few times, giving each attempt time to scan, associate
-            // and pull a lease before judging it.
-            'campaign: for _ in 0..WAKE_RECONNECT_ATTEMPTS {
-                if is_online() {
+            let iface = interface();
+            // The first attempt is ALWAYS a cold power-cycle, run
+            // unconditionally — we must not trust is_online() before it. After
+            // a suspend the radio is dead, yet the pre-sleep IPv4 address
+            // survives the interface down/up, so is_online() reports a stale
+            // "connected" and a warm-only campaign would no-op exactly when a
+            // real reset is needed. Later attempts are warm re-associates and
+            // bail the instant the link is genuinely back.
+            'campaign: for attempt in 0..WAKE_RECONNECT_ATTEMPTS {
+                if attempt > 0 && is_online() {
                     break;
                 }
-                bring_up_wifi();
+                let mode = if attempt == 0 { Mode::Cold } else { Mode::Warm };
+                run_enable_detached(&iface, mode);
                 let start = Instant::now();
                 while start.elapsed() < WAKE_RECONNECT_ATTEMPT {
                     std::thread::sleep(POLL_INTERVAL);
@@ -164,11 +196,9 @@ pub fn reconnect_after_wake() {
             RECONNECTING.store(false, Ordering::SeqCst);
         });
     if spawned.is_err() {
-        // Couldn't spawn — fall back to a single inline kick.
+        // Couldn't spawn — fall back to a single inline cold reset.
         RECONNECTING.store(false, Ordering::SeqCst);
-        if !is_online() {
-            bring_up_wifi();
-        }
+        run_enable_detached(&interface(), Mode::Cold);
     }
 }
 
@@ -392,7 +422,7 @@ pub fn ensure_online(timeout: Duration) -> bool {
 /// Module name, kernel-module directory and wpa_supplicant config are
 /// overridable by env (KOReader sources these from Nickel's environment); the
 /// defaults are the Libra Colour values.
-fn enable_script(iface: &str) -> String {
+fn enable_script(iface: &str, mode: Mode) -> String {
     // KOReader: WIFI_MODULE=wlan_drv_gen4m for the MTK Libra Colour.
     let module = env_nonempty("GIDEON_WIFI_MODULE")
         .or_else(|| env_nonempty("WIFI_MODULE"))
@@ -405,19 +435,45 @@ fn enable_script(iface: &str) -> String {
     let conf = env_nonempty("GIDEON_WPA_SUPPLICANT_CONF")
         .unwrap_or_else(|| "/etc/wpa_supplicant/wpa_supplicant.conf".to_string());
 
+    let cold = mode == Mode::Cold;
+    // Cold start = a genuine radio power-cycle (Nickel's Wi-Fi toggle), the
+    // only thing that recovers the link after suspend. Tear everything down
+    // first — interface, chip power, supplicant and its stale control socket,
+    // and any half-acquired lease — so the bring-up below rebuilds from a clean
+    // slate instead of poking a half-dead chip. Warm start skips all of this.
+    let teardown = if cold {
+        format!(
+            "ifconfig {iface} down 2>/dev/null || :\n\
+             echo 0 > /dev/wmtWifi 2>/dev/null || :\n\
+             pkill wpa_supplicant 2>/dev/null || :\n\
+             rm -f /var/run/wpa_supplicant/{iface} 2>/dev/null || :\n\
+             dhcpcd -k {iface} 2>/dev/null || :\n\
+             sleep 1\n"
+        )
+    } else {
+        String::new()
+    };
+    // The control node persists across suspend even after the chip lost its
+    // firmware, so `[ ! -e /dev/wmtWifi ]` alone won't re-init a woken chip.
+    // Cold forces the firmware (wmt_dbg) init regardless; warm only inits a
+    // truly cold node (first-ever bring-up). `true`/`false` are shell builtins.
+    let force_init = if cold { "true" } else { "false" };
+
     // Each step is best-effort (`|| :`); insmod only when the module isn't
-    // already loaded, and the whole module/power block is skipped once the
-    // chip control node exists (warm start — the common reconnect case).
+    // already loaded, and the module block is skipped once the chip control
+    // node exists (warm start — the common on-demand reconnect case).
     format!(
         r#"
 sleep_ms() {{ usleep "$1"000 2>/dev/null || sleep 1; }}
-if [ ! -e /dev/wmtWifi ]; then
+{teardown}if [ ! -e /dev/wmtWifi ]; then
   for m in wmt_drv wmt_chrdev_wifi wmt_cdev_bt {module}; do
     if ! grep -q "^${{m}} " /proc/modules 2>/dev/null; then
       insmod {kmod_dir}/${{m}}.ko 2>/dev/null || :
       sleep_ms 250
     fi
   done
+fi
+if [ ! -e /dev/wmtWifi ] || {force_init}; then
   echo 0xDB9DB9 > /proc/driver/wmt_dbg 2>/dev/null || :
   echo "7 9 0"  > /proc/driver/wmt_dbg 2>/dev/null || :
   sleep 1
@@ -489,7 +545,7 @@ mod tests {
 
     #[test]
     fn enable_script_has_the_monza_sequence() {
-        let s = enable_script("eth0");
+        let s = enable_script("eth0", Mode::Warm);
         // Module loads, chip power-on, interface up, supplicant, DHCP — in
         // the KOReader order, on the resolved interface.
         assert!(s.contains("wlan_drv_gen4m"));
@@ -516,9 +572,45 @@ mod tests {
     }
 
     #[test]
+    fn warm_start_does_not_power_cycle_or_force_init() {
+        // The on-demand path reuses a running radio: no chip power-off, no
+        // supplicant kill, and the firmware init stays gated on a cold node.
+        let s = enable_script("eth0", Mode::Warm);
+        assert!(!s.contains("echo 0 > /dev/wmtWifi"), "warm must not power off");
+        assert!(!s.contains("pkill wpa_supplicant"), "warm must not kill supplicant");
+        assert!(
+            s.contains("[ ! -e /dev/wmtWifi ] || false"),
+            "warm only inits a truly cold node"
+        );
+    }
+
+    #[test]
+    fn cold_start_power_cycles_the_radio_and_forces_init() {
+        // The post-wake path is a full off→on (Nickel's toggle): tear the
+        // interface, chip power, supplicant, its control socket and the lease
+        // down first, then force the firmware re-init on the way back up.
+        let s = enable_script("eth0", Mode::Cold);
+        assert!(s.contains("ifconfig eth0 down"));
+        assert!(s.contains("echo 0 > /dev/wmtWifi"), "powers the chip off");
+        assert!(s.contains("pkill wpa_supplicant"), "kills the stale supplicant");
+        assert!(
+            s.contains("rm -f /var/run/wpa_supplicant/eth0"),
+            "clears the stale control socket"
+        );
+        assert!(
+            s.contains("[ ! -e /dev/wmtWifi ] || true"),
+            "cold forces the firmware re-init"
+        );
+        // Teardown must come before the bring-up powers the chip back on.
+        let power_off = s.find("echo 0 > /dev/wmtWifi").unwrap();
+        let power_on = s.find("echo 1 > /dev/wmtWifi").unwrap();
+        assert!(power_off < power_on, "power off, then back on");
+    }
+
+    #[test]
     fn enable_script_honors_module_and_iface_overrides() {
         std::env::set_var("GIDEON_WIFI_MODULE", "moal");
-        let s = enable_script("wlan0");
+        let s = enable_script("wlan0", Mode::Warm);
         assert!(s.contains("moal"));
         assert!(s.contains("ifconfig wlan0 up"));
         std::env::remove_var("GIDEON_WIFI_MODULE");
