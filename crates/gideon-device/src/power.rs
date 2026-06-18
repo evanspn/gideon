@@ -143,10 +143,12 @@ impl KoboSuspend {
     /// Best-effort `ifconfig <iface> up|down` on hardware, on the **real**
     /// Wi-Fi interface (the Kobo's is `eth0`, NOT `wlan0` — using the wrong
     /// name silently no-ops, which left the radio "up" with a stale address
-    /// across suspend so nothing reconnected on wake). wpa_supplicant and
-    /// dhcpcd keep running across this (gideon never kills them), so the
-    /// interface coming back up reassociates and renews the lease without
-    /// our help. `GIDEON_SUSPEND_WIFI=0` opts out entirely.
+    /// across suspend so nothing reconnected on wake). This is only the cheap
+    /// link toggle around suspend; the actual reconnection is owned by
+    /// `network::reconnect_after_wake()`, which the app fires after we return
+    /// and which power-cycles the radio and restarts wpa_supplicant from
+    /// scratch (a warm re-associate doesn't recover the MTK chip after sleep).
+    /// `GIDEON_SUSPEND_WIFI=0` opts out entirely.
     fn wifi(&mut self, direction: &str) {
         if std::env::var("GIDEON_SUSPEND_WIFI").as_deref() == Ok("0") {
             return;
