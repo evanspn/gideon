@@ -112,6 +112,12 @@ fn scan_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 pub struct ProgressStore {
     #[serde(default)]
     progress: HashMap<String, ReadingProgress>,
+    /// The last chapter opened per series (series directory → chapter key).
+    /// Recorded the instant a chapter opens, so "resume" lands on exactly
+    /// where the reader last was — independent of the wall clock and robust to
+    /// the app being killed before progress is flushed.
+    #[serde(default)]
+    last_opened: HashMap<String, String>,
 }
 
 impl ProgressStore {
@@ -160,6 +166,19 @@ impl ProgressStore {
                 last_read_at,
             },
         );
+    }
+
+    /// Record `chapter_key` as the chapter the user most recently opened in
+    /// `series_key` (its top-level directory). Called the moment the reader
+    /// opens a chapter.
+    pub fn set_last_opened(&mut self, series_key: &str, chapter_key: &str) {
+        self.last_opened
+            .insert(series_key.to_owned(), chapter_key.to_owned());
+    }
+
+    /// The chapter most recently opened in `series_key`, if recorded.
+    pub fn last_opened(&self, series_key: &str) -> Option<&str> {
+        self.last_opened.get(series_key).map(|s| s.as_str())
     }
 
     pub fn len(&self) -> usize {
@@ -248,6 +267,20 @@ mod tests {
         assert!(p.last_read_at > 0);
         assert!(!p.is_finished());
         assert!((p.percent() - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn last_opened_round_trips_and_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/progress.json");
+        let mut store = ProgressStore::default();
+        store.set_last_opened("Series", "Series/vol5.cbz");
+        store.set_last_opened("Series", "Series/vol6.cbz"); // overwrites
+        store.save(&path).unwrap();
+
+        let reloaded = ProgressStore::load(&path).unwrap();
+        assert_eq!(reloaded.last_opened("Series"), Some("Series/vol6.cbz"));
+        assert_eq!(reloaded.last_opened("Other"), None);
     }
 
     #[test]

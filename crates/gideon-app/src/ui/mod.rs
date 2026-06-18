@@ -102,29 +102,20 @@ impl SeriesCard {
         }
     }
 
-    /// The chapter a tap opens. Predictable and order-independent — it never
-    /// guesses a "next" chapter by file order (that was sending taps to a random
-    /// earlier chapter):
-    /// 1. the most recently read chapter you **haven't finished** — resume where
-    ///    you left off;
-    /// 2. else the most recently read chapter (everything's finished) — reopen
-    ///    it rather than dumping you back at chapter 1;
-    /// 3. else the first chapter (nothing read yet).
+    /// The chapter a tap opens — the chapter the user **last opened** in this
+    /// series, resumed at its saved page. This is read from the explicitly
+    /// stored `last_opened` record (written the instant the reader opens a
+    /// chapter), so it's exact and clock-independent — never a guess. Falls back
+    /// to the most-recently-read chapter (for libraries from before the record
+    /// existed), then the first chapter.
     fn resume_chapter(&self, store: &ProgressStore) -> &LibraryEntry {
-        let most_recent_unfinished = self
-            .chapters
-            .iter()
-            .filter_map(|c| {
-                store
-                    .get(&c.relative_path)
-                    .filter(|p| !p.is_finished())
-                    .map(|p| (p.last_read_at, c))
-            })
-            .max_by_key(|(at, _)| *at)
-            .map(|(_, c)| c);
-        most_recent_unfinished
-            .or_else(|| self.latest_read(store))
-            .unwrap_or(&self.chapters[0])
+        let series_key = series_key_of(&self.chapters[0].relative_path);
+        if let Some(key) = store.last_opened(series_key) {
+            if let Some(entry) = self.chapters.iter().find(|c| c.relative_path == key) {
+                return entry;
+            }
+        }
+        self.latest_read(store).unwrap_or(&self.chapters[0])
     }
 
     /// The chapter the user most recently read in this card (finished or not),
@@ -1942,6 +1933,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             CbzDocument::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
         let progress_file = progress_path(&self.library_dir);
         let mut store = ProgressStore::load(&progress_file).unwrap_or_default();
+
+        // Record this chapter as the series' last-opened the moment it opens —
+        // BEFORE the first page even paints — so "resume" always lands here,
+        // even if the app is killed (Nickel home button) before any later save.
+        store.set_last_opened(series_key_of(key), key);
+        let _ = store.save(&progress_file);
 
         // The reader works in PANEL coordinates (self.layout may be the
         // rotated menu layout): build its gesture geometry from the
@@ -4050,6 +4047,13 @@ fn record_chapter_in_index(
 }
 
 /// Card name for a library entry: "Series — Chapter" when it lives in a
+/// The series key a chapter key belongs to: its top-level directory
+/// ("Series/vol3.cbz" → "Series"), or the whole key for a loose root file.
+/// Used to record/look up the series' last-opened chapter.
+fn series_key_of(chapter_key: &str) -> &str {
+    chapter_key.split('/').next().unwrap_or(chapter_key)
+}
+
 /// series directory, just the file stem otherwise.
 fn entry_title(relative_path: &str) -> String {
     let mut parts = relative_path.rsplitn(2, '/');
