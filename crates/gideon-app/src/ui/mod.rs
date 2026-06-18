@@ -361,6 +361,11 @@ const WIFI_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// wrong password, captive portal).
 const WIFI_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// While waiting to connect, re-fire the bring-up/reassociate this often rather
+/// than waiting passively — KOReader-style persistence: the chip can miss the
+/// first association after waking, so keep nudging it until it sticks.
+const WIFI_REKICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
+
 pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
@@ -1187,10 +1192,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::WifiList { networks } => {
                 let n = networks.len();
                 if row == 0 {
-                    // The Wi-Fi toggle (currently on): flip it off.
+                    // The Wi-Fi toggle (currently on): flip it off and close the
+                    // whole Wi-Fi/Power menu — back to the library, not lingering
+                    // on a parent menu.
                     gideon_device::network::disable_wifi();
-                    self.show_status(&["Wi-Fi turned off."])?;
-                    self.pop()?;
+                    self.stack.truncate(1);
+                    self.render_current(RefreshMode::Full)?;
                 } else if row <= n {
                     let net = networks[row - 1].clone();
                     self.tap_wifi_network(&net)?;
@@ -2345,6 +2352,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.last_wifi_fail = None;
         gideon_device::network::connect_network(ssid, password);
         let start = std::time::Instant::now();
+        let mut last_kick = start;
         let mut online = gideon_device::network::is_online();
         while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
             self.show_status(&[
@@ -2359,6 +2367,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 break;
             }
             online = gideon_device::network::is_online();
+            // Re-issue the connect if it hasn't taken yet (the first associate
+            // can miss right after the radio comes up).
+            if !online && last_kick.elapsed() >= WIFI_REKICK_INTERVAL {
+                gideon_device::network::connect_network(ssid, password);
+                last_kick = std::time::Instant::now();
+            }
         }
         if matches!(self.stack.last(), Some(Screen::WifiPassword { .. })) {
             self.stack.pop();
@@ -2370,6 +2384,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// already on it), then repaint.
     fn refresh_wifi_list(&mut self) -> Result<()> {
         self.show_status(&["Scanning for Wi-Fi…"])?;
+        // If we're offline, bring the radio up / reassociate as part of the
+        // scan, so "Scan again" doubles as a reconnect.
+        if !gideon_device::network::is_online() {
+            gideon_device::network::bring_up_wifi();
+        }
         let networks = scan_wifi_sorted();
         match self.stack.last_mut() {
             Some(s @ Screen::WifiList { .. }) => *s = Screen::WifiList { networks },
@@ -2424,6 +2443,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // needs a moment to come up after sleep, so we keep scanning until the
         // timeout or the user gives up.
         let start = std::time::Instant::now();
+        let mut last_kick = start;
         let mut online = gideon_device::network::is_online();
         let mut cancelled = false;
         while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
@@ -2442,6 +2462,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 break;
             }
             online = gideon_device::network::is_online();
+            // Keep nudging the chip to re-scan/re-associate instead of waiting
+            // passively for a first attempt that may have missed.
+            if !online && last_kick.elapsed() >= WIFI_REKICK_INTERVAL {
+                gideon_device::network::bring_up_wifi();
+                last_kick = std::time::Instant::now();
+            }
         }
         // Back off after a failure OR a cancel, so the next tap doesn't
         // immediately re-enter a long wait the user just dismissed.
