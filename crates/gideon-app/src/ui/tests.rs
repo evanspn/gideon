@@ -1196,11 +1196,12 @@ fn book_menu_targets_the_chapter_a_tap_would_open() {
 }
 
 #[test]
-fn cover_tap_resumes_the_last_opened_chapter_not_an_earlier_one() {
-    // The user's complaint: a cover tap must open the chapter they last had
-    // open, never a "random earlier" one. Here vol2 was opened most recently
-    // (at=300) even though vol1 and vol3 are finished and surround it — the
-    // resume target is vol2, full stop.
+fn cover_tap_without_a_record_resumes_the_furthest_read_chapter() {
+    // No last_opened record (an old library, just upgraded): the fallback must
+    // open the FURTHEST chapter read — where you are in the series — not an
+    // earlier one that happens to carry a newer timestamp. This is the
+    // "I'm on 209 but it opens 139" bug: vol1 was touched most recently
+    // (at=300) but vol3 is further along, so the tap opens vol3.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
@@ -1211,9 +1212,8 @@ fn cover_tap_resumes_the_last_opened_chapter_not_an_earlier_one() {
     std::fs::write(
         &progress_file,
         r#"{"progress":{
-            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":100},
-            "Series/vol3.cbz":{"current_page":3,"total_pages":4,"last_read_at":200},
-            "Series/vol2.cbz":{"current_page":2,"total_pages":5,"last_read_at":300}
+            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":300},
+            "Series/vol3.cbz":{"current_page":2,"total_pages":4,"last_read_at":100}
         }}"#,
     )
     .unwrap();
@@ -1230,8 +1230,8 @@ fn cover_tap_resumes_the_last_opened_chapter_not_an_earlier_one() {
         panic!("expected the book menu");
     };
     assert_eq!(
-        entry.relative_path, "Series/vol2.cbz",
-        "resumes the last-opened chapter, not an earlier or later finished one"
+        entry.relative_path, "Series/vol3.cbz",
+        "resumes the furthest chapter read, not the more-recently-touched earlier one"
     );
 }
 

@@ -103,11 +103,17 @@ impl SeriesCard {
     }
 
     /// The chapter a tap opens — the chapter the user **last opened** in this
-    /// series, resumed at its saved page. This is read from the explicitly
-    /// stored `last_opened` record (written the instant the reader opens a
-    /// chapter), so it's exact and clock-independent — never a guess. Falls back
-    /// to the most-recently-read chapter (for libraries from before the record
-    /// existed), then the first chapter.
+    /// series, resumed at its saved page. Read from the explicitly stored
+    /// `last_opened` record (written the instant the reader opens a chapter), so
+    /// it's exact and clock-independent — never a guess.
+    ///
+    /// Only when there's no record yet (a library from before the record
+    /// existed) does it fall back — to the **furthest** chapter with any
+    /// progress (the last one in reading order you've touched), NOT the newest
+    /// timestamp. "Furthest" is what "where am I in this series" means: if you've
+    /// read up to ch209 that's ch209, even if you dipped back into an earlier
+    /// chapter more recently (which is what made it jump to ch139). Then the
+    /// first chapter, if nothing's been read.
     fn resume_chapter(&self, store: &ProgressStore) -> &LibraryEntry {
         let series_key = series_key_of(&self.chapters[0].relative_path);
         if let Some(key) = store.last_opened(series_key) {
@@ -115,7 +121,17 @@ impl SeriesCard {
                 return entry;
             }
         }
-        self.latest_read(store).unwrap_or(&self.chapters[0])
+        self.furthest_read(store).unwrap_or(&self.chapters[0])
+    }
+
+    /// The furthest chapter (last in reading order) that has any progress —
+    /// "how far into the series am I". Order-based, so it ignores when each was
+    /// last touched.
+    fn furthest_read(&self, store: &ProgressStore) -> Option<&LibraryEntry> {
+        self.chapters
+            .iter()
+            .rev()
+            .find(|c| store.get(&c.relative_path).is_some())
     }
 
     /// The chapter the user most recently read in this card (finished or not),
@@ -2763,11 +2779,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         .iter()
                         .map(|c| {
                             let on_disk = downloaded.contains_key(&c.id);
-                            let finished = downloaded
-                                .get(&c.id)
-                                .and_then(|file| store.get(&format!("{dir}/{file}")))
+                            let key = downloaded.get(&c.id).map(|file| format!("{dir}/{file}"));
+                            let finished = key
+                                .as_deref()
+                                .and_then(|k| store.get(k))
                                 .is_some_and(|p| p.is_finished());
-                            (c.label(), on_disk, finished)
+                            let is_last =
+                                key.is_some() && store.last_opened(&dir) == key.as_deref();
+                            (label_with_last(c.label(), is_last), on_disk, finished)
                         })
                         .collect()
                 });
@@ -2786,7 +2805,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         .map(|e| {
                             let finished =
                                 store.get(&e.relative_path).is_some_and(|p| p.is_finished());
-                            (chapter_label(&e.relative_path), true, finished)
+                            let is_last = store.last_opened(series_key_of(&e.relative_path))
+                                == Some(e.relative_path.as_str());
+                            (
+                                label_with_last(chapter_label(&e.relative_path), is_last),
+                                true,
+                                finished,
+                            )
                         })
                         .collect()
                 });
@@ -4114,6 +4139,17 @@ fn chapter_label(relative_path: &str) -> String {
         .or_else(|| file.strip_suffix(".CBZ"))
         .unwrap_or(file)
         .to_string()
+}
+
+/// Tag a chapter-row label with " · last opened" when it's the series'
+/// last-opened chapter (the one a cover tap resumes), so it's visible in the
+/// list.
+fn label_with_last(label: String, is_last: bool) -> String {
+    if is_last {
+        format!("{label} · last opened")
+    } else {
+        label
+    }
 }
 
 fn placeholder_cover() -> image::DynamicImage {
