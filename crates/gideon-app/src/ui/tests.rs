@@ -550,7 +550,7 @@ fn bottom_edge_swipe_up() -> UiEvent {
 /// Tap row `i` of the controls sheet (rotation 0: panel == reading frame).
 fn tap_sheet_row(i: usize) -> UiEvent {
     let l = layout();
-    let top = H - 3 * l.row_h;
+    let top = H - SHEET_ROW_COUNT * l.row_h;
     UiEvent::Tap {
         x: W / 2,
         y: top + i as u32 * l.row_h + l.row_h / 2,
@@ -567,9 +567,9 @@ fn controls_sheet_opens_from_bottom_edge_swipe_only() {
     let events = vec![
         tap_row(0),
         tap_shelf_cell0(),
-        bottom_edge_swipe_up(), // opens the sheet — must NOT rotate
-        tap_sheet_row(2),       // Close
-        reader_tap_next(),      // zones still unrotated -> page 1
+        bottom_edge_swipe_up(),         // opens the sheet — must NOT rotate
+        tap_sheet_row(SHEET_ROW_CLOSE), // Close
+        reader_tap_next(),              // zones still unrotated -> page 1
         reader_tap_back(),
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
@@ -635,10 +635,10 @@ fn orientation_lock_toggle_persists_and_auto_keeps_rotation_session_only() {
         tap_row(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),
-        tap_sheet_row(1), // Orientation: locked -> auto (persisted)
-        tap_sheet_row(2), // Close
-        mid_swipe_up,     // rotate to 90 — session-only now
-        tap_panel_bottom, // the rotation still applies in-session
+        tap_sheet_row(SHEET_ROW_ORIENTATION), // locked -> auto (persisted)
+        tap_sheet_row(SHEET_ROW_CLOSE),       // Close
+        mid_swipe_up,                         // rotate to 90 — session-only now
+        tap_panel_bottom,                     // the rotation still applies in-session
         tap_rotated_back,
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
@@ -663,22 +663,33 @@ fn orientation_lock_toggle_persists_and_auto_keeps_rotation_session_only() {
 
 #[test]
 fn controls_sheet_labels_show_lock_state() {
-    assert_eq!(controls_sheet_labels(true)[1], "Orientation: locked");
-    assert_eq!(controls_sheet_labels(false)[1], "Orientation: auto");
-    assert_eq!(controls_sheet_labels(true)[0], "Rotate 90°");
-    assert_eq!(controls_sheet_labels(true)[2], "Close");
+    assert_eq!(controls_sheet_labels(true, false)[1], "Orientation: locked");
+    assert_eq!(controls_sheet_labels(false, false)[1], "Orientation: auto");
+    assert_eq!(controls_sheet_labels(true, false)[0], "Rotate 90°");
+    assert_eq!(
+        controls_sheet_labels(true, false)[SHEET_ROW_AUTO_SPREAD],
+        "Auto-rotate spreads: off"
+    );
+    assert_eq!(
+        controls_sheet_labels(true, true)[SHEET_ROW_AUTO_SPREAD],
+        "Auto-rotate spreads: on"
+    );
+    assert_eq!(controls_sheet_labels(true, false)[SHEET_ROW_CLOSE], "Close");
 }
 
 #[test]
 fn controls_sheet_rows_resolve_from_reading_taps() {
-    // An 800-high reading frame with 48px rows: the sheet covers
-    // [656, 800); above it is None (closes the sheet).
-    assert_eq!(controls_sheet_row(800, 48, 655), None);
-    assert_eq!(controls_sheet_row(800, 48, 656), Some(SHEET_ROW_ROTATE));
-    assert_eq!(controls_sheet_row(800, 48, 703), Some(SHEET_ROW_ROTATE));
+    // An 800-high reading frame with 48px rows and four rows: the sheet covers
+    // [608, 800); above it is None (closes the sheet).
+    assert_eq!(controls_sheet_row(800, 48, 607), None);
+    assert_eq!(controls_sheet_row(800, 48, 608), Some(SHEET_ROW_ROTATE));
+    assert_eq!(
+        controls_sheet_row(800, 48, 656),
+        Some(SHEET_ROW_ORIENTATION)
+    );
     assert_eq!(
         controls_sheet_row(800, 48, 704),
-        Some(SHEET_ROW_ORIENTATION)
+        Some(SHEET_ROW_AUTO_SPREAD)
     );
     assert_eq!(controls_sheet_row(800, 48, 752), Some(SHEET_ROW_CLOSE));
     assert_eq!(controls_sheet_row(800, 48, 799), Some(SHEET_ROW_CLOSE));

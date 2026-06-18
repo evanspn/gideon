@@ -2030,6 +2030,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                                         &panel,
                                         rotation,
                                         rotation_locked,
+                                        self.auto_rotate_spreads,
+                                    )?;
+                                }
+                                Some(SHEET_ROW_AUTO_SPREAD) => {
+                                    // Toggle auto-rotate spreads live: repaint the
+                                    // page (it may rotate now) and keep the sheet
+                                    // up with the flipped label.
+                                    self.auto_rotate_spreads = !self.auto_rotate_spreads;
+                                    let on = self.auto_rotate_spreads;
+                                    reader.set_auto_rotate_spreads(on);
+                                    persist_settings(self.settings_dir.as_deref(), |s| {
+                                        s.auto_rotate_spreads = on;
+                                    });
+                                    reader.show_current_page()?;
+                                    show_controls_sheet(
+                                        &mut reader,
+                                        &panel,
+                                        rotation,
+                                        rotation_locked,
+                                        on,
                                     )?;
                                 }
                                 _ => {
@@ -2162,6 +2182,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                                     &panel,
                                     rotation,
                                     rotation_locked,
+                                    self.auto_rotate_spreads,
                                 )?;
                                 continue;
                             }
@@ -2989,29 +3010,38 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 /// Rows of the reader-controls sheet, top to bottom.
 const SHEET_ROW_ROTATE: usize = 0;
 const SHEET_ROW_ORIENTATION: usize = 1;
-const SHEET_ROW_CLOSE: usize = 2;
-const SHEET_ROW_COUNT: u32 = 3;
+const SHEET_ROW_AUTO_SPREAD: usize = 2;
+const SHEET_ROW_CLOSE: usize = 3;
+const SHEET_ROW_COUNT: u32 = 4;
 
-fn controls_sheet_labels(locked: bool) -> [String; 3] {
+fn controls_sheet_labels(locked: bool, auto_spread: bool) -> [String; 4] {
     [
         "Rotate 90°".to_string(),
         format!("Orientation: {}", if locked { "locked" } else { "auto" }),
+        format!(
+            "Auto-rotate spreads: {}",
+            if auto_spread { "on" } else { "off" }
+        ),
         "Close".to_string(),
     ]
 }
 
 /// The controls sheet as a reading-frame strip (the caller rotates it
-/// into the panel): three full-width rows with a dark top border.
+/// into the panel): full-width rows with a dark top border.
 fn compose_controls_sheet(
     reading_w: u32,
     row_h: u32,
     text_px: f32,
     pad: u32,
     locked: bool,
+    auto_spread: bool,
 ) -> GrayPage {
     let mut sheet = GrayPage::new_white(reading_w, SHEET_ROW_COUNT * row_h.max(1));
     hline(&mut sheet, 0, 0x00);
-    for (i, label) in controls_sheet_labels(locked).iter().enumerate() {
+    for (i, label) in controls_sheet_labels(locked, auto_spread)
+        .iter()
+        .enumerate()
+    {
         let top = i as u32 * row_h;
         draw_text(
             &mut sheet,
@@ -3058,13 +3088,21 @@ fn show_controls_sheet<D: Display>(
     panel: &UiLayout,
     rotation: u32,
     locked: bool,
+    auto_spread: bool,
 ) -> Result<()> {
     let reading_w = if rotation % 180 == 90 {
         panel.height
     } else {
         panel.width
     };
-    let sheet = compose_controls_sheet(reading_w, panel.row_h, panel.text_px, panel.pad, locked);
+    let sheet = compose_controls_sheet(
+        reading_w,
+        panel.row_h,
+        panel.text_px,
+        panel.pad,
+        locked,
+        auto_spread,
+    );
     let sheet_h = sheet.height;
     let rotated = rotate_for_panel(sheet, rotation);
     let (x, y) = controls_sheet_origin(panel.width, panel.height, sheet_h, rotation);

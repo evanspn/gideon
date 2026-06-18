@@ -112,6 +112,15 @@ impl<D: Display> Reader<D> {
         }
     }
 
+    /// Whether to actually rotate a wide spread *right now*. Only in portrait:
+    /// when the reader is already in landscape (90/270) a spread fills the wide
+    /// screen as-is, so rotating it would just fight normal page flipping. So
+    /// auto-rotate kicks in for portrait reading and stays out of landscape's
+    /// way.
+    fn rotate_spreads_now(&self) -> bool {
+        self.auto_rotate_spreads && matches!(self.rotation % 360, 0 | 180)
+    }
+
     /// Whether the most recent [`Self::show_current_page`] used a full
     /// (flashing) refresh — the slow-turn debounce uses this to ignore the
     /// expected periodic flash.
@@ -225,7 +234,7 @@ impl<D: Display> Reader<D> {
             screen_height: reading_h,
             fit: self.fit,
             dither: true,
-            rotate_wide_spreads: self.auto_rotate_spreads,
+            rotate_wide_spreads: self.rotate_spreads_now(),
         };
         self.prefetcher.start(self.current_page, &opts);
     }
@@ -241,7 +250,7 @@ impl<D: Display> Reader<D> {
             screen_height: reading_h,
             fit: self.fit,
             dither: true,
-            rotate_wide_spreads: self.auto_rotate_spreads,
+            rotate_wide_spreads: self.rotate_spreads_now(),
         };
         let cached = matches!(&self.rendered, Some((index, _)) if *index == self.current_page);
         if !cached {
@@ -755,6 +764,30 @@ mod tests {
             FitMode::Contain,
             0,
         )
+    }
+
+    #[test]
+    fn spreads_only_auto_rotate_in_portrait() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = new_reader(dir.path(), 2);
+        reader.set_auto_rotate_spreads(true);
+
+        // Portrait (0 / 180): a wide spread is rotated to fit.
+        reader.set_rotation(0);
+        assert!(reader.rotate_spreads_now());
+        reader.set_rotation(180);
+        assert!(reader.rotate_spreads_now());
+
+        // Landscape (90 / 270): leave the spread alone so flipping is normal.
+        reader.set_rotation(90);
+        assert!(!reader.rotate_spreads_now());
+        reader.set_rotation(270);
+        assert!(!reader.rotate_spreads_now());
+
+        // Off entirely: never rotate, regardless of orientation.
+        reader.set_auto_rotate_spreads(false);
+        reader.set_rotation(0);
+        assert!(!reader.rotate_spreads_now());
     }
 
     #[test]
