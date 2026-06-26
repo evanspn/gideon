@@ -11,12 +11,14 @@
 //!    `Not charging`, `Full` and `Unknown`, all of which a plugged-in
 //!    charger can report — blocks the suspend. Only a missing status file
 //!    (tests, dev machines) falls through to suspending.
-//! 2. Take Wi-Fi down. KOReader "murders" Wi-Fi before every suspend and
+//! 2. Take Wi-Fi fully down. KOReader "murders" Wi-Fi before every suspend and
 //!    Nickel powers it down too; suspending with the SDIO radio associated
-//!    risks `EBUSY` loops and a broken association after resume. We
-//!    best-effort `ifconfig wlan0 down` (wpa_supplicant and dhcpcd stay
-//!    alive — only Nickel was killed — so link-up on wake reassociates and
-//!    renews the lease). `GIDEON_SUSPEND_WIFI=0` disables both halves.
+//!    risks `EBUSY` loops and a broken association after resume. We run the
+//!    full KOReader `disable-wifi.sh` (release lease, terminate wpa_supplicant,
+//!    `ifconfig down`, power the chip off) so the chip is off for the whole
+//!    sleep and the restore on wake starts clean. `GIDEON_SUSPEND_WIFI=0`
+//!    disables it. The matching bring-up is owned by the caller's
+//!    `network::reconnect_after_wake` (KOReader's `restore-wifi-async.sh`).
 //! 3. `echo 1 > /sys/power/state-extended` — sets the kernel-global
 //!    `gSleep_Mode_Suspend` flag that NTX/MTK kernels use to put peripheral
 //!    subsystems to sleep and arm the wakeup pins. Abort on failure.
@@ -108,21 +110,27 @@ impl KoboSuspend {
             return Ok(SuspendOutcome::SkippedCharging);
         }
 
-        // KOReader kills Wi-Fi before every suspend; a live SDIO radio is
-        // the classic source of EBUSY and post-resume breakage.
-        self.wifi("down");
+        // KOReader's Kobo:suspend takes Wi-Fi fully down before suspending:
+        // release the lease, terminate wpa_supplicant, drop the interface and
+        // power the chip OFF. The chip stays off for the whole sleep; on wake
+        // the app's `network::reconnect_after_wake` runs the matching
+        // `restore-wifi-async` enable. A live SDIO radio is the classic source
+        // of EBUSY and post-resume breakage, and powering off here (rather than
+        // power-cycling at resume) is what makes the reconnect reliable.
+        self.wifi_down();
 
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
             match self.try_suspend() {
                 Ok(()) => {
                     // Awake again: resume subsystems and give the kernel a
-                    // moment (KOReader waits 0.1 s after the write).
+                    // moment (KOReader waits 0.1 s after the write). We do NOT
+                    // bring Wi-Fi up here — the caller drives the full restore
+                    // via `network::reconnect_after_wake` after we return.
                     self.write_sysfs("sys/power/state-extended", "0")?;
                     if !self.settle.is_zero() {
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                    self.wifi("up");
                     self.step("woke up".to_string());
                     return Ok(SuspendOutcome::Suspended);
                 }
@@ -135,35 +143,30 @@ impl KoboSuspend {
                 }
             }
         }
-        // Don't leave the radio down after a failed suspend.
-        self.wifi("up");
+        // A failed suspend left Wi-Fi down; the caller's post-suspend
+        // `reconnect_after_wake` (it runs even when we return Err) brings it
+        // back, so we don't restore the radio here.
         Err(last_err.unwrap_or_else(|| Error::Display("suspend failed".to_string())))
     }
 
-    /// Best-effort `ifconfig <iface> up|down` on hardware, on the **real**
-    /// Wi-Fi interface (the Kobo's is `eth0`, NOT `wlan0` — using the wrong
-    /// name silently no-ops, which left the radio "up" with a stale address
-    /// across suspend so nothing reconnected on wake). This is only the cheap
-    /// link toggle around suspend; the actual reconnection is owned by
-    /// `network::reconnect_after_wake()`, which the app fires after we return
-    /// and which power-cycles the radio and restarts wpa_supplicant from
-    /// scratch (a warm re-associate doesn't recover the MTK chip after sleep).
+    /// Take Wi-Fi fully down before suspending — KOReader's pre-suspend
+    /// `disableWifi`: release the lease, terminate wpa_supplicant, drop the
+    /// interface and power the MTK chip off (modules stay loaded). Powering off
+    /// *here*, before the kernel suspends, is what makes the post-wake restore
+    /// reliable — a chip left powered through suspend comes back wedged. The
+    /// restore on wake is owned by `network::reconnect_after_wake`.
     /// `GIDEON_SUSPEND_WIFI=0` opts out entirely.
-    fn wifi(&mut self, direction: &str) {
+    fn wifi_down(&mut self) {
         if std::env::var("GIDEON_SUSPEND_WIFI").as_deref() == Ok("0") {
             return;
         }
+        // Only touch the radio on real hardware; tests run against a tempdir
+        // root and just record the step. (`disable_wifi` is itself a no-op
+        // off-device, but gating keeps the test log deterministic.)
         if self.root == Path::new("/") {
-            let iface = crate::network::interface();
-            let status = std::process::Command::new("ifconfig")
-                .args([iface.as_str(), direction])
-                .status();
-            if !matches!(status, Ok(s) if s.success()) {
-                self.step(format!("ifconfig {iface} {direction} failed (ignored)"));
-                return;
-            }
+            crate::network::disable_wifi();
         }
-        self.step(format!("wifi {direction}"));
+        self.step("wifi down".to_string());
     }
 
     /// One `1 → settle → sync → mem` attempt. Returns once the device has
@@ -315,8 +318,10 @@ mod tests {
         let (dir, mut suspend) = fixture();
         assert_eq!(suspend.suspend().unwrap(), SuspendOutcome::Suspended);
 
-        // The exact write/step order of the Nickel/KOReader dance:
-        // Wi-Fi dies first, comes back only after the kernel resumed.
+        // The exact write/step order of the Nickel/KOReader dance: Wi-Fi is
+        // taken fully down first, and the bring-up on wake is owned by the
+        // caller (network::reconnect_after_wake), so suspend itself never
+        // brings Wi-Fi back up.
         assert_eq!(
             suspend.log(),
             &[
@@ -325,7 +330,6 @@ mod tests {
                 "sync",
                 "sys/power/state <- mem",
                 "sys/power/state-extended <- 0",
-                "wifi up",
                 "woke up",
             ]
         );

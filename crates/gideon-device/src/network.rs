@@ -1,25 +1,37 @@
-//! Best-effort Wi-Fi auto-enable and connectivity check, ported from
-//! KOReader's Kobo scripts for the MTK Libra Colour (monza).
+//! Wi-Fi management, a faithful port of KOReader's Kobo scripts for the MTK
+//! Libra Colour (monza, `wlan_drv_gen4m`).
 //!
-//! gideon used to *inherit* whatever Wi-Fi state Nickel left behind and never
-//! touch the radio — so if the user launched with Wi-Fi off, nothing could
-//! download, with no way to recover in-app. This brings the radio up itself,
-//! exactly the "it should just fix itself" behaviour: before a network action
-//! that finds no connection, gideon loads the MTK Wi-Fi modules (if cold),
-//! powers the chip on, brings the interface up, starts wpa_supplicant against
-//! Nickel's saved networks, runs DHCP, and waits for an address.
+//! We deliberately do **exactly what KOReader does**, in the same places, after
+//! many attempts at "cleverer" variants regressed reconnection. KOReader splits
+//! Wi-Fi across the suspend boundary into four scripts; we mirror each one:
 //!
-//! Everything here is **best-effort and additive**: it only acts when we are
-//! actually offline (the connected path returns instantly and untouched), and
-//! it only runs on a real device — off-device (desktop/CI) the Kobo marker
-//! `/mnt/onboard` is absent, so every call is a no-op and reports "online" so
-//! tests never try to manage Wi-Fi.
+//! * [`enable_wifi_script`]  ← `platform/kobo/enable-wifi.sh`
+//! * [`obtain_ip_script`]    ← `platform/kobo/obtain-ip.sh` (+ `release-ip.sh`)
+//! * [`disable_wifi_script`] ← `platform/kobo/disable-wifi.sh`
+//! * [`restore_wifi_script`] ← `platform/kobo/restore-wifi-async.sh`
 //!
-//! Device-specific facts are sourced from KOReader (`platform/kobo/
-//! enable-wifi.sh`, `obtain-ip.sh`; `frontend/ui/network/manager.lua`'s
-//! `ifHasAnAddress`/`connectivityCheck`) and are overridable by environment
-//! variable, since KOReader itself reads them from Nickel's environment rather
-//! than hardcoding them per codename.
+//! The lifecycle KOReader uses, which we follow exactly:
+//!   - **Before suspend** (`Kobo:suspend` → `disableWifi`): release the lease,
+//!     terminate wpa_supplicant, drop the interface and power the chip **off**.
+//!     The chip is off for the whole sleep; the modules stay loaded.
+//!   - **After resume** (`restoreWifiAsync`): run `enable-wifi.sh` (which on the
+//!     MTK chip re-runs the firmware power-on dance **every time** — the chip
+//!     loses its state across a power-off, so this is never gated — and starts a
+//!     fresh wpa_supplicant), wait for `wpa_state=COMPLETED`, then `obtain-ip`.
+//!     If association doesn't complete in ~15s, tear Wi-Fi back down.
+//!
+//! What we are NOT doing any more (these were gideon-only embellishments that
+//! left the radio — and Nickel, after we exit — in a wedged state): power-cycling
+//! the chip at *resume* instead of suspend, `pkill`-ing and `rm`-ing the
+//! supplicant control socket on every bring-up, and kicking explicit
+//! `wpa_cli scan`/`reconnect`/`reassociate`. KOReader does none of that; a fresh
+//! `-s` supplicant re-associates on its own and we just wait for it.
+//!
+//! Everything is best-effort and only runs on a real device: off-device
+//! (desktop/CI) the Kobo marker `/mnt/onboard` is absent, so every call no-ops
+//! and [`is_online`] reports "online" so tests never try to manage Wi-Fi.
+//! Device facts (module name, kmod dir, supplicant config) are overridable by
+//! env, since KOReader reads them from Nickel's environment too.
 
 use std::path::Path;
 use std::process::Command;
@@ -34,35 +46,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connectivity poll cadence while waiting (KOReader's `scheduleConnectivityCheck`).
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Post-wake reconnect: how many bring-up attempts, and how long to give each
-/// one to associate + get a lease before re-kicking. The chip can take a few
-/// seconds to come back after suspend and the first associate often misses, so
-/// a single shot isn't enough — keep trying for roughly a minute. The first
-/// attempt is a full power-cycle (see [`Mode::Cold`]) which needs more headroom
-/// than a warm re-associate.
-const WAKE_RECONNECT_ATTEMPTS: u32 = 4;
-const WAKE_RECONNECT_ATTEMPT: Duration = Duration::from_secs(20);
-
-/// How hard a bring-up tries. The on-demand path reuses whatever Nickel/our
-/// previous bring-up left running; the post-wake path power-cycles from scratch.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// Reuse a loaded module, a powered chip and a live wpa_supplicant: just
-    /// re-scan / re-associate / renew the lease. Cheap; the on-demand path.
-    Warm,
-    /// A genuine radio power-cycle — interface down, chip *off*, supplicant
-    /// killed, lease released, then the full firmware init and a fresh
-    /// supplicant on the way back up. This is exactly the off→on that Nickel's
-    /// Wi-Fi toggle performs, and the only thing that reliably recovers the
-    /// link after a suspend: a warm re-associate leaves the MTK chip powered
-    /// but with stale firmware/association state (the control node persists
-    /// across suspend, so the warm path's `[ ! -e /dev/wmtWifi ]` guard skips
-    /// the re-init the chip actually needs). Used as the first post-wake try.
-    Cold,
-}
-
-/// Guards against stacking reconnect campaigns when several wakes land close
-/// together — only one background reconnect runs at a time.
+/// Guards against stacking restore campaigns when several wakes land close
+/// together — only one background restore runs at a time.
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
 
 /// The Wi-Fi interface name. KOReader resolves this from Nickel's environment
@@ -78,6 +63,11 @@ pub fn interface() -> String {
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// `GIDEON_WIFI_AUTOENABLE=0` opts out of all automatic Wi-Fi bring-up.
+fn autoenable_off() -> bool {
+    std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0")
 }
 
 /// Whether we're on a Kobo, independent of Wi-Fi state. We can't key this on
@@ -124,94 +114,66 @@ pub fn is_online() -> bool {
     operstate_up(&iface) && has_ipv4(&iface).unwrap_or(true)
 }
 
-/// Fire the best-effort bring-up sequence (modules → power → ifup →
-/// wpa_supplicant → scan/re-associate → DHCP) and return **immediately**.
-/// Returns without doing anything if off-device or opted out via
-/// `GIDEON_WIFI_AUTOENABLE=0`. The sequence is run **detached in the
-/// background** (`( … ) &`) — its slow steps (the chip waking up, a DHCP
-/// wait of up to 30s) must NOT block the caller, so the UI can show a
-/// cancellable "Connecting…" status and poll [`is_online`] for the result.
-/// Failures of individual steps are swallowed (the device may already be
-/// partway up).
+/// Bring Wi-Fi up on demand (a network action found no connection): KOReader's
+/// `turnOnWifi` → enable + wait-for-association + obtain-ip, run detached so the
+/// UI stays responsive and can poll [`is_online`]. No-op off-device or when
+/// auto-enable is opted out.
 pub fn bring_up_wifi() {
-    if !on_device() || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
+    if !on_device() || autoenable_off() {
         return;
     }
-    run_enable_detached(&interface(), Mode::Warm);
+    run_detached(&restore_wifi_script(&interface()));
 }
 
-/// Run a bring-up [`enable_script`] **detached in the background** so `sh`
-/// returns at once and the slow steps (chip wake, a DHCP wait of up to 30s)
-/// continue reparented to init. A lease that lands after the UI stops waiting
-/// still leaves the device online for the next action.
-fn run_enable_detached(iface: &str, mode: Mode) {
-    let detached = format!(
-        "( {} ) </dev/null >/dev/null 2>&1 &",
-        enable_script(iface, mode)
-    );
-    let _ = Command::new("sh").arg("-c").arg(detached).status();
-}
-
-/// Rejoin a known network after the device wakes from sleep. A suspend leaves
-/// the MTK radio dead-but-powered, so the first thing we do is a full cold
-/// power-cycle ([`Mode::Cold`]) — the same off→on as Nickel's Wi-Fi toggle,
-/// the one recovery the user can see working — rather than a warm re-associate
-/// against a half-dead chip. Runs in a detached background thread (the campaign
-/// can span ~a minute) so the UI is responsive immediately; subsequent attempts
-/// are warm and stop the instant the link is genuinely back. No-op off-device
-/// or when auto-enable is opted out (`GIDEON_WIFI_AUTOENABLE=0`).
+/// Rejoin the network after waking from sleep — KOReader's `restoreWifiAsync`.
+/// Suspend left the chip powered off and wpa_supplicant terminated (see
+/// [`disable_wifi`]); this runs the full enable + wait-for-`COMPLETED` +
+/// obtain-ip, exactly like `restore-wifi-async.sh`. Runs in a guarded
+/// background thread so only one restore runs at a time and the UI is
+/// responsive immediately. No-op off-device or when auto-enable is opted out.
 pub fn reconnect_after_wake() {
-    if !on_device() || std::env::var("GIDEON_WIFI_AUTOENABLE").as_deref() == Ok("0") {
+    if !on_device() || autoenable_off() {
         return;
     }
-    // Only one reconnect campaign at a time (back-to-back wakes, debounce).
+    // One restore at a time (back-to-back wakes / debounce).
     if RECONNECTING.swap(true, Ordering::SeqCst) {
         return;
     }
     let spawned = std::thread::Builder::new()
-        .name("gideon-wifi-reconnect".into())
+        .name("gideon-wifi-restore".into())
         .spawn(|| {
-            let iface = interface();
-            // The first attempt is ALWAYS a cold power-cycle, run
-            // unconditionally — we must not trust is_online() before it. After
-            // a suspend the radio is dead, yet the pre-sleep IPv4 address
-            // survives the interface down/up, so is_online() reports a stale
-            // "connected" and a warm-only campaign would no-op exactly when a
-            // real reset is needed. Later attempts are warm re-associates and
-            // bail the instant the link is genuinely back.
-            'campaign: for attempt in 0..WAKE_RECONNECT_ATTEMPTS {
-                if attempt > 0 && is_online() {
-                    break;
-                }
-                let mode = if attempt == 0 { Mode::Cold } else { Mode::Warm };
-                run_enable_detached(&iface, mode);
-                let start = Instant::now();
-                while start.elapsed() < WAKE_RECONNECT_ATTEMPT {
-                    std::thread::sleep(POLL_INTERVAL);
-                    if is_online() {
-                        break 'campaign;
-                    }
-                }
-            }
+            run_blocking(&restore_wifi_script(&interface()));
             RECONNECTING.store(false, Ordering::SeqCst);
         });
     if spawned.is_err() {
-        // Couldn't spawn — fall back to a single inline cold reset.
+        // Couldn't spawn — fall back to a detached one-shot.
         RECONNECTING.store(false, Ordering::SeqCst);
-        run_enable_detached(&interface(), Mode::Cold);
+        run_detached(&restore_wifi_script(&interface()));
     }
 }
 
-/// Turn Wi-Fi off to save battery: drop the interface and power the chip
-/// down. Best-effort and no-op off-device. The module is left loaded (a warm
-/// re-enable is then fast). The user re-enables from the Wi-Fi controls.
+/// Take Wi-Fi fully down — KOReader's `disable-wifi.sh` for the wmt chip:
+/// release the lease, terminate wpa_supplicant, drop the interface and power
+/// the chip off (modules stay loaded). Used both by the in-app "turn Wi-Fi
+/// off" control and by the suspend path (the chip is off for the whole sleep).
+/// Blocks briefly; no-op off-device.
 pub fn disable_wifi() {
     if !on_device() {
         return;
     }
-    let iface = interface();
-    let script =
-        format!("ifconfig {iface} down 2>/dev/null || :; echo 0 > /dev/wmtWifi 2>/dev/null || :");
+    run_blocking(&disable_wifi_script(&interface()));
+}
+
+/// Run a script **detached in the background** (`( … ) &`) so `sh` returns at
+/// once and slow steps (chip wake, a DHCP wait) continue reparented to init.
+fn run_detached(script: &str) {
+    let detached = format!("( {script} ) </dev/null >/dev/null 2>&1 &");
+    let _ = Command::new("sh").arg("-c").arg(detached).status();
+}
+
+/// Run a script and wait for it to finish (used from background threads that
+/// want to know when the work is done, e.g. to release the restore guard).
+fn run_blocking(script: &str) {
     let _ = Command::new("sh").arg("-c").arg(script).status();
 }
 
@@ -242,7 +204,7 @@ impl WifiNetwork {
     }
 }
 
-/// The wpa_supplicant control socket path (matches [`enable_script`]).
+/// The wpa_supplicant control socket directory (matches the bring-up scripts).
 const WPA_CTRL: &str = "/var/run/wpa_supplicant";
 
 /// Run `wpa_cli` against the supplicant on `iface`; stdout, or `None` if it
@@ -417,12 +379,10 @@ pub fn ensure_online(timeout: Duration) -> bool {
     wait_until_online(timeout)
 }
 
-/// The MTK (monza, `wlan_drv_gen4m`) Wi-Fi enable sequence as a shell script,
-/// ported from KOReader's `platform/kobo/enable-wifi.sh` + `obtain-ip.sh`.
-/// Module name, kernel-module directory and wpa_supplicant config are
-/// overridable by env (KOReader sources these from Nickel's environment); the
-/// defaults are the Libra Colour values.
-fn enable_script(iface: &str, mode: Mode) -> String {
+/// Resolve the MTK module name, kernel-module dir and wpa_supplicant config.
+/// KOReader sources these from Nickel's environment; the defaults are the
+/// Libra Colour (monza) values. Each is overridable by env.
+fn wifi_env() -> (String, String, String) {
     // KOReader: WIFI_MODULE=wlan_drv_gen4m for the MTK Libra Colour.
     let module = env_nonempty("GIDEON_WIFI_MODULE")
         .or_else(|| env_nonempty("WIFI_MODULE"))
@@ -434,94 +394,90 @@ fn enable_script(iface: &str, mode: Mode) -> String {
         .unwrap_or_else(|| "/drivers/*/mt66xx".to_string());
     let conf = env_nonempty("GIDEON_WPA_SUPPLICANT_CONF")
         .unwrap_or_else(|| "/etc/wpa_supplicant/wpa_supplicant.conf".to_string());
+    (module, kmod_dir, conf)
+}
 
-    let cold = mode == Mode::Cold;
-    // Cold start = a genuine radio power-cycle (Nickel's Wi-Fi toggle), the
-    // only thing that recovers the link after suspend. Tear everything down
-    // first — interface, chip power, supplicant and its stale control socket,
-    // and any half-acquired lease — so the bring-up below rebuilds from a clean
-    // slate instead of poking a half-dead chip. Warm start skips all of this.
-    let teardown = if cold {
-        format!(
-            "ifconfig {iface} down 2>/dev/null || :\n\
-             echo 0 > /dev/wmtWifi 2>/dev/null || :\n\
-             pkill wpa_supplicant 2>/dev/null || :\n\
-             rm -f /var/run/wpa_supplicant/{iface} 2>/dev/null || :\n\
-             dhcpcd -k {iface} 2>/dev/null || :\n\
-             sleep 1\n"
-        )
-    } else {
-        String::new()
-    };
-    // The control node persists across suspend even after the chip lost its
-    // firmware, so `[ ! -e /dev/wmtWifi ]` alone won't re-init a woken chip.
-    // Cold forces the firmware (wmt_dbg) init regardless; warm only inits a
-    // truly cold node (first-ever bring-up). `true`/`false` are shell builtins.
-    let force_init = if cold { "true" } else { "false" };
-
-    // Each step is best-effort (`|| :`); insmod only when the module isn't
-    // already loaded, and the module block is skipped once the chip control
-    // node exists (warm start — the common on-demand reconnect case).
+/// KOReader's `enable-wifi.sh` for the wmt (Libra Colour) chip: load the
+/// modules if cold (they're loaded once and never unloaded), run the `wmt_dbg`
+/// firmware power-on dance **unconditionally** (the chip loses this state across
+/// a power-off, which is why KOReader never gates it), power the chip on, bring
+/// the interface up, and start a wpa_supplicant if one isn't already running.
+/// We do NOT kick an explicit scan/reconnect — a fresh `-s` supplicant
+/// re-associates against the saved networks on its own; the caller waits for it.
+fn enable_wifi_script(iface: &str) -> String {
+    let (module, kmod_dir, conf) = wifi_env();
     format!(
-        r#"
-sleep_ms() {{ usleep "$1"000 2>/dev/null || sleep 1; }}
-{teardown}if [ ! -e /dev/wmtWifi ]; then
-  for m in wmt_drv wmt_chrdev_wifi wmt_cdev_bt {module}; do
-    if ! grep -q "^${{m}} " /proc/modules 2>/dev/null; then
-      insmod {kmod_dir}/${{m}}.ko 2>/dev/null || :
-      sleep_ms 250
-    fi
-  done
-fi
-if [ ! -e /dev/wmtWifi ] || {force_init}; then
-  echo 0xDB9DB9 > /proc/driver/wmt_dbg 2>/dev/null || :
-  echo "7 9 0"  > /proc/driver/wmt_dbg 2>/dev/null || :
-  sleep 1
-  echo 0xDB9DB9 > /proc/driver/wmt_dbg 2>/dev/null || :
-  echo "7 9 1"  > /proc/driver/wmt_dbg 2>/dev/null || :
-fi
+        r#"sleep_ms() {{ usleep "$1"000 2>/dev/null || sleep 1; }}
+for m in wmt_drv wmt_chrdev_wifi wmt_cdev_bt {module}; do
+  grep -q "^${{m}} " /proc/modules 2>/dev/null || {{ insmod {kmod_dir}/${{m}}.ko 2>/dev/null || :; sleep_ms 250; }}
+done
+echo 0xDB9DB9 > /proc/driver/wmt_dbg 2>/dev/null || :
+echo "7 9 0"  > /proc/driver/wmt_dbg 2>/dev/null || :
+sleep 1
+echo 0xDB9DB9 > /proc/driver/wmt_dbg 2>/dev/null || :
+echo "7 9 1"  > /proc/driver/wmt_dbg 2>/dev/null || :
 echo 1 > /dev/wmtWifi 2>/dev/null || :
+sleep_ms 250
 sleep 1
 ifconfig {iface} up 2>/dev/null || :
 pkill -0 wpa_supplicant 2>/dev/null || \
   wpa_supplicant -D nl80211 -s -i {iface} -c {conf} -C /var/run/wpa_supplicant -B 2>/dev/null || :
-# Actively kick a scan + (re)association instead of passively hoping the
-# radio reconnects on its own — the chip needs a moment to come up after
-# sleep, and a supplicant that's already running may be sitting idle. Give it
-# a beat to scan, then re-associate against the saved networks.
-if command -v wpa_cli >/dev/null 2>&1; then
-  wpa_cli -i {iface} -p /var/run/wpa_supplicant scan 2>/dev/null || :
-  sleep 2
-  # `reconnect` re-enables every saved network and connects to the best one
-  # (the disconnected case); `reassociate` re-associates if it's idling on one
-  # already. Run both, like KOReader, so either state recovers.
-  wpa_cli -i {iface} -p /var/run/wpa_supplicant reconnect 2>/dev/null || :
-  wpa_cli -i {iface} -p /var/run/wpa_supplicant reassociate 2>/dev/null || :
-  # Wait for association to actually COMPLETE before asking for a lease —
-  # KOReader's restore-wifi-async.sh does the same. Otherwise dhcpcd broadcasts
-  # DISCOVERs into a still-unassociated link and burns its timeout before the
-  # radio is even up. Bounded (~10s) so the detached campaign can't wedge; an
-  # attempt that never associates falls through to DHCP (which then times out)
-  # and the outer retry re-kicks.
-  i=0
-  while [ $i -lt 40 ]; do
-    wpa_cli -i {iface} -p /var/run/wpa_supplicant status 2>/dev/null \
-      | grep -q "wpa_state=COMPLETED" && break
-    sleep_ms 250
-    i=$((i + 1))
-  done
-fi
+"#
+    )
+}
+
+/// KOReader's `obtain-ip.sh` (with `release-ip.sh` inlined): drop any existing
+/// lease first, then acquire a fresh one with dhcpcd (Nickel's choice; udhcpc
+/// fallback). Releasing first mirrors KOReader and avoids a second dhcpcd
+/// fighting a stale lease.
+fn obtain_ip_script(iface: &str) -> String {
+    format!(
+        r#"dhcpcd -d -k {iface} 2>/dev/null || :
+killall -q -TERM udhcpc 2>/dev/null || :
 if command -v dhcpcd >/dev/null 2>&1; then
-  # Release any stale/contending lease first (Nickel's dhcpcd is left alive
-  # by the launcher, so a bare second dhcpcd would fight it and hang) — this
-  # mirrors KOReader's release-ip.sh before obtain-ip.sh. Only reached when
-  # we're already offline, so there's no good lease to protect.
-  dhcpcd -k {iface} 2>/dev/null || :
-  dhcpcd -t 30 -w {iface} 2>/dev/null || :
+  dhcpcd -d -t 30 -w {iface} 2>/dev/null || :
 else
   udhcpc -i {iface} -t 5 -T 3 -n -q 2>/dev/null || :
 fi
 "#
+    )
+}
+
+/// KOReader's `disable-wifi.sh` for the wmt chip: release the lease, terminate
+/// wpa_supplicant, drop the interface, and power the chip off. The modules are
+/// left loaded (KOReader's `SKIP_UNLOAD` for `wlan_drv_gen4m`).
+fn disable_wifi_script(iface: &str) -> String {
+    format!(
+        r#"dhcpcd -d -k {iface} 2>/dev/null || :
+killall -q -TERM udhcpc 2>/dev/null || :
+wpa_cli -i {iface} -p /var/run/wpa_supplicant terminate 2>/dev/null || :
+ifconfig {iface} down 2>/dev/null || :
+echo 0 > /dev/wmtWifi 2>/dev/null || :
+"#
+    )
+}
+
+/// KOReader's `restore-wifi-async.sh`: enable Wi-Fi, then wait for
+/// wpa_supplicant to actually reach `wpa_state=COMPLETED` before asking for a
+/// lease (so dhcpcd doesn't broadcast into an un-associated link). If
+/// association doesn't complete within ~15s (60 × 0.25s), tear Wi-Fi back down
+/// and bail — the next on-demand bring-up will try again from a clean state.
+fn restore_wifi_script(iface: &str) -> String {
+    let enable = enable_wifi_script(iface);
+    let obtain = obtain_ip_script(iface);
+    let disable = disable_wifi_script(iface);
+    format!(
+        r#"{enable}
+wpac_timeout=0
+while ! wpa_cli -i {iface} -p /var/run/wpa_supplicant status 2>/dev/null | grep -q "wpa_state=COMPLETED"; do
+  if [ $wpac_timeout -ge 60 ]; then
+{disable}
+    exit 1
+  fi
+  usleep 250000 2>/dev/null || sleep 1
+  wpac_timeout=$((wpac_timeout + 1))
+done
+{obtain}"#
     )
 }
 
@@ -532,9 +488,6 @@ mod tests {
     #[test]
     fn interface_prefers_env_then_falls_back_to_eth0() {
         // Default (no env set in this process) is eth0.
-        // (We avoid mutating env vars here to not race other tests; just
-        // assert the documented fallback constant is what we return when the
-        // overrides are empty.)
         std::env::remove_var("GIDEON_WIFI_INTERFACE");
         std::env::remove_var("INTERFACE");
         assert_eq!(interface(), "eth0");
@@ -557,90 +510,85 @@ mod tests {
     }
 
     #[test]
-    fn enable_script_has_the_monza_sequence() {
-        let s = enable_script("eth0", Mode::Warm);
-        // Module loads, chip power-on, interface up, supplicant, DHCP — in
-        // the KOReader order, on the resolved interface.
+    fn enable_runs_the_firmware_init_unconditionally_like_koreader() {
+        let s = enable_wifi_script("eth0");
+        // Module load, the wmt_dbg firmware dance, chip power-on, interface up,
+        // and a wpa_supplicant — KOReader's enable-wifi.sh, in order.
         assert!(s.contains("wlan_drv_gen4m"));
-        assert!(s.contains("/dev/wmtWifi"));
+        assert!(s.contains("0xDB9DB9"), "runs the wmt_dbg firmware dance");
+        assert!(s.contains("echo 1 > /dev/wmtWifi"), "powers the chip on");
         assert!(s.contains("ifconfig eth0 up"));
         assert!(s.contains("wpa_supplicant -D nl80211 -s -i eth0"));
-        assert!(s.contains("dhcpcd -t 30 -w eth0"));
-        // Actively kicks a scan + reconnect + re-association rather than
-        // passively waiting.
-        assert!(s.contains("wpa_cli -i eth0"));
-        assert!(s.contains("reconnect"));
-        assert!(s.contains("reassociate"));
-        // Release a stale/contending lease before re-acquiring (KOReader's
-        // release-ip.sh before obtain-ip.sh).
-        assert!(s.contains("dhcpcd -k eth0"));
-        // Wait for association to COMPLETE before DHCP (KOReader's
-        // restore-wifi-async.sh), so dhcpcd doesn't broadcast into a dead link.
-        assert!(s.contains("wpa_state=COMPLETED"));
-        let drv = s.find("/dev/wmtWifi").unwrap();
-        let ifup = s.find("ifconfig eth0 up").unwrap();
-        let release = s.find("dhcpcd -k eth0").unwrap();
-        let acquire = s.find("dhcpcd -t 30 -w eth0").unwrap();
-        let associated = s.find("wpa_state=COMPLETED").unwrap();
+        // The firmware dance is UNGATED — KOReader re-runs it on every enable,
+        // because the chip loses its state across a power-off/suspend. This is
+        // the bug the old `[ ! -e /dev/wmtWifi ]` gate caused.
         assert!(
-            drv < ifup && ifup < release && release < acquire,
-            "steps must be ordered: power, ifup, release, acquire"
+            !s.contains("! -e /dev/wmtWifi"),
+            "firmware init must not be gated on the control node"
         );
-        assert!(
-            associated < acquire,
-            "must wait for association before acquiring a lease"
-        );
-    }
-
-    #[test]
-    fn warm_start_does_not_power_cycle_or_force_init() {
-        // The on-demand path reuses a running radio: no chip power-off, no
-        // supplicant kill, and the firmware init stays gated on a cold node.
-        let s = enable_script("eth0", Mode::Warm);
+        // KOReader does NOT kick an explicit scan/reconnect/reassociate, nor
+        // kill/rm the supplicant socket — a fresh -s supplicant reconnects.
+        assert!(!s.contains("reassociate"));
+        assert!(!s.contains("pkill wpa_supplicant"));
         assert!(
             !s.contains("echo 0 > /dev/wmtWifi"),
-            "warm must not power off"
+            "enable never powers off"
         );
+        let dance = s.find("0xDB9DB9").unwrap();
+        let power_on = s.find("echo 1 > /dev/wmtWifi").unwrap();
+        let ifup = s.find("ifconfig eth0 up").unwrap();
         assert!(
-            !s.contains("pkill wpa_supplicant"),
-            "warm must not kill supplicant"
-        );
-        assert!(
-            s.contains("[ ! -e /dev/wmtWifi ] || false"),
-            "warm only inits a truly cold node"
+            dance < power_on && power_on < ifup,
+            "order: firmware dance, power on, ifup"
         );
     }
 
     #[test]
-    fn cold_start_power_cycles_the_radio_and_forces_init() {
-        // The post-wake path is a full off→on (Nickel's toggle): tear the
-        // interface, chip power, supplicant, its control socket and the lease
-        // down first, then force the firmware re-init on the way back up.
-        let s = enable_script("eth0", Mode::Cold);
+    fn disable_terminates_powers_off_and_keeps_modules() {
+        // KOReader disable-wifi.sh for wmt: release, terminate, ifdown, power
+        // off — and crucially never rmmod (SKIP_UNLOAD for wlan_drv_gen4m).
+        let s = disable_wifi_script("eth0");
+        assert!(s.contains("dhcpcd -d -k eth0"), "releases the lease");
+        assert!(s.contains("terminate"), "terminates wpa_supplicant");
         assert!(s.contains("ifconfig eth0 down"));
         assert!(s.contains("echo 0 > /dev/wmtWifi"), "powers the chip off");
-        assert!(
-            s.contains("pkill wpa_supplicant"),
-            "kills the stale supplicant"
-        );
-        assert!(
-            s.contains("rm -f /var/run/wpa_supplicant/eth0"),
-            "clears the stale control socket"
-        );
-        assert!(
-            s.contains("[ ! -e /dev/wmtWifi ] || true"),
-            "cold forces the firmware re-init"
-        );
-        // Teardown must come before the bring-up powers the chip back on.
-        let power_off = s.find("echo 0 > /dev/wmtWifi").unwrap();
-        let power_on = s.find("echo 1 > /dev/wmtWifi").unwrap();
-        assert!(power_off < power_on, "power off, then back on");
+        assert!(!s.contains("rmmod"), "modules stay loaded on the wmt chip");
     }
 
     #[test]
-    fn enable_script_honors_module_and_iface_overrides() {
+    fn obtain_ip_releases_before_acquiring() {
+        let s = obtain_ip_script("eth0");
+        let release = s.find("dhcpcd -d -k eth0").unwrap();
+        let acquire = s.find("dhcpcd -d -t 30 -w eth0").unwrap();
+        assert!(
+            release < acquire,
+            "release the stale lease before acquiring"
+        );
+    }
+
+    #[test]
+    fn restore_enables_then_waits_for_completed_then_obtains_ip() {
+        let s = restore_wifi_script("eth0");
+        // enable (firmware dance) → wait for COMPLETED → DHCP, in that order.
+        let dance = s.find("0xDB9DB9").unwrap();
+        let completed = s.find("wpa_state=COMPLETED").unwrap();
+        let acquire = s.find("dhcpcd -d -t 30 -w eth0").unwrap();
+        assert!(
+            dance < completed && completed < acquire,
+            "order: enable, wait for association, then DHCP"
+        );
+        // On a failed association it tears Wi-Fi down (KOReader's behaviour):
+        // the disable's power-off appears (in the timeout branch).
+        assert!(
+            s.contains("echo 0 > /dev/wmtWifi"),
+            "tears Wi-Fi down if association never completes"
+        );
+    }
+
+    #[test]
+    fn scripts_honor_module_and_iface_overrides() {
         std::env::set_var("GIDEON_WIFI_MODULE", "moal");
-        let s = enable_script("wlan0", Mode::Warm);
+        let s = enable_wifi_script("wlan0");
         assert!(s.contains("moal"));
         assert!(s.contains("ifconfig wlan0 up"));
         std::env::remove_var("GIDEON_WIFI_MODULE");
