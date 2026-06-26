@@ -83,14 +83,16 @@ pub const WIDEN_BATCH: usize = 18;
 /// that turned up no matches — only the ones that actually had a hit are
 /// kept installed. Missing files are not an error (idempotent).
 pub fn uninstall_source(data_dir: &Path, source_id: &str) -> Result<()> {
-    let path = sources_dir(data_dir).join(format!("{}.aix", sanitize(source_id)));
+    let dir = sources_dir(data_dir);
+    let stem = sanitize(source_id);
+    let path = dir.join(format!("{stem}.aix"));
     if path.exists() {
         std::fs::remove_file(&path)
             .with_context(|| format!("couldn't remove source {}", path.display()))?;
     }
-    if let Ok(meta) = Source::meta_source_path(&path) {
-        let _ = std::fs::remove_file(meta);
-    }
+    // The sidecar meta file written alongside the package (".{stem}.source",
+    // see `Source::write_meta_file`).
+    let _ = std::fs::remove_file(dir.join(format!(".{stem}.source")));
     Ok(())
 }
 

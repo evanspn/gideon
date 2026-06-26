@@ -1701,7 +1701,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Widen the current global search to not-yet-installed sources: pull in
-    /// up to [`manga::WIDEN_BATCH`] candidates that haven't been tried yet,
+    /// up to [`crate::manga::WIDEN_BATCH`] candidates that haven't been tried yet,
     /// search each, keep the ones that matched (merging their hits) and
     /// uninstall the rest. Updates the results screen in place.
     fn widen_search(&mut self) -> Result<()> {
@@ -1731,7 +1731,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let candidates: Vec<SourceEntry> = available
             .into_iter()
             .filter(|s| !tried.iter().any(|id| id == &s.id))
-            .take(manga::WIDEN_BATCH)
+            .take(crate::manga::WIDEN_BATCH)
             .collect();
         if candidates.is_empty() {
             return self.push(Screen::Message {
