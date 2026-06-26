@@ -1022,6 +1022,37 @@ fn three_chapters_of_one_series_make_one_card() {
 }
 
 #[test]
+fn returning_to_the_library_rescans_for_newly_downloaded_chapters() {
+    // The "I just read 209 but the cover opens 139" bug: a chapter downloaded
+    // while the library sat on the nav stack must be in the card when you back
+    // out — otherwise resume_chapter runs on a stale card that can't find what
+    // you just read and falls back to an earlier chapter.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.open_library().unwrap();
+    // Something on top of the library (e.g. a chapter list while reading).
+    app.stack.push(Screen::Settings);
+
+    // A new chapter lands on disk while the library is buried on the stack.
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    app.pop().unwrap(); // back to the library — must rescan
+
+    let Screen::Library { items, .. } = app.screen() else {
+        panic!("expected library screen");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].chapters.len(),
+        2,
+        "the newly-downloaded chapter is in the card after returning"
+    );
+}
+
+#[test]
 fn tapping_a_series_card_resumes_the_in_progress_chapter() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");

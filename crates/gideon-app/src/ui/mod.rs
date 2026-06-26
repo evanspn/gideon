@@ -759,8 +759,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
         }
         self.stack.pop();
+        // Returning to the library: rebuild it from disk so chapters downloaded
+        // (and the last-opened record written) while it sat on the stack are
+        // reflected. Without this the card is a stale snapshot, and a cover tap
+        // resumes against chapters that don't include what you just read — so it
+        // falls back to an earlier chapter.
+        self.refresh_library_in_place()?;
         self.render_current(RefreshMode::Full)?;
         Ok(Flow::Continue)
+    }
+
+    /// If the current top screen is the Library, rebuild its cards from a fresh
+    /// disk scan, keeping the shelf page (clamped). Cheap and only runs when the
+    /// Library is actually showing.
+    fn refresh_library_in_place(&mut self) -> Result<()> {
+        if !matches!(self.stack.last(), Some(Screen::Library { .. })) {
+            return Ok(());
+        }
+        let items = group_library(Library::new(&self.library_dir).scan()?);
+        let capacity = self.shelf_layout().capacity().max(1);
+        let max_page = items.len().div_ceil(capacity).saturating_sub(1);
+        if let Some(Screen::Library { items: slot, page }) = self.stack.last_mut() {
+            *page = (*page).min(max_page);
+            *slot = items;
+        }
+        Ok(())
     }
 
     fn show_error(&mut self, error: &anyhow::Error) -> Result<()> {
