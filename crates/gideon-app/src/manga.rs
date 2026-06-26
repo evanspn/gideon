@@ -72,6 +72,28 @@ pub fn install_source(data_dir: &Path, source_id: &str) -> Result<gideon_aidoku:
     Ok(source.manifest())
 }
 
+/// How many not-yet-installed sources a single "search more sources" widen
+/// pulls in at once. Bounded so a widened search stays responsive on the
+/// device (each candidate is a download + WASM load + search); a second
+/// widen continues past the ones already tried.
+pub const WIDEN_BATCH: usize = 18;
+
+/// Remove an installed source by id: delete its `.aix` package and the
+/// sidecar meta file. Used to discard sources pulled in by a widened search
+/// that turned up no matches — only the ones that actually had a hit are
+/// kept installed. Missing files are not an error (idempotent).
+pub fn uninstall_source(data_dir: &Path, source_id: &str) -> Result<()> {
+    let path = sources_dir(data_dir).join(format!("{}.aix", sanitize(source_id)));
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("couldn't remove source {}", path.display()))?;
+    }
+    if let Ok(meta) = Source::meta_source_path(&path) {
+        let _ = std::fs::remove_file(meta);
+    }
+    Ok(())
+}
+
 pub fn cmd_source_install(data_dir: &Path, source_id: &str) -> Result<()> {
     println!("Downloading {source_id}...");
     let manifest = install_source(data_dir, source_id)?;
@@ -167,23 +189,118 @@ pub fn cmd_source_installed(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_manga_search(data_dir: &Path, source_id: &str, query: &str) -> Result<()> {
+/// Search a single installed source synchronously.
+fn search_one(
+    data_dir: &Path,
+    runtime: &tokio::runtime::Runtime,
+    source_id: &str,
+    query: &str,
+) -> Result<Vec<gideon_aidoku::Manga>> {
     let source = load_source(data_dir, source_id)?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let mangas =
-        runtime.block_on(source.search_mangas(CancellationToken::new(), query.to_string()))?;
+    runtime.block_on(source.search_mangas(CancellationToken::new(), query.to_string()))
+}
 
-    if mangas.is_empty() {
-        println!("No results for '{query}' on {source_id}.");
-        return Ok(());
-    }
-    println!("{} result(s):\n", mangas.len());
+/// Print one source's hits (title + id, tagged with the source name) and
+/// return how many there were.
+fn print_source_hits(source_name: &str, mangas: &[gideon_aidoku::Manga]) -> usize {
     for manga in mangas {
         println!(
-            "  {:<40} id: {}",
+            "  {:<40} id: {}  [{}]",
             manga.title.as_deref().unwrap_or("(untitled)"),
-            manga.id
+            manga.id,
+            source_name
         );
+    }
+    mangas.len()
+}
+
+/// Search for manga. With `source_id`, searches that one source (the classic
+/// path). Without it, searches every installed source and merges the results
+/// — the same reach the device's "Search all sources" gives. With `widen`,
+/// it then pulls in not-yet-installed sources (up to [`WIDEN_BATCH`]) and
+/// keeps any that actually matched, discarding the rest.
+pub fn cmd_manga_search(
+    data_dir: &Path,
+    source_id: Option<&str>,
+    query: &str,
+    widen: bool,
+) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    // Single source: keep the original, source-scoped output.
+    if let Some(source_id) = source_id {
+        let mangas = search_one(data_dir, &runtime, source_id, query)?;
+        if mangas.is_empty() {
+            println!("No results for '{query}' on {source_id}.");
+            return Ok(());
+        }
+        println!("{} result(s):\n", mangas.len());
+        for manga in mangas {
+            println!(
+                "  {:<40} id: {}",
+                manga.title.as_deref().unwrap_or("(untitled)"),
+                manga.id
+            );
+        }
+        return Ok(());
+    }
+
+    // Every installed source, merged.
+    let installed = installed_sources(data_dir)?;
+    let mut tried: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for src in &installed {
+        if src.broken {
+            continue;
+        }
+        tried.push(src.id.clone());
+        match search_one(data_dir, &runtime, &src.id, query) {
+            Ok(mangas) => total += print_source_hits(&src.name, &mangas),
+            Err(e) => eprintln!("  (search on {} failed: {e:#})", src.name),
+        }
+    }
+
+    // Widen: try not-yet-installed sources, keeping the ones that match.
+    if widen {
+        // Sources the user already had — never remove one of these, only the
+        // ones this widen installs itself.
+        let preinstalled: std::collections::HashSet<String> =
+            installed.iter().map(|s| s.id.clone()).collect();
+        let fetcher = UreqFetcher::new();
+        let available = configured_lists(data_dir)?.available_sources(&fetcher)?;
+        let candidates: Vec<_> = available
+            .into_iter()
+            .filter(|s| !tried.iter().any(|id| id == &s.id))
+            .take(WIDEN_BATCH)
+            .collect();
+        if candidates.is_empty() {
+            println!("\nNo more sources to try.");
+        }
+        for info in candidates {
+            let added_here = !preinstalled.contains(&info.id);
+            if let Err(e) = install_source(data_dir, &info.id) {
+                eprintln!("  (couldn't add {}: {e:#})", info.name);
+                continue;
+            }
+            match search_one(data_dir, &runtime, &info.id, query) {
+                Ok(mangas) if !mangas.is_empty() => {
+                    total += print_source_hits(&info.name, &mangas);
+                    // Had a hit — keep it installed.
+                }
+                // No match (or it errored): don't leave behind a source this
+                // widen added (but keep ones the user already had).
+                _ if added_here => {
+                    let _ = uninstall_source(data_dir, &info.id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if total == 0 {
+        println!("\nNo results for '{query}'.");
+    } else {
+        println!("\n{total} result(s) total.");
     }
     Ok(())
 }

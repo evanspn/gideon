@@ -141,10 +141,15 @@ enum SourceCommand {
 
 #[derive(Subcommand)]
 enum MangaCommand {
-    /// Search for manga on an installed source.
+    /// Search for manga. With --source, searches that one source; without
+    /// it, searches every installed source and merges the results.
     Search {
         #[arg(short, long)]
-        source: String,
+        source: Option<String>,
+        /// Also try not-yet-installed sources from your lists, keeping any
+        /// that match. Ignored when --source is given.
+        #[arg(long)]
+        widen: bool,
         query: String,
     },
     /// List chapters of a manga.
@@ -196,9 +201,11 @@ fn main() -> Result<()> {
             SourceCommand::Installed => manga::cmd_source_installed(&data_dir()),
         },
         Command::Manga(cmd) => match cmd {
-            MangaCommand::Search { source, query } => {
-                manga::cmd_manga_search(&data_dir(), &source, &query)
-            }
+            MangaCommand::Search {
+                source,
+                widen,
+                query,
+            } => manga::cmd_manga_search(&data_dir(), source.as_deref(), &query, widen),
             MangaCommand::Chapters { source, manga_id } => {
                 manga::cmd_manga_chapters(&data_dir(), &source, &manga_id)
             }

@@ -37,7 +37,7 @@ use crate::reader::Reader;
 
 const HOME_ROWS: [&str; 5] = [
     "Library",
-    "Search",
+    "Search all sources",
     "Browse sources",
     "Settings",
     "Check for updates",
@@ -46,6 +46,11 @@ const HOME_ROWS: [&str; 5] = [
 /// "scan + reconnect" for the roam-while-idle case, without a battery-draining
 /// background connectivity poll.
 const HOME_RECONNECT_ROW: &str = "No Wi-Fi - tap to reconnect";
+/// Trailing row on the global-search results screen: widen the search to
+/// sources that aren't installed yet (keeping any that match).
+const SEARCH_MORE_ROW: &str = "+ Search more sources";
+/// How many recent global searches the search UI keeps for instant reopen.
+const RECENT_SEARCHES: usize = 3;
 const SHELF_COLUMNS: u32 = 3;
 
 /// Values the Settings screen cycles through per tap.
@@ -221,10 +226,21 @@ enum Screen {
         source: Option<SourceEntry>,
         query: String,
     },
-    /// Global search results: each row knows which source it came from.
+    /// "Search all sources" landing screen shown when there's history: a "New
+    /// search" row plus the recent searches, each tappable to reopen its
+    /// cached results instantly. `(query, result count)` per recent.
+    RecentSearches {
+        recents: Vec<(String, usize)>,
+    },
+    /// Global search results: each row knows which source it came from. A
+    /// trailing "Search more sources" row widens the search to not-yet-
+    /// installed sources. `tried` is every source id already searched for
+    /// this query (installed ones, plus any pulled in by a widen) so a
+    /// repeated widen continues past them.
     SearchResults {
         query: String,
         results: Vec<(SourceEntry, MangaEntry)>,
+        tried: Vec<String>,
         page: usize,
     },
     MangaList {
@@ -373,6 +389,17 @@ const WIFI_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(45
 /// first association after waking, so keep nudging it until it sticks.
 const WIFI_REKICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// A cached global search, kept so the most recent few can be reopened
+/// instantly (no network) from the "Search all sources" screen.
+#[derive(Clone)]
+struct RecentSearch {
+    query: String,
+    results: Vec<(SourceEntry, MangaEntry)>,
+    /// Source ids already searched for this query, so a reopened search can
+    /// keep widening past them.
+    tried: Vec<String>,
+}
+
 pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     display: D,
     input: I,
@@ -453,6 +480,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// `None` for gateways without background support (tests), which fall
     /// back to a foreground pre-download.
     predownloader: Option<Predownloader>,
+    /// The most recent global searches (newest first, capped at
+    /// [`RECENT_SEARCHES`]) for instant reopen from the search screen.
+    recent_searches: Vec<RecentSearch>,
 }
 
 /// Cover-cache key: (source path, file mtime, target cell size).
@@ -496,6 +526,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             progress_cache: std::cell::RefCell::new(None),
             index_guard: Arc::new(Mutex::new(())),
             predownloader: None,
+            recent_searches: Vec::new(),
         }
     }
 
@@ -977,7 +1008,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let (page, count) = match screen {
             Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
-            Screen::SearchResults { results, page, .. } => (page, results.len().div_ceil(per_page)),
+            // +1 for the trailing "Search more sources" row.
+            Screen::SearchResults { results, page, .. } => {
+                (page, (results.len() + 1).div_ceil(per_page))
+            }
             Screen::MangaList { mangas, page, .. } => (page, mangas.len().div_ceil(per_page)),
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
             Screen::DownloadedChapters { entries, page, .. } => {
@@ -1055,10 +1089,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.tap_keyboard(&source, &query, x, y)?;
                 Ok(Flow::Continue)
             }
+            Screen::RecentSearches { recents } => {
+                // Row 0 starts a new search; the rest reopen cached recents.
+                if row == 0 {
+                    self.open_search_keyboard()?;
+                } else if let Some((query, _)) = recents.get(row - 1) {
+                    self.reopen_recent(query)?;
+                }
+                Ok(Flow::Continue)
+            }
             Screen::SearchResults { results, page, .. } => {
                 let index = page * self.layout.rows_per_page() + row;
-                if let Some((source, manga)) = results.get(index).cloned() {
-                    self.open_chapter_list(&source, &manga)?;
+                match results.get(index).cloned() {
+                    Some((source, manga)) => self.open_chapter_list(&source, &manga)?,
+                    // The slot just past the last result is the "Search more
+                    // sources" row — widen to not-yet-installed sources.
+                    None if index == results.len() => self.widen_search()?,
+                    None => {}
                 }
                 Ok(Flow::Continue)
             }
@@ -1511,7 +1558,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Full)
     }
 
-    /// Open the global-search keyboard from Home (every installed source).
+    /// Open global search from Home. With recent searches, land on the
+    /// recents screen (tap one to reopen instantly, or start a new search);
+    /// otherwise go straight to the keyboard.
     fn open_global_search(&mut self) -> Result<()> {
         if self.gateway.installed_sources()?.is_empty() {
             return self.push(Screen::Message {
@@ -1520,11 +1569,70 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .to_string(),
             });
         }
+        if !self.recent_searches.is_empty() {
+            let recents = self
+                .recent_searches
+                .iter()
+                .map(|r| (r.query.clone(), r.results.len()))
+                .collect();
+            return self.push(Screen::RecentSearches { recents });
+        }
+        self.open_search_keyboard()
+    }
+
+    /// Push the global-search keyboard (empty query, every installed source).
+    fn open_search_keyboard(&mut self) -> Result<()> {
         self.keyboard_paints = 0;
         self.push(Screen::Search {
             source: None,
             query: String::new(),
         })
+    }
+
+    /// Record (or refresh) a global search at the front of the recent list,
+    /// deduped by query (case-insensitive, trimmed) and capped. Empty queries
+    /// and empty result sets aren't worth remembering.
+    fn remember_search(
+        &mut self,
+        query: &str,
+        results: &[(SourceEntry, MangaEntry)],
+        tried: &[String],
+    ) {
+        let key = query.trim().to_lowercase();
+        if key.is_empty() || results.is_empty() {
+            return;
+        }
+        self.recent_searches
+            .retain(|r| r.query.trim().to_lowercase() != key);
+        self.recent_searches.insert(
+            0,
+            RecentSearch {
+                query: query.to_string(),
+                results: results.to_vec(),
+                tried: tried.to_vec(),
+            },
+        );
+        self.recent_searches.truncate(RECENT_SEARCHES);
+    }
+
+    /// Reopen a cached recent search instantly (no network); if it has aged
+    /// out of the cache, run it fresh.
+    fn reopen_recent(&mut self, query: &str) -> Result<()> {
+        let key = query.trim().to_lowercase();
+        if let Some(recent) = self
+            .recent_searches
+            .iter()
+            .find(|r| r.query.trim().to_lowercase() == key)
+            .cloned()
+        {
+            return self.push(Screen::SearchResults {
+                query: recent.query,
+                results: recent.results,
+                tried: recent.tried,
+                page: 0,
+            });
+        }
+        self.run_global_search(query)
     }
 
     fn run_search(&mut self, source: &Option<SourceEntry>, query: &str) -> Result<()> {
@@ -1558,13 +1666,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Search every installed source and merge the results. A source that
-    /// errors is skipped (its name is noted) — one broken source must not
-    /// kill the search.
+    /// errors is skipped (noted to stderr) — one broken source must not kill
+    /// the search. The results screen always opens, even with no hits, so its
+    /// "Search more sources" row can widen to uninstalled sources.
     fn run_global_search(&mut self, query: &str) -> Result<()> {
         self.ensure_online()?;
         let sources = self.gateway.installed_sources()?;
         let mut results: Vec<(SourceEntry, MangaEntry)> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
+        let mut tried: Vec<String> = Vec::new();
         for (i, source) in sources.iter().enumerate() {
             // One status screen for the whole search, partially updated
             // per source — N full flashes made an N-source search strobe.
@@ -1572,32 +1681,140 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 &format!("Searching for \"{query}\"…"),
                 &format!("{}/{}: {}…", i + 1, sources.len(), source.name),
             ])?;
+            tried.push(source.id.clone());
             match self.gateway.search_manga(&source.id, query) {
                 Ok(mangas) => {
                     results.extend(mangas.into_iter().map(|m| (source.clone(), m)));
                 }
                 Err(e) => {
                     eprintln!("gideon: search on {} failed: {e:#}", source.name);
-                    failed.push(source.name.clone());
                 }
             }
         }
-        if results.is_empty() {
-            let mut body = format!("No results for \"{query}\".");
-            if !failed.is_empty() {
-                body.push_str(&format!("\n(Search failed on: {}.)", failed.join(", ")));
-            }
-            // Stay on the keyboard so the user can refine the query.
-            return self.push(Screen::Message {
-                title: "Search".to_string(),
-                body,
-            });
-        }
+        self.remember_search(query, &results, &tried);
         self.push(Screen::SearchResults {
             query: query.to_string(),
             results,
+            tried,
             page: 0,
         })
+    }
+
+    /// Widen the current global search to not-yet-installed sources: pull in
+    /// up to [`manga::WIDEN_BATCH`] candidates that haven't been tried yet,
+    /// search each, keep the ones that matched (merging their hits) and
+    /// uninstall the rest. Updates the results screen in place.
+    fn widen_search(&mut self) -> Result<()> {
+        let Some(Screen::SearchResults {
+            query,
+            results,
+            tried,
+            ..
+        }) = self.stack.last()
+        else {
+            return Ok(());
+        };
+        let query = query.clone();
+        let mut results = results.clone();
+        let mut tried = tried.clone();
+
+        self.ensure_online()?;
+        let available = match self.gateway.available_sources() {
+            Ok(available) => available,
+            Err(e) => {
+                return self.push(Screen::Message {
+                    title: "Search more".to_string(),
+                    body: format!("Couldn't load the source list:\n{e:#}"),
+                });
+            }
+        };
+        let candidates: Vec<SourceEntry> = available
+            .into_iter()
+            .filter(|s| !tried.iter().any(|id| id == &s.id))
+            .take(manga::WIDEN_BATCH)
+            .collect();
+        if candidates.is_empty() {
+            return self.push(Screen::Message {
+                title: "Search more".to_string(),
+                body: "No more sources to try — every source in your lists has been searched."
+                    .to_string(),
+            });
+        }
+
+        // Sources the user already had: a widen must never remove one of
+        // these, even if `tried` is stale (e.g. a reopened recent search, or
+        // a source that failed to load). It only cleans up what it adds.
+        let preinstalled: std::collections::HashSet<String> = self
+            .gateway
+            .installed_sources()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        let before = results.len();
+        let mut failures = 0usize;
+        for (i, source) in candidates.iter().enumerate() {
+            self.show_status(&[
+                &format!("Searching more for \"{query}\"…"),
+                &format!("{}/{}: {}…", i + 1, candidates.len(), source.name),
+            ])?;
+            tried.push(source.id.clone());
+            // Only discard a source this widen actually installed.
+            let added_here = !preinstalled.contains(&source.id);
+            // Installing or searching can fail (bad source, network); skip it
+            // and make sure nothing half-installed is left behind.
+            if self.gateway.install_source(&source.id).is_err() {
+                failures += 1;
+                if added_here {
+                    let _ = self.gateway.uninstall_source(&source.id);
+                }
+                continue;
+            }
+            match self.gateway.search_manga(&source.id, &query) {
+                Ok(mangas) if !mangas.is_empty() => {
+                    // Had a hit — keep it installed and merge its results.
+                    results.extend(mangas.into_iter().map(|m| (source.clone(), m)));
+                }
+                Ok(_) => {
+                    if added_here {
+                        let _ = self.gateway.uninstall_source(&source.id);
+                    }
+                }
+                Err(_) => {
+                    failures += 1;
+                    if added_here {
+                        let _ = self.gateway.uninstall_source(&source.id);
+                    }
+                }
+            }
+        }
+        let found = results.len() - before;
+        self.remember_search(&query, &results, &tried);
+
+        // Fold the widened results back into the results screen.
+        if let Some(screen @ Screen::SearchResults { .. }) = self.stack.last_mut() {
+            *screen = Screen::SearchResults {
+                query: query.clone(),
+                results,
+                tried,
+                page: 0,
+            };
+        }
+        if found == 0 {
+            // Underlying screen is already updated; the message sits on top.
+            // Distinguish "tried and missed" from "couldn't reach anything" so
+            // a dropped Wi-Fi mid-widen doesn't read as a definitive no-result.
+            let body = if failures == candidates.len() {
+                "Couldn't reach the extra sources — check Wi-Fi and try again.".to_string()
+            } else {
+                format!("Tried {} more source(s); no new matches.", candidates.len())
+            };
+            return self.push(Screen::Message {
+                title: "Search more".to_string(),
+                body,
+            });
+        }
+        self.render_current(RefreshMode::Full)
     }
 
     fn open_chapter_list(&mut self, source: &SourceEntry, manga: &MangaEntry) -> Result<()> {
@@ -2753,22 +2970,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let scope = source.as_ref().map_or("all sources", |s| s.name.as_str());
                 compose_search(l, scope, query)
             }
+            Screen::RecentSearches { recents } => {
+                let mut rows: Vec<(String, bool)> = vec![("New search…".to_string(), true)];
+                for (query, count) in recents {
+                    rows.push((format!("\"{query}\"  ({count})"), true));
+                }
+                compose_list(l, "Search all sources", &rows, 0, 1)
+            }
             Screen::SearchResults {
                 query,
                 results,
                 page,
+                ..
             } => {
-                let rows: Vec<(String, bool)> = paged(results, *page, per_page)
+                // Results, plus a trailing "Search more sources" row, paged
+                // together so the widen row is reachable on the last page.
+                let mut labels: Vec<(String, bool)> = results
                     .iter()
                     .map(|(s, m)| (format!("{} — {}", m.title, s.name), true))
                     .collect();
-                compose_list(
-                    l,
-                    &format!("\"{query}\""),
-                    &rows,
-                    *page,
-                    l.page_count(results.len()),
-                )
+                labels.push((SEARCH_MORE_ROW.to_string(), true));
+                let total = labels.len();
+                let rows = paged(&labels, *page, per_page).to_vec();
+                let title = if results.is_empty() {
+                    format!("\"{query}\" — none in your sources")
+                } else {
+                    format!("\"{query}\"")
+                };
+                compose_list(l, &title, &rows, *page, l.page_count(total))
             }
             Screen::MangaList {
                 source,

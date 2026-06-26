@@ -55,6 +55,8 @@ struct FakeGateway {
     installs: std::cell::Cell<usize>,
     /// How many cover downloads were requested.
     covers: std::cell::Cell<usize>,
+    /// Source ids passed to `uninstall_source`, in order.
+    uninstalled: RefCell<Vec<String>>,
 }
 
 impl Default for FakeGateway {
@@ -72,6 +74,7 @@ impl Default for FakeGateway {
             update_available: false,
             installs: std::cell::Cell::new(0),
             covers: std::cell::Cell::new(0),
+            uninstalled: RefCell::new(Vec::new()),
         }
     }
 }
@@ -92,6 +95,12 @@ impl SourceGateway for FakeGateway {
             .find(|s| s.id == source_id)
             .ok_or_else(|| anyhow!("unknown source {source_id}"))?;
         self.installed.borrow_mut().push(source);
+        Ok(())
+    }
+
+    fn uninstall_source(&self, source_id: &str) -> Result<()> {
+        self.uninstalled.borrow_mut().push(source_id.to_string());
+        self.installed.borrow_mut().retain(|s| s.id != source_id);
         Ok(())
     }
 
@@ -1851,6 +1860,9 @@ impl SourceGateway for BgGateway {
     fn install_source(&self, _source_id: &str) -> Result<()> {
         Ok(())
     }
+    fn uninstall_source(&self, _source_id: &str) -> Result<()> {
+        Ok(())
+    }
     fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
         Ok(vec![])
     }
@@ -3396,7 +3408,10 @@ fn global_search_queries_every_source_and_labels_results() {
 }
 
 #[test]
-fn global_search_with_no_hits_keeps_the_keyboard() {
+fn global_search_with_no_hits_opens_results_then_back_to_keyboard() {
+    // No installed source matched: the results screen still opens (offering
+    // "Search more sources"), and Back returns to the keyboard with the
+    // query intact so it can be refined.
     let dir = tempfile::tempdir().unwrap();
     let mut gateway = search_gateway();
     gateway.search_results = Ok(Vec::new());
@@ -3404,7 +3419,7 @@ fn global_search_with_no_hits_keeps_the_keyboard() {
         tap_row(1),
         tap_key(Key::Char('z')),
         tap_key(Key::Search),
-        tap_back(), // dismiss the message
+        tap_back(), // leave the (empty) results -> back to the keyboard
     ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
@@ -3416,10 +3431,10 @@ fn global_search_with_no_hits_keeps_the_keyboard() {
 }
 
 #[test]
-fn global_search_skips_a_broken_source_keeps_the_rest() {
-    // search_results is shared in the fake, so simulate "one broken
-    // source" with all-broken + non-empty vs the message path instead:
-    // a failing source must surface in the no-results message.
+fn global_search_with_a_failing_source_still_opens_results() {
+    // A source that errors is skipped (logged to stderr), never fatal. Even
+    // with no hits the results screen opens, so its "Search more sources"
+    // row is there to widen the search.
     let dir = tempfile::tempdir().unwrap();
     let mut gateway = search_gateway();
     gateway.search_results = Err("cloudflare tantrum".into());
@@ -3427,11 +3442,10 @@ fn global_search_skips_a_broken_source_keeps_the_rest() {
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
-    let Screen::Message { title, body } = app.screen() else {
-        panic!("expected message screen");
+    let Screen::SearchResults { results, .. } = app.screen() else {
+        panic!("expected the results screen even with no hits");
     };
-    assert_eq!(title, "Search");
-    assert!(body.contains("Search failed on: Src"), "{body}");
+    assert!(results.is_empty(), "a failing source contributes nothing");
 }
 
 #[test]
@@ -3657,6 +3671,275 @@ fn back_leaves_the_keyboard() {
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Listings { .. }));
+}
+
+// --- widening to not-yet-installed sources ("Search more sources") ---
+
+#[test]
+fn widen_installs_matching_sources_and_merges_their_results() {
+    // One installed source (a hit), two more available but not installed.
+    // Tapping "Search more sources" pulls them in; both match, so both are
+    // kept installed and their hits are merged into the results.
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        available: Ok(vec![
+            SourceEntry {
+                id: "extra1".into(),
+                name: "Extra One".into(),
+            },
+            SourceEntry {
+                id: "extra2".into(),
+                name: "Extra Two".into(),
+            },
+        ]),
+        search_results: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Naruto".into(),
+            cover_url: None,
+        }]),
+        ..FakeGateway::default()
+    };
+    let events = vec![
+        tap_row(1),               // Home -> global search keyboard (no history)
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search),     // -> SearchResults (1 hit from src)
+        tap_row(1),               // the "Search more sources" row (index 1)
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::SearchResults { results, tried, .. } = app.screen() else {
+        panic!("expected widened results");
+    };
+    assert_eq!(results.len(), 3, "src + extra1 + extra2 each contributed");
+    // Every source was searched, none left untried.
+    assert!(["src", "extra1", "extra2"]
+        .iter()
+        .all(|id| tried.iter().any(|t| t == id)));
+    // The matching extras were kept installed; nothing was uninstalled.
+    let installed: Vec<String> = app
+        .gateway()
+        .installed
+        .borrow()
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    assert!(installed.contains(&"extra1".to_string()));
+    assert!(installed.contains(&"extra2".to_string()));
+    assert!(app.gateway().uninstalled.borrow().is_empty());
+}
+
+#[test]
+fn widen_with_no_matches_uninstalls_the_sources_it_tried() {
+    // Nothing matches anywhere. Widening installs the two available sources,
+    // finds no hits, and removes them again — the library isn't polluted.
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        available: Ok(vec![
+            SourceEntry {
+                id: "extra1".into(),
+                name: "Extra One".into(),
+            },
+            SourceEntry {
+                id: "extra2".into(),
+                name: "Extra Two".into(),
+            },
+        ]),
+        search_results: Ok(Vec::new()),
+        ..FakeGateway::default()
+    };
+    let events = vec![
+        tap_row(1),
+        tap_key(Key::Char('z')),
+        tap_key(Key::Search), // -> empty SearchResults
+        tap_row(0),           // the "Search more sources" row (index 0)
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    // No new matches -> a message sits on top of the (still empty) results.
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected a 'no new matches' message");
+    };
+    assert_eq!(title, "Search more");
+    assert!(body.contains("no new matches"), "{body}");
+    // Both tried-but-empty sources were removed again.
+    let mut uninstalled = app.gateway().uninstalled.borrow().clone();
+    uninstalled.sort();
+    assert_eq!(uninstalled, vec!["extra1".to_string(), "extra2".to_string()]);
+    let installed: Vec<String> = app
+        .gateway()
+        .installed
+        .borrow()
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    assert_eq!(installed, vec!["src".to_string()], "library left as it was");
+}
+
+#[test]
+fn widen_never_uninstalls_a_source_the_user_already_had() {
+    // A reopened recent carries a `tried` from when it was cached — it can
+    // predate the user installing another source. Widening from it finds no
+    // new match in that already-installed source, and must NOT delete it.
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![
+            SourceEntry {
+                id: "src".into(),
+                name: "Src".into(),
+            },
+            SourceEntry {
+                id: "extra1".into(),
+                name: "Extra One".into(),
+            },
+        ]),
+        available: Ok(vec![
+            SourceEntry {
+                id: "extra1".into(),
+                name: "Extra One".into(),
+            },
+            SourceEntry {
+                id: "extra2".into(),
+                name: "Extra Two".into(),
+            },
+        ]),
+        // Nothing new matches during the widen.
+        search_results: Ok(Vec::new()),
+        ..FakeGateway::default()
+    };
+    let mut app = app(dir.path(), gateway, vec![]);
+    // A results screen whose `tried` only knows about "src" (extra1 was
+    // installed later), exactly as a reopened recent would look.
+    app.stack.push(Screen::SearchResults {
+        query: "n".into(),
+        results: vec![(
+            SourceEntry {
+                id: "src".into(),
+                name: "Src".into(),
+            },
+            MangaEntry {
+                id: "m1".into(),
+                title: "Naruto".into(),
+                cover_url: None,
+            },
+        )],
+        tried: vec!["src".into()],
+        page: 0,
+    });
+    app.widen_search().unwrap();
+
+    let uninstalled = app.gateway().uninstalled.borrow().clone();
+    assert!(
+        !uninstalled.contains(&"extra1".to_string()),
+        "must not remove a source the user already had: {uninstalled:?}"
+    );
+    // Only the genuinely widen-added, no-hit source is removed.
+    assert_eq!(uninstalled, vec!["extra2".to_string()]);
+    assert!(
+        app.gateway()
+            .installed
+            .borrow()
+            .iter()
+            .any(|s| s.id == "extra1"),
+        "extra1 should still be installed"
+    );
+}
+
+#[test]
+fn widen_with_nothing_left_to_try_says_so() {
+    // Every available source is already installed (and was searched), so
+    // there's nothing for a widen to pull in.
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        available: Ok(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        search_results: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Naruto".into(),
+            cover_url: None,
+        }]),
+        ..FakeGateway::default()
+    };
+    let events = vec![
+        tap_row(1),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search), // -> SearchResults (1 hit)
+        tap_row(1),           // "Search more sources"
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected a 'no more sources' message");
+    };
+    assert_eq!(title, "Search more");
+    assert!(body.contains("No more sources"), "{body}");
+}
+
+// --- recent searches ---
+
+#[test]
+fn recent_search_is_remembered_and_reopened_from_cache() {
+    // After a global search, opening search again lands on the recents
+    // screen; tapping the recent reopens its cached results without
+    // re-querying any source.
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(1),               // Home -> keyboard (no history yet)
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search),     // -> SearchResults, remembers "n"
+        tap_back(),               // -> keyboard
+        tap_back(),               // -> Home
+        tap_row(1),               // -> RecentSearches (history exists now)
+        tap_row(1),               // tap the recent "n" -> cached results
+    ];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    // Only the original search hit the gateway; the reopen came from cache.
+    assert_eq!(*app.gateway().searches.borrow(), vec!["n".to_string()]);
+    let Screen::SearchResults { query, results, .. } = app.screen() else {
+        panic!("expected the cached results to reopen");
+    };
+    assert_eq!(query, "n");
+    assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn recents_screen_new_search_row_opens_the_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(1),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search), // remembers "n"
+        tap_back(),
+        tap_back(),
+        tap_row(1), // -> RecentSearches
+        tap_row(0), // "New search…" -> keyboard
+    ];
+    let mut app = app(dir.path(), search_gateway(), events);
+    app.run().unwrap();
+
+    let Screen::Search { source, query } = app.screen() else {
+        panic!("expected the search keyboard");
+    };
+    assert!(source.is_none());
+    assert_eq!(query, "");
 }
 
 // --- physical page-turn buttons ---
