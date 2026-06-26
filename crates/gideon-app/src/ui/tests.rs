@@ -3704,10 +3704,10 @@ fn widen_installs_matching_sources_and_merges_their_results() {
         ..FakeGateway::default()
     };
     let events = vec![
-        tap_row(1),               // Home -> global search keyboard (no history)
+        tap_row(1), // Home -> global search keyboard (no history)
         tap_key(Key::Char('n')),
-        tap_key(Key::Search),     // -> SearchResults (1 hit from src)
-        tap_row(1),               // the "Search more sources" row (index 1)
+        tap_key(Key::Search), // -> SearchResults (1 hit from src)
+        tap_row(1),           // the "Search more sources" row (index 1)
     ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
@@ -3774,7 +3774,10 @@ fn widen_with_no_matches_uninstalls_the_sources_it_tried() {
     // Both tried-but-empty sources were removed again.
     let mut uninstalled = app.gateway().uninstalled.borrow().clone();
     uninstalled.sort();
-    assert_eq!(uninstalled, vec!["extra1".to_string(), "extra2".to_string()]);
+    assert_eq!(
+        uninstalled,
+        vec!["extra1".to_string(), "extra2".to_string()]
+    );
     let installed: Vec<String> = app
         .gateway()
         .installed
@@ -3900,13 +3903,13 @@ fn recent_search_is_remembered_and_reopened_from_cache() {
     // re-querying any source.
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1),               // Home -> keyboard (no history yet)
+        tap_row(1), // Home -> keyboard (no history yet)
         tap_key(Key::Char('n')),
-        tap_key(Key::Search),     // -> SearchResults, remembers "n"
-        tap_back(),               // -> keyboard
-        tap_back(),               // -> Home
-        tap_row(1),               // -> RecentSearches (history exists now)
-        tap_row(1),               // tap the recent "n" -> cached results
+        tap_key(Key::Search), // -> SearchResults, remembers "n"
+        tap_back(),           // -> keyboard
+        tap_back(),           // -> Home
+        tap_row(1),           // -> RecentSearches (history exists now)
+        tap_row(1),           // tap the recent "n" -> cached results
     ];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
