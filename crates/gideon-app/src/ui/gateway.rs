@@ -76,6 +76,10 @@ pub trait SourceGateway {
     /// Download and install a source by id.
     fn install_source(&self, source_id: &str) -> Result<()>;
 
+    /// Remove an installed source by id. Used to discard sources pulled in by
+    /// a widened search that turned up no matches.
+    fn uninstall_source(&self, source_id: &str) -> Result<()>;
+
     /// Fetch a listing ("Popular", "Latest") from a source, falling back to
     /// an empty search when the source has no such listing.
     fn list_manga(&self, source_id: &str, listing: &str) -> Result<Vec<MangaEntry>>;
@@ -204,6 +208,12 @@ impl SourceGateway for AidokuGateway {
     fn install_source(&self, source_id: &str) -> Result<()> {
         manga::install_source(&self.data_dir, source_id)?;
         Ok(())
+    }
+
+    fn uninstall_source(&self, source_id: &str) -> Result<()> {
+        // Drop any cached WASM instance so a later reinstall reloads fresh.
+        self.cache.borrow_mut().remove(source_id);
+        manga::uninstall_source(&self.data_dir, source_id)
     }
 
     fn list_manga(&self, source_id: &str, listing: &str) -> Result<Vec<MangaEntry>> {
