@@ -193,19 +193,46 @@ fn tap_back() -> UiEvent {
     }
 }
 
-fn tap_nav_prev() -> UiEvent {
+/// Center x of a multi-page nav-bar button (the layout used by every
+/// paginated list).
+fn nav_button_center(target: TapTarget) -> u32 {
     let l = layout();
+    l.nav_buttons(true)
+        .into_iter()
+        .find(|(t, ..)| *t == target)
+        .map(|(_, x, w)| x + w / 2)
+        .expect("nav button present in the paged layout")
+}
+
+fn nav_tap(target: TapTarget) -> UiEvent {
     UiEvent::Tap {
-        x: l.width / 2,
-        y: l.nav_top() + 1,
+        x: nav_button_center(target),
+        y: layout().nav_top() + 1,
     }
 }
 
+fn tap_nav_prev() -> UiEvent {
+    nav_tap(TapTarget::Prev)
+}
+
 fn tap_nav_next() -> UiEvent {
+    nav_tap(TapTarget::Next)
+}
+
+fn tap_nav_first() -> UiEvent {
+    nav_tap(TapTarget::First)
+}
+
+fn tap_nav_last() -> UiEvent {
+    nav_tap(TapTarget::Last)
+}
+
+/// Tap the sort button parked at the right edge of a chapter list's title bar.
+fn tap_sort() -> UiEvent {
     let l = layout();
     UiEvent::Tap {
-        x: l.width - 2,
-        y: l.nav_top() + 1,
+        x: sort_button_x(&l) + l.pad,
+        y: 1,
     }
 }
 
@@ -2024,6 +2051,7 @@ fn leaving_a_manga_cancels_its_queued_pre_downloads() {
         manga: manga.clone(),
         chapters: vec![],
         page: 0,
+        sort: ChapterSort::default(),
     });
 
     // The worker has begun c2 — leave the manga while it's still downloading.
@@ -2961,6 +2989,162 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
     assert_eq!(source.id, "src");
     assert_eq!(manga.id, "m1");
     assert_eq!(chapters.len(), 2, "all chapters listed for download");
+}
+
+// --- chapter-list sorting & page jumps ---
+
+/// A library with one source-linked series, plus a gateway that serves `n`
+/// numbered chapters for it. Opening the card's "All chapters" lands on the
+/// source ChapterList.
+fn linked_series(dir: &Path, n: usize) -> (PathBuf, FakeGateway) {
+    let lib = dir.join("Manga");
+    make_cbz(&lib.join("Manga One/Chapter 1.cbz"), 2);
+    let mut index = gideon_core::SeriesIndex::load(&lib);
+    index.record(
+        "Manga One",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Manga One".into(),
+            ..gideon_core::SeriesRef::default()
+        },
+    );
+    index.save(&lib).unwrap();
+    // Newest-first, the way real sources serve them.
+    let chapters = (1..=n)
+        .rev()
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: None,
+        })
+        .collect();
+    let gateway = FakeGateway {
+        chapters,
+        ..FakeGateway::default()
+    };
+    (lib, gateway)
+}
+
+/// Open the source chapter list for the single linked series.
+fn open_chapters(cell: (u32, u32)) -> Vec<UiEvent> {
+    let (x, y) = cell;
+    vec![
+        tap_row(0),                  // Home -> Library
+        UiEvent::LongPress { x, y }, // card -> book menu
+        tap_row(0),                  // "All chapters (from source)"
+    ]
+}
+
+#[test]
+fn pure_chapter_display_order_sorts_and_reverses() {
+    // Source order is preserved as-is.
+    let nums = [Some(3.0), Some(1.0), Some(2.0)];
+    assert_eq!(
+        chapter_display_order(&nums, ChapterSort::Source),
+        vec![0, 1, 2]
+    );
+    // Ascending by number; Descending is its exact reverse.
+    assert_eq!(
+        chapter_display_order(&nums, ChapterSort::Ascending),
+        vec![1, 2, 0]
+    );
+    assert_eq!(
+        chapter_display_order(&nums, ChapterSort::Descending),
+        vec![0, 2, 1]
+    );
+    // Unnumbered chapters keep their order at the end (ascending) and still
+    // flip under descending.
+    let mixed = [Some(2.0), None, Some(1.0), None];
+    assert_eq!(
+        chapter_display_order(&mixed, ChapterSort::Ascending),
+        vec![2, 0, 1, 3]
+    );
+    assert_eq!(
+        chapter_display_order(&mixed, ChapterSort::Descending),
+        vec![3, 1, 0, 2]
+    );
+}
+
+#[test]
+fn pure_label_chapter_num_parses_markers() {
+    assert_eq!(label_chapter_num("Ch 12 — Title"), Some(12.0));
+    assert_eq!(label_chapter_num("Vol.01 Ch.012.5"), Some(12.5));
+    assert_eq!(label_chapter_num("Chapter 7"), Some(7.0));
+    assert_eq!(label_chapter_num("#42"), Some(42.0));
+    assert_eq!(label_chapter_num("009 - intro"), Some(9.0));
+    assert_eq!(label_chapter_num("prologue"), None);
+}
+
+#[test]
+fn last_button_jumps_to_the_final_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lib, gateway) = linked_series(dir.path(), 30);
+    let per_page = layout().rows_per_page();
+    let cell = match tap_shelf_cell0() {
+        UiEvent::Tap { x, y } => (x, y),
+        _ => unreachable!(),
+    };
+    let mut events = open_chapters(cell);
+    events.push(tap_nav_last());
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    let Screen::ChapterList { chapters, page, .. } = app.screen() else {
+        panic!("expected the chapter list");
+    };
+    let last = chapters.len().div_ceil(per_page) - 1;
+    assert!(last > 0, "30 chapters must span several pages");
+    assert_eq!(*page, last, "Last jumps straight to the final page");
+}
+
+#[test]
+fn first_button_returns_to_the_beginning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lib, gateway) = linked_series(dir.path(), 30);
+    let cell = match tap_shelf_cell0() {
+        UiEvent::Tap { x, y } => (x, y),
+        _ => unreachable!(),
+    };
+    let mut events = open_chapters(cell);
+    // Go to the end, then one tap back to the very beginning.
+    events.push(tap_nav_last());
+    events.push(tap_nav_first());
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    let Screen::ChapterList { page, .. } = app.screen() else {
+        panic!("expected the chapter list");
+    };
+    assert_eq!(*page, 0, "First returns to page 0 in one tap");
+}
+
+#[test]
+fn sort_button_cycles_order_and_resets_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lib, gateway) = linked_series(dir.path(), 30);
+    let cell = match tap_shelf_cell0() {
+        UiEvent::Tap { x, y } => (x, y),
+        _ => unreachable!(),
+    };
+    let mut events = open_chapters(cell);
+    // Move off page 0, then sort: the rows all move, so it snaps back to page 0.
+    events.push(tap_nav_last());
+    events.push(tap_sort());
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    let Screen::ChapterList { sort, page, .. } = app.screen() else {
+        panic!("expected the chapter list");
+    };
+    assert_eq!(
+        *sort,
+        ChapterSort::Ascending,
+        "Source -> Ascending on first tap"
+    );
+    assert_eq!(*page, 0, "changing the sort returns to the first page");
 }
 
 #[test]
