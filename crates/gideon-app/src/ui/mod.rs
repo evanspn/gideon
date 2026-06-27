@@ -629,6 +629,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         &self.input
     }
 
+    #[cfg(test)]
+    pub(crate) fn input_mut(&mut self) -> &mut I {
+        &mut self.input
+    }
+
     #[cfg_attr(feature = "kobo", allow(dead_code))]
     fn screen(&self) -> &Screen {
         self.stack.last().expect("screen stack is never empty")
@@ -748,6 +753,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // fds; input made after the reopen survives.
         self.input.discard_queued();
         self.input.refresh_devices();
+        // Snap to how the device is held now (auto mode only): the gsensor
+        // reports only on *change*, so without an explicit resync the menus
+        // would stay at the pre-sleep orientation until the device was
+        // physically moved — the "screen won't rotate after sleep" bug.
+        if !self.rotation_locked {
+            if let Some(UiEvent::Rotate { rotation }) = self.input.resync_orientation() {
+                let rotation = rotation % 360;
+                if rotation != self.reader_rotation {
+                    self.reader_rotation = rotation;
+                    self.rebuild_layout();
+                }
+            }
+        }
         // Proactively rejoin Wi-Fi (unless auto-connect is off): a suspend
         // usually leaves the radio un-associated / lease-less, so kick a
         // (detached, non-blocking) scan + re-associate now rather than waiting
@@ -2520,6 +2538,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // chapter, which "sometimes" failed after sleep).
                         self.input.discard_queued();
                         self.input.refresh_devices();
+                        // Snap the reader to the device's current orientation on
+                        // wake (auto mode only): the gsensor reports only on
+                        // *change*, so otherwise it stays at the pre-sleep
+                        // orientation until the device is physically moved — the
+                        // "screen won't rotate after sleep" bug. Field accesses
+                        // only here (reader still borrows self.display).
+                        if !rotation_locked {
+                            if let Some(UiEvent::Rotate { rotation: target }) =
+                                self.input.resync_orientation()
+                            {
+                                let target = target % 360;
+                                if target != rotation {
+                                    reader.set_rotation(target);
+                                    rotation = target;
+                                    self.reader_rotation = target;
+                                }
+                            }
+                        }
                         // Proactively rejoin Wi-Fi after the suspend (detached,
                         // non-blocking; no-op if still connected) so a download
                         // at the end of the chapter just works — unless the
