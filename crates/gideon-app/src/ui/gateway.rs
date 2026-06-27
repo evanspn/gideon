@@ -87,6 +87,15 @@ pub trait SourceGateway {
     /// Search a source for manga matching `query`.
     fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>>;
 
+    /// Popular manga from MyAnimeList, for the Home "Popular manga" tab. These
+    /// are catalogue entries (title + cover), independent of installed
+    /// sources; the UI searches the installed sources by title to download
+    /// them. The default is empty so gateways that don't support it (tests)
+    /// opt in by overriding.
+    fn popular_manga(&self) -> Result<Vec<MangaEntry>> {
+        Ok(Vec::new())
+    }
+
     /// Download a manga cover image to `dest` (best-effort metadata).
     fn download_cover(&self, url: &str, dest: &Path) -> Result<()>;
 
@@ -256,6 +265,23 @@ impl SourceGateway for AidokuGateway {
                 title: m.title.unwrap_or_else(|| m.id.clone()),
                 cover_url: m.cover_url.map(|u| u.to_string()),
                 id: m.id,
+            })
+            .collect())
+    }
+
+    fn popular_manga(&self) -> Result<Vec<MangaEntry>> {
+        // MyAnimeList's public Jikan API — a plain HTTPS GET, so it reuses the
+        // blocking source-list fetcher rather than the async download runtime.
+        let fetcher = UreqFetcher::new();
+        let popular = crate::mal::fetch_popular(&fetcher)?;
+        Ok(popular
+            .into_iter()
+            .map(|p| MangaEntry {
+                // The title is also the search key the UI feeds to the global
+                // search, so it doubles as the id.
+                id: p.title.clone(),
+                title: p.title,
+                cover_url: p.cover_url,
             })
             .collect())
     }
