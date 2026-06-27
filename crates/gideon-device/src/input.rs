@@ -93,6 +93,10 @@ pub struct FakeInput {
     /// How often `discard_taps` ran (the post-slow-turn input flush), for
     /// tests.
     pub discard_taps_calls: usize,
+    /// What `resync_orientation` should report — the orientation the device
+    /// is "held at" when auto-rotation re-arms (e.g. on wake). `None` mimics
+    /// hardware that hasn't seen the accelerometer yet.
+    pub resync: Option<u32>,
 }
 
 impl FakeInput {
@@ -101,7 +105,15 @@ impl FakeInput {
             events: events.into_iter(),
             refreshes: 0,
             discard_taps_calls: 0,
+            resync: None,
         }
+    }
+
+    /// Make `resync_orientation` report `rotation` (degrees) — the device is
+    /// held at that orientation when auto-rotation re-arms.
+    pub fn with_resync(mut self, rotation: u32) -> Self {
+        self.resync = Some(rotation);
+        self
     }
 }
 
@@ -123,6 +135,10 @@ impl InputSource for FakeInput {
 
     fn discard_taps(&mut self) {
         self.discard_taps_calls += 1;
+    }
+
+    fn resync_orientation(&mut self) -> Option<UiEvent> {
+        self.resync.map(|rotation| UiEvent::Rotate { rotation })
     }
 }
 
