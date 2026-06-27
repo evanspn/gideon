@@ -407,6 +407,21 @@ impl GyroTracker {
             None
         }
     }
+
+    /// Drop any in-flight settle but keep the orientation last observed.
+    /// A suspend/resume cycle re-registers the input nodes (so the device
+    /// list is rebuilt), but the accelerometer is the same physical sensor
+    /// and the device is still held the same way. Because the Kobo gsensor
+    /// reports only on *change*, forgetting the observed orientation here
+    /// would leave a post-wake [`Self::resync`] with nothing to snap to —
+    /// auto-rotation would stay stuck at the pre-sleep orientation until the
+    /// user physically moved the device. We only clear the transient pending
+    /// candidate (any settle started before the suspend is stale) and the
+    /// diagnostic log gate.
+    pub fn forget_pending(&mut self) {
+        self.candidate = None;
+        self.last_logged_code = None;
+    }
 }
 
 impl Default for GyroTracker {
@@ -487,7 +502,12 @@ impl KoboTouch {
                     self.max_y = scan.max_y;
                     self.tracker = TouchTracker::new();
                     self.buttons = ButtonTracker::new();
-                    self.gyro = GyroTracker::new();
+                    // Keep the gyro's known orientation across the reopen: the
+                    // accelerometer is the same sensor and the device is still
+                    // held the same way, so the post-wake resync can snap to it
+                    // (the gsensor only reports on *change* — a fresh tracker
+                    // would have nothing until the user moved the device).
+                    self.gyro.forget_pending();
                     self.pending.clear();
                     return;
                 }
@@ -508,7 +528,12 @@ impl KoboTouch {
         }
         self.tracker = TouchTracker::new();
         self.buttons = ButtonTracker::new();
-        self.gyro = GyroTracker::new();
+        // The orientation the device is held at is not a stale "queued event":
+        // dropping the wake key press has nothing to do with the accelerometer,
+        // and wiping it here (the gsensor reports only on change) would leave
+        // the post-wake resync with nothing to snap to. Keep it — this matches
+        // discard_taps, which already preserves the gyro across an input flush.
+        self.gyro.forget_pending();
         self.pending.clear();
     }
 }
@@ -1148,6 +1173,35 @@ mod tests {
         assert_eq!(g.resync(), Some(UiEvent::Rotate { rotation: 90 }));
         // With no orientation ever seen, resync has nothing to apply.
         assert_eq!(gyro().resync(), None);
+    }
+
+    #[test]
+    fn forget_pending_keeps_the_observed_orientation_for_a_post_wake_resync() {
+        // A suspend/resume reopens the input nodes (and drains queued events),
+        // which calls forget_pending. The device is still held the same way and
+        // the gsensor reports only on change, so the observed orientation must
+        // survive so the post-wake resync can snap to it — otherwise
+        // auto-rotation is stuck until the device is physically moved.
+        let t0 = std::time::Instant::now();
+
+        // No in-flight change at wake: the settled pose simply survives.
+        let mut g = gyro();
+        g.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_LEFT), t0);
+        assert_eq!(
+            g.settled(t0 + GYRO_SETTLE),
+            Some(UiEvent::Rotate { rotation: 90 })
+        );
+        g.forget_pending();
+        assert_eq!(g.resync(), Some(UiEvent::Rotate { rotation: 90 }));
+
+        // An in-flight candidate (movement that hadn't settled yet) is dropped
+        // so it can't fire a stale rotation later, but the orientation it
+        // reported is still the device's current pose, so resync re-applies it.
+        let mut g2 = gyro();
+        g2.observe(&msc(MSC_RAW_GSENSOR_LANDSCAPE_LEFT), t0);
+        g2.forget_pending();
+        assert_eq!(g2.settled(t0 + GYRO_SETTLE * 10), None, "candidate dropped");
+        assert_eq!(g2.resync(), Some(UiEvent::Rotate { rotation: 90 }));
     }
 
     #[test]
