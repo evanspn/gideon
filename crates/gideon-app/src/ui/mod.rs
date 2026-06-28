@@ -35,12 +35,14 @@ use gideon_render::{rotate_page, rotate_page_rgb, FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
-const HOME_ROWS: [&str; 5] = [
+const HOME_ROWS: [&str; 6] = [
     "Library",
     "Search all sources",
     "Browse sources",
     "Settings",
     "Check for updates",
+    // Appended (not inserted) so the existing Home rows keep their indices.
+    "Popular manga",
 ];
 /// A tappable top row shown on Home ONLY when offline (device only): a manual
 /// "scan + reconnect" for the roam-while-idle case, without a battery-draining
@@ -313,6 +315,13 @@ enum Screen {
         query: String,
         results: Vec<(SourceEntry, MangaEntry)>,
         tried: Vec<String>,
+        page: usize,
+    },
+    /// MyAnimeList "Popular manga" tab (Home entry). Catalogue titles, not
+    /// tied to any source; tapping one runs a global search for its title so
+    /// it can be found and downloaded from the installed sources.
+    Popular {
+        mangas: Vec<MangaEntry>,
         page: usize,
     },
     MangaList {
@@ -703,6 +712,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         &self.input
     }
 
+    #[cfg(test)]
+    pub(crate) fn input_mut(&mut self) -> &mut I {
+        &mut self.input
+    }
+
     #[cfg_attr(feature = "kobo", allow(dead_code))]
     fn screen(&self) -> &Screen {
         self.stack.last().expect("screen stack is never empty")
@@ -822,6 +836,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // fds; input made after the reopen survives.
         self.input.discard_queued();
         self.input.refresh_devices();
+        // Snap to how the device is held now (auto mode only): the gsensor
+        // reports only on *change*, so without an explicit resync the menus
+        // would stay at the pre-sleep orientation until the device was
+        // physically moved — the "screen won't rotate after sleep" bug.
+        if !self.rotation_locked {
+            if let Some(UiEvent::Rotate { rotation }) = self.input.resync_orientation() {
+                let rotation = rotation % 360;
+                if rotation != self.reader_rotation {
+                    self.reader_rotation = rotation;
+                    self.rebuild_layout();
+                }
+            }
+        }
         // Proactively rejoin Wi-Fi (unless auto-connect is off): a suspend
         // usually leaves the radio un-associated / lease-less, so kick a
         // (detached, non-blocking) scan + re-associate now rather than waiting
@@ -1157,6 +1184,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::SearchResults { results, page, .. } => {
                 (page, (results.len() + 1).div_ceil(per_page))
             }
+            Screen::Popular { mangas, page } => (page, mangas.len().div_ceil(per_page)),
             Screen::MangaList { mangas, page, .. } => (page, mangas.len().div_ceil(per_page)),
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
             Screen::DownloadedChapters { entries, page, .. } => {
@@ -1198,6 +1226,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     2 => self.open_sources()?,
                     3 => self.push(Screen::Settings)?,
                     4 => self.check_updates()?,
+                    5 => self.open_popular()?,
                     _ => {}
                 }
                 Ok(Flow::Continue)
@@ -1255,6 +1284,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // sources" row — widen to not-yet-installed sources.
                     None if index == results.len() => self.widen_search()?,
                     None => {}
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::Popular { mangas, page } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(manga) = mangas.get(index).cloned() {
+                    // Reuse the global search: find this MyAnimeList title
+                    // across the installed sources so the user can download
+                    // it. The results land on top of this tab; Back returns.
+                    self.run_global_search(&manga.title)?;
                 }
                 Ok(Flow::Continue)
             }
@@ -1722,6 +1761,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.save_settings(&settings);
         self.stack.truncate(1);
         self.render_current(RefreshMode::Full)
+    }
+
+    /// Open the "Popular manga" tab: MyAnimeList's popular ranking. It's a
+    /// live fetch, so it needs the network and surfaces the offline message
+    /// like every other network action. Tapping a title there runs a global
+    /// search for it (handled in the tap dispatch).
+    fn open_popular(&mut self) -> Result<()> {
+        self.ensure_online()?;
+        self.show_status(&["Loading popular manga…"])?;
+        let mangas = self
+            .gateway
+            .popular_manga()
+            .context("loading popular manga from MyAnimeList")?;
+        if mangas.is_empty() {
+            return self.push(Screen::Message {
+                title: "Popular manga".to_string(),
+                body: "Couldn't load popular manga.\nCheck your connection and try again.".into(),
+            });
+        }
+        self.push(Screen::Popular { mangas, page: 0 })
     }
 
     /// Open global search from Home. With recent searches, land on the
@@ -2687,6 +2746,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // chapter, which "sometimes" failed after sleep).
                         self.input.discard_queued();
                         self.input.refresh_devices();
+                        // Snap the reader to the device's current orientation on
+                        // wake (auto mode only): the gsensor reports only on
+                        // *change*, so otherwise it stays at the pre-sleep
+                        // orientation until the device is physically moved — the
+                        // "screen won't rotate after sleep" bug. Field accesses
+                        // only here (reader still borrows self.display).
+                        if !rotation_locked {
+                            if let Some(UiEvent::Rotate { rotation: target }) =
+                                self.input.resync_orientation()
+                            {
+                                let target = target % 360;
+                                if target != rotation {
+                                    reader.set_rotation(target);
+                                    rotation = target;
+                                    self.reader_rotation = target;
+                                }
+                            }
+                        }
                         // Proactively rejoin Wi-Fi after the suspend (detached,
                         // non-blocking; no-op if still connected) so a download
                         // at the end of the chapter just works — unless the
@@ -3165,6 +3242,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     format!("\"{query}\"")
                 };
                 compose_list(l, &title, &rows, *page, l.page_count(total))
+            }
+            Screen::Popular { mangas, page } => {
+                let rows: Vec<(String, bool)> = paged(mangas, *page, per_page)
+                    .iter()
+                    .map(|m| (m.title.clone(), true))
+                    .collect();
+                compose_list(l, "Popular manga", &rows, *page, l.page_count(mangas.len()))
             }
             Screen::MangaList {
                 source,

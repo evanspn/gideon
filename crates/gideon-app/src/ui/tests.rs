@@ -43,6 +43,8 @@ struct FakeGateway {
     installed: RefCell<Vec<SourceEntry>>,
     available: std::result::Result<Vec<SourceEntry>, String>,
     mangas: std::result::Result<Vec<MangaEntry>, String>,
+    /// Canned MyAnimeList "Popular manga" titles for the Home tab.
+    popular: std::result::Result<Vec<MangaEntry>, String>,
     search_results: std::result::Result<Vec<MangaEntry>, String>,
     /// Queries passed to `search_manga`, in order.
     searches: RefCell<Vec<String>>,
@@ -65,6 +67,7 @@ impl Default for FakeGateway {
             installed: RefCell::new(Vec::new()),
             available: Ok(Vec::new()),
             mangas: Ok(Vec::new()),
+            popular: Ok(Vec::new()),
             search_results: Ok(Vec::new()),
             searches: RefCell::new(Vec::new()),
             searched_sources: RefCell::new(Vec::new()),
@@ -106,6 +109,10 @@ impl SourceGateway for FakeGateway {
 
     fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
         self.mangas.clone().map_err(|e| anyhow!(e))
+    }
+
+    fn popular_manga(&self) -> Result<Vec<MangaEntry>> {
+        self.popular.clone().map_err(|e| anyhow!(e))
     }
 
     fn download_cover(&self, _url: &str, dest: &Path) -> Result<()> {
@@ -825,6 +832,89 @@ fn gyro_rotates_the_reader_in_auto_mode() {
         store.get("Sample/vol1.cbz").unwrap().current_page,
         1,
         "the reader must rotate to the gyro orientation and map taps to it"
+    );
+}
+
+#[test]
+fn waking_snaps_the_menus_to_the_current_orientation() {
+    // The Kobo gsensor reports only on *change*, so after a suspend/resume it
+    // won't re-announce the current orientation — the wake path must resync
+    // and rotate the menus itself, or they stay stuck at the pre-sleep angle
+    // ("screen won't rotate after sleep").
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    auto_orientation_settings(&settings_dir);
+    let (_count, sleeper) = counting_sleeper();
+
+    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
+        .with_settings_dir(settings_dir)
+        .with_sleeper(sleeper);
+    // The device is held at 90° when it wakes.
+    app.input_mut().resync = Some(90);
+    app.run().unwrap();
+
+    let l = menu_layout(90);
+    let (x, y) = panel_point_for(l.width / 2, l.title_h - 1, 90);
+    assert_eq!(
+        app.display().pixel(x, y),
+        0x55,
+        "waking must snap the menus to how the device is held"
+    );
+}
+
+#[test]
+fn waking_keeps_the_menus_upright_when_orientation_locked() {
+    // No settings dir: orientation defaults to locked. A wake resync that
+    // reports 90° must be ignored — a locked orientation never follows the
+    // accelerometer, on wake or otherwise.
+    let dir = tempfile::tempdir().unwrap();
+    let (_count, sleeper) = counting_sleeper();
+
+    let mut app =
+        app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep]).with_sleeper(sleeper);
+    app.input_mut().resync = Some(90);
+    app.run().unwrap();
+
+    let l = menu_layout(0);
+    assert_eq!(
+        app.display().pixel(l.width / 2, l.title_h - 1),
+        0x55,
+        "a locked orientation must ignore the wake resync"
+    );
+}
+
+#[test]
+fn waking_snaps_the_reader_to_the_current_orientation() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+    auto_orientation_settings(&settings_dir);
+    let (_count, sleeper) = counting_sleeper();
+
+    // Open the reader upright, sleep, then wake held at 90°: the tap zones must
+    // now follow the 90° orientation (panel bottom = next page), proving the
+    // reader rotated on wake without a fresh gyro report.
+    let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
+    let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        UiEvent::Sleep,
+        tap_panel_bottom,
+        tap_rotated_back,
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events)
+        .with_settings_dir(settings_dir)
+        .with_sleeper(sleeper);
+    app.input_mut().resync = Some(90);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        1,
+        "waking must rotate the reader to how the device is held and map taps to it"
     );
 }
 
@@ -3481,6 +3571,94 @@ fn update_prompt_installs_on_tap() {
         1,
         "tap on prompt should install"
     );
+}
+
+// --- popular manga (MyAnimeList tab) ---
+
+#[test]
+fn home_popular_lists_titles_and_tap_searches_installed_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src1".into(),
+            name: "First".into(),
+        }]),
+        popular: Ok(vec![
+            MangaEntry {
+                id: "Berserk".into(),
+                title: "Berserk".into(),
+                cover_url: None,
+            },
+            MangaEntry {
+                id: "Vagabond".into(),
+                title: "Vagabond".into(),
+                cover_url: None,
+            },
+        ]),
+        search_results: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Berserk".into(),
+            cover_url: None,
+        }]),
+        ..FakeGateway::default()
+    };
+    let events = vec![
+        tap_row(5), // Home -> Popular manga
+        tap_row(0), // first popular title -> global search for it
+    ];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    // Tapping a MyAnimeList title runs a global search for it across the
+    // installed sources, so it can be found and downloaded.
+    assert_eq!(
+        *app.gateway().searches.borrow(),
+        vec!["Berserk".to_string()],
+        "the tapped popular title drives a source search"
+    );
+    let Screen::SearchResults { query, results, .. } = app.screen() else {
+        panic!("expected search results from a popular title");
+    };
+    assert_eq!(query, "Berserk");
+    assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn home_popular_renders_the_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        popular: Ok(vec![MangaEntry {
+            id: "Berserk".into(),
+            title: "Berserk".into(),
+            cover_url: None,
+        }]),
+        ..FakeGateway::default()
+    };
+    let mut app = app(dir.path(), gateway, vec![tap_row(5)]);
+    app.run().unwrap();
+
+    let Screen::Popular { mangas, .. } = app.screen() else {
+        panic!("expected the Popular manga tab");
+    };
+    assert_eq!(mangas.len(), 1);
+    assert!(
+        app.display().buffer.iter().any(|&p| p < 0x80),
+        "popular tab is blank"
+    );
+}
+
+#[test]
+fn home_popular_empty_explains_instead_of_a_blank_tab() {
+    // No popular titles came back (offline, or MyAnimeList hiccup): the user
+    // gets a message, not an empty list.
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![tap_row(5)]);
+    app.run().unwrap();
+
+    let Screen::Message { title, .. } = app.screen() else {
+        panic!("expected a message for empty popular results");
+    };
+    assert_eq!(title, "Popular manga");
 }
 
 // --- search keyboard ---

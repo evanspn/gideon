@@ -11,6 +11,10 @@
 //! * `gideon read <file.cbz>` — read on the device framebuffer (Kobo
 //!   builds) or interactively in the terminal (desktop builds)
 
+// Like `ui`, the MyAnimeList client is only reachable from the on-device
+// browse UI, so it looks dead in non-kobo builds (still exercised by tests).
+#[cfg_attr(not(feature = "kobo"), allow(dead_code))]
+mod mal;
 mod manga;
 mod reader;
 // Outside device (`kobo`) builds, only the headless screenshot path of the
