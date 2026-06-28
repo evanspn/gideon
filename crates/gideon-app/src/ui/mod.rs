@@ -207,6 +207,78 @@ fn group_library(entries: Vec<LibraryEntry>) -> Vec<SeriesCard> {
     cards
 }
 
+/// Display order for a chapter list. The backing `Vec` always stays in the
+/// source's (or disk scan's) natural order — reading-continuity logic like
+/// [`next_chapter`] and the downloaded reading chain depend on it — so this
+/// only permutes which rows the user sees and taps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ChapterSort {
+    /// As fetched from the source / scanned from disk (sources are usually
+    /// newest-first). The default, so opening a manga looks unchanged.
+    #[default]
+    Source,
+    /// Chapter number ascending — chapter 1 at the top.
+    Ascending,
+    /// Chapter number descending — the newest chapter at the top.
+    Descending,
+}
+
+impl ChapterSort {
+    /// The next order in the tap-to-cycle ring: Source → Asc → Desc → Source.
+    fn next(self) -> Self {
+        match self {
+            ChapterSort::Source => ChapterSort::Ascending,
+            ChapterSort::Ascending => ChapterSort::Descending,
+            ChapterSort::Descending => ChapterSort::Source,
+        }
+    }
+
+    /// Short label for the title-bar sort button (ASCII so it renders in the
+    /// bundled font).
+    fn label(self) -> &'static str {
+        match self {
+            ChapterSort::Source => "Sort: src",
+            ChapterSort::Ascending => "Sort: 1-9",
+            ChapterSort::Descending => "Sort: 9-1",
+        }
+    }
+}
+
+/// Indices into a chapter list in display order. `nums[i]` is chapter `i`'s
+/// number (`None` when unknown). Ascending sorts numbered chapters low→high,
+/// leaving any unnumbered ones in their original order at the end; Descending
+/// is the exact reverse of that, so it still flips the list even when no
+/// chapter carries a parseable number.
+fn chapter_display_order(nums: &[Option<f32>], sort: ChapterSort) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..nums.len()).collect();
+    if matches!(sort, ChapterSort::Source) {
+        return order;
+    }
+    order.sort_by(|&a, &b| match (nums[a], nums[b]) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        // Numbered chapters sort ahead of unnumbered ones; unnumbered keep
+        // their original relative order (the sort is stable).
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    if matches!(sort, ChapterSort::Descending) {
+        order.reverse();
+    }
+    order
+}
+
+/// A page-navigation request within a paginated list (see [`App::move_page`]).
+#[derive(Debug, Clone, Copy)]
+enum PageMove {
+    /// Step relative to the current page (clamped to the valid range).
+    Delta(i64),
+    /// Jump to the first page.
+    First,
+    /// Jump to the last page.
+    Last,
+}
+
 #[derive(Debug, Clone)]
 enum Screen {
     Home,
@@ -263,6 +335,7 @@ enum Screen {
         manga: MangaEntry,
         chapters: Vec<ChapterEntry>,
         page: usize,
+        sort: ChapterSort,
     },
     /// Offline list of a series' **downloaded** chapters — built from local
     /// files, never the source. Tapping a row opens it in the reader.
@@ -270,6 +343,7 @@ enum Screen {
         title: String,
         entries: Vec<LibraryEntry>,
         page: usize,
+        sort: ChapterSort,
     },
     /// Per-chapter read-status menu, opened from the ⋮ button on a chapter row.
     /// `key` is the chapter's progress key (its on-disk path); `None` when the
@@ -854,8 +928,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     // --- input handling ---
 
     fn handle_tap(&mut self, x: u32, y: u32) -> Result<Flow> {
-        match self.layout.tap_target(x, y) {
+        let paged = self.current_page_count() > 1;
+        match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
+            TapTarget::First => {
+                self.move_page(PageMove::First)?;
+                Ok(Flow::Continue)
+            }
             TapTarget::Prev => {
                 self.flip_page(-1)?;
                 Ok(Flow::Continue)
@@ -864,9 +943,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.flip_page(1)?;
                 Ok(Flow::Continue)
             }
+            TapTarget::Last => {
+                self.move_page(PageMove::Last)?;
+                Ok(Flow::Continue)
+            }
+            TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
-                if matches!(self.screen(), Screen::Home) {
+                // A chapter list's title bar carries the sort button on its
+                // right edge; tapping it cycles the order.
+                if self.screen_has_sort() && x >= sort_button_x(&self.layout) {
+                    self.cycle_chapter_sort()?;
+                } else if matches!(self.screen(), Screen::Home) {
                     if x >= self.layout.width.saturating_sub(self.layout.title_h * 2) {
                         // The power symbol lives in Home's top-right corner.
                         self.push(Screen::PowerMenu)?;
@@ -879,6 +967,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
         }
+    }
+
+    /// Whether the current screen is a chapter list (and so shows the sort
+    /// button in its title bar).
+    fn screen_has_sort(&self) -> bool {
+        matches!(
+            self.stack.last(),
+            Some(Screen::ChapterList { .. } | Screen::DownloadedChapters { .. })
+        )
+    }
+
+    /// Advance the current chapter list's sort to the next order and redraw
+    /// from the first page (the rows have all moved, so the old page is
+    /// meaningless).
+    fn cycle_chapter_sort(&mut self) -> Result<()> {
+        match self.stack.last_mut() {
+            Some(Screen::ChapterList { sort, page, .. })
+            | Some(Screen::DownloadedChapters { sort, page, .. }) => {
+                *sort = sort.next();
+                *page = 0;
+            }
+            _ => return Ok(()),
+        }
+        self.render_current(RefreshMode::Partial)
     }
 
     /// Long press: a library card opens its book menu; a chapter row
@@ -918,12 +1030,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 manga,
                 chapters,
                 page,
+                sort,
             } => {
                 // Long press on a chapter row: download it and stay on the
                 // list — for stocking up before going offline.
-                if let TapTarget::Row(row) = self.layout.tap_target(x, y) {
-                    let index = page * self.layout.rows_per_page() + row;
-                    if let Some(chapter) = chapters.get(index).cloned() {
+                let paged = self.current_page_count() > 1;
+                if let TapTarget::Row(row) = self.layout.tap_target(x, y, paged) {
+                    let nums: Vec<Option<f32>> = chapters.iter().map(|c| c.num).collect();
+                    let order = chapter_display_order(&nums, sort);
+                    let displayed = page * self.layout.rows_per_page() + row;
+                    if let Some(chapter) =
+                        order.get(displayed).and_then(|&i| chapters.get(i)).cloned()
+                    {
                         let cbz_path = self.download_to_library(&source, &manga, &chapter)?;
                         // No reader session here — fetch the cover now.
                         self.fetch_cover_if_missing(&manga, &cbz_path);
@@ -983,6 +1101,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             manga: manga.clone(),
             chapters,
             page: 0,
+            sort: ChapterSort::default(),
         })
     }
 
@@ -1000,6 +1119,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             title: series_dir.to_string(),
             entries,
             page: 0,
+            sort: ChapterSort::default(),
         })
     }
 
@@ -1025,8 +1145,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Full)
     }
 
-    /// Change page within the current screen (partial refresh).
+    /// The number of pages the current top screen spans (1 when it isn't a
+    /// paginated list). Mirrors the page-count arithmetic in [`Self::move_page`]
+    /// — note the Library paginates by shelf capacity, not list rows.
+    fn current_page_count(&self) -> usize {
+        let per_page = self.layout.rows_per_page();
+        let shelf_capacity = self.shelf_layout().capacity().max(1);
+        match self.stack.last() {
+            Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
+            Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
+            Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
+            Some(Screen::MangaList { mangas, .. }) => mangas.len().div_ceil(per_page),
+            Some(Screen::ChapterList { chapters, .. }) => chapters.len().div_ceil(per_page),
+            Some(Screen::DownloadedChapters { entries, .. }) => entries.len().div_ceil(per_page),
+            _ => 1,
+        }
+        .max(1)
+    }
+
+    /// Step one page forward/backward within the current screen.
     fn flip_page(&mut self, delta: i64) -> Result<()> {
+        self.move_page(PageMove::Delta(delta))
+    }
+
+    /// Move within the current paginated screen (partial refresh). `Delta`
+    /// steps relative to the current page (clamped); `First`/`Last` jump to an
+    /// end — so a long chapter list is one tap from the start instead of many.
+    fn move_page(&mut self, mv: PageMove) -> Result<()> {
         let per_page = self.layout.rows_per_page();
         let shelf_capacity = self.shelf_layout().capacity().max(1);
         let Some(screen) = self.stack.last_mut() else {
@@ -1048,7 +1193,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             _ => return Ok(()),
         };
         let count = count.max(1);
-        let new = (*page as i64 + delta).clamp(0, count as i64 - 1) as usize;
+        let new = match mv {
+            PageMove::Delta(delta) => (*page as i64 + delta).clamp(0, count as i64 - 1) as usize,
+            PageMove::First => 0,
+            PageMove::Last => count - 1,
+        };
         if new != *page {
             *page = new;
             self.render_current(RefreshMode::Partial)?;
@@ -1165,9 +1314,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 manga,
                 chapters,
                 page,
+                sort,
             } => {
-                let index = page * self.layout.rows_per_page() + row;
-                if let Some(chapter) = chapters.get(index).cloned() {
+                // Map the tapped row through the current display order back to
+                // the chapter's index in the (source-order) Vec.
+                let nums: Vec<Option<f32>> = chapters.iter().map(|c| c.num).collect();
+                let order = chapter_display_order(&nums, sort);
+                let displayed = page * self.layout.rows_per_page() + row;
+                if let Some(chapter) = order.get(displayed).and_then(|&i| chapters.get(i)).cloned()
+                {
                     // Tap on the ⋮ button opens the read-status menu; the rest of
                     // the row opens/downloads the chapter.
                     if chapter_kebab_tapped(&self.layout, x) {
@@ -1180,9 +1335,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
-            Screen::DownloadedChapters { entries, page, .. } => {
-                let index = page * self.layout.rows_per_page() + row;
-                if let Some(entry) = entries.get(index) {
+            Screen::DownloadedChapters {
+                entries,
+                page,
+                sort,
+                ..
+            } => {
+                let nums: Vec<Option<f32>> = entries
+                    .iter()
+                    .map(|e| label_chapter_num(&chapter_label(&e.relative_path)))
+                    .collect();
+                let order = chapter_display_order(&nums, sort);
+                let displayed = page * self.layout.rows_per_page() + row;
+                if let Some(&index) = order.get(displayed) {
+                    let entry = &entries[index];
                     if chapter_kebab_tapped(&self.layout, x) {
                         let title = chapter_label(&entry.relative_path);
                         let key = Some(entry.relative_path.clone());
@@ -1888,6 +2054,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             manga: manga.clone(),
             chapters,
             page: 0,
+            sort: ChapterSort::default(),
         })
     }
 
@@ -3101,6 +3268,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 manga,
                 chapters,
                 page,
+                sort,
             } => {
                 // A download icon marks what's on disk; a book icon marks
                 // what's been read (finished). Downloaded chapters open
@@ -3110,10 +3278,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Some((dir, series)) => (dir.to_string(), series.downloaded.clone()),
                     None => (String::new(), Default::default()),
                 };
+                let nums: Vec<Option<f32>> = chapters.iter().map(|c| c.num).collect();
+                let order = chapter_display_order(&nums, *sort);
                 let rows: Vec<(String, bool, bool)> = self.with_progress(|_, store| {
-                    paged(chapters, *page, per_page)
+                    order
                         .iter()
-                        .map(|c| {
+                        .skip(*page * per_page)
+                        .take(per_page)
+                        .map(|&i| {
+                            let c = &chapters[i];
                             let on_disk = downloaded.contains_key(&c.id);
                             let key = downloaded.get(&c.id).map(|file| format!("{dir}/{file}"));
                             let finished = key
@@ -3126,19 +3299,35 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         })
                         .collect()
                 });
-                compose_chapter_list(l, &manga.title, &rows, *page, l.page_count(chapters.len()))
+                compose_chapter_list(
+                    l,
+                    &manga.title,
+                    &rows,
+                    *page,
+                    l.page_count(chapters.len()),
+                    *sort,
+                )
             }
             Screen::DownloadedChapters {
                 title,
                 entries,
                 page,
+                sort,
             } => {
                 // Everything here is on disk by definition; the book icon still
                 // marks what's been read (finished).
+                let nums: Vec<Option<f32>> = entries
+                    .iter()
+                    .map(|e| label_chapter_num(&chapter_label(&e.relative_path)))
+                    .collect();
+                let order = chapter_display_order(&nums, *sort);
                 let rows: Vec<(String, bool, bool)> = self.with_progress(|_, store| {
-                    paged(entries, *page, per_page)
+                    order
                         .iter()
-                        .map(|e| {
+                        .skip(*page * per_page)
+                        .take(per_page)
+                        .map(|&i| {
+                            let e = &entries[i];
                             let finished =
                                 store.get(&e.relative_path).is_some_and(|p| p.is_finished());
                             let is_last = store.last_opened(series_key_of(&e.relative_path))
@@ -3151,7 +3340,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         })
                         .collect()
                 });
-                compose_chapter_list(l, title, &rows, *page, l.page_count(entries.len()))
+                compose_chapter_list(l, title, &rows, *page, l.page_count(entries.len()), *sort)
             }
             Screen::UpdatePrompt { body } => compose_message(l, "Update available", body),
             Screen::Message { title, body } => compose_message(l, title, body),
@@ -3574,6 +3763,20 @@ fn compose_chrome_opts(
     page_count: usize,
     show_back: bool,
 ) -> GrayPage {
+    compose_chrome_reserved(l, title, page, page_count, show_back, 0)
+}
+
+/// The shared chrome, with `right_reserved` pixels held free at the right of
+/// the title bar (so a chapter list can park its sort button there without the
+/// page indicator overlapping it).
+fn compose_chrome_reserved(
+    l: &UiLayout,
+    title: &str,
+    page: usize,
+    page_count: usize,
+    show_back: bool,
+    right_reserved: u32,
+) -> GrayPage {
     let mut canvas = GrayPage::new_white(l.width, l.height);
     let text_y = |top: u32, h: u32| top + h.saturating_sub(l.text_px as u32 + 4) / 2;
 
@@ -3592,7 +3795,7 @@ fn compose_chrome_opts(
         let w = measure_text(l.text_px, &label, false).min(l.width / 3);
         draw_text(
             &mut canvas,
-            l.width.saturating_sub(w + l.pad),
+            l.width.saturating_sub(w + l.pad + right_reserved),
             text_y(0, l.title_h),
             l.text_px,
             &label,
@@ -3602,38 +3805,28 @@ fn compose_chrome_opts(
     }
     hline(&mut canvas, l.title_h - 1, 0x55);
 
-    // Bottom navigation bar: [Back] [Prev] [Next] thirds.
+    // Bottom navigation bar. A single-page list shows just [< Back]; a
+    // multi-page one splits into [< Back][First][Prev][Next][Last] (see
+    // [`UiLayout::nav_buttons`]).
     hline(&mut canvas, l.nav_top(), 0x55);
-    let third = (l.width / 3).max(1);
     let nav_y = text_y(l.nav_top(), l.nav_h);
-    if show_back {
+    for (target, bx, bw) in l.nav_buttons(page_count > 1) {
+        let label = match target {
+            TapTarget::Back if show_back => "< Back",
+            TapTarget::Back => continue,
+            TapTarget::First => "First",
+            TapTarget::Prev => "Prev",
+            TapTarget::Next => "Next",
+            TapTarget::Last => "Last",
+            _ => continue,
+        };
         draw_text(
             &mut canvas,
-            l.pad,
+            bx + l.pad,
             nav_y,
             l.text_px,
-            "< Back",
-            third.saturating_sub(l.pad),
-            false,
-        );
-    }
-    if page_count > 1 {
-        draw_text(
-            &mut canvas,
-            third + l.pad,
-            nav_y,
-            l.text_px,
-            "Prev",
-            third.saturating_sub(l.pad),
-            false,
-        );
-        draw_text(
-            &mut canvas,
-            2 * third + l.pad,
-            nav_y,
-            l.text_px,
-            "Next",
-            third.saturating_sub(l.pad),
+            label,
+            bw.saturating_sub(2 * l.pad),
             false,
         );
     }
@@ -3688,8 +3881,20 @@ fn compose_chapter_list(
     rows: &[(String, bool, bool)],
     page: usize,
     page_count: usize,
+    sort: ChapterSort,
 ) -> GrayPage {
-    let mut canvas = compose_chrome_opts(l, title, page, page_count, true);
+    let sort_w = sort_button_width(l);
+    let mut canvas = compose_chrome_reserved(l, title, page, page_count, true, sort_w + l.pad);
+    // The sort button lives at the right edge of the title bar.
+    draw_text(
+        &mut canvas,
+        sort_button_x(l) + l.pad,
+        l.title_h.saturating_sub(l.text_px as u32 + 4) / 2,
+        l.text_px,
+        sort.label(),
+        sort_w.saturating_sub(l.pad),
+        false,
+    );
     let icon = (l.row_h as f32 * 0.5) as u32;
     let gap = 5u32;
     let gutter = 2 * icon + 2 * gap;
@@ -3722,6 +3927,59 @@ fn compose_chapter_list(
         }
     }
     canvas
+}
+
+/// Width reserved for the title-bar sort button: the widest label plus
+/// padding on each side. Same value for draw and hit-test.
+fn sort_button_width(l: &UiLayout) -> u32 {
+    let widest = [
+        ChapterSort::Source,
+        ChapterSort::Ascending,
+        ChapterSort::Descending,
+    ]
+    .iter()
+    .map(|s| measure_text(l.text_px, s.label(), false))
+    .max()
+    .unwrap_or(0);
+    widest + 2 * l.pad
+}
+
+/// The left x of the title-bar sort button (it runs to the right edge).
+fn sort_button_x(l: &UiLayout) -> u32 {
+    l.width.saturating_sub(sort_button_width(l) + l.pad)
+}
+
+/// Best-effort chapter number parsed from a downloaded file's label, used only
+/// for sorting. Prefers the number right after a "chapter"/"ch"/"#" marker
+/// (so "Vol.01 Ch.012" sorts by 12, not the volume), else the first number in
+/// the string. `None` when there's nothing numeric to go on.
+fn label_chapter_num(label: &str) -> Option<f32> {
+    let lower = label.to_ascii_lowercase();
+    for marker in ["chapter", "ch", "#"] {
+        if let Some(pos) = lower.find(marker) {
+            if let Some(n) = first_number(&lower[pos + marker.len()..]) {
+                return Some(n);
+            }
+        }
+    }
+    first_number(&lower)
+}
+
+/// The first decimal number in `s` (e.g. "012.5" → 12.5), or `None`.
+fn first_number(s: &str) -> Option<f32> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            return s[start..i].trim_end_matches('.').parse().ok();
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The x where a chapter row's ⋮ (kebab) read-status button sits — shared by
