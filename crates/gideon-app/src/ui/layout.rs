@@ -13,10 +13,14 @@ pub enum TapTarget {
     Row(usize),
     /// Bottom bar: \[Back\].
     Back,
+    /// Bottom bar: \[First\] — jump to the first page.
+    First,
     /// Bottom bar: \[Prev\].
     Prev,
     /// Bottom bar: \[Next\].
     Next,
+    /// Bottom bar: \[Last\] — jump to the last page.
+    Last,
 }
 
 /// Reader tap zones: thirds of the screen width.
@@ -106,15 +110,18 @@ impl UiLayout {
     }
 
     /// Resolve a tap into a [`TapTarget`].
+    ///
+    /// The bottom bar is five equal zones: \[Back\] \[First\] \[Prev\] \[Next\]
+    /// \[Last\]. First/Last jump to the first/last page; they're inert (and
+    /// undrawn) on single-page screens.
     pub fn tap_target(&self, x: u32, y: u32) -> TapTarget {
         if y >= self.nav_top() {
-            let third = (self.width / 3).max(1);
-            if x < third {
-                TapTarget::Back
-            } else if x < 2 * third {
-                TapTarget::Prev
-            } else {
-                TapTarget::Next
+            match (x * 5 / self.width.max(1)).min(4) {
+                0 => TapTarget::Back,
+                1 => TapTarget::First,
+                2 => TapTarget::Prev,
+                3 => TapTarget::Next,
+                _ => TapTarget::Last,
             }
         } else if y >= self.content_top() {
             TapTarget::Row(((y - self.content_top()) / self.row_h) as usize)
@@ -263,14 +270,15 @@ mod tests {
         assert_eq!(l.tap_target(500, 88), TapTarget::Row(0));
         assert_eq!(l.tap_target(500, 175), TapTarget::Row(0));
         assert_eq!(l.tap_target(500, 176), TapTarget::Row(1));
-        // Nav bar thirds: width 1072 → third = 357.
+        // Nav bar fifths: width 1072 → fifth ≈ 214.
         let nav_y = l.nav_top();
         assert_eq!(l.tap_target(0, nav_y), TapTarget::Back);
-        assert_eq!(l.tap_target(356, nav_y), TapTarget::Back);
-        assert_eq!(l.tap_target(357, nav_y), TapTarget::Prev);
-        assert_eq!(l.tap_target(713, nav_y), TapTarget::Prev);
-        assert_eq!(l.tap_target(714, nav_y), TapTarget::Next);
-        assert_eq!(l.tap_target(1071, 1447), TapTarget::Next);
+        assert_eq!(l.tap_target(213, nav_y), TapTarget::Back);
+        assert_eq!(l.tap_target(215, nav_y), TapTarget::First);
+        assert_eq!(l.tap_target(500, nav_y), TapTarget::Prev);
+        assert_eq!(l.tap_target(700, nav_y), TapTarget::Next);
+        assert_eq!(l.tap_target(900, nav_y), TapTarget::Last);
+        assert_eq!(l.tap_target(1071, 1447), TapTarget::Last);
         // Last pixel above the nav bar is still a row.
         assert!(matches!(l.tap_target(500, nav_y - 1), TapTarget::Row(_)));
     }
