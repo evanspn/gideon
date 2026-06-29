@@ -2456,27 +2456,119 @@ fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
     );
 }
 
-#[test]
-fn book_menu_opens_downloaded_chapters_offline() {
-    let dir = tempfile::tempdir().unwrap();
-    let lib = dir.path().join("Manga");
+/// A source-linked series with two downloaded chapters, recorded in the index
+/// so that — when online — "All chapters" would fetch the source list.
+fn offline_fixture(lib: &Path) {
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
     make_cbz(&lib.join("Series/vol2.cbz"), 2);
+    let mut index = gideon_core::SeriesIndex::load(lib);
+    index.record(
+        "Series",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Series".into(),
+            ..Default::default()
+        },
+    );
+    index.record_download("Series", "c1", "vol1.cbz");
+    index.record_download("Series", "c2", "vol2.cbz");
+    index.save(lib).unwrap();
+}
+
+/// A source-linked gateway whose chapter list, if ever consulted, is clearly
+/// distinguishable from the on-disk files — and whose download is unconfigured,
+/// so any download attempt errors. Lets a test prove the source was never
+/// touched.
+fn source_gateway() -> FakeGateway {
+    FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c99".into(),
+            num: Some(99.0),
+            title: Some("from the network".into()),
+            lang: None,
+        }],
+        ..FakeGateway::default()
+    }
+}
+
+/// End-to-end: with Wi-Fi down, opening a *source-linked* series swaps straight
+/// to its downloaded chapters — no connect attempt, no source fetch, no
+/// download — and reading one records progress. Driven through the real event
+/// loop with an injected offline probe.
+#[test]
+fn offline_series_swaps_to_downloads_and_reads_without_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    offline_fixture(&lib);
 
     let cell = tap_shelf_cell0();
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Library → long press → BookMenu, then row 1 = "Downloaded chapters".
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
-    let mut app = app(&lib, FakeGateway::default(), events);
+    // Offline, Home shows the "reconnect" row at row 0, so Library is row 1.
+    let events = vec![
+        tap_row(1),                  // Home -> Library
+        UiEvent::LongPress { x, y }, // card -> BookMenu
+        tap_row(0),                  // "All chapters" -> downloads (offline)
+        tap_row(0),                  // first downloaded chapter -> reader
+        reader_tap_next(),           // turn a page
+        reader_tap_back(),           // back to the list
+    ];
+    let mut app = app(&lib, source_gateway(), events).with_online_probe(Box::new(|| false));
     app.run().unwrap();
 
+    // We're on the LOCAL downloaded list (not the source ChapterList), and the
+    // chapters came from disk, not the gateway's "from the network" sentinel.
     let Screen::DownloadedChapters { entries, .. } = app.screen() else {
-        panic!("row 1 opens the offline downloaded-chapters list");
+        panic!("offline, the series opens straight to its downloaded chapters");
     };
     let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
     assert_eq!(rel, vec!["Series/vol1.cbz", "Series/vol2.cbz"]);
+
+    // Reading a downloaded chapter offline recorded progress — no download path
+    // was hit (the gateway has no download configured, so it would have errored).
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Series/vol1.cbz").is_some(),
+        "reading a downloaded chapter offline recorded progress"
+    );
+}
+
+/// The mirror of the above: when online, the same source-linked series opens
+/// the source chapter list (so you can pull chapters you don't have yet).
+#[test]
+fn online_series_opens_the_source_chapter_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    offline_fixture(&lib);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    // Online, Home has no reconnect row, so Library is row 0.
+    let events = vec![
+        tap_row(0),                  // Home -> Library
+        UiEvent::LongPress { x, y }, // card -> BookMenu
+        tap_row(0),                  // "All chapters" -> source list (online)
+    ];
+    let mut app = app(&lib, source_gateway(), events).with_online_probe(Box::new(|| true));
+    app.run().unwrap();
+
+    let Screen::ChapterList { chapters, .. } = app.screen() else {
+        panic!("online, the series opens the source chapter list");
+    };
+    assert_eq!(
+        chapters.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["c99"],
+        "the chapters came from the source, not local files"
+    );
 }
 
 #[test]
@@ -3528,9 +3620,8 @@ fn book_menu_deletes_a_chapter() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Row 3 is "Delete this chapter" (rows 1/2 are "Downloaded chapters" and
-    // "Mark as unread").
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(3)];
+    // Row 2 is "Delete this chapter" (row 1 is "Mark as unread").
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -3557,9 +3648,8 @@ fn book_menu_deletes_the_whole_series() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Row 4 is "Delete whole series" (after "Downloaded chapters" and
-    // "Mark as unread" pushed it down).
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(4)];
+    // Row 3 is "Delete whole series" (shifted by the new "Mark as unread" row).
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(3)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -3573,7 +3663,7 @@ fn book_menu_deletes_the_whole_series() {
 #[test]
 fn book_menu_marks_the_latest_read_chapter_unread() {
     // "I clicked the wrong thing" undo: vol1 was read (and finished); the menu's
-    // "Mark as unread" (row 2) forgets vol1's progress, leaving vol2 untouched.
+    // "Mark as unread" (row 1) forgets vol1's progress, leaving vol2 untouched.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
@@ -3593,8 +3683,8 @@ fn book_menu_marks_the_latest_read_chapter_unread() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Long press → BookMenu, then row 2 = "Mark as unread".
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    // Long press → BookMenu, then row 1 = "Mark as unread".
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 

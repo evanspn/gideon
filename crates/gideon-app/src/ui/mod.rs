@@ -477,6 +477,10 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// uses the same offset that was drawn, even if connectivity flips between
     /// the paint and the tap.
     home_offline: bool,
+    /// Connectivity probe. `None` uses the real
+    /// [`gideon_device::network::is_online`]; tests inject a closure so the
+    /// whole UI can be driven through its offline state deterministically.
+    online_probe: Option<Box<dyn Fn() -> bool>>,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
     /// Whether the reading orientation is locked. Locked: the accelerometer
@@ -556,6 +560,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             last_wifi_fail: None,
             wifi_auto_connect: true,
             home_offline: false,
+            online_probe: None,
             reader_rotation: 0,
             rotation_locked: true,
             sleeper: None,
@@ -641,6 +646,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         self.settings_dir = Some(dir);
         self
+    }
+
+    /// Override the connectivity probe (tests drive the offline UI through
+    /// this; production leaves it `None` and uses the real Wi-Fi check).
+    #[cfg(test)]
+    pub(crate) fn with_online_probe(mut self, probe: Box<dyn Fn() -> bool>) -> Self {
+        self.online_probe = Some(probe);
+        self
+    }
+
+    /// Whether the device has a usable connection — the single point the UI
+    /// consults to decide online vs. offline behavior, so it swaps states
+    /// consistently. Defers to the injected probe when present.
+    fn is_online(&self) -> bool {
+        match &self.online_probe {
+            Some(probe) => probe(),
+            None => gideon_device::network::is_online(),
+        }
     }
 
     /// Install the battery probe (sysfs capacity on hardware): the Home
@@ -985,29 +1008,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// when the series is linked, otherwise the search keyboard prefilled
     /// with the series name so one download can re-link it.
     fn open_series_chapters(&mut self, series_dir: &str) -> Result<()> {
-        let index = gideon_core::SeriesIndex::load(&self.library_dir);
-        // With a recorded source and a live connection, fetch the full chapter
-        // list (so you can grab chapters you don't have yet). Otherwise — no
-        // source link, offline, or the source errors — fall back to what's
-        // already on disk so reading downloaded chapters never needs the network.
-        if let Some(origin) = index.get(series_dir) {
-            let source = SourceEntry {
-                id: origin.source_id.clone(),
-                name: origin.source_name.clone(),
-            };
-            let manga = MangaEntry {
-                id: origin.manga_id.clone(),
-                title: origin.manga_title.clone(),
-                cover_url: origin.cover_url.clone(),
-            };
-            self.ensure_online()?;
-            if gideon_device::network::is_online() {
-                match self.try_open_chapter_list(&source, &manga) {
-                    Ok(()) => return Ok(()),
-                    // Source reachable check passed but the fetch failed — don't
-                    // strand the user; show their downloads instead.
-                    Err(_) => return self.open_downloaded_chapters(series_dir),
+        // The behavior swaps on connectivity, automatically:
+        //
+        // - Online with a recorded source: fetch the full chapter list so you
+        //   can grab chapters you don't have yet.
+        // - Offline (or no source link, or the fetch fails): show what's on
+        //   disk. Crucially we do NOT try to bring Wi-Fi up here — viewing your
+        //   downloads must never be blocked by the UI attempting to connect.
+        if self.is_online() {
+            let index = gideon_core::SeriesIndex::load(&self.library_dir);
+            if let Some(origin) = index.get(series_dir) {
+                let source = SourceEntry {
+                    id: origin.source_id.clone(),
+                    name: origin.source_name.clone(),
+                };
+                let manga = MangaEntry {
+                    id: origin.manga_id.clone(),
+                    title: origin.manga_title.clone(),
+                    cover_url: origin.cover_url.clone(),
+                };
+                // The `origin` borrow of `index` ends with these clones.
+                if self.try_open_chapter_list(&source, &manga).is_ok() {
+                    return Ok(());
                 }
+                // Source reachable but the fetch failed — fall through to the
+                // downloaded list rather than stranding the user.
             }
         }
         self.open_downloaded_chapters(series_dir)
@@ -1338,12 +1363,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 match row {
                     0 => self.open_series_chapters(&series_dir)?,
                     1 => {
-                        // View the series' downloaded chapters straight from
-                        // disk — no source fetch and no Wi-Fi wait, so it works
-                        // instantly offline.
-                        self.open_downloaded_chapters(&series_dir)?
-                    }
-                    2 => {
                         // Mark as unread: forget the latest-read chapter's
                         // progress (an "I tapped the wrong thing" undo). The
                         // card's resume point falls back to the prior read.
@@ -1354,7 +1373,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                         self.pop()?;
                     }
-                    3 => {
+                    2 => {
                         // Delete this chapter's file; drop it from the
                         // series' download history.
                         std::fs::remove_file(&entry.path)
@@ -1376,7 +1395,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                         self.refresh_library_after_delete()?;
                     }
-                    4 => {
+                    3 => {
                         // Delete the whole series directory.
                         let target = entry
                             .path
@@ -3146,7 +3165,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Refresh Home's offline state once per paint (one is_online probe),
         // so the "reconnect" row and the tap dispatch agree on the offset.
         if matches!(self.stack.last(), Some(Screen::Home)) {
-            self.home_offline = !gideon_device::network::is_online();
+            self.home_offline = !self.is_online();
         }
         // Color shelf: when a visible Library card has real cover art,
         // compose in RGB so Kaleido panels show it in color. The caller's
@@ -3267,8 +3286,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     None => "Mark as unread".to_string(),
                 };
                 let rows = vec![
-                    ("All chapters (from source)".to_string(), true),
-                    ("Downloaded chapters (offline)".to_string(), true),
+                    ("All chapters".to_string(), true),
                     (unread, read_key.is_some()),
                     ("Delete this chapter".to_string(), true),
                     ("Delete whole series".to_string(), true),
@@ -3311,7 +3329,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::PowerMenu => {
                 // Wi-Fi networks at the top — scan/connect without digging into
                 // Settings; the live status hints at what tapping does.
-                let wifi = if gideon_device::network::is_online() {
+                let wifi = if self.is_online() {
                     "Wi-Fi: connected (tap to manage)"
                 } else {
                     "Wi-Fi: off (tap to scan)"
