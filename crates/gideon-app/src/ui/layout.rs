@@ -13,14 +13,16 @@ pub enum TapTarget {
     Row(usize),
     /// Bottom bar: \[Back\].
     Back,
-    /// Bottom bar: \[First\] — jump to the first page.
+    /// Bottom bar: \[« First\] — jump to the first page.
     First,
     /// Bottom bar: \[Prev\].
     Prev,
     /// Bottom bar: \[Next\].
     Next,
-    /// Bottom bar: \[Last\] — jump to the last page.
+    /// Bottom bar: \[Last »\] — jump to the last page.
     Last,
+    /// An inert region (e.g. the empty nav bar of a single-page list).
+    None,
 }
 
 /// Reader tap zones: thirds of the screen width.
@@ -109,20 +111,54 @@ impl UiLayout {
         self.content_top() + i as u32 * self.row_h
     }
 
-    /// Resolve a tap into a [`TapTarget`].
+    /// The bottom navigation bar's buttons, left to right, as
+    /// `(target, x, width)` — one source of truth for both drawing and
+    /// hit-testing.
     ///
-    /// The bottom bar is five equal zones: \[Back\] \[First\] \[Prev\] \[Next\]
-    /// \[Last\]. First/Last jump to the first/last page; they're inert (and
-    /// undrawn) on single-page screens.
-    pub fn tap_target(&self, x: u32, y: u32) -> TapTarget {
+    /// A single-page list shows only `[< Back]` in the left third (the rest
+    /// of the bar is inert). A multi-page list (`paged`) splits the bar into
+    /// five equal zones — `[< Back][« First][‹ Prev][Next ›][Last »]` — so a
+    /// 600-chapter manga is one tap from either end instead of dozens.
+    pub fn nav_buttons(&self, paged: bool) -> Vec<(TapTarget, u32, u32)> {
+        if !paged {
+            return vec![(TapTarget::Back, 0, (self.width / 3).max(1))];
+        }
+        let zones = [
+            TapTarget::Back,
+            TapTarget::First,
+            TapTarget::Prev,
+            TapTarget::Next,
+            TapTarget::Last,
+        ];
+        let n = zones.len() as u32;
+        let unit = (self.width / n).max(1);
+        zones
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let x = i as u32 * unit;
+                // The last zone soaks up the rounding remainder.
+                let w = if i as u32 == n - 1 {
+                    self.width.saturating_sub(x)
+                } else {
+                    unit
+                };
+                (t, x, w)
+            })
+            .collect()
+    }
+
+    /// Resolve a tap into a [`TapTarget`]. `paged` says whether the current
+    /// list spans more than one page, which decides the nav-bar layout (see
+    /// [`Self::nav_buttons`]).
+    pub fn tap_target(&self, x: u32, y: u32, paged: bool) -> TapTarget {
         if y >= self.nav_top() {
-            match (x * 5 / self.width.max(1)).min(4) {
-                0 => TapTarget::Back,
-                1 => TapTarget::First,
-                2 => TapTarget::Prev,
-                3 => TapTarget::Next,
-                _ => TapTarget::Last,
+            for (target, bx, bw) in self.nav_buttons(paged) {
+                if x >= bx && x < bx + bw {
+                    return target;
+                }
             }
+            TapTarget::None
         } else if y >= self.content_top() {
             TapTarget::Row(((y - self.content_top()) / self.row_h) as usize)
         } else {
@@ -264,23 +300,60 @@ mod tests {
     fn tap_zones_resolve_exactly() {
         let l = UiLayout::new(1072, 1448);
         // Title bar.
-        assert_eq!(l.tap_target(500, 0), TapTarget::Title);
-        assert_eq!(l.tap_target(500, 87), TapTarget::Title);
+        assert_eq!(l.tap_target(500, 0, true), TapTarget::Title);
+        assert_eq!(l.tap_target(500, 87, true), TapTarget::Title);
         // First row starts at 88.
-        assert_eq!(l.tap_target(500, 88), TapTarget::Row(0));
-        assert_eq!(l.tap_target(500, 175), TapTarget::Row(0));
-        assert_eq!(l.tap_target(500, 176), TapTarget::Row(1));
-        // Nav bar fifths: width 1072 → fifth ≈ 214.
-        let nav_y = l.nav_top();
-        assert_eq!(l.tap_target(0, nav_y), TapTarget::Back);
-        assert_eq!(l.tap_target(213, nav_y), TapTarget::Back);
-        assert_eq!(l.tap_target(215, nav_y), TapTarget::First);
-        assert_eq!(l.tap_target(500, nav_y), TapTarget::Prev);
-        assert_eq!(l.tap_target(700, nav_y), TapTarget::Next);
-        assert_eq!(l.tap_target(900, nav_y), TapTarget::Last);
-        assert_eq!(l.tap_target(1071, 1447), TapTarget::Last);
+        assert_eq!(l.tap_target(500, 88, true), TapTarget::Row(0));
+        assert_eq!(l.tap_target(500, 175, true), TapTarget::Row(0));
+        assert_eq!(l.tap_target(500, 176, true), TapTarget::Row(1));
         // Last pixel above the nav bar is still a row.
-        assert!(matches!(l.tap_target(500, nav_y - 1), TapTarget::Row(_)));
+        assert!(matches!(
+            l.tap_target(500, nav_y(&l) - 1, true),
+            TapTarget::Row(_)
+        ));
+    }
+
+    fn nav_y(l: &UiLayout) -> u32 {
+        l.nav_top()
+    }
+
+    #[test]
+    fn single_page_nav_is_back_then_inert() {
+        let l = UiLayout::new(1072, 1448);
+        let y = l.nav_top();
+        // Only the left third is Back; the rest of the bar does nothing.
+        assert_eq!(l.tap_target(0, y, false), TapTarget::Back);
+        assert_eq!(l.tap_target(356, y, false), TapTarget::Back);
+        assert_eq!(l.tap_target(357, y, false), TapTarget::None);
+        assert_eq!(l.tap_target(1071, y, false), TapTarget::None);
+    }
+
+    #[test]
+    fn multi_page_nav_has_five_zones() {
+        let l = UiLayout::new(1072, 1448);
+        let y = l.nav_top();
+        // width 1072 → five 214px zones (the last takes the remainder).
+        assert_eq!(l.tap_target(0, y, true), TapTarget::Back);
+        assert_eq!(l.tap_target(213, y, true), TapTarget::Back);
+        assert_eq!(l.tap_target(214, y, true), TapTarget::First);
+        assert_eq!(l.tap_target(428, y, true), TapTarget::Prev);
+        assert_eq!(l.tap_target(642, y, true), TapTarget::Next);
+        assert_eq!(l.tap_target(856, y, true), TapTarget::Last);
+        assert_eq!(l.tap_target(1071, 1447, true), TapTarget::Last);
+    }
+
+    #[test]
+    fn nav_buttons_tile_the_bar_without_gaps() {
+        let l = UiLayout::new(1072, 1448);
+        let buttons = l.nav_buttons(true);
+        assert_eq!(buttons.len(), 5);
+        assert_eq!(buttons[0].1, 0);
+        // Contiguous: each button starts where the previous ends.
+        for pair in buttons.windows(2) {
+            assert_eq!(pair[0].1 + pair[0].2, pair[1].1);
+        }
+        let last = buttons.last().unwrap();
+        assert_eq!(last.1 + last.2, l.width);
     }
 
     #[test]
