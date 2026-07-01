@@ -7,7 +7,7 @@
 //!
 //! Screens: Home → Library (cover shelf → Reader) and Home → Sources →
 //! Listings → MangaList → ChapterList → download → Reader. Navigation is a
-//! stack; the bottom bar is [Back] [Prev] [Next]. Screen changes use a full
+//! stack; the bottom bar is [Back] [First] [Prev] [Next] [Last]. Screen changes use a full
 //! e-ink refresh, in-screen updates (pagination, status) partial ones.
 //! Errors never panic the UI: they land on a message screen with Back.
 
@@ -66,6 +66,13 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
     2 * 1024 * 1024 * 1024,
     5 * 1024 * 1024 * 1024,
 ];
+/// Index of the trailing "Storage" row on the Settings screen — appended after
+/// the nine cycling rows ([`settings_rows`]), it opens the storage detail
+/// screen instead of cycling a value.
+const SETTINGS_STORAGE_ROW: usize = 9;
+/// Row of the "Free up space now" action on the Storage screen (after three
+/// read-only info rows). Shared by the renderer and the tap handler.
+const STORAGE_FREE_ROW: usize = 3;
 
 /// One row on the Sources screen.
 #[derive(Debug, Clone)]
@@ -345,13 +352,25 @@ enum Screen {
         page: usize,
         sort: ChapterSort,
     },
-    /// Per-chapter read-status menu, opened from the ⋮ button on a chapter row.
-    /// `key` is the chapter's progress key (its on-disk path); `None` when the
-    /// chapter isn't downloaded, so there's nothing to mark yet.
+    /// Per-chapter action menu, opened from the ⋮ button on a chapter row.
+    /// `key` is the chapter's progress key (its on-disk path) when downloaded —
+    /// `None` means it isn't on disk yet (nothing to mark/delete). `download`
+    /// carries the source context for the download actions; `None` when the
+    /// menu was opened from the offline downloaded-chapters list (no source).
     ChapterMenu {
         title: String,
         key: Option<String>,
         finished: bool,
+        download: Option<DownloadContext>,
+    },
+    /// "Download from here…" count picker, opened from a chapter's ⋮ menu. Each
+    /// row queues that many chapters — from `index` forward — onto the
+    /// background downloader so they're ready offline.
+    DownloadAheadMenu {
+        source: SourceEntry,
+        manga: MangaEntry,
+        chapters: Vec<ChapterEntry>,
+        index: usize,
     },
     /// Context menu for a library book (long press on its card).
     BookMenu {
@@ -376,6 +395,9 @@ enum Screen {
     /// Device-global settings (NOT per profile): each tap cycles a value
     /// and saves settings.json immediately.
     Settings,
+    /// Storage usage detail, opened from Settings: how much downloaded content
+    /// is on disk against the limit, plus a manual "free up space now" action.
+    Storage,
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
     /// Wi-Fi networks from a scan: tap one to connect (or enter a password).
@@ -518,6 +540,10 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// uses the same offset that was drawn, even if connectivity flips between
     /// the paint and the tap.
     home_offline: bool,
+    /// Connectivity probe. `None` uses the real
+    /// [`gideon_device::network::is_online`]; tests inject a closure so the
+    /// whole UI can be driven through its offline state deterministically.
+    online_probe: Option<Box<dyn Fn() -> bool>>,
     /// Reader rotation in degrees (from settings.json `reader_rotation`).
     reader_rotation: u32,
     /// Whether the reading orientation is locked. Locked: the accelerometer
@@ -597,6 +623,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             last_wifi_fail: None,
             wifi_auto_connect: true,
             home_offline: false,
+            online_probe: None,
             reader_rotation: 0,
             rotation_locked: true,
             sleeper: None,
@@ -682,6 +709,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         self.settings_dir = Some(dir);
         self
+    }
+
+    /// Override the connectivity probe (tests drive the offline UI through
+    /// this; production leaves it `None` and uses the real Wi-Fi check).
+    #[cfg(test)]
+    pub(crate) fn with_online_probe(mut self, probe: Box<dyn Fn() -> bool>) -> Self {
+        self.online_probe = Some(probe);
+        self
+    }
+
+    /// Whether the device has a usable connection — the single point the UI
+    /// consults to decide online vs. offline behavior, so it swaps states
+    /// consistently. Defers to the injected probe when present.
+    fn is_online(&self) -> bool {
+        match &self.online_probe {
+            Some(probe) => probe(),
+            None => gideon_device::network::is_online(),
+        }
     }
 
     /// Install the battery probe (sysfs capacity on hardware): the Home
@@ -936,11 +981,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             TapTarget::Prev => {
-                self.flip_page(-1)?;
+                self.move_page(PageMove::Delta(-1))?;
                 Ok(Flow::Continue)
             }
             TapTarget::Next => {
-                self.flip_page(1)?;
+                self.move_page(PageMove::Delta(1))?;
                 Ok(Flow::Continue)
             }
             TapTarget::Last => {
@@ -1062,29 +1107,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// when the series is linked, otherwise the search keyboard prefilled
     /// with the series name so one download can re-link it.
     fn open_series_chapters(&mut self, series_dir: &str) -> Result<()> {
-        let index = gideon_core::SeriesIndex::load(&self.library_dir);
-        // With a recorded source and a live connection, fetch the full chapter
-        // list (so you can grab chapters you don't have yet). Otherwise — no
-        // source link, offline, or the source errors — fall back to what's
-        // already on disk so reading downloaded chapters never needs the network.
-        if let Some(origin) = index.get(series_dir) {
-            let source = SourceEntry {
-                id: origin.source_id.clone(),
-                name: origin.source_name.clone(),
-            };
-            let manga = MangaEntry {
-                id: origin.manga_id.clone(),
-                title: origin.manga_title.clone(),
-                cover_url: origin.cover_url.clone(),
-            };
-            self.ensure_online()?;
-            if gideon_device::network::is_online() {
-                match self.try_open_chapter_list(&source, &manga) {
-                    Ok(()) => return Ok(()),
-                    // Source reachable check passed but the fetch failed — don't
-                    // strand the user; show their downloads instead.
-                    Err(_) => return self.open_downloaded_chapters(series_dir),
+        // The behavior swaps on connectivity, automatically:
+        //
+        // - Online with a recorded source: fetch the full chapter list so you
+        //   can grab chapters you don't have yet.
+        // - Offline (or no source link, or the fetch fails): show what's on
+        //   disk. Crucially we do NOT try to bring Wi-Fi up here — viewing your
+        //   downloads must never be blocked by the UI attempting to connect.
+        if self.is_online() {
+            let index = gideon_core::SeriesIndex::load(&self.library_dir);
+            if let Some(origin) = index.get(series_dir) {
+                let source = SourceEntry {
+                    id: origin.source_id.clone(),
+                    name: origin.source_name.clone(),
+                };
+                let manga = MangaEntry {
+                    id: origin.manga_id.clone(),
+                    title: origin.manga_title.clone(),
+                    cover_url: origin.cover_url.clone(),
+                };
+                // The `origin` borrow of `index` ends with these clones.
+                if self.try_open_chapter_list(&source, &manga).is_ok() {
+                    return Ok(());
                 }
+                // Source reachable but the fetch failed — fall through to the
+                // downloaded list rather than stranding the user.
             }
         }
         self.open_downloaded_chapters(series_dir)
@@ -1321,15 +1368,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 let nums: Vec<Option<f32>> = chapters.iter().map(|c| c.num).collect();
                 let order = chapter_display_order(&nums, sort);
                 let displayed = page * self.layout.rows_per_page() + row;
-                if let Some(chapter) = order.get(displayed).and_then(|&i| chapters.get(i)).cloned()
-                {
-                    // Tap on the ⋮ button opens the read-status menu; the rest of
+                if let Some(&index) = order.get(displayed) {
+                    let chapter = chapters[index].clone();
+                    // Tap on the ⋮ button opens the chapter action menu (download
+                    // this one / from here, mark read/unread, delete); the rest of
                     // the row opens/downloads the chapter.
                     if chapter_kebab_tapped(&self.layout, x) {
                         let key = self
                             .downloaded_chapter_path(&source, &manga, &chapter.id)
                             .map(|p| progress_key(&self.library_dir, &p));
-                        return self.open_chapter_menu(chapter.label(), key);
+                        let context = DownloadContext {
+                            source: source.clone(),
+                            manga: manga.clone(),
+                            chapters: chapters.clone(),
+                            index,
+                        };
+                        return self.open_chapter_menu(chapter.label(), key, Some(context));
                     }
                     return self.download_and_read(&source, &manga, &chapter, &chapters);
                 }
@@ -1352,27 +1406,95 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     if chapter_kebab_tapped(&self.layout, x) {
                         let title = chapter_label(&entry.relative_path);
                         let key = Some(entry.relative_path.clone());
-                        return self.open_chapter_menu(title, key);
+                        return self.open_chapter_menu(title, key, None);
                     }
                     return self.read_downloaded_chain(&entries, index);
                 }
                 Ok(Flow::Continue)
             }
-            Screen::ChapterMenu { key, .. } => {
-                if let Some(key) = key {
-                    match row {
-                        0 => {
+            Screen::ChapterMenu {
+                key,
+                finished,
+                download,
+                ..
+            } => {
+                let rows = chapter_menu_rows(&download, &key, finished);
+                let action = rows.get(row).filter(|r| r.1).map(|r| r.2);
+                match action {
+                    Some(ChapterMenuAction::DownloadThis) => {
+                        let ctx = download.expect("DownloadThis only with a source link");
+                        let chapter = ctx.chapters[ctx.index].clone();
+                        self.pop()?; // back to the chapter list, then download over it
+                        let cbz = self.download_to_library(&ctx.source, &ctx.manga, &chapter)?;
+                        self.fetch_cover_if_missing(&ctx.manga, &cbz);
+                        self.input.discard_taps();
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                    Some(ChapterMenuAction::DownloadAhead) => {
+                        let ctx = download.expect("DownloadAhead only with a source link");
+                        // Replace the menu with the count picker (no extra flash).
+                        self.stack.pop();
+                        self.push(Screen::DownloadAheadMenu {
+                            source: ctx.source,
+                            manga: ctx.manga,
+                            chapters: ctx.chapters,
+                            index: ctx.index,
+                        })?;
+                    }
+                    Some(ChapterMenuAction::MarkRead) => {
+                        if let Some(key) = key {
                             self.mark_read(&key)?;
                             self.show_status(&["Marked as read."])?;
                         }
-                        1 => {
+                        self.pop()?;
+                    }
+                    Some(ChapterMenuAction::MarkUnread) => {
+                        if let Some(key) = key {
                             self.mark_unread(&key)?;
                             self.show_status(&["Marked as unread."])?;
                         }
-                        _ => {}
+                        self.pop()?;
+                    }
+                    Some(ChapterMenuAction::DeleteDownload) => {
+                        if let Some(key) = key {
+                            self.delete_download(&key)?;
+                        }
+                        self.pop()?; // back to the list, rebuilt to drop the file
+                        self.refresh_downloaded_in_place()?;
+                    }
+                    // A disabled row (e.g. the "download to track" hint) — close.
+                    None => {
+                        self.pop()?;
                     }
                 }
-                self.pop()?; // back to the chapter list (repaints the new state)
+                Ok(Flow::Continue)
+            }
+            Screen::DownloadAheadMenu {
+                source,
+                manga,
+                chapters,
+                index,
+            } => {
+                let remaining = chapters.len().saturating_sub(index);
+                let rows = download_ahead_rows(remaining);
+                if let Some((_, count)) = rows.get(row).cloned() {
+                    let queued =
+                        self.queue_batch_download(&source, &manga, &chapters, index, count)?;
+                    self.stack.pop(); // leave the picker
+                    let body = if queued == 0 {
+                        "Those chapters are already downloaded.".to_string()
+                    } else {
+                        format!(
+                            "Downloading {queued} chapter{} in the background.\n\
+                             They'll appear as they finish.",
+                            if queued == 1 { "" } else { "s" }
+                        )
+                    };
+                    self.push(Screen::Message {
+                        title: "Downloading".to_string(),
+                        body,
+                    })?;
+                }
                 Ok(Flow::Continue)
             }
             Screen::BookMenu {
@@ -1440,6 +1562,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             Screen::Settings => {
                 self.tap_setting(row)?;
+                Ok(Flow::Continue)
+            }
+            Screen::Storage => {
+                if row == STORAGE_FREE_ROW {
+                    let freed = self.enforce_storage_limit();
+                    let msg = if freed > 0 {
+                        format!("Freed {}.", gideon_core::StorageSize(freed))
+                    } else {
+                        "Already within the storage limit.".to_string()
+                    };
+                    self.show_status(&[&msg])?;
+                    self.render_current(RefreshMode::Full)?;
+                }
                 Ok(Flow::Continue)
             }
             Screen::ProfileMenu { profiles } => {
@@ -1645,6 +1780,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if row == 6 {
             return self.open_wifi();
         }
+        // The trailing storage row opens the usage detail screen.
+        if row == SETTINGS_STORAGE_ROW {
+            return self.open_storage();
+        }
         let mut settings = self.load_settings();
         match row {
             0 => {
@@ -1704,6 +1843,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             _ => return Ok(()),
         }
         self.save_settings(&settings);
+        // Lowering the storage limit should take effect now, not just on the
+        // next download — evict down to the new budget immediately.
+        if row == 1 {
+            self.enforce_storage_limit();
+        }
         self.render_current(RefreshMode::Partial)
     }
 
@@ -2166,6 +2310,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &chapter.id,
             &cbz_path,
         );
+        // Keep within the storage budget: evict the least-recently-read
+        // downloads if this one pushed us over. The just-downloaded chapter is
+        // newest, so it's never the one evicted.
+        self.enforce_storage_limit();
         Ok(cbz_path)
     }
 
@@ -2284,10 +2432,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return true;
         }
         if let Some(gateway) = self.gateway.background_clone() {
+            let storage_limit = self.load_settings().storage_size_limit.bytes();
             self.predownloader = Some(Predownloader::spawn(
                 gateway,
                 self.library_dir.clone(),
                 Arc::clone(&self.index_guard),
+                storage_limit,
             ));
             return true;
         }
@@ -2318,8 +2468,149 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 manga: manga.clone(),
                 chapter_id: chapter.id.clone(),
                 epoch,
+                persistent: false,
             });
         }
+    }
+
+    /// Download a contiguous run of chapters — `chapters[start..start+count]`,
+    /// skipping any already on disk — so they're ready offline. Returns how many
+    /// were actually queued/fetched.
+    ///
+    /// The normal path queues them onto the background worker as **persistent**
+    /// jobs: a deliberate "download these" must survive leaving the manga (unlike
+    /// the auto look-ahead, which is abandoned when you move on). If the gateway
+    /// has no background worker (some tests), it falls back to a foreground
+    /// download so an explicit request never silently does nothing.
+    fn queue_batch_download(
+        &mut self,
+        source: &SourceEntry,
+        manga: &MangaEntry,
+        chapters: &[ChapterEntry],
+        start: usize,
+        count: usize,
+    ) -> Result<usize> {
+        let end = (start + count).min(chapters.len());
+        let targets: Vec<ChapterEntry> = chapters
+            .get(start..end)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|c| self.downloaded_chapter_path(source, manga, &c.id).is_none())
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        // Bring Wi-Fi up if needed so the worker has a connection to fetch over.
+        self.ensure_online()?;
+        if self.ensure_predownloader() {
+            let worker = self.predownloader.as_mut().expect("just ensured");
+            let epoch = worker.epoch();
+            for chapter in &targets {
+                worker.queue(PreloadJob {
+                    source: source.clone(),
+                    manga: manga.clone(),
+                    chapter_id: chapter.id.clone(),
+                    epoch,
+                    persistent: true,
+                });
+            }
+        } else {
+            // No background worker: download in the foreground with progress so
+            // the explicit request still completes.
+            for chapter in &targets {
+                let cbz = self.download_to_library(source, manga, chapter)?;
+                self.fetch_cover_if_missing(manga, &cbz);
+            }
+        }
+        Ok(targets.len())
+    }
+
+    /// Delete a downloaded chapter's CBZ and drop it from the series index, so
+    /// the storage budget frees up and the row stops showing as downloaded.
+    /// Empty series directories are removed too.
+    fn delete_download(&self, key: &str) -> Result<()> {
+        let path = self.library_dir.join(key);
+        std::fs::remove_file(&path)
+            .with_context(|| format!("couldn't delete {}", path.display()))?;
+        let series_dir = series_key_of(key);
+        if let Some(file) = path.file_name() {
+            let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+            index.forget_download(series_dir, &file.to_string_lossy());
+            let _ = index.save(&self.library_dir);
+        }
+        if let Some(parent) = path.parent() {
+            if parent != self.library_dir
+                && std::fs::read_dir(parent)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false)
+            {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        self.invalidate_progress_cache();
+        Ok(())
+    }
+
+    /// After deleting a download, rebuild the underlying downloaded-chapters
+    /// list from disk so the removed row disappears. No-op on other screens
+    /// (the source chapter list recomputes its download marks on repaint).
+    fn refresh_downloaded_in_place(&mut self) -> Result<()> {
+        let (title, sort) = match self.stack.last() {
+            Some(Screen::DownloadedChapters { title, sort, .. }) => (title.clone(), *sort),
+            _ => return Ok(()),
+        };
+        let entries = self.downloaded_entries(&title);
+        if entries.is_empty() {
+            // Nothing left in the series — drop the now-empty list.
+            self.pop()?;
+        } else if let Some(screen @ Screen::DownloadedChapters { .. }) = self.stack.last_mut() {
+            *screen = Screen::DownloadedChapters {
+                title,
+                entries,
+                page: 0,
+                sort,
+            };
+            self.render_current(RefreshMode::Full)?;
+        }
+        Ok(())
+    }
+
+    /// Downloaded-content usage: total bytes, chapter count and series count of
+    /// the index-tracked downloads currently on disk. Side-loaded files aren't
+    /// counted — the budget governs what gideon downloaded.
+    fn storage_stats(&self) -> StorageStats {
+        let _g = self.index_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let mut stats = StorageStats::default();
+        for (dir, series) in index.iter() {
+            let mut any = false;
+            for file in series.downloaded.values() {
+                if let Ok(meta) = std::fs::metadata(self.library_dir.join(dir).join(file)) {
+                    stats.used += meta.len();
+                    stats.chapters += 1;
+                    any = true;
+                }
+            }
+            if any {
+                stats.series += 1;
+            }
+        }
+        stats
+    }
+
+    /// Evict least-recently-read downloads until within the configured storage
+    /// limit. Returns bytes freed. The live counterpart to the (previously
+    /// unused) size-budget engine — wired into the download paths so the
+    /// "Storage limit" setting actually takes effect.
+    fn enforce_storage_limit(&self) -> u64 {
+        let limit = self.load_settings().storage_size_limit.bytes();
+        evict_to_storage_limit(&self.library_dir, &self.index_guard, limit)
+    }
+
+    /// Open the storage-usage screen from Settings.
+    fn open_storage(&mut self) -> Result<()> {
+        self.push(Screen::Storage)
     }
 
     // --- library shelf ---
@@ -3018,7 +3309,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Refresh Home's offline state once per paint (one is_online probe),
         // so the "reconnect" row and the tap dispatch agree on the offset.
         if matches!(self.stack.last(), Some(Screen::Home)) {
-            self.home_offline = !gideon_device::network::is_online();
+            self.home_offline = !self.is_online();
         }
         // Color shelf: when a visible Library card has real cover art,
         // compose in RGB so Kaleido panels show it in color. The caller's
@@ -3107,17 +3398,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 title,
                 key,
                 finished,
+                download,
             } => {
-                let rows = if key.is_some() {
-                    vec![
-                        ("Mark as read".to_string(), !*finished),
-                        ("Mark as unread".to_string(), *finished),
-                    ]
-                } else {
-                    // Nothing to track until it's downloaded.
-                    vec![("Download to track read status".to_string(), false)]
-                };
+                let rows: Vec<(String, bool)> = chapter_menu_rows(download, key, *finished)
+                    .into_iter()
+                    .map(|(label, enabled, _)| (label, enabled))
+                    .collect();
                 compose_list(l, title, &rows, 0, 1)
+            }
+            Screen::DownloadAheadMenu {
+                manga,
+                chapters,
+                index,
+                ..
+            } => {
+                let remaining = chapters.len().saturating_sub(*index);
+                let rows: Vec<(String, bool)> = download_ahead_rows(remaining)
+                    .into_iter()
+                    .map(|(label, _)| (label, true))
+                    .collect();
+                let title = format!("Download — {}", manga.title);
+                compose_list(l, &title, &rows, 0, 1)
             }
             Screen::BookMenu {
                 series_dir,
@@ -3129,7 +3430,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     None => "Mark as unread".to_string(),
                 };
                 let rows = vec![
-                    ("All chapters (from source)".to_string(), true),
+                    ("All chapters".to_string(), true),
                     (unread, read_key.is_some()),
                     ("Delete this chapter".to_string(), true),
                     ("Delete whole series".to_string(), true),
@@ -3153,13 +3454,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             Screen::NewProfile { name } => compose_keyboard(l, "New profile", name, "Create"),
             Screen::Settings => {
-                let rows = settings_rows(&self.load_settings());
+                let settings = self.load_settings();
+                let mut rows = settings_rows(&settings);
+                // A trailing tappable row summarizing storage use; opens the
+                // storage detail screen (SETTINGS_STORAGE_ROW).
+                let stats = self.storage_stats();
+                rows.push((
+                    format!(
+                        "Storage: {} of {} ›",
+                        gideon_core::StorageSize(stats.used),
+                        settings.storage_size_limit
+                    ),
+                    true,
+                ));
                 compose_list(l, "Settings", &rows, 0, 1)
             }
+            Screen::Storage => self.compose_storage()?,
             Screen::PowerMenu => {
                 // Wi-Fi networks at the top — scan/connect without digging into
                 // Settings; the live status hints at what tapping does.
-                let wifi = if gideon_device::network::is_online() {
+                let wifi = if self.is_online() {
                     "Wi-Fi: connected (tap to manage)"
                 } else {
                     "Wi-Fi: off (tap to scan)"
@@ -3347,6 +3661,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
+    /// The storage detail screen: how much downloaded content is on disk
+    /// against the budget, plus the manual "free up space now" action.
+    fn compose_storage(&self) -> Result<GrayPage> {
+        let l = &self.layout;
+        let settings = self.load_settings();
+        let stats = self.storage_stats();
+        let limit = settings.storage_size_limit;
+        let used = gideon_core::StorageSize(stats.used);
+        let pct = if limit.bytes() > 0 {
+            (stats.used.saturating_mul(100) / limit.bytes()).min(100)
+        } else {
+            0
+        };
+        let rows = vec![
+            (format!("Used: {used} of {limit} ({pct}%)"), false),
+            (
+                format!("{} chapters · {} series", stats.chapters, stats.series),
+                false,
+            ),
+            (
+                "Auto-cleanup removes least-recently-read first".to_string(),
+                false,
+            ),
+            ("Free up space now".to_string(), true),
+        ];
+        Ok(compose_list(l, "Storage", &rows, 0, 1))
+    }
+
     fn compose_library(&self, items: &[SeriesCard], page: usize) -> Result<GrayPage> {
         let l = &self.layout;
         let shelf = self.shelf_layout();
@@ -3466,9 +3808,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(())
     }
 
-    /// Open the per-chapter read-status menu (the ⋮ button). `key` is the
-    /// chapter's progress key when it's downloaded, else `None`.
-    fn open_chapter_menu(&mut self, title: String, key: Option<String>) -> Result<Flow> {
+    /// Open the per-chapter action menu (the ⋮ button). `key` is the chapter's
+    /// progress key when it's downloaded, else `None`; `download` carries the
+    /// source context for the download actions (`None` from the offline list).
+    fn open_chapter_menu(
+        &mut self,
+        title: String,
+        key: Option<String>,
+        download: Option<DownloadContext>,
+    ) -> Result<Flow> {
         let finished = key
             .as_ref()
             .map(|k| self.with_progress(|_, s| s.get(k).is_some_and(|p| p.is_finished())))
@@ -3477,6 +3825,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             title,
             key,
             finished,
+            download,
         })?;
         Ok(Flow::Continue)
     }
@@ -3927,6 +4276,116 @@ fn compose_chapter_list(
         }
     }
     canvas
+}
+
+/// Source context a chapter's ⋮ menu needs to drive its download actions:
+/// which source/manga it belongs to, the full chapter list and this chapter's
+/// position in it (so "download from here" can walk forward). Absent when the
+/// menu is opened from the offline downloaded-chapters list.
+#[derive(Debug, Clone)]
+struct DownloadContext {
+    source: SourceEntry,
+    manga: MangaEntry,
+    chapters: Vec<ChapterEntry>,
+    index: usize,
+}
+
+/// One row of a chapter's ⋮ menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChapterMenuAction {
+    /// Download just this chapter (foreground, with progress).
+    DownloadThis,
+    /// Open the "download from here…" count picker.
+    DownloadAhead,
+    MarkRead,
+    MarkUnread,
+    /// Delete this chapter's downloaded file.
+    DeleteDownload,
+}
+
+/// The rows of a chapter's ⋮ menu, computed identically by the renderer (for
+/// labels + enabled state) and the tap handler (to map a row to its action),
+/// so the two never disagree about what sits where.
+///
+/// Download actions appear when there's a source link; read-status and delete
+/// appear once the chapter is on disk. The offline downloaded list (no source)
+/// therefore shows only the read-status + delete rows.
+fn chapter_menu_rows(
+    download: &Option<DownloadContext>,
+    key: &Option<String>,
+    finished: bool,
+) -> Vec<(String, bool, ChapterMenuAction)> {
+    let mut rows = Vec::new();
+    let downloaded = key.is_some();
+    if let Some(ctx) = download {
+        if !downloaded {
+            rows.push((
+                "Download this chapter".to_string(),
+                true,
+                ChapterMenuAction::DownloadThis,
+            ));
+        }
+        let ahead = ctx.chapters.len().saturating_sub(ctx.index);
+        rows.push((
+            "Download from here…".to_string(),
+            ahead > 1,
+            ChapterMenuAction::DownloadAhead,
+        ));
+    }
+    if downloaded {
+        rows.push((
+            "Mark as read".to_string(),
+            !finished,
+            ChapterMenuAction::MarkRead,
+        ));
+        rows.push((
+            "Mark as unread".to_string(),
+            finished,
+            ChapterMenuAction::MarkUnread,
+        ));
+        rows.push((
+            "Delete download".to_string(),
+            true,
+            ChapterMenuAction::DeleteDownload,
+        ));
+    }
+    if rows.is_empty() {
+        // No source link and nothing on disk: there's nothing to act on yet.
+        rows.push((
+            "Download to track read status".to_string(),
+            false,
+            ChapterMenuAction::DownloadThis,
+        ));
+    }
+    rows
+}
+
+/// The chapter counts offered by the "download from here…" picker: the round
+/// batch sizes smaller than what's left, then always an "all remaining" option.
+/// `remaining` is the number of chapters from the chosen one to the end.
+fn download_ahead_counts(remaining: usize) -> Vec<usize> {
+    let mut counts: Vec<usize> = [5usize, 10, 25]
+        .into_iter()
+        .filter(|&n| n < remaining)
+        .collect();
+    counts.push(remaining); // "all remaining"
+    counts
+}
+
+/// Labelled rows for the "download from here…" picker, shared by the renderer
+/// and the tap handler so they agree on row order.
+fn download_ahead_rows(remaining: usize) -> Vec<(String, usize)> {
+    download_ahead_counts(remaining)
+        .into_iter()
+        .map(|n| {
+            let label = if n == remaining {
+                format!("Download all remaining ({n})")
+            } else {
+                format!("Download {n} chapters")
+            };
+            (label, n)
+        })
+        .collect()
 }
 
 /// Width reserved for the title-bar sort button: the widest label plus
@@ -4536,6 +4995,11 @@ struct PreloadJob {
     /// The cancellation epoch this job was queued under. The worker drops the
     /// job if the epoch has since moved on (the user left the manga).
     epoch: u64,
+    /// A deliberate "download these" request (the ⋮ menu's batch download), as
+    /// opposed to the automatic read-ahead. Persistent jobs ignore the epoch so
+    /// leaving the manga doesn't abandon a download the user explicitly asked
+    /// for.
+    persistent: bool,
 }
 
 /// Background chapter pre-downloader: a single worker thread that owns its own
@@ -4563,6 +5027,7 @@ impl Predownloader {
         gateway: Box<dyn SourceGateway + Send>,
         library_dir: PathBuf,
         index_guard: Arc<Mutex<()>>,
+        storage_limit: u64,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PreloadJob>();
         let epoch = Arc::new(AtomicU64::new(0));
@@ -4577,7 +5042,9 @@ impl Predownloader {
                 for job in rx {
                     // The user left this manga after the job was queued — drop it
                     // instead of downloading chapters they've navigated away from.
-                    if job.epoch != worker_epoch.load(Ordering::Relaxed) {
+                    // Persistent (explicitly requested) downloads ignore the epoch
+                    // and always run.
+                    if !job.persistent && job.epoch != worker_epoch.load(Ordering::Relaxed) {
                         continue;
                     }
                     if chapter_on_disk(
@@ -4597,14 +5064,18 @@ impl Predownloader {
                         &library_dir,
                         &mut noop,
                     ) {
-                        Ok(cbz) => record_chapter_in_index(
-                            &library_dir,
-                            &index_guard,
-                            &job.source,
-                            &job.manga,
-                            &job.chapter_id,
-                            &cbz,
-                        ),
+                        Ok(cbz) => {
+                            record_chapter_in_index(
+                                &library_dir,
+                                &index_guard,
+                                &job.source,
+                                &job.manga,
+                                &job.chapter_id,
+                                &cbz,
+                            );
+                            // Stay within the storage budget as the batch lands.
+                            evict_to_storage_limit(&library_dir, &index_guard, storage_limit);
+                        }
                         // Offline / source error: skip quietly and take the next
                         // job — the chapter just stays un-stocked.
                         Err(_) => continue,
@@ -4644,6 +5115,85 @@ impl Predownloader {
         self.epoch.fetch_add(1, Ordering::Relaxed);
         self.queued.clear();
     }
+}
+
+/// Downloaded-content usage for the storage screen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StorageStats {
+    used: u64,
+    chapters: usize,
+    series: usize,
+}
+
+/// Evict least-recently-read downloads until the index-tracked downloads fit
+/// within `limit_bytes`. Removes the CBZ, forgets it from the series index and
+/// prunes a now-empty series directory; returns the number of bytes freed.
+///
+/// Recency is `max(atime, mtime)` per chapter (the same LRU signal the storage
+/// engine uses): a chapter you just read or just downloaded is newest and goes
+/// last. Guarded by `index_guard` so it never races a concurrent index rewrite.
+fn evict_to_storage_limit(library_dir: &Path, guard: &Mutex<()>, limit_bytes: u64) -> u64 {
+    let _g = guard.lock().unwrap_or_else(|e| e.into_inner());
+    let mut index = gideon_core::SeriesIndex::load(library_dir);
+
+    // (series_dir, file, path, size, recency) for every tracked, on-disk chapter.
+    let mut items: Vec<(String, String, PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    for (dir, series) in index.iter() {
+        for file in series.downloaded.values() {
+            let path = library_dir.join(dir).join(file);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let atime = meta.accessed().unwrap_or(std::time::UNIX_EPOCH);
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                items.push((
+                    dir.to_string(),
+                    file.clone(),
+                    path,
+                    meta.len(),
+                    atime.max(mtime),
+                ));
+            }
+        }
+    }
+
+    let mut total: u64 = items.iter().map(|i| i.3).sum();
+    if total <= limit_bytes {
+        return 0;
+    }
+
+    items.sort_by_key(|i| i.4); // least-recently-touched first
+    let mut freed = 0u64;
+    let mut touched_dirs: Vec<String> = Vec::new();
+    for (dir, file, path, size, _) in items {
+        if total <= limit_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            index.forget_download(&dir, &file);
+            total = total.saturating_sub(size);
+            freed += size;
+            if !touched_dirs.contains(&dir) {
+                touched_dirs.push(dir);
+            }
+        }
+    }
+
+    if freed > 0 {
+        if let Err(e) = index.save(library_dir) {
+            eprintln!("gideon: couldn't save the series index after eviction: {e}");
+        }
+        // Drop series dirs left empty by eviction.
+        for dir in touched_dirs {
+            let path = library_dir.join(&dir);
+            if path != *library_dir
+                && std::fs::read_dir(&path)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false)
+            {
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+    freed
 }
 
 /// Whether a chapter's CBZ is recorded in the series index *and* present on

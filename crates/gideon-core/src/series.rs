@@ -87,6 +87,12 @@ impl SeriesIndex {
         self.series.remove(series_dir);
     }
 
+    /// Every recorded series directory and its origin, in directory order.
+    /// Used by storage accounting to size up what's been downloaded.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &SeriesRef)> {
+        self.series.iter().map(|(dir, r)| (dir.as_str(), r))
+    }
+
     /// The series downloaded from this source/manga, if any.
     pub fn find_manga(&self, source_id: &str, manga_id: &str) -> Option<(&str, &SeriesRef)> {
         self.series

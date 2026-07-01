@@ -2134,6 +2134,7 @@ fn leaving_a_manga_cancels_its_queued_pre_downloads() {
             manga: manga.clone(),
             chapter_id: id.into(),
             epoch,
+            persistent: false,
         });
     }
     app.stack.push(Screen::ChapterList {
@@ -2265,6 +2266,518 @@ fn chapter_kebab_opens_read_menu_and_toggles_read_state() {
     assert!(
         store.get(key).is_none(),
         "Mark as unread clears the chapter's progress"
+    );
+}
+
+#[test]
+fn download_ahead_counts_are_round_sizes_then_all_remaining() {
+    // Plenty left: the round sizes that fit, then an "all remaining".
+    assert_eq!(download_ahead_counts(30), vec![5, 10, 25, 30]);
+    // Fewer left than the bigger round sizes: only the ones that fit, then all.
+    assert_eq!(download_ahead_counts(8), vec![5, 8]);
+    // Just a couple left: only "all remaining".
+    assert_eq!(download_ahead_counts(2), vec![2]);
+}
+
+fn dl_context(total: usize, index: usize) -> DownloadContext {
+    DownloadContext {
+        source: SourceEntry {
+            id: "s".into(),
+            name: "S".into(),
+        },
+        manga: MangaEntry {
+            id: "m".into(),
+            title: "M".into(),
+            cover_url: None,
+        },
+        chapters: (1..=total)
+            .map(|i| ChapterEntry {
+                id: format!("c{i}"),
+                num: Some(i as f32),
+                title: None,
+                lang: None,
+            })
+            .collect(),
+        index,
+    }
+}
+
+#[test]
+fn chapter_menu_rows_adapt_to_source_link_and_download_state() {
+    let ctx = Some(dl_context(2, 0));
+    let labels = |rows: Vec<(String, bool, ChapterMenuAction)>| {
+        rows.into_iter().map(|(l, _, _)| l).collect::<Vec<_>>()
+    };
+
+    // Source link, not on disk: download actions only.
+    assert_eq!(
+        labels(chapter_menu_rows(&ctx, &None, false)),
+        vec!["Download this chapter", "Download from here…"]
+    );
+    // Source link, on disk: "download this" drops, read-status + delete appear.
+    assert_eq!(
+        labels(chapter_menu_rows(&ctx, &Some("M/c1.cbz".into()), false)),
+        vec![
+            "Download from here…",
+            "Mark as read",
+            "Mark as unread",
+            "Delete download",
+        ]
+    );
+    // No source link (offline list), on disk: just read-status + delete.
+    assert_eq!(
+        labels(chapter_menu_rows(&None, &Some("M/c1.cbz".into()), false)),
+        vec!["Mark as read", "Mark as unread", "Delete download"]
+    );
+}
+
+#[test]
+fn chapter_kebab_on_a_source_list_opens_the_download_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.stack.push(Screen::ChapterList {
+        source: SourceEntry {
+            id: "s".into(),
+            name: "S".into(),
+        },
+        manga: MangaEntry {
+            id: "m".into(),
+            title: "M".into(),
+            cover_url: None,
+        },
+        chapters: (1..=3)
+            .map(|i| ChapterEntry {
+                id: format!("c{i}"),
+                num: Some(i as f32),
+                title: None,
+                lang: None,
+            })
+            .collect(),
+        page: 0,
+        sort: ChapterSort::default(),
+    });
+
+    // ⋮ on row 0 opens the chapter action menu carrying the source context.
+    let (kx, ky) = tap_row_kebab(0);
+    app.activate(0, kx, ky).unwrap();
+    let Screen::ChapterMenu { download, key, .. } = app.screen() else {
+        panic!("the ⋮ button opens the chapter action menu");
+    };
+    assert!(
+        download.is_some(),
+        "the menu carries the source download context"
+    );
+    assert!(key.is_none(), "this chapter isn't downloaded yet");
+
+    // Row 1 ("Download from here…") opens the count picker.
+    let UiEvent::Tap { x, y } = tap_row(1) else {
+        unreachable!()
+    };
+    app.activate(1, x, y).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::DownloadAheadMenu { .. }),
+        "\"Download from here…\" opens the count picker"
+    );
+}
+
+#[test]
+fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
+    // A deliberate "download these" must keep going after you leave the manga —
+    // unlike the automatic look-ahead, which is cancelled.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<String>();
+    let gateway = BgGateway {
+        manga_dir: "Manga One".into(),
+        pages: 2,
+        delay_ms: 40, // keep the batch in flight while we leave the manga
+        started: Some(started_tx),
+    };
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(vec![]),
+        gateway,
+        lib.clone(),
+    );
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+    let chapters: Vec<ChapterEntry> = (1..=12)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: Some("en".into()),
+        })
+        .collect();
+    app.stack.push(Screen::ChapterList {
+        source: source.clone(),
+        manga: manga.clone(),
+        chapters: chapters.clone(),
+        page: 0,
+        sort: ChapterSort::default(),
+    });
+
+    // ⋮ on c1 → "Download from here…" (row 1) → "Download 5 chapters" (row 0).
+    let (kx, ky) = tap_row_kebab(0);
+    app.activate(0, kx, ky).unwrap();
+    let UiEvent::Tap { x, y } = tap_row(1) else {
+        unreachable!()
+    };
+    app.activate(1, x, y).unwrap();
+    assert!(matches!(app.screen(), Screen::DownloadAheadMenu { .. }));
+    let UiEvent::Tap { x, y } = tap_row(0) else {
+        unreachable!()
+    };
+    app.activate(0, x, y).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::Message { .. }),
+        "a confirmation is shown after queueing"
+    );
+
+    // The worker has begun the batch; now leave the manga entirely.
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    app.pop().unwrap(); // leave the confirmation
+    app.pop().unwrap(); // leave the chapter list → would cancel a look-ahead
+
+    // All five queued chapters still land; the sixth was never requested.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if (1..=5).all(|i| {
+            app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
+                .is_some()
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    for i in 1..=5 {
+        assert!(
+            app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
+                .is_some(),
+            "c{i} downloads despite leaving the manga (persistent batch)"
+        );
+    }
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c6").is_none(),
+        "only the requested five chapters were queued"
+    );
+}
+
+/// A source-linked series with two downloaded chapters, recorded in the index
+/// so that — when online — "All chapters" would fetch the source list.
+fn offline_fixture(lib: &Path) {
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+    let mut index = gideon_core::SeriesIndex::load(lib);
+    index.record(
+        "Series",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Series".into(),
+            ..Default::default()
+        },
+    );
+    index.record_download("Series", "c1", "vol1.cbz");
+    index.record_download("Series", "c2", "vol2.cbz");
+    index.save(lib).unwrap();
+}
+
+/// A source-linked gateway whose chapter list, if ever consulted, is clearly
+/// distinguishable from the on-disk files — and whose download is unconfigured,
+/// so any download attempt errors. Lets a test prove the source was never
+/// touched.
+fn source_gateway() -> FakeGateway {
+    FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c99".into(),
+            num: Some(99.0),
+            title: Some("from the network".into()),
+            lang: None,
+        }],
+        ..FakeGateway::default()
+    }
+}
+
+/// End-to-end: with Wi-Fi down, opening a *source-linked* series swaps straight
+/// to its downloaded chapters — no connect attempt, no source fetch, no
+/// download — and reading one records progress. Driven through the real event
+/// loop with an injected offline probe.
+#[test]
+fn offline_series_swaps_to_downloads_and_reads_without_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    offline_fixture(&lib);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    // Offline, Home shows the "reconnect" row at row 0, so Library is row 1.
+    let events = vec![
+        tap_row(1),                  // Home -> Library
+        UiEvent::LongPress { x, y }, // card -> BookMenu
+        tap_row(0),                  // "All chapters" -> downloads (offline)
+        tap_row(0),                  // first downloaded chapter -> reader
+        reader_tap_next(),           // turn a page
+        reader_tap_back(),           // back to the list
+    ];
+    let mut app = app(&lib, source_gateway(), events).with_online_probe(Box::new(|| false));
+    app.run().unwrap();
+
+    // We're on the LOCAL downloaded list (not the source ChapterList), and the
+    // chapters came from disk, not the gateway's "from the network" sentinel.
+    let Screen::DownloadedChapters { entries, .. } = app.screen() else {
+        panic!("offline, the series opens straight to its downloaded chapters");
+    };
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Series/vol1.cbz", "Series/vol2.cbz"]);
+
+    // Reading a downloaded chapter offline recorded progress — no download path
+    // was hit (the gateway has no download configured, so it would have errored).
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Series/vol1.cbz").is_some(),
+        "reading a downloaded chapter offline recorded progress"
+    );
+}
+
+/// The mirror of the above: when online, the same source-linked series opens
+/// the source chapter list (so you can pull chapters you don't have yet).
+#[test]
+fn online_series_opens_the_source_chapter_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    offline_fixture(&lib);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    // Online, Home has no reconnect row, so Library is row 0.
+    let events = vec![
+        tap_row(0),                  // Home -> Library
+        UiEvent::LongPress { x, y }, // card -> BookMenu
+        tap_row(0),                  // "All chapters" -> source list (online)
+    ];
+    let mut app = app(&lib, source_gateway(), events).with_online_probe(Box::new(|| true));
+    app.run().unwrap();
+
+    let Screen::ChapterList { chapters, .. } = app.screen() else {
+        panic!("online, the series opens the source chapter list");
+    };
+    assert_eq!(
+        chapters.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["c99"],
+        "the chapters came from the source, not local files"
+    );
+}
+
+#[test]
+fn chapter_menu_deletes_a_downloaded_chapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.open_downloaded_chapters("Series").unwrap();
+
+    // ⋮ on vol1 → menu rows are Mark read(0)/unread(1)/Delete download(2).
+    let (kx, ky) = tap_row_kebab(0);
+    app.activate(0, kx, ky).unwrap();
+    let UiEvent::Tap { x, y } = tap_row(2) else {
+        unreachable!()
+    };
+    app.activate(2, x, y).unwrap();
+
+    assert!(
+        !lib.join("Series/vol1.cbz").exists(),
+        "the chapter file is deleted"
+    );
+    let Screen::DownloadedChapters { entries, .. } = app.screen() else {
+        panic!("back on the downloaded list, rebuilt without the deleted file");
+    };
+    let rel: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+    assert_eq!(rel, vec!["Series/vol2.cbz"], "the deleted chapter is gone");
+}
+
+#[test]
+fn nav_first_last_jump_to_the_ends_of_a_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    let chapters: Vec<ChapterEntry> = (1..=40)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: None,
+        })
+        .collect();
+    app.stack.push(Screen::ChapterList {
+        source: SourceEntry {
+            id: "s".into(),
+            name: "S".into(),
+        },
+        manga: MangaEntry {
+            id: "m".into(),
+            title: "M".into(),
+            cover_url: None,
+        },
+        chapters,
+        page: 0,
+        sort: ChapterSort::default(),
+    });
+
+    let per = layout().rows_per_page();
+    let last_page = 40usize.div_ceil(per) - 1;
+    assert!(last_page >= 1, "this test needs a multi-page listing");
+
+    // Last → jump straight to the final page (not one step).
+    let UiEvent::Tap { x, y } = tap_nav_last() else {
+        unreachable!()
+    };
+    app.handle_tap(x, y).unwrap();
+    let Screen::ChapterList { page, .. } = app.screen() else {
+        panic!("still on the chapter list")
+    };
+    assert_eq!(*page, last_page, "Last jumps to the final page");
+
+    // First → straight back to the start.
+    let UiEvent::Tap { x, y } = tap_nav_first() else {
+        unreachable!()
+    };
+    app.handle_tap(x, y).unwrap();
+    let Screen::ChapterList { page, .. } = app.screen() else {
+        panic!("still on the chapter list")
+    };
+    assert_eq!(*page, 0, "First jumps back to the beginning");
+}
+
+#[test]
+fn storage_limit_evicts_least_recently_read_downloads() {
+    use filetime::{set_file_times, FileTime};
+
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    // Three downloaded chapters, recorded in the index with distinct ages.
+    for (i, name) in ["a", "b", "c"].iter().enumerate() {
+        let path = lib.join("Series").join(format!("{name}.cbz"));
+        make_cbz(&path, 6); // each comfortably over the tiny budget below
+        let t = FileTime::from_unix_time(1000 + i as i64 * 100, 0); // a oldest
+        set_file_times(&path, t, t).unwrap();
+    }
+    let mut index = gideon_core::SeriesIndex::load(&lib);
+    index.record(
+        "Series",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Series".into(),
+            ..Default::default()
+        },
+    );
+    for name in ["a", "b", "c"] {
+        index.record_download("Series", &format!("ch{name}"), &format!("{name}.cbz"));
+    }
+    index.save(&lib).unwrap();
+
+    let app = app(&lib, FakeGateway::default(), vec![]);
+    // Budget that fits two of the three chapters but not all three.
+    let two = std::fs::metadata(lib.join("Series/a.cbz")).unwrap().len()
+        + std::fs::metadata(lib.join("Series/b.cbz")).unwrap().len();
+    let freed = evict_to_storage_limit(&lib, &app.index_guard, two);
+
+    assert!(freed > 0, "something was evicted to get under budget");
+    assert!(
+        !lib.join("Series/a.cbz").exists(),
+        "the least-recently-read chapter (a) is evicted first"
+    );
+    assert!(lib.join("Series/b.cbz").exists(), "newer chapters are kept");
+    assert!(lib.join("Series/c.cbz").exists(), "newer chapters are kept");
+    // The index no longer claims the evicted chapter is downloaded.
+    let index = gideon_core::SeriesIndex::load(&lib);
+    assert!(
+        !index
+            .get("Series")
+            .unwrap()
+            .downloaded
+            .values()
+            .any(|f| f == "a.cbz"),
+        "the evicted chapter is forgotten from the index"
+    );
+}
+
+#[test]
+fn storage_screen_reports_usage_and_frees_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    // Storage accounting uses only file sizes (it never opens the archive), so
+    // plain files of a known size stand in for chapters. 2 MB each ⇒ 4 MB on
+    // disk, comfortably over the 1 MB budget set below (the smallest limit that
+    // round-trips through StorageSize's MB-granular settings serialization).
+    std::fs::create_dir_all(lib.join("Series")).unwrap();
+    let two_mb = vec![0u8; 2 * 1024 * 1024];
+    std::fs::write(lib.join("Series/a.cbz"), &two_mb).unwrap();
+    std::fs::write(lib.join("Series/b.cbz"), &two_mb).unwrap();
+    let mut index = gideon_core::SeriesIndex::load(&lib);
+    index.record(
+        "Series",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Series".into(),
+            ..Default::default()
+        },
+    );
+    index.record_download("Series", "cha", "a.cbz");
+    index.record_download("Series", "chb", "b.cbz");
+    index.save(&lib).unwrap();
+
+    let settings_dir = dir.path().join("data");
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    let stats = app.storage_stats();
+    assert_eq!(stats.chapters, 2, "both downloaded chapters are counted");
+    assert_eq!(stats.series, 1);
+    assert!(stats.used > 0);
+
+    // A 1 MB budget — well under the 4 MB on disk — so the manual cleanup
+    // evicts both chapters.
+    let mut s = app.load_settings();
+    s.storage_size_limit = gideon_core::StorageSize(1024 * 1024);
+    app.save_settings(&s);
+
+    // Open the storage screen and tap "Free up space now".
+    app.push(Screen::Storage).unwrap();
+    let l = layout();
+    app.handle_tap(l.width / 2, l.row_top(STORAGE_FREE_ROW) + l.row_h / 2)
+        .unwrap();
+    assert_eq!(
+        app.storage_stats().chapters,
+        0,
+        "the manual cleanup evicted everything over the (tiny) budget"
     );
 }
 
@@ -3292,7 +3805,7 @@ fn book_menu_deletes_a_chapter() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Row 2 is "Delete this chapter" (row 1 is now "Mark as unread").
+    // Row 2 is "Delete this chapter" (row 1 is "Mark as unread").
     let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
