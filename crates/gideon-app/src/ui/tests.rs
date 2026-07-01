@@ -2733,8 +2733,14 @@ fn storage_limit_evicts_least_recently_read_downloads() {
 fn storage_screen_reports_usage_and_frees_space() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
-    make_cbz(&lib.join("Series/a.cbz"), 4);
-    make_cbz(&lib.join("Series/b.cbz"), 4);
+    // Storage accounting uses only file sizes (it never opens the archive), so
+    // plain files of a known size stand in for chapters. 2 MB each ⇒ 4 MB on
+    // disk, comfortably over the 1 MB budget set below (the smallest limit that
+    // round-trips through StorageSize's MB-granular settings serialization).
+    std::fs::create_dir_all(lib.join("Series")).unwrap();
+    let two_mb = vec![0u8; 2 * 1024 * 1024];
+    std::fs::write(lib.join("Series/a.cbz"), &two_mb).unwrap();
+    std::fs::write(lib.join("Series/b.cbz"), &two_mb).unwrap();
     let mut index = gideon_core::SeriesIndex::load(&lib);
     index.record(
         "Series",
@@ -2757,9 +2763,10 @@ fn storage_screen_reports_usage_and_frees_space() {
     assert_eq!(stats.series, 1);
     assert!(stats.used > 0);
 
-    // Force a tiny budget so the manual cleanup actually evicts something.
+    // A 1 MB budget — well under the 4 MB on disk — so the manual cleanup
+    // evicts both chapters.
     let mut s = app.load_settings();
-    s.storage_size_limit = gideon_core::StorageSize(1);
+    s.storage_size_limit = gideon_core::StorageSize(1024 * 1024);
     app.save_settings(&s);
 
     // Open the storage screen and tap "Free up space now".
