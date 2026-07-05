@@ -1255,9 +1255,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let items = group_library(Library::new(&self.library_dir).scan()?);
         // Unwind whatever sits above the library (the book menu, plus the delete
         // confirmation when the delete came through it) and refresh it in place.
-        while self.stack.len() > 1
-            && !matches!(self.stack.last(), Some(Screen::Library { .. }))
-        {
+        while self.stack.len() > 1 && !matches!(self.stack.last(), Some(Screen::Library { .. })) {
             self.stack.pop();
         }
         if let Some(screen @ Screen::Library { .. }) = self.stack.last_mut() {
@@ -3511,14 +3509,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         format!("Delete \"{}\"?", entry_title(&entry.relative_path)),
                         "Delete this chapter",
                     ),
-                    DeleteScope::Series => {
-                        (format!("Delete all of \"{series_dir}\"?"), "Delete whole series")
-                    }
+                    DeleteScope::Series => (
+                        format!("Delete all of \"{series_dir}\"?"),
+                        "Delete whole series",
+                    ),
                 };
-                let rows = vec![
-                    (confirm.to_string(), true),
-                    ("Cancel".to_string(), true),
-                ];
+                let rows = vec![(confirm.to_string(), true), ("Cancel".to_string(), true)];
                 compose_list(l, &title, &rows, 0, 1)
             }
             Screen::ProfileMenu { profiles } => {
