@@ -3805,8 +3805,14 @@ fn book_menu_deletes_a_chapter() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Row 2 is "Delete this chapter" (row 1 is "Mark as unread").
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    // Row 2 is "Delete this chapter" (row 1 is "Mark as unread"); the delete now
+    // routes through a confirmation whose row 0 confirms.
+    let events = vec![
+        tap_row(0),
+        UiEvent::LongPress { x, y },
+        tap_row(2), // Delete this chapter -> confirm screen
+        tap_row(0), // confirm
+    ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -3823,6 +3829,53 @@ fn book_menu_deletes_a_chapter() {
 }
 
 #[test]
+fn book_menu_delete_asks_for_confirmation_first() {
+    // A long-hold that lands on "Delete this chapter" must NOT delete outright —
+    // it opens a confirmation, and cancelling leaves every file in place.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+
+    // Tapping "Delete this chapter" opens the confirmation without touching disk.
+    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    let mut opened = app(&lib, FakeGateway::default(), events);
+    opened.run().unwrap();
+    assert!(
+        matches!(opened.screen(), Screen::ConfirmDelete { .. }),
+        "delete asks before removing anything"
+    );
+    assert!(
+        lib.join("Series/vol1.cbz").exists(),
+        "nothing is deleted until the user confirms"
+    );
+
+    // Now cancel it (confirmation row 1) and confirm the file survives.
+    let events = vec![
+        tap_row(0),
+        UiEvent::LongPress { x, y },
+        tap_row(2), // -> confirm screen
+        tap_row(1), // Cancel
+    ];
+    let mut cancelled = app(&lib, FakeGateway::default(), events);
+    cancelled.run().unwrap();
+    assert!(
+        matches!(cancelled.screen(), Screen::BookMenu { .. }),
+        "cancelling returns to the book menu"
+    );
+    assert!(
+        lib.join("Series/vol1.cbz").exists(),
+        "cancel keeps the chapter"
+    );
+    assert!(lib.join("Series/vol2.cbz").exists());
+}
+
+#[test]
 fn book_menu_deletes_the_whole_series() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
@@ -3833,8 +3886,14 @@ fn book_menu_deletes_the_whole_series() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    // Row 3 is "Delete whole series" (shifted by the new "Mark as unread" row).
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(3)];
+    // Row 3 is "Delete whole series" (shifted by the new "Mark as unread" row);
+    // confirm on the follow-up screen (row 0).
+    let events = vec![
+        tap_row(0),
+        UiEvent::LongPress { x, y },
+        tap_row(3), // Delete whole series -> confirm screen
+        tap_row(0), // confirm
+    ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 

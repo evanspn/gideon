@@ -383,6 +383,14 @@ enum Screen {
         /// the card has been read yet.
         read_key: Option<String>,
     },
+    /// Confirmation before an irreversible delete from the book menu. Carries
+    /// everything the delete needs, so nothing is removed from disk until the
+    /// user taps the confirm row — Back cancels harmlessly.
+    ConfirmDelete {
+        entry: LibraryEntry,
+        series_dir: String,
+        scope: DeleteScope,
+    },
     /// Profile picker, opened from the left half of Home's title bar.
     ProfileMenu {
         profiles: Vec<String>,
@@ -433,6 +441,15 @@ pub enum Exit {
 enum Flow {
     Continue,
     Quit(Exit),
+}
+
+/// What a confirmed delete removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteScope {
+    /// Just the resume chapter's file (and the series dir if it empties out).
+    Chapter,
+    /// The whole series directory and its download history.
+    Series,
 }
 
 /// How a reader session ended.
@@ -1183,9 +1200,66 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Rebuild the Library screen beneath the book menu after a delete.
+    /// Carry out a confirmed delete from the book menu, then return to a
+    /// freshly-scanned library. Nothing here runs until the user has confirmed.
+    fn perform_delete(
+        &mut self,
+        entry: &LibraryEntry,
+        series_dir: &str,
+        scope: DeleteScope,
+    ) -> Result<()> {
+        match scope {
+            DeleteScope::Chapter => {
+                // Delete this chapter's file; drop it from the series' download
+                // history.
+                std::fs::remove_file(&entry.path)
+                    .with_context(|| format!("couldn't delete {}", entry.path.display()))?;
+                if let Some(file) = entry.path.file_name() {
+                    let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+                    index.forget_download(series_dir, &file.to_string_lossy());
+                    let _ = index.save(&self.library_dir);
+                }
+                // Remove the series dir too when it's now empty.
+                if let Some(parent) = entry.path.parent() {
+                    if parent != self.library_dir
+                        && std::fs::read_dir(parent)
+                            .map(|mut d| d.next().is_none())
+                            .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                }
+            }
+            DeleteScope::Series => {
+                // Delete the whole series directory.
+                let target = entry
+                    .path
+                    .parent()
+                    .filter(|p| *p != self.library_dir)
+                    .map(|p| p.to_path_buf());
+                match target {
+                    Some(dir) => std::fs::remove_dir_all(&dir)
+                        .with_context(|| format!("couldn't delete {}", dir.display()))?,
+                    None => std::fs::remove_file(&entry.path)
+                        .with_context(|| format!("couldn't delete {}", entry.path.display()))?,
+                }
+                let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+                index.remove(series_dir);
+                let _ = index.save(&self.library_dir);
+            }
+        }
+        self.refresh_library_after_delete()
+    }
+
     fn refresh_library_after_delete(&mut self) -> Result<()> {
         let items = group_library(Library::new(&self.library_dir).scan()?);
-        self.stack.pop(); // leave the book menu
+        // Unwind whatever sits above the library (the book menu, plus the delete
+        // confirmation when the delete came through it) and refresh it in place.
+        while self.stack.len() > 1
+            && !matches!(self.stack.last(), Some(Screen::Library { .. }))
+        {
+            self.stack.pop();
+        }
         if let Some(screen @ Screen::Library { .. }) = self.stack.last_mut() {
             *screen = Screen::Library { items, page: 0 };
         }
@@ -1516,47 +1590,37 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.pop()?;
                     }
                     2 => {
-                        // Delete this chapter's file; drop it from the
-                        // series' download history.
-                        std::fs::remove_file(&entry.path)
-                            .with_context(|| format!("couldn't delete {}", entry.path.display()))?;
-                        if let Some(file) = entry.path.file_name() {
-                            let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
-                            index.forget_download(&series_dir, &file.to_string_lossy());
-                            let _ = index.save(&self.library_dir);
-                        }
-                        // Remove the series dir too when it's now empty.
-                        if let Some(parent) = entry.path.parent() {
-                            if parent != self.library_dir
-                                && std::fs::read_dir(parent)
-                                    .map(|mut d| d.next().is_none())
-                                    .unwrap_or(false)
-                            {
-                                let _ = std::fs::remove_dir(parent);
-                            }
-                        }
-                        self.refresh_library_after_delete()?;
+                        // Deleting is irreversible, so confirm first instead of
+                        // acting on the long press directly (a mis-hold once wiped
+                        // a title outright).
+                        self.push(Screen::ConfirmDelete {
+                            entry,
+                            series_dir,
+                            scope: DeleteScope::Chapter,
+                        })?;
                     }
                     3 => {
-                        // Delete the whole series directory.
-                        let target = entry
-                            .path
-                            .parent()
-                            .filter(|p| *p != self.library_dir)
-                            .map(|p| p.to_path_buf());
-                        match target {
-                            Some(dir) => std::fs::remove_dir_all(&dir)
-                                .with_context(|| format!("couldn't delete {}", dir.display()))?,
-                            None => std::fs::remove_file(&entry.path).with_context(|| {
-                                format!("couldn't delete {}", entry.path.display())
-                            })?,
-                        }
-                        let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
-                        index.remove(&series_dir);
-                        let _ = index.save(&self.library_dir);
-                        self.refresh_library_after_delete()?;
+                        self.push(Screen::ConfirmDelete {
+                            entry,
+                            series_dir,
+                            scope: DeleteScope::Series,
+                        })?;
                     }
                     _ => {}
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::ConfirmDelete {
+                entry,
+                series_dir,
+                scope,
+            } => {
+                // Row 0 confirms the delete; anything else (the Cancel row) just
+                // backs out to the book menu, touching nothing on disk.
+                if row == 0 {
+                    self.perform_delete(&entry, &series_dir, scope)?;
+                } else {
+                    self.pop()?;
                 }
                 Ok(Flow::Continue)
             }
@@ -3436,6 +3500,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("Delete whole series".to_string(), true),
                 ];
                 compose_list(l, series_dir, &rows, 0, 1)
+            }
+            Screen::ConfirmDelete {
+                entry,
+                series_dir,
+                scope,
+            } => {
+                let (title, confirm) = match scope {
+                    DeleteScope::Chapter => (
+                        format!("Delete \"{}\"?", entry_title(&entry.relative_path)),
+                        "Delete this chapter",
+                    ),
+                    DeleteScope::Series => {
+                        (format!("Delete all of \"{series_dir}\"?"), "Delete whole series")
+                    }
+                };
+                let rows = vec![
+                    (confirm.to_string(), true),
+                    ("Cancel".to_string(), true),
+                ];
+                compose_list(l, &title, &rows, 0, 1)
             }
             Screen::ProfileMenu { profiles } => {
                 let mut rows: Vec<(String, bool)> = profiles
