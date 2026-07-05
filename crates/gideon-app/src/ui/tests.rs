@@ -3872,6 +3872,48 @@ fn deleting_a_chapter_keeps_its_reading_record() {
 }
 
 #[test]
+fn deleting_a_whole_series_keeps_its_reading_records() {
+    // "Keep my shelf clean": deleting the entire series removes its files but
+    // must keep every chapter's reading record, so stats persist regardless of
+    // library status. progress.json lives at the library root, not inside the
+    // series dir, so the recursive dir removal leaves it alone.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("Series/vol2.cbz"), 2);
+    let progress_file = progress_path(&lib);
+    std::fs::create_dir_all(progress_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &progress_file,
+        r#"{"progress":{
+            "Series/vol1.cbz":{"current_page":1,"total_pages":2,"last_read_at":200},
+            "Series/vol2.cbz":{"current_page":0,"total_pages":2,"last_read_at":100}
+        },"last_opened":{"Series":"Series/vol1.cbz"}}"#,
+    )
+    .unwrap();
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    let events = vec![
+        tap_row(0),
+        UiEvent::LongPress { x, y },
+        tap_row(3), // Delete whole series -> confirm screen
+        tap_row(0), // confirm
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    assert!(!lib.join("Series").exists(), "the series files are gone");
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Series/vol1.cbz").is_some() && store.get("Series/vol2.cbz").is_some(),
+        "every chapter's reading record survives deleting the series"
+    );
+}
+
+#[test]
 fn book_menu_delete_asks_for_confirmation_first() {
     // A long-hold that lands on "Delete this chapter" must NOT delete outright —
     // it opens a confirmation, and cancelling leaves every file in place.
