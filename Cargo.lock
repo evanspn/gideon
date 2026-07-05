@@ -1230,6 +1230,7 @@ dependencies = [
  "gideon-sources",
  "image",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
