@@ -70,6 +70,9 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
 /// the nine cycling rows ([`settings_rows`]), it opens the storage detail
 /// screen instead of cycling a value.
 const SETTINGS_STORAGE_ROW: usize = 9;
+/// Index of the trailing "Account" row on the Settings screen — appended after
+/// the storage row, it opens the sync account menu (sign in / sync / sign out).
+const SETTINGS_ACCOUNT_ROW: usize = 10;
 /// Row of the "Free up space now" action on the Storage screen (after three
 /// read-only info rows). Shared by the renderer and the tap handler.
 const STORAGE_FREE_ROW: usize = 3;
@@ -406,6 +409,20 @@ enum Screen {
     /// Storage usage detail, opened from Settings: how much downloaded content
     /// is on disk against the limit, plus a manual "free up space now" action.
     Storage,
+    /// Sync account menu, opened from Settings. Signed out it offers sign-in;
+    /// signed in it shows the email with "Sync now" and "Sign out".
+    AccountMenu,
+    /// On-screen keyboard for the account email; the action key sends a one-time
+    /// login code and advances to [`Screen::AccountCode`].
+    AccountEmail {
+        email: String,
+    },
+    /// On-screen keyboard for the emailed one-time code; the action key verifies
+    /// it, stores the session, and triggers a first sync.
+    AccountCode {
+        email: String,
+        code: String,
+    },
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
     /// Wi-Fi networks from a scan: tap one to connect (or enter a password).
@@ -1639,6 +1656,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Screen::AccountMenu => {
+                self.tap_account_menu(row)?;
+                Ok(Flow::Continue)
+            }
+            Screen::AccountEmail { email } => {
+                self.tap_account_email(&email, x, y)?;
+                Ok(Flow::Continue)
+            }
+            Screen::AccountCode { email, code } => {
+                self.tap_account_code(&email, &code, x, y)?;
+                Ok(Flow::Continue)
+            }
             Screen::ProfileMenu { profiles } => {
                 if let Some(name) = profiles.get(row).cloned() {
                     if name == self.active_profile {
@@ -1705,6 +1734,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 )
             })?;
         }
+        // Opening the library is a good "app foreground" moment to pull any
+        // progress made on another device (and push anything we're ahead on).
+        // Fully background — the shelf renders immediately regardless.
+        self.trigger_sync();
         let items = group_library(Library::new(&self.library_dir).scan()?);
         self.push(Screen::Library { items, page: 0 })
     }
@@ -1768,6 +1801,126 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             mangas,
             page: 0,
         })
+    }
+
+    // --- sync account ---
+
+    /// The active profile's sync [`Account`], if sync is configured (it always
+    /// is via the build default, unless disabled by an empty env override).
+    fn account(&self) -> Option<gideon_sync::account::Account> {
+        crate::sync::account(&self.library_dir)
+    }
+
+    /// The signed-in email for the active profile, if any.
+    fn account_email(&self) -> Option<String> {
+        self.account().and_then(|a| a.email())
+    }
+
+    /// Kick a best-effort background reconcile for the active profile. Never
+    /// blocks (spawns a thread) and no-ops when signed out — safe on any thread.
+    fn trigger_sync(&self) {
+        crate::sync::spawn_sync(&self.library_dir);
+    }
+
+    /// Tap on the account menu: sign in (signed out), or sync-now / sign-out.
+    fn tap_account_menu(&mut self, row: usize) -> Result<()> {
+        match (self.account_email(), row) {
+            (Some(_), 1) => {
+                self.trigger_sync();
+                self.show_status(&["Syncing in the background…"])?;
+                self.render_current(RefreshMode::Full)?;
+            }
+            (Some(_), 2) => {
+                if let Some(account) = self.account() {
+                    let _ = account.sign_out();
+                }
+                self.pop()?; // back to Settings, now showing "sign in"
+            }
+            (None, 0) => {
+                self.keyboard_paints = 0;
+                self.push(Screen::AccountEmail {
+                    email: String::new(),
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Email keyboard: the action key emails a one-time code and advances to the
+    /// code screen; other keys edit the address in place.
+    fn tap_account_email(&mut self, email: &str, x: u32, y: u32) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let addr = email.trim().to_string();
+            if addr.is_empty() {
+                return Ok(());
+            }
+            let Some(account) = self.account() else {
+                return Ok(());
+            };
+            self.show_status(&["Sending code…"])?;
+            match account.request_code(&addr) {
+                Ok(()) => {
+                    self.keyboard_paints = 0;
+                    self.push(Screen::AccountCode {
+                        email: addr,
+                        code: String::new(),
+                    })?;
+                }
+                Err(e) => self.push(Screen::Message {
+                    title: "Couldn't send code".to_string(),
+                    body: format!("{e}\nCheck the address and your connection."),
+                })?,
+            }
+            return Ok(());
+        }
+        if let Some(v) = key.and_then(|key| apply_key_edit(email, key)) {
+            if let Some(Screen::AccountEmail { email }) = self.stack.last_mut() {
+                *email = v;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
+    }
+
+    /// Code keyboard: the action key verifies the code, stores the session, and
+    /// triggers a first sync; other keys edit the code in place.
+    fn tap_account_code(&mut self, email: &str, code: &str, x: u32, y: u32) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let token = code.trim().to_string();
+            if token.is_empty() {
+                return Ok(());
+            }
+            let Some(account) = self.account() else {
+                return Ok(());
+            };
+            self.show_status(&["Verifying…"])?;
+            match account.verify(email, &token, crate::sync::now()) {
+                Ok(_) => {
+                    self.trigger_sync();
+                    // Unwind the two keyboard screens back to the account menu,
+                    // which now renders the signed-in state.
+                    self.stack.pop(); // AccountCode
+                    self.stack.pop(); // AccountEmail
+                    self.show_status(&["Signed in. Syncing…"])?;
+                    self.render_current(RefreshMode::Full)?;
+                }
+                Err(e) => self.push(Screen::Message {
+                    title: "Couldn't verify".to_string(),
+                    body: format!("{e}\nDouble-check the code and try again."),
+                })?,
+            }
+            return Ok(());
+        }
+        if let Some(v) = key.and_then(|key| apply_key_edit(code, key)) {
+            if let Some(Screen::AccountCode { code, .. }) = self.stack.last_mut() {
+                *code = v;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
     }
 
     /// Handle a tap on the search keyboard: edit the query in place
@@ -1845,6 +1998,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // The trailing storage row opens the usage detail screen.
         if row == SETTINGS_STORAGE_ROW {
             return self.open_storage();
+        }
+        // The trailing account row opens the sync account menu.
+        if row == SETTINGS_ACCOUNT_ROW {
+            return self.push(Screen::AccountMenu);
         }
         let mut settings = self.load_settings();
         match row {
@@ -3136,6 +3293,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         store.save(&progress_file)?;
         // The shelf's cached store is stale now — the session moved pages.
         self.invalidate_progress_cache();
+        // Reading advanced this chapter's page: push it (and pull anything new)
+        // in the background so another device picks up where we stopped.
+        self.trigger_sync();
         // The session may have rotated the reading orientation: the menus
         // follow it, so rebuild the layout before repainting them.
         self.rebuild_layout();
@@ -3547,9 +3707,41 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ),
                     true,
                 ));
+                // Trailing sync-account row (SETTINGS_ACCOUNT_ROW): shows the
+                // signed-in email, or an invitation to sign in.
+                rows.push((
+                    match self.account_email() {
+                        Some(email) => format!("Account: {email} ›"),
+                        None => "Account: sign in to sync ›".to_string(),
+                    },
+                    true,
+                ));
                 compose_list(l, "Settings", &rows, 0, 1)
             }
             Screen::Storage => self.compose_storage()?,
+            Screen::AccountMenu => {
+                let rows = match self.account_email() {
+                    Some(email) => vec![
+                        (format!("Signed in as {email}"), false),
+                        ("Sync now".to_string(), true),
+                        ("Sign out".to_string(), true),
+                    ],
+                    None => vec![
+                        ("Sign in with email".to_string(), true),
+                        (
+                            "A one-time code is emailed to you — no password.".to_string(),
+                            false,
+                        ),
+                    ],
+                };
+                compose_list(l, "Sync account", &rows, 0, 1)
+            }
+            Screen::AccountEmail { email } => {
+                compose_keyboard(l, "Enter your email", email, "Send code")
+            }
+            Screen::AccountCode { email, code } => {
+                compose_keyboard(l, &format!("Code sent to {email}"), code, "Verify")
+            }
             Screen::PowerMenu => {
                 // Wi-Fi networks at the top — scan/connect without digging into
                 // Settings; the live status hints at what tapping does.

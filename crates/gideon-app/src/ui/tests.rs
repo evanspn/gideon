@@ -3990,6 +3990,32 @@ fn book_menu_deletes_the_whole_series() {
 }
 
 #[test]
+fn account_menu_signed_out_leads_to_email_sign_in() {
+    // With no session on this profile, the account menu offers email sign-in,
+    // and tapping it opens the email keyboard. (No network: we stop at the
+    // keyboard, before a code is requested.)
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+
+    assert!(
+        app.account_email().is_none(),
+        "a fresh profile has no signed-in account"
+    );
+
+    app.stack.push(Screen::AccountMenu);
+    let UiEvent::Tap { x, y } = tap_row(0) else {
+        unreachable!()
+    };
+    app.activate(0, x, y).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::AccountEmail { .. }),
+        "signed out, the account menu leads to email sign-in"
+    );
+}
+
+#[test]
 fn book_menu_marks_the_latest_read_chapter_unread() {
     // "I clicked the wrong thing" undo: vol1 was read (and finished); the menu's
     // "Mark as unread" (row 1) forgets vol1's progress, leaving vol2 untouched.
