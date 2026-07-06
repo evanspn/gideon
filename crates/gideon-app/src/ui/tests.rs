@@ -3019,6 +3019,62 @@ fn new_profile_keyboard_creates_and_switches() {
 }
 
 #[test]
+fn keyboard_shift_types_uppercase() {
+    // The Shift key makes letters upper-case — needed for case-sensitive input
+    // (passwords). Drive it through the new-profile keyboard: Shift, b -> "B".
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = profile_settings_dir(dir.path(), &["default"]);
+
+    let events = vec![
+        tap_title_left(),
+        tap_row(1),              // New profile…
+        tap_key(Key::Shift),     // caps on
+        tap_key(Key::Char('b')), // -> 'B'
+        tap_key(Key::Shift),     // caps off
+        tap_key(Key::Char('o')),
+        tap_key(Key::Char('b')),
+        tap_key(Key::Search), // create "Bob"
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert!(
+        settings.profiles.contains(&"Bob".to_string()),
+        "Shift produced an uppercase B: {:?}",
+        settings.profiles
+    );
+}
+
+#[test]
+fn keyboard_shift_and_at_sign_editing() {
+    // Unit-level: Shift upper-cases letters, other characters are unaffected,
+    // and Shift/Search don't edit the buffer.
+    assert_eq!(
+        apply_key_edit("ab", Key::Char('c'), false).as_deref(),
+        Some("abc")
+    );
+    assert_eq!(
+        apply_key_edit("ab", Key::Char('c'), true).as_deref(),
+        Some("abC")
+    );
+    assert_eq!(
+        apply_key_edit("a", Key::Char('@'), true).as_deref(),
+        Some("a@")
+    );
+    assert_eq!(apply_key_edit("a", Key::Shift, true), None);
+    // The '@' key is actually on the keyboard — email addresses need it.
+    assert!(
+        layout()
+            .keyboard_keys()
+            .iter()
+            .any(|(k, ..)| *k == Key::Char('@')),
+        "keyboard has an @ key"
+    );
+}
+
+#[test]
 fn picking_the_active_profile_just_closes_the_menu() {
     let dir = tempfile::tempdir().unwrap();
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);

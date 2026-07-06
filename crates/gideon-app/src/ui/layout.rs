@@ -39,6 +39,9 @@ pub enum Key {
     Char(char),
     Backspace,
     Space,
+    /// Toggle upper/lower case for letter keys — needed for case-sensitive
+    /// input like passwords.
+    Shift,
     /// Run the search with the current query.
     Search,
 }
@@ -214,12 +217,16 @@ impl UiLayout {
                 keys.push((Key::Char(c), x0 + j as u32 * w, y, w, key_h));
             }
         }
-        // Bottom row in tenths: [backspace 2][space 5][search 3].
+        // Bottom row in tenths: [shift 2][backspace 2][@ 1][space 3][search 2].
+        // Shift (case) and @ (email) live here so email + password fields are
+        // actually typeable on the device.
         let y = self.keyboard_top() + KEYBOARD_ROWS.len() as u32 * key_h;
         let unit = (self.width / 10).max(1);
-        keys.push((Key::Backspace, 0, y, 2 * unit, key_h));
-        keys.push((Key::Space, 2 * unit, y, 5 * unit, key_h));
-        keys.push((Key::Search, 7 * unit, y, self.width - 7 * unit, key_h));
+        keys.push((Key::Shift, 0, y, 2 * unit, key_h));
+        keys.push((Key::Backspace, 2 * unit, y, 2 * unit, key_h));
+        keys.push((Key::Char('@'), 4 * unit, y, unit, key_h));
+        keys.push((Key::Space, 5 * unit, y, 3 * unit, key_h));
+        keys.push((Key::Search, 8 * unit, y, self.width - 8 * unit, key_h));
         keys
     }
 
@@ -491,9 +498,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let expected: Vec<char> = KEYBOARD_ROWS.iter().flat_map(|r| r.chars()).collect();
+        // The letter rows, plus the '@' key in the bottom row (for email).
+        let expected: Vec<char> = KEYBOARD_ROWS
+            .iter()
+            .flat_map(|r| r.chars())
+            .chain(['@'])
+            .collect();
         assert_eq!(chars, expected);
-        assert_eq!(keys.len(), expected.len() + 3, "backspace, space, search");
+        assert_eq!(
+            keys.len(),
+            expected.len() + 4,
+            "shift, backspace, space, search (@ is a Char)"
+        );
     }
 
     #[test]
@@ -528,10 +544,13 @@ mod tests {
         assert_eq!(l.key_at(50, top + 1), Some(Key::Char('1')));
         // Second row starts with 'q'.
         assert_eq!(l.key_at(50, top + key_h), Some(Key::Char('q')));
-        // Bottom row tenths: backspace 0..200, space 200..700, search 700..
+        // Bottom row tenths: shift 0..200, backspace 200..400, @ 400..500,
+        // space 500..800, search 800..
         let bottom = top + 4 * key_h;
-        assert_eq!(l.key_at(100, bottom), Some(Key::Backspace));
-        assert_eq!(l.key_at(450, bottom), Some(Key::Space));
+        assert_eq!(l.key_at(100, bottom), Some(Key::Shift));
+        assert_eq!(l.key_at(300, bottom), Some(Key::Backspace));
+        assert_eq!(l.key_at(450, bottom), Some(Key::Char('@')));
+        assert_eq!(l.key_at(650, bottom), Some(Key::Space));
         assert_eq!(l.key_at(999, bottom), Some(Key::Search));
     }
 }
