@@ -7,12 +7,31 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::natsort::natural_cmp;
 use crate::Result;
+
+/// Serializes all `progress.json` writes in this process, so the reader thread
+/// and the background sync thread can't interleave a read-modify-write and lose
+/// each other's updates. Held only for the brief load-merge-rename, never across
+/// network I/O.
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// A per-write-unique temp path next to `path`, so two concurrent atomic saves
+/// never share (and corrupt) one temp file before the rename.
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{pid}.{n}"));
+    path.with_file_name(name)
+}
 
 /// A manga archive discovered in the library directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,12 +150,72 @@ impl ProgressStore {
         }
     }
 
-    /// Persist the store to `path` atomically (write temp file then rename).
+    /// Persist the store to `path` atomically and **authoritatively** — the
+    /// on-disk file becomes exactly this store. Use for writes that must be able
+    /// to *remove* entries (mark-unread); a merge would resurrect them. Prefer
+    /// [`Self::merge_save`] for progress-*advancing* writes that may race a
+    /// second writer (the background sync thread), so a concurrent update isn't
+    /// clobbered.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_atomic(path)
+    }
+
+    /// Fold this store into whatever is currently on disk and save, under the
+    /// same process lock as [`Self::save`]. Merge rule mirrors the sync layer's
+    /// **furthest-page-wins**: per chapter the higher `current_page` and later
+    /// `last_read_at` win, this store's `total_pages` and `last_opened` are
+    /// taken as the latest report, and chapters only on disk are preserved. So a
+    /// write that landed between this store being loaded and saved (e.g. a
+    /// background pull, or a reader session that advanced a page) is never lost.
+    /// Only ever *raises* a page — never removes — so it must not be used for
+    /// mark-unread.
+    pub fn merge_save(&self, path: &Path) -> Result<()> {
+        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut disk = Self::load(path).unwrap_or_default();
+        for (key, p) in &self.progress {
+            disk.progress
+                .entry(key.clone())
+                .and_modify(|d| {
+                    d.current_page = d.current_page.max(p.current_page);
+                    d.total_pages = p.total_pages;
+                    d.last_read_at = d.last_read_at.max(p.last_read_at);
+                })
+                .or_insert(*p);
+        }
+        for (series, chapter) in &self.last_opened {
+            disk.last_opened.insert(series.clone(), chapter.clone());
+        }
+        disk.write_atomic(path)
+    }
+
+    /// Save, taking **this store's value** for every chapter it knows (so the
+    /// reader can move a page up *or* down — a deliberate flip back must stick),
+    /// while preserving any chapter a concurrent writer (the background sync
+    /// thread) added to disk since this store was loaded. Under the same process
+    /// lock as [`Self::save`]. Use for the reader's own progress writes; sync
+    /// uses [`Self::merge_save`] (furthest-page-wins) so it can never rewind
+    /// another device.
+    pub fn overlay_save(&self, path: &Path) -> Result<()> {
+        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut disk = Self::load(path).unwrap_or_default();
+        for (key, p) in &self.progress {
+            disk.progress.insert(key.clone(), *p);
+        }
+        for (series, chapter) in &self.last_opened {
+            disk.last_opened.insert(series.clone(), chapter.clone());
+        }
+        disk.write_atomic(path)
+    }
+
+    /// Atomic write (temp file + rename) with a *unique* temp name, so two
+    /// concurrent writers can't corrupt a shared temp file. Callers hold
+    /// `SAVE_LOCK`; this does not lock (it would deadlock).
+    fn write_atomic(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        let tmp = unique_temp_path(path);
         fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -304,5 +383,82 @@ mod tests {
         };
         assert!(p.is_finished());
         assert_eq!(p.percent(), 100.0);
+    }
+
+    #[test]
+    fn merge_save_preserves_a_concurrent_write_to_another_chapter() {
+        // Simulates the reader/sync race: something wrote chapter B to disk
+        // after this store (holding only A) was loaded. merge_save must fold in
+        // rather than clobber, so B survives.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+
+        let mut on_disk = ProgressStore::default();
+        on_disk.update("B/vol1.cbz", 15, 30); // written by the "other" writer
+        on_disk.save(&path).unwrap();
+
+        let mut mine = ProgressStore::default();
+        mine.update("A/vol1.cbz", 3, 10); // my stale snapshot only knows A
+        mine.merge_save(&path).unwrap();
+
+        let merged = ProgressStore::load(&path).unwrap();
+        assert!(merged.get("A/vol1.cbz").is_some(), "my chapter is written");
+        assert_eq!(
+            merged.get("B/vol1.cbz").unwrap().current_page,
+            15,
+            "the concurrent write to B is preserved, not clobbered"
+        );
+    }
+
+    #[test]
+    fn overlay_save_is_authoritative_but_preserves_other_chapters() {
+        // The reader can move its own chapter down (deliberate flip back) AND a
+        // chapter the background sync added to disk must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+
+        let mut on_disk = ProgressStore::default();
+        on_disk.update("A/vol1.cbz", 5, 10); // reader's chapter, currently 5
+        on_disk.update("B/vol1.cbz", 15, 30); // added by a background sync
+        on_disk.save(&path).unwrap();
+
+        // Reader loaded A at 5, paged back to 2, and knows nothing of B.
+        let mut reader = ProgressStore::default();
+        reader.update("A/vol1.cbz", 2, 10);
+        reader.overlay_save(&path).unwrap();
+
+        let saved = ProgressStore::load(&path).unwrap();
+        assert_eq!(
+            saved.get("A/vol1.cbz").unwrap().current_page,
+            2,
+            "the reader is authoritative for its own chapter, even moving back"
+        );
+        assert_eq!(
+            saved.get("B/vol1.cbz").unwrap().current_page,
+            15,
+            "a chapter the sync added is preserved, not clobbered"
+        );
+    }
+
+    #[test]
+    fn merge_save_never_lowers_a_page() {
+        // Furthest-page-wins: a stale writer at page 2 can't rewind disk's 9.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+
+        let mut on_disk = ProgressStore::default();
+        on_disk.update("A/vol1.cbz", 9, 10);
+        on_disk.save(&path).unwrap();
+
+        let mut stale = ProgressStore::default();
+        stale.update("A/vol1.cbz", 2, 10);
+        stale.merge_save(&path).unwrap();
+
+        let merged = ProgressStore::load(&path).unwrap();
+        assert_eq!(
+            merged.get("A/vol1.cbz").unwrap().current_page,
+            9,
+            "merge_save keeps the furthest page, never rewinds"
+        );
     }
 }

@@ -2930,7 +2930,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // BEFORE the first page even paints — so "resume" always lands here,
         // even if the app is killed (Nickel home button) before any later save.
         store.set_last_opened(series_key_of(key), key);
-        let _ = store.save(&progress_file);
+        // overlay_save (not save): a background sync may be writing this file
+        // too; keep our value for this chapter but preserve chapters it added.
+        let _ = store.overlay_save(&progress_file);
 
         // The reader works in PANEL coordinates (self.layout may be the
         // rotated menu layout): build its gesture geometry from the
@@ -3239,7 +3241,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // Save the reading position before the power goes
                         // down — a dead battery must not lose it.
                         reader.save_progress(&mut store, key);
-                        store.save(&progress_file)?;
+                        store.overlay_save(&progress_file)?;
                         let result = self.sleeper.as_mut().expect("checked above")();
                         self.last_wake = Some(std::time::Instant::now());
                         if let Err(e) = &result {
@@ -3290,7 +3292,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             reader.save_progress(&mut store, key);
         }
-        store.save(&progress_file)?;
+        store.overlay_save(&progress_file)?;
         // The shelf's cached store is stale now — the session moved pages.
         self.invalidate_progress_cache();
         // Reading advanced this chapter's page: push it (and pull anything new)
@@ -4075,7 +4077,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let path = progress_path(&self.library_dir);
         let mut store = ProgressStore::load(&path).unwrap_or_default();
         store.update(key, total - 1, total);
-        store.save(&path)?;
+        // Mark-read is authoritative for this chapter; overlay so a concurrent
+        // sync write to *other* chapters survives.
+        store.overlay_save(&path)?;
         self.invalidate_progress_cache();
         Ok(())
     }

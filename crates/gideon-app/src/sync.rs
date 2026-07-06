@@ -7,10 +7,17 @@
 //! and dropped, and the local `progress.json` stays authoritative.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gideon_sync::account::Account;
 use gideon_sync::supabase::SupabaseConfig;
+
+/// True while a background reconcile is in flight, so overlapping triggers
+/// (library-open then a quick chapter-close) don't run two syncs at once —
+/// which would race each other's writes and double-spend the rotating refresh
+/// token. The next trigger after this clears will catch up.
+static SYNC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Default Supabase project the app syncs against. The anon key is public by
 /// design — row-level security (keyed to `auth.uid()`), not this key, is what
@@ -69,16 +76,24 @@ pub fn spawn_sync(library_dir: &Path) {
     if !account.is_signed_in() {
         return; // no session — nothing to sync, and no auth to attempt
     }
-    std::thread::spawn(move || match account.sync(now()) {
-        Ok(outcome) => {
-            if outcome.merged > 0 || outcome.pushed > 0 {
-                eprintln!(
-                    "sync: merged {} pulled row(s), pushed {}",
-                    outcome.merged, outcome.pushed
-                );
+    // Only one reconcile at a time; a trigger that arrives mid-sync is dropped
+    // (the running sync, or the next trigger, covers it).
+    if SYNC_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        match account.sync(now()) {
+            Ok(outcome) => {
+                if outcome.merged > 0 || outcome.pushed > 0 {
+                    eprintln!(
+                        "sync: merged {} pulled row(s), pushed {}",
+                        outcome.merged, outcome.pushed
+                    );
+                }
             }
+            Err(e) => eprintln!("sync: skipped ({e})"),
         }
-        Err(e) => eprintln!("sync: skipped ({e})"),
+        SYNC_IN_FLIGHT.store(false, Ordering::Release);
     });
 }
 

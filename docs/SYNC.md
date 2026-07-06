@@ -69,6 +69,22 @@ browser-redirect callback, but it can show a keyboard for an emailed 6-digit
 code. The returned session (access + refresh token) is persisted per profile and
 the short-lived access token is refreshed silently from the refresh token.
 
+## Concurrency (device)
+
+The background sync thread and the reader both write a profile's `progress.json`,
+so writes are coordinated to avoid lost updates:
+
+- All writes take a process-wide lock and use a per-write-unique temp file, so
+  two writers can't corrupt each other (`ProgressStore::save` / `merge_save` /
+  `overlay_save`).
+- The **reader** writes with `overlay_save`: authoritative for the chapter it's
+  reading (a deliberate page-back sticks), but it preserves any chapter the sync
+  thread added.
+- **Sync** writes with `merge_save`: furthest-page-wins, so it only ever raises a
+  page and can never rewind the reader.
+- Only one reconcile runs at a time (an in-flight guard in `gideon-app::sync`),
+  so overlapping triggers don't double-spend the rotating refresh token.
+
 ## Account ↔ profile binding
 
 An account's session and sync bookkeeping live **inside the profile's `.gideon`

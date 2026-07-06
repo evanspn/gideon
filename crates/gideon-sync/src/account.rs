@@ -9,9 +9,9 @@
 //! Keeping these **per profile** is what binds a profile to exactly one cloud
 //! account: switching profiles switches every one of these files, so one
 //! profile's reading can never sync into another account. And signing a profile
-//! into a *different* account resets the sync bookkeeping (see
-//! [`Account::verify`]), so a previous user's cursor can never pull their rows
-//! into this profile's store.
+//! into a *different* account wipes this profile's local reading + bookkeeping
+//! (see [`Account::verify`]), so a previous user's rows can neither be pushed up
+//! into the new account nor linger in its library.
 //!
 //! The project connection ([`SupabaseConfig`]) is device-global (it identifies
 //! the backend, not the user), so it's passed in rather than stored here.
@@ -74,18 +74,25 @@ impl Account {
         AuthClient::new(self.config.clone()).request_code(email)
     }
 
-    /// Step 2 of sign-in: verify the code, persist the session, and — if this
-    /// is a *different* account than was signed in before — reset the sync
-    /// bookkeeping so the previous user's cursor can't pull their rows into this
-    /// profile. The local `progress.json` is left untouched (offline-first: it's
-    /// authoritative and a following sync reconciles it).
+    /// Step 2 of sign-in: verify the code and persist the session. On a
+    /// *different* account than was signed in before, wipe this profile's local
+    /// reading data and sync bookkeeping too — a profile is bound to one
+    /// account, so account A's chapters must not (a) get pushed up into account
+    /// B, nor (b) linger in B's library. First-time sign-in (no previous
+    /// account) keeps the local `progress.json` and pushes it up — it's this
+    /// device's own reading.
     pub fn verify(&self, email: &str, code: &str, now: u64) -> Result<Session> {
         let previous_email = self.email();
         let session = AuthClient::new(self.config.clone()).verify_code(email, code, now)?;
 
-        if previous_email.as_deref() != Some(session.email.as_str()) {
-            // New identity on this profile — drop any cursor/high-water marks
-            // that belonged to the old account.
+        let switching_accounts = previous_email
+            .as_deref()
+            .is_some_and(|prev| prev != session.email);
+        if switching_accounts {
+            // Different user on this profile: drop the prior account's local
+            // reading and cursor entirely, so nothing of theirs leaks into the
+            // new account (in either direction).
+            let _ = std::fs::remove_file(self.progress_path());
             let _ = std::fs::remove_file(self.state_path());
         }
         self.save_session(&session)?;
@@ -126,8 +133,11 @@ impl Account {
 
         // Persist only after a clean reconcile, so a mid-sync failure never
         // corrupts the local store or advances the cursor past unmerged rows.
+        // merge_save (not save): this runs on a background thread that races the
+        // reader's own writes — folding in (furthest-page-wins) rather than
+        // blind-overwriting means a page the reader just advanced isn't lost.
         store
-            .save(&self.progress_path())
+            .merge_save(&self.progress_path())
             .map_err(|e| crate::Error::Transport(e.to_string()))?;
         self.save_state(&state)?;
         Ok(outcome)
@@ -214,11 +224,20 @@ mod tests {
         );
     }
 
+    /// Mirror the branch `verify` takes for a given `(previous, new)` identity
+    /// pair, without hitting the network — the only network step in `verify` is
+    /// the code exchange; the local reset is pure filesystem.
+    fn apply_switch_reset(acct: &Account, previous: Option<&str>, new_email: &str) {
+        if previous.is_some_and(|p| p != new_email) {
+            let _ = std::fs::remove_file(acct.progress_path());
+            let _ = std::fs::remove_file(acct.state_path());
+        }
+    }
+
     #[test]
-    fn switching_accounts_resets_the_sync_cursor() {
-        // The cross-account guard, tested without network by pre-seeding state
-        // and exercising the reset branch directly: a stale cursor from account
-        // A must not survive into account B on the same profile.
+    fn switching_accounts_wipes_the_prior_users_local_data() {
+        // A's reading + cursor must not survive into B on the same profile —
+        // neither pushed up to B nor pulled back for A.
         let dir = tempfile::tempdir().unwrap();
         let acct = Account::new(config(), dir.path());
         acct.save_session(&session("a@example.com")).unwrap();
@@ -227,24 +246,42 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let mut store = ProgressStore::default();
+        store.update("A Secret Manga/vol1.cbz", 40, 40);
+        store.save(&acct.progress_path()).unwrap();
 
-        // Simulate the verify() reset branch for a different identity.
-        let previous = acct.email();
-        assert_eq!(previous.as_deref(), Some("a@example.com"));
-        let new = session("b@example.com");
-        if previous.as_deref() != Some(new.email.as_str()) {
-            std::fs::remove_file(acct.state_path()).unwrap();
-        }
-        acct.save_session(&new).unwrap();
+        apply_switch_reset(&acct, acct.email().as_deref(), "b@example.com");
+        acct.save_session(&session("b@example.com")).unwrap();
 
+        assert!(!acct.state_path().exists(), "A's cursor is gone");
         assert!(
-            !acct.state_path().exists(),
-            "a different account resets the pull cursor so its rows can't leak in"
+            !acct.progress_path().exists(),
+            "A's reading list is gone, so it can't be pushed into B's account"
         );
     }
 
     #[test]
-    fn same_account_keeps_its_cursor() {
+    fn first_sign_in_keeps_local_reading_to_push_up() {
+        // No previous account: the device's own offline reading must be kept
+        // (and later pushed up), not wiped.
+        let dir = tempfile::tempdir().unwrap();
+        let acct = Account::new(config(), dir.path());
+        let mut store = ProgressStore::default();
+        store.update("My Manga/vol1.cbz", 12, 30);
+        store.save(&acct.progress_path()).unwrap();
+
+        apply_switch_reset(&acct, acct.email().as_deref(), "me@example.com");
+        acct.save_session(&session("me@example.com")).unwrap();
+
+        let reloaded = ProgressStore::load(&acct.progress_path()).unwrap();
+        assert!(
+            reloaded.get("My Manga/vol1.cbz").is_some(),
+            "first sign-in keeps the device's own reading to sync up"
+        );
+    }
+
+    #[test]
+    fn same_account_keeps_its_cursor_and_reading() {
         let dir = tempfile::tempdir().unwrap();
         let acct = Account::new(config(), dir.path());
         acct.save_session(&session("a@example.com")).unwrap();
@@ -254,11 +291,7 @@ mod tests {
         })
         .unwrap();
 
-        let previous = acct.email();
-        let same = session("a@example.com");
-        if previous.as_deref() != Some(same.email.as_str()) {
-            std::fs::remove_file(acct.state_path()).unwrap();
-        }
+        apply_switch_reset(&acct, acct.email().as_deref(), "a@example.com");
 
         assert!(
             acct.state_path().exists(),
