@@ -594,6 +594,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Keyboard repaints since the search screen opened, for the periodic
     /// anti-ghosting full refresh.
     keyboard_paints: u32,
+    /// Whether the on-screen keyboard is in upper-case mode (Shift). Sticky
+    /// (caps-lock style); reset each time a keyboard screen opens.
+    keyboard_shift: bool,
     /// Frontlight hook for the reader's edge slides; `None` (tests,
     /// headless) means swipes are ignored.
     lights: Option<Box<dyn LightControl>>,
@@ -663,6 +666,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             sleeper: None,
             last_wake: None,
             keyboard_paints: 0,
+            keyboard_shift: false,
             lights: None,
             settings_dir: None,
             battery: None,
@@ -1388,6 +1392,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     1 => "Latest",
                     2 => {
                         self.keyboard_paints = 0;
+                        self.keyboard_shift = false;
                         self.push(Screen::Search {
                             source: Some(source),
                             query: String::new(),
@@ -1677,6 +1682,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                 } else if row == profiles.len() {
                     self.keyboard_paints = 0;
+                    self.keyboard_shift = false;
                     self.push(Screen::NewProfile {
                         name: String::new(),
                     })?;
@@ -1838,6 +1844,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             (None, 0) => {
                 self.keyboard_paints = 0;
+                self.keyboard_shift = false;
                 self.push(Screen::AccountEmail {
                     email: String::new(),
                 })?;
@@ -1857,13 +1864,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 return Ok(());
             }
             self.keyboard_paints = 0;
+            self.keyboard_shift = false;
             self.push(Screen::AccountPassword {
                 email: addr,
                 password: String::new(),
             })?;
             return Ok(());
         }
-        if let Some(v) = key.and_then(|key| apply_key_edit(email, key)) {
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(v) = key.and_then(|key| apply_key_edit(email, key, self.keyboard_shift)) {
             if let Some(Screen::AccountEmail { email }) = self.stack.last_mut() {
                 *email = v;
             }
@@ -1901,7 +1912,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             return Ok(());
         }
-        if let Some(v) = key.and_then(|key| apply_key_edit(password, key)) {
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(v) = key.and_then(|key| apply_key_edit(password, key, self.keyboard_shift)) {
             if let Some(Screen::AccountPassword { password, .. }) = self.stack.last_mut() {
                 *password = v;
             }
@@ -1927,7 +1941,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             return Ok(());
         }
-        if let Some(q) = key.and_then(|key| apply_key_edit(query, key)) {
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(q) = key.and_then(|key| apply_key_edit(query, key, self.keyboard_shift)) {
             if let Some(Screen::Search { query, .. }) = self.stack.last_mut() {
                 *query = q;
             }
@@ -1947,7 +1964,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             return Ok(());
         }
-        if let Some(n) = key.and_then(|key| apply_key_edit(name, key)) {
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(n) = key.and_then(|key| apply_key_edit(name, key, self.keyboard_shift)) {
             if let Some(Screen::NewProfile { name }) = self.stack.last_mut() {
                 *name = n;
             }
@@ -1970,6 +1990,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             RefreshMode::Partial
         };
         self.render_current(mode)
+    }
+
+    /// If `key` is Shift, flip the keyboard's case mode and repaint, returning
+    /// `true` (the caller then skips buffer editing). Otherwise `false`.
+    fn toggle_shift_if_pressed(&mut self, key: Option<Key>) -> Result<bool> {
+        if key == Some(Key::Shift) {
+            self.keyboard_shift = !self.keyboard_shift;
+            self.keyboard_repaint()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // --- settings screen ---
@@ -2158,6 +2190,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Push the global-search keyboard (empty query, every installed source).
     fn open_search_keyboard(&mut self) -> Result<()> {
         self.keyboard_paints = 0;
+        self.keyboard_shift = false;
         self.push(Screen::Search {
             source: None,
             query: String::new(),
@@ -3342,6 +3375,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.connect_to_network(&net.ssid, None)
         } else {
             self.keyboard_paints = 0;
+            self.keyboard_shift = false;
             self.push(Screen::WifiPassword {
                 ssid: net.ssid.clone(),
                 password: String::new(),
@@ -3356,7 +3390,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if key == Some(Key::Search) {
             return self.connect_to_network(ssid, Some(password));
         }
-        if let Some(p) = key.and_then(|key| apply_key_edit(password, key)) {
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(p) = key.and_then(|key| apply_key_edit(password, key, self.keyboard_shift)) {
             if let Some(Screen::WifiPassword { password, .. }) = self.stack.last_mut() {
                 *password = p;
             }
@@ -3681,7 +3718,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 rows.push(("New profile…".to_string(), true));
                 compose_list(l, "Profiles", &rows, 0, 1)
             }
-            Screen::NewProfile { name } => compose_keyboard(l, "New profile", name, "Create"),
+            Screen::NewProfile { name } => {
+                compose_keyboard(l, "New profile", name, "Create", self.keyboard_shift)
+            }
             Screen::Settings => {
                 let settings = self.load_settings();
                 let mut rows = settings_rows(&settings);
@@ -3725,10 +3764,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 };
                 compose_list(l, "Sync account", &rows, 0, 1)
             }
-            Screen::AccountEmail { email } => compose_keyboard(l, "Your email", email, "Next"),
-            Screen::AccountPassword { email, password } => {
-                compose_keyboard(l, &format!("Password for {email}"), password, "Sign in")
+            Screen::AccountEmail { email } => {
+                compose_keyboard(l, "Your email", email, "Next", self.keyboard_shift)
             }
+            Screen::AccountPassword { email, password } => compose_keyboard(
+                l,
+                &format!("Password for {email}"),
+                password,
+                "Sign in",
+                self.keyboard_shift,
+            ),
             Screen::PowerMenu => {
                 // Wi-Fi networks at the top — scan/connect without digging into
                 // Settings; the live status hints at what tapping does.
@@ -3764,9 +3809,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // on; tapping it turns Wi-Fi off.
                 compose_wifi_list(l, title, &nets, true)
             }
-            Screen::WifiPassword { ssid, password } => {
-                compose_keyboard(l, &format!("Password — {ssid}"), password, "Connect")
-            }
+            Screen::WifiPassword { ssid, password } => compose_keyboard(
+                l,
+                &format!("Password — {ssid}"),
+                password,
+                "Connect",
+                self.keyboard_shift,
+            ),
             Screen::Library { items, page } => self.compose_library(items, *page)?,
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
@@ -3785,7 +3834,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             Screen::Search { source, query } => {
                 let scope = source.as_ref().map_or("all sources", |s| s.name.as_str());
-                compose_search(l, scope, query)
+                compose_search(l, scope, query, self.keyboard_shift)
             }
             Screen::RecentSearches { recents } => {
                 let mut rows: Vec<(String, bool)> = vec![("New search…".to_string(), true)];
@@ -4819,11 +4868,17 @@ fn compose_wifi_list(l: &UiLayout, title: &str, nets: &[WifiRow], wifi_on: bool)
 /// Apply an edit key to a keyboard buffer; `None` means no change (the
 /// action key is handled by the caller). Shared by the search and
 /// new-profile keyboards.
-fn apply_key_edit(buffer: &str, key: Key) -> Option<String> {
+fn apply_key_edit(buffer: &str, key: Key, shift: bool) -> Option<String> {
     match key {
         Key::Char(c) => {
             let mut b = buffer.to_string();
-            b.push(c);
+            // Shift upper-cases letters (case-sensitive passwords); other
+            // characters are unaffected.
+            if shift {
+                b.extend(c.to_uppercase());
+            } else {
+                b.push(c);
+            }
             Some(b)
         }
         // No leading or doubled spaces — sources won't match them, and
@@ -4840,18 +4895,26 @@ fn apply_key_edit(buffer: &str, key: Key) -> Option<String> {
             b.pop();
             Some(b)
         }
-        Key::Search => None,
+        // Shift toggles case; handled by the caller (it mutates keyboard state
+        // and repaints). Search runs the action. Neither edits the buffer.
+        Key::Shift | Key::Search => None,
     }
 }
 
 /// The search screen: chrome + the query line + the on-screen keyboard.
-fn compose_search(l: &UiLayout, source_name: &str, query: &str) -> GrayPage {
-    compose_keyboard(l, &format!("Search {source_name}"), query, "Search")
+fn compose_search(l: &UiLayout, source_name: &str, query: &str, shift: bool) -> GrayPage {
+    compose_keyboard(l, &format!("Search {source_name}"), query, "Search", shift)
 }
 
 /// A keyboard screen: chrome + the edited line + the on-screen keyboard,
 /// with the action key labeled `action` ("Search", "Create"…).
-fn compose_keyboard(l: &UiLayout, title: &str, buffer: &str, action: &str) -> GrayPage {
+fn compose_keyboard(
+    l: &UiLayout,
+    title: &str,
+    buffer: &str,
+    action: &str,
+    shift: bool,
+) -> GrayPage {
     let mut canvas = compose_chrome(l, title, 0, 1);
 
     // Edited line with a trailing caret, in the area above the keyboard.
@@ -4876,12 +4939,18 @@ fn compose_keyboard(l: &UiLayout, title: &str, buffer: &str, action: &str) -> Gr
     for (key, x, y, w, h) in l.keyboard_keys() {
         rect_outline(&mut canvas, x, y, w, h, 0xAA);
         let label = match key {
+            // Show the case that will actually be typed.
+            Key::Char(c) if shift => c.to_uppercase().to_string(),
             Key::Char(c) => c.to_string(),
             Key::Backspace => "<del".to_string(),
             Key::Space => "space".to_string(),
+            Key::Shift if shift => "SHIFT".to_string(),
+            Key::Shift => "shift".to_string(),
             Key::Search => action.to_string(),
         };
-        let bold = key == Key::Search;
+        // Bold the action key, and the Shift key while it's active, so its state
+        // is visible.
+        let bold = key == Key::Search || (key == Key::Shift && shift);
         let tw = measure_text(l.text_px, &label, bold).min(w);
         draw_text(
             &mut canvas,
