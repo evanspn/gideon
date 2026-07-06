@@ -2930,9 +2930,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // BEFORE the first page even paints — so "resume" always lands here,
         // even if the app is killed (Nickel home button) before any later save.
         store.set_last_opened(series_key_of(key), key);
-        // overlay_save (not save): a background sync may be writing this file
-        // too; keep our value for this chapter but preserve chapters it added.
-        let _ = store.overlay_save(&progress_file);
+        // merge_save (not save): a background sync may be writing this file too;
+        // furthest-page-wins folds in rather than clobbering, and never rewinds.
+        let _ = store.merge_save(&progress_file);
 
         // The reader works in PANEL coordinates (self.layout may be the
         // rotated menu layout): build its gesture geometry from the
@@ -3241,7 +3241,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // Save the reading position before the power goes
                         // down — a dead battery must not lose it.
                         reader.save_progress(&mut store, key);
-                        store.overlay_save(&progress_file)?;
+                        store.merge_save(&progress_file)?;
                         let result = self.sleeper.as_mut().expect("checked above")();
                         self.last_wake = Some(std::time::Instant::now());
                         if let Err(e) = &result {
@@ -3292,7 +3292,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             reader.save_progress(&mut store, key);
         }
-        store.overlay_save(&progress_file)?;
+        store.merge_save(&progress_file)?;
         // The shelf's cached store is stale now — the session moved pages.
         self.invalidate_progress_cache();
         // Reading advanced this chapter's page: push it (and pull anything new)
@@ -4055,10 +4055,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// drop the cache. Returns whether anything was actually cleared.
     fn mark_unread(&self, key: &str) -> Result<bool> {
         let path = progress_path(&self.library_dir);
-        let mut store = ProgressStore::load(&path).unwrap_or_default();
-        let removed = store.remove(key);
+        // forget() does the load-remove-write under the store lock, so a
+        // background sync's concurrent addition isn't dropped by a stale save.
+        let removed = ProgressStore::forget(&path, key)?;
         if removed {
-            store.save(&path)?;
             self.invalidate_progress_cache();
         }
         Ok(removed)
@@ -4077,9 +4077,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let path = progress_path(&self.library_dir);
         let mut store = ProgressStore::load(&path).unwrap_or_default();
         store.update(key, total - 1, total);
-        // Mark-read is authoritative for this chapter; overlay so a concurrent
-        // sync write to *other* chapters survives.
-        store.overlay_save(&path)?;
+        // Mark-read advances to the last page; merge_save folds in (furthest
+        // wins) so a concurrent sync write to another chapter survives.
+        store.merge_save(&path)?;
         self.invalidate_progress_cache();
         Ok(())
     }

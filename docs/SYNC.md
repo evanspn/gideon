@@ -77,11 +77,12 @@ so writes are coordinated to avoid lost updates:
 - All writes take a process-wide lock and use a per-write-unique temp file, so
   two writers can't corrupt each other (`ProgressStore::save` / `merge_save` /
   `overlay_save`).
-- The **reader** writes with `overlay_save`: authoritative for the chapter it's
-  reading (a deliberate page-back sticks), but it preserves any chapter the sync
-  thread added.
-- **Sync** writes with `merge_save`: furthest-page-wins, so it only ever raises a
-  page and can never rewind the reader.
+- Both the **reader** and **sync** write with `merge_save`: furthest-page-wins,
+  so a write only ever *raises* a page and neither can rewind the other. Local
+  reading never diverges below the furthest page the account has reached — a
+  deliberate flip-back to re-read doesn't record a lower position (never-rewind
+  is the cardinal rule). Mark-unread is the deliberate exception: it uses
+  `ProgressStore::forget` (a lock-held remove) since a merge can't remove.
 - Only one reconcile runs at a time (an in-flight guard in `gideon-app::sync`),
   so overlapping triggers don't double-spend the rotating refresh token.
 
@@ -90,10 +91,15 @@ so writes are coordinated to avoid lost updates:
 An account's session and sync bookkeeping live **inside the profile's `.gideon`
 directory** (`sync_session.json`, `sync_state.json`), next to that profile's
 `progress.json`. So a profile is bound to exactly one cloud account: switching
-profiles switches all of it, and signing a profile into a *different* account
-resets the pull cursor (`gideon_sync::account::Account::verify`) so a previous
-user's rows can never be pulled into this profile's store. Local `progress.json`
-is never touched by sign-in/out — reading stays fully offline-first.
+profiles switches all of it.
+
+Signing a profile into a *different* account wipes this profile's local reading
+and cursor (`gideon_sync::account::Account::verify`), so the prior user's rows
+neither get pushed up into the new account nor linger in its library. The switch
+is detected against a **durable owner marker** (`sync_owner`) rather than the
+live session — it survives sign-out, so the common sign-out-then-sign-in-as-
+someone-else flow is caught, not just a direct account swap. A *first* sign-in
+(no prior owner) keeps the device's own offline reading and pushes it up.
 
 ## Status
 

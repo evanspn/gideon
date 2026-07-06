@@ -26,6 +26,10 @@ use crate::{Result, SyncOutcome, SyncState, Syncer};
 const SESSION_FILE: &str = "sync_session.json";
 const STATE_FILE: &str = "sync_state.json";
 const PROGRESS_FILE: &str = "progress.json";
+/// Durable record of which account `progress.json` belongs to. Unlike the
+/// session, it survives sign-out — so signing a profile into a *different*
+/// account is detected even across the usual sign-out-then-sign-in flow.
+const OWNER_FILE: &str = "sync_owner";
 
 /// Reading-progress sync for one profile against one Supabase project.
 pub struct Account {
@@ -52,6 +56,18 @@ impl Account {
     }
     fn progress_path(&self) -> PathBuf {
         self.dir.join(PROGRESS_FILE)
+    }
+    fn owner_path(&self) -> PathBuf {
+        self.dir.join(OWNER_FILE)
+    }
+
+    /// The account `progress.json` currently belongs to (durable across
+    /// sign-out), or `None` if this profile has never been signed in.
+    fn owner(&self) -> Option<String> {
+        std::fs::read_to_string(self.owner_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     /// The signed-in session, if any (unreadable/absent ⇒ `None`).
@@ -82,10 +98,14 @@ impl Account {
     /// account) keeps the local `progress.json` and pushes it up — it's this
     /// device's own reading.
     pub fn verify(&self, email: &str, code: &str, now: u64) -> Result<Session> {
-        let previous_email = self.email();
+        // Compare against the *durable owner*, not the live session: the usual
+        // flow is sign-out (session gone, progress kept) then sign-in, so a
+        // session-based check would miss the switch and re-push the prior user's
+        // rows into the new account.
+        let previous_owner = self.owner();
         let session = AuthClient::new(self.config.clone()).verify_code(email, code, now)?;
 
-        let switching_accounts = previous_email
+        let switching_accounts = previous_owner
             .as_deref()
             .is_some_and(|prev| prev != session.email);
         if switching_accounts {
@@ -95,12 +115,24 @@ impl Account {
             let _ = std::fs::remove_file(self.progress_path());
             let _ = std::fs::remove_file(self.state_path());
         }
+        self.write_owner(&session.email)?;
         self.save_session(&session)?;
         Ok(session)
     }
 
+    /// Record `email` as the durable owner of this profile's `progress.json`.
+    fn write_owner(&self, email: &str) -> Result<()> {
+        if let Some(parent) = self.owner_path().parent() {
+            std::fs::create_dir_all(parent).map_err(|e| crate::Error::Transport(e.to_string()))?;
+        }
+        std::fs::write(self.owner_path(), email).map_err(|e| crate::Error::Transport(e.to_string()))
+    }
+
     /// Sign out: forget the session and the sync cursor (so a later sign-in
-    /// starts clean), but keep local `progress.json` — reading works offline.
+    /// starts clean), but keep local `progress.json` — reading works offline —
+    /// and keep the durable owner marker, so signing this profile into a
+    /// *different* account afterwards is still detected as a switch and wipes the
+    /// prior user's rows (see [`Self::verify`]).
     pub fn sign_out(&self) -> Result<()> {
         let _ = std::fs::remove_file(self.session_path());
         let _ = std::fs::remove_file(self.state_path());
@@ -224,45 +256,53 @@ mod tests {
         );
     }
 
-    /// Mirror the branch `verify` takes for a given `(previous, new)` identity
-    /// pair, without hitting the network — the only network step in `verify` is
-    /// the code exchange; the local reset is pure filesystem.
-    fn apply_switch_reset(acct: &Account, previous: Option<&str>, new_email: &str) {
-        if previous.is_some_and(|p| p != new_email) {
+    /// Mirror the local wipe-decision half of `verify` (the only network step is
+    /// the code exchange; the reset is pure filesystem), keyed off the durable
+    /// owner exactly as `verify` is.
+    fn simulate_verify(acct: &Account, new_email: &str) {
+        let switching = acct.owner().is_some_and(|prev| prev != new_email);
+        if switching {
             let _ = std::fs::remove_file(acct.progress_path());
             let _ = std::fs::remove_file(acct.state_path());
         }
+        acct.write_owner(new_email).unwrap();
+        acct.save_session(&session(new_email)).unwrap();
     }
 
     #[test]
-    fn switching_accounts_wipes_the_prior_users_local_data() {
-        // A's reading + cursor must not survive into B on the same profile —
-        // neither pushed up to B nor pulled back for A.
+    fn sign_out_then_different_account_wipes_the_prior_users_data() {
+        // The real UI path: sign in A, sign OUT (which keeps progress), then sign
+        // in B. B must not inherit A's reading list — this is the leak the
+        // session-based check missed, so it's keyed off the durable owner.
         let dir = tempfile::tempdir().unwrap();
         let acct = Account::new(config(), dir.path());
-        acct.save_session(&session("a@example.com")).unwrap();
-        acct.save_state(&SyncState {
-            cursor: Some("t-from-account-a".into()),
-            ..Default::default()
-        })
-        .unwrap();
+
+        simulate_verify(&acct, "a@example.com");
         let mut store = ProgressStore::default();
         store.update("A Secret Manga/vol1.cbz", 40, 40);
         store.save(&acct.progress_path()).unwrap();
+        acct.save_state(&SyncState {
+            cursor: Some("t-a".into()),
+            ..Default::default()
+        })
+        .unwrap();
 
-        apply_switch_reset(&acct, acct.email().as_deref(), "b@example.com");
-        acct.save_session(&session("b@example.com")).unwrap();
+        acct.sign_out().unwrap(); // session gone, progress + owner kept
+        assert_eq!(acct.owner().as_deref(), Some("a@example.com"));
 
-        assert!(!acct.state_path().exists(), "A's cursor is gone");
+        simulate_verify(&acct, "b@example.com"); // roommate signs in
+
         assert!(
             !acct.progress_path().exists(),
-            "A's reading list is gone, so it can't be pushed into B's account"
+            "A's reading list is wiped, so it can't be pushed into B's account"
         );
+        assert!(!acct.state_path().exists(), "A's cursor is gone");
+        assert_eq!(acct.owner().as_deref(), Some("b@example.com"));
     }
 
     #[test]
     fn first_sign_in_keeps_local_reading_to_push_up() {
-        // No previous account: the device's own offline reading must be kept
+        // No previous owner: the device's own offline reading must be kept
         // (and later pushed up), not wiped.
         let dir = tempfile::tempdir().unwrap();
         let acct = Account::new(config(), dir.path());
@@ -270,8 +310,7 @@ mod tests {
         store.update("My Manga/vol1.cbz", 12, 30);
         store.save(&acct.progress_path()).unwrap();
 
-        apply_switch_reset(&acct, acct.email().as_deref(), "me@example.com");
-        acct.save_session(&session("me@example.com")).unwrap();
+        simulate_verify(&acct, "me@example.com");
 
         let reloaded = ProgressStore::load(&acct.progress_path()).unwrap();
         assert!(
@@ -281,21 +320,28 @@ mod tests {
     }
 
     #[test]
-    fn same_account_keeps_its_cursor_and_reading() {
+    fn signing_back_into_the_same_account_keeps_cursor_and_reading() {
         let dir = tempfile::tempdir().unwrap();
         let acct = Account::new(config(), dir.path());
-        acct.save_session(&session("a@example.com")).unwrap();
+        simulate_verify(&acct, "a@example.com");
         acct.save_state(&SyncState {
             cursor: Some("keep-me".into()),
             ..Default::default()
         })
         .unwrap();
+        let mut store = ProgressStore::default();
+        store.update("Mine/vol1.cbz", 4, 10);
+        store.save(&acct.progress_path()).unwrap();
 
-        apply_switch_reset(&acct, acct.email().as_deref(), "a@example.com");
+        acct.sign_out().unwrap();
+        // No sync_state after sign-out, but progress + owner persist; re-signing
+        // into the SAME account must not wipe the reading.
+        simulate_verify(&acct, "a@example.com");
 
+        let reloaded = ProgressStore::load(&acct.progress_path()).unwrap();
         assert!(
-            acct.state_path().exists(),
-            "re-signing into the same account preserves its cursor"
+            reloaded.get("Mine/vol1.cbz").is_some(),
+            "re-signing into the same account keeps the reading"
         );
     }
 }

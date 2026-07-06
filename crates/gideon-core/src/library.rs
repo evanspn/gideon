@@ -189,23 +189,19 @@ impl ProgressStore {
         disk.write_atomic(path)
     }
 
-    /// Save, taking **this store's value** for every chapter it knows (so the
-    /// reader can move a page up *or* down — a deliberate flip back must stick),
-    /// while preserving any chapter a concurrent writer (the background sync
-    /// thread) added to disk since this store was loaded. Under the same process
-    /// lock as [`Self::save`]. Use for the reader's own progress writes; sync
-    /// uses [`Self::merge_save`] (furthest-page-wins) so it can never rewind
-    /// another device.
-    pub fn overlay_save(&self, path: &Path) -> Result<()> {
+    /// Remove `key`'s progress and save, doing the whole load-remove-write under
+    /// [`SAVE_LOCK`] so a concurrent writer's addition isn't dropped. Returns
+    /// whether a row was removed. This is the *authoritative* way to forget a
+    /// chapter (mark-unread) — a merge/overlay can't remove, and loading outside
+    /// the lock would let a background sync's addition be clobbered.
+    pub fn forget(path: &Path, key: &str) -> Result<bool> {
         let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut disk = Self::load(path).unwrap_or_default();
-        for (key, p) in &self.progress {
-            disk.progress.insert(key.clone(), *p);
+        let removed = disk.progress.remove(key).is_some();
+        if removed {
+            disk.write_atomic(path)?;
         }
-        for (series, chapter) in &self.last_opened {
-            disk.last_opened.insert(series.clone(), chapter.clone());
-        }
-        disk.write_atomic(path)
+        Ok(removed)
     }
 
     /// Atomic write (temp file + rename) with a *unique* temp name, so two
@@ -411,32 +407,29 @@ mod tests {
     }
 
     #[test]
-    fn overlay_save_is_authoritative_but_preserves_other_chapters() {
-        // The reader can move its own chapter down (deliberate flip back) AND a
-        // chapter the background sync added to disk must survive.
+    fn forget_removes_under_the_lock_and_preserves_other_chapters() {
+        // mark-unread must remove its chapter but keep a chapter a background
+        // sync added to disk (load-remove-write is done under the lock).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("progress.json");
 
         let mut on_disk = ProgressStore::default();
-        on_disk.update("A/vol1.cbz", 5, 10); // reader's chapter, currently 5
+        on_disk.update("A/vol1.cbz", 5, 10);
         on_disk.update("B/vol1.cbz", 15, 30); // added by a background sync
         on_disk.save(&path).unwrap();
 
-        // Reader loaded A at 5, paged back to 2, and knows nothing of B.
-        let mut reader = ProgressStore::default();
-        reader.update("A/vol1.cbz", 2, 10);
-        reader.overlay_save(&path).unwrap();
+        assert!(ProgressStore::forget(&path, "A/vol1.cbz").unwrap());
+        assert!(
+            !ProgressStore::forget(&path, "A/vol1.cbz").unwrap(),
+            "forgetting again is a no-op"
+        );
 
         let saved = ProgressStore::load(&path).unwrap();
-        assert_eq!(
-            saved.get("A/vol1.cbz").unwrap().current_page,
-            2,
-            "the reader is authoritative for its own chapter, even moving back"
-        );
+        assert!(saved.get("A/vol1.cbz").is_none(), "A is forgotten");
         assert_eq!(
             saved.get("B/vol1.cbz").unwrap().current_page,
             15,
-            "a chapter the sync added is preserved, not clobbered"
+            "the sync-added chapter is preserved"
         );
     }
 
