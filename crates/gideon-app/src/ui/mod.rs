@@ -412,16 +412,16 @@ enum Screen {
     /// Sync account menu, opened from Settings. Signed out it offers sign-in;
     /// signed in it shows the email with "Sync now" and "Sign out".
     AccountMenu,
-    /// On-screen keyboard for the account email; the action key sends a one-time
-    /// login code and advances to [`Screen::AccountCode`].
+    /// On-screen keyboard for the account email; the action key advances to
+    /// [`Screen::AccountPassword`].
     AccountEmail {
         email: String,
     },
-    /// On-screen keyboard for the emailed one-time code; the action key verifies
-    /// it, stores the session, and triggers a first sync.
-    AccountCode {
+    /// On-screen keyboard for the account password; the action key signs in
+    /// (email + password), stores the session, and triggers a first sync.
+    AccountPassword {
         email: String,
-        code: String,
+        password: String,
     },
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
@@ -1664,8 +1664,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.tap_account_email(&email, x, y)?;
                 Ok(Flow::Continue)
             }
-            Screen::AccountCode { email, code } => {
-                self.tap_account_code(&email, &code, x, y)?;
+            Screen::AccountPassword { email, password } => {
+                self.tap_account_password(&email, &password, x, y)?;
                 Ok(Flow::Continue)
             }
             Screen::ProfileMenu { profiles } => {
@@ -1847,8 +1847,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(())
     }
 
-    /// Email keyboard: the action key emails a one-time code and advances to the
-    /// code screen; other keys edit the address in place.
+    /// Email keyboard: the action key advances to the password screen (no
+    /// network yet); other keys edit the address in place.
     fn tap_account_email(&mut self, email: &str, x: u32, y: u32) -> Result<()> {
         let key = self.layout.key_at(x, y);
         if key == Some(Key::Search) {
@@ -1856,23 +1856,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             if addr.is_empty() {
                 return Ok(());
             }
-            let Some(account) = self.account() else {
-                return Ok(());
-            };
-            self.show_status(&["Sending code…"])?;
-            match account.request_code(&addr) {
-                Ok(()) => {
-                    self.keyboard_paints = 0;
-                    self.push(Screen::AccountCode {
-                        email: addr,
-                        code: String::new(),
-                    })?;
-                }
-                Err(e) => self.push(Screen::Message {
-                    title: "Couldn't send code".to_string(),
-                    body: format!("{e}\nCheck the address and your connection."),
-                })?,
-            }
+            self.keyboard_paints = 0;
+            self.push(Screen::AccountPassword {
+                email: addr,
+                password: String::new(),
+            })?;
             return Ok(());
         }
         if let Some(v) = key.and_then(|key| apply_key_edit(email, key)) {
@@ -1884,39 +1872,38 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(())
     }
 
-    /// Code keyboard: the action key verifies the code, stores the session, and
-    /// triggers a first sync; other keys edit the code in place.
-    fn tap_account_code(&mut self, email: &str, code: &str, x: u32, y: u32) -> Result<()> {
+    /// Password keyboard: the action key signs in (email + password), stores the
+    /// session, and triggers a first sync; other keys edit the password in place.
+    fn tap_account_password(&mut self, email: &str, password: &str, x: u32, y: u32) -> Result<()> {
         let key = self.layout.key_at(x, y);
         if key == Some(Key::Search) {
-            let token = code.trim().to_string();
-            if token.is_empty() {
+            if password.is_empty() {
                 return Ok(());
             }
             let Some(account) = self.account() else {
                 return Ok(());
             };
-            self.show_status(&["Verifying…"])?;
-            match account.verify(email, &token, crate::sync::now()) {
+            self.show_status(&["Signing in…"])?;
+            match account.sign_in(email, password, crate::sync::now()) {
                 Ok(_) => {
                     self.trigger_sync();
                     // Unwind the two keyboard screens back to the account menu,
                     // which now renders the signed-in state.
-                    self.stack.pop(); // AccountCode
+                    self.stack.pop(); // AccountPassword
                     self.stack.pop(); // AccountEmail
                     self.show_status(&["Signed in. Syncing…"])?;
                     self.render_current(RefreshMode::Full)?;
                 }
                 Err(e) => self.push(Screen::Message {
-                    title: "Couldn't verify".to_string(),
-                    body: format!("{e}\nDouble-check the code and try again."),
+                    title: "Couldn't sign in".to_string(),
+                    body: format!("{e}\nCheck your email and password, then try again."),
                 })?,
             }
             return Ok(());
         }
-        if let Some(v) = key.and_then(|key| apply_key_edit(code, key)) {
-            if let Some(Screen::AccountCode { code, .. }) = self.stack.last_mut() {
-                *code = v;
+        if let Some(v) = key.and_then(|key| apply_key_edit(password, key)) {
+            if let Some(Screen::AccountPassword { password, .. }) = self.stack.last_mut() {
+                *password = v;
             }
             self.keyboard_repaint()?;
         }
@@ -3731,18 +3718,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     None => vec![
                         ("Sign in with email".to_string(), true),
                         (
-                            "A one-time code is emailed to you — no password.".to_string(),
+                            "Use the email + password you set up on the web.".to_string(),
                             false,
                         ),
                     ],
                 };
                 compose_list(l, "Sync account", &rows, 0, 1)
             }
-            Screen::AccountEmail { email } => {
-                compose_keyboard(l, "Enter your email", email, "Send code")
-            }
-            Screen::AccountCode { email, code } => {
-                compose_keyboard(l, &format!("Code sent to {email}"), code, "Verify")
+            Screen::AccountEmail { email } => compose_keyboard(l, "Your email", email, "Next"),
+            Screen::AccountPassword { email, password } => {
+                compose_keyboard(l, &format!("Password for {email}"), password, "Sign in")
             }
             Screen::PowerMenu => {
                 // Wi-Fi networks at the top — scan/connect without digging into
