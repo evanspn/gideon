@@ -84,6 +84,40 @@ test("signing in shows the continue-reading list", async ({ page }) => {
   await expect(page.getByText("reader@example.com")).toBeVisible();
 });
 
+test("chapters of the same series collapse to one card (most recent)", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, [
+    {
+      chapter_key: "One Piece/vol1.cbz",
+      current_page: 19,
+      total_pages: 20,
+      updated_at: new Date(Date.now() - 5 * 86400e3).toISOString(),
+    },
+    {
+      chapter_key: "One Piece/vol3.cbz",
+      current_page: 5,
+      total_pages: 20,
+      updated_at: new Date(Date.now() - 3600e3).toISOString(),
+    },
+    {
+      chapter_key: "Naruto/vol1.cbz",
+      current_page: 2,
+      total_pages: 18,
+      updated_at: new Date(Date.now() - 2 * 86400e3).toISOString(),
+    },
+  ]);
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  const items = page.getByTestId("item");
+  // Two series -> two cards, even though One Piece has two chapters.
+  await expect(items).toHaveCount(2);
+  // The One Piece card shows its most-recent chapter (vol3), newest first.
+  await expect(items.nth(0)).toContainText("One Piece");
+  await expect(items.nth(0)).toContainText("vol3");
+  await expect(items.nth(1)).toContainText("Naruto");
+});
+
 test("progress bar width tracks percent read", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, ROWS);
