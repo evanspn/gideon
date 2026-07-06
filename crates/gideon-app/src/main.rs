@@ -17,6 +17,10 @@
 mod mal;
 mod manga;
 mod reader;
+// Reading-progress sync wiring (gideon-sync bridge). Exercised by tests and the
+// device UI; unused symbols in non-kobo builds are fine.
+#[cfg_attr(not(feature = "kobo"), allow(dead_code))]
+mod sync;
 // Outside device (`kobo`) builds, only the headless screenshot path of the
 // UI is reachable from the binary; the rest is exercised by unit tests.
 #[cfg_attr(not(feature = "kobo"), allow(dead_code))]

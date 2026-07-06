@@ -940,8 +940,9 @@ fn physical_forward_button_advances_when_upright() {
 #[test]
 fn physical_buttons_swap_when_upside_down() {
     // The physical page buttons follow the reading orientation: held upside
-    // down (180°) the two keys have physically swapped places, so the
-    // forward button goes BACK.
+    // down (180°) the two keys have physically swapped places, so the BACK
+    // button advances the page. (Observed via the advance, since progress is
+    // furthest-page-wins and never records a lower page.)
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
@@ -952,7 +953,7 @@ fn physical_buttons_swap_when_upside_down() {
     let events = vec![
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
-        UiEvent::PageForward,                // 180°: forward goes back -> page 1
+        UiEvent::PageBack, // 180°: the back button goes forward -> page 3
         UiEvent::Tap { x: W / 2, y: H / 2 }, // center is Back at any rotation
     ];
     let mut app =
@@ -962,8 +963,8 @@ fn physical_buttons_swap_when_upside_down() {
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
     assert_eq!(
         store.get("Sample/vol1.cbz").unwrap().current_page,
-        1,
-        "upside down, the forward button goes back"
+        3,
+        "upside down, the back button advances the page"
     );
 }
 
@@ -3987,6 +3988,32 @@ fn book_menu_deletes_the_whole_series() {
     };
     assert!(items.is_empty(), "whole series gone");
     assert!(!lib.join("Series").exists());
+}
+
+#[test]
+fn account_menu_signed_out_leads_to_email_sign_in() {
+    // With no session on this profile, the account menu offers email sign-in,
+    // and tapping it opens the email keyboard. (No network: we stop at the
+    // keyboard, before a code is requested.)
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+
+    assert!(
+        app.account_email().is_none(),
+        "a fresh profile has no signed-in account"
+    );
+
+    app.stack.push(Screen::AccountMenu);
+    let UiEvent::Tap { x, y } = tap_row(0) else {
+        unreachable!()
+    };
+    app.activate(0, x, y).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::AccountEmail { .. }),
+        "signed out, the account menu leads to email sign-in"
+    );
 }
 
 #[test]
