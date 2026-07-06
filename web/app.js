@@ -1,9 +1,10 @@
 // gideon web — reading-progress dashboard.
 //
-// Signs in with a Supabase magic link (works on the free tier's default email;
-// the device uses the 6-digit code from the same sign-in) and shows the same
-// `reading_progress` rows the Kobo syncs, newest first. It reads and never
-// writes here, so it can't rewind your place — the device is the writer.
+// Signs in with email + password (Supabase Auth — the same account the Kobo
+// signs into) and shows the `reading_progress` rows the device syncs, newest
+// first. Set the account up here once (Create account), then sign in with the
+// same email + password on your Kobo. It reads and never writes here, so it
+// can't rewind your place — the device is the writer.
 //
 // The anon key is public by design: row-level security (auth.uid()), not the
 // key, is what scopes every row to its owner.
@@ -50,36 +51,49 @@ function renderSignIn(message) {
     <div class="head"><div class="brand">gideon <span>· sync</span></div></div>
     <div class="card">
       <h1>Your reading, everywhere</h1>
-      <p>Sign in to see where you left off on your Kobo. We'll email you a sign-in link.</p>
-      <form class="field" id="signin">
-        <input type="email" id="email" placeholder="you@example.com" autocomplete="email" required />
-        <button class="primary" type="submit">Send link</button>
+      <p>Sign in to see where you left off on your Kobo. Create the account here once, then use the same email &amp; password on your device.</p>
+      <form id="signin">
+        <div class="stack">
+          <input type="email" id="email" placeholder="you@example.com" autocomplete="email" required />
+          <input type="password" id="password" placeholder="password" autocomplete="current-password" required minlength="6" />
+        </div>
+        <div class="field actions">
+          <button class="primary" type="submit" data-mode="signin">Sign in</button>
+          <button class="ghost" type="button" id="create">Create account</button>
+        </div>
       </form>
       <div class="note ${message ? "ok" : ""}" id="note">${message ? esc(message) : ""}</div>
     </div>`;
+
   const form = document.getElementById("signin");
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const email = document.getElementById("email").value.trim();
-    if (!email) return;
-    const btn = form.querySelector("button");
-    btn.disabled = true;
-    const note = document.getElementById("note");
+  const note = document.getElementById("note");
+  const emailEl = document.getElementById("email");
+  const pwEl = document.getElementById("password");
+
+  async function submit(mode) {
+    const email = emailEl.value.trim();
+    const password = pwEl.value;
+    if (!email || !password) return;
+    form.querySelectorAll("button").forEach((b) => (b.disabled = true));
     note.className = "note";
-    note.textContent = "Sending…";
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.origin },
-    });
+    note.textContent = mode === "signup" ? "Creating account…" : "Signing in…";
+    const { error } =
+      mode === "signup"
+        ? await supabase.auth.signUp({ email, password })
+        : await supabase.auth.signInWithPassword({ email, password });
     if (error) {
       note.className = "note";
-      note.textContent = `Couldn't send: ${error.message}`;
-      btn.disabled = false;
-    } else {
-      note.className = "note ok";
-      note.textContent = `Check ${email} for a sign-in link (or the code, if you're on your Kobo).`;
+      note.textContent = error.message;
+      form.querySelectorAll("button").forEach((b) => (b.disabled = false));
     }
+    // On success, onAuthStateChange swaps to the library view.
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    submit("signin");
   });
+  document.getElementById("create").addEventListener("click", () => submit("signup"));
 }
 
 function renderLibrary(email, rows) {

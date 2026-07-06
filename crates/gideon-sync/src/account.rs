@@ -85,25 +85,20 @@ impl Account {
         self.session().is_some()
     }
 
-    /// Step 1 of sign-in: email a one-time code.
-    pub fn request_code(&self, email: &str) -> Result<()> {
-        AuthClient::new(self.config.clone()).request_code(email)
-    }
-
-    /// Step 2 of sign-in: verify the code and persist the session. On a
-    /// *different* account than was signed in before, wipe this profile's local
-    /// reading data and sync bookkeeping too — a profile is bound to one
-    /// account, so account A's chapters must not (a) get pushed up into account
-    /// B, nor (b) linger in B's library. First-time sign-in (no previous
-    /// account) keeps the local `progress.json` and pushes it up — it's this
-    /// device's own reading.
-    pub fn verify(&self, email: &str, code: &str, now: u64) -> Result<Session> {
+    /// Sign in with email + password (the account is created once on the web)
+    /// and persist the session. On a *different* account than was signed in
+    /// before, wipe this profile's local reading data and sync bookkeeping too —
+    /// a profile is bound to one account, so account A's chapters must not (a)
+    /// get pushed up into account B, nor (b) linger in B's library. First-time
+    /// sign-in (no previous account) keeps the local `progress.json` and pushes
+    /// it up — it's this device's own reading.
+    pub fn sign_in(&self, email: &str, password: &str, now: u64) -> Result<Session> {
         // Compare against the *durable owner*, not the live session: the usual
         // flow is sign-out (session gone, progress kept) then sign-in, so a
         // session-based check would miss the switch and re-push the prior user's
         // rows into the new account.
         let previous_owner = self.owner();
-        let session = AuthClient::new(self.config.clone()).verify_code(email, code, now)?;
+        let session = AuthClient::new(self.config.clone()).sign_in(email, password, now)?;
 
         let switching_accounts = previous_owner
             .as_deref()

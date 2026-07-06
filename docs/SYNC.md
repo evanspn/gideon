@@ -8,10 +8,12 @@ and the Kobo device so a reader's place follows them.
 ## Decisions
 
 - **Backend:** Supabase (managed Postgres + Auth + auto REST/RPC API + RLS).
-  Chosen over Neon because it gives a secure client API and magic-link auth
-  with no server to host. (No Neon credential is configured anyway.)
-- **Identity:** Supabase Auth **email magic-link** — no passwords to type on
-  an e-ink keyboard.
+  Chosen over Neon because it gives a secure client API and hosted auth with no
+  server to host. (No Neon credential is configured anyway.)
+- **Identity:** Supabase Auth **email + password**. The account is created once
+  on the web (from a phone); the device just signs in with the same email +
+  password. No email round-trip at sign-in, so it needs no custom SMTP and works
+  on the free tier (signups are auto-confirmed).
 - **Conflict rule:** **furthest-page-wins** (monotonic). Two devices reading
   the same chapter offline converge to the higher `current_page`; a stale
   device can never rewind another. Enforced server-side by the
@@ -46,28 +48,30 @@ See `supabase/migrations/0001_reading_progress.sql`:
   updated_at > <last_pull>`; merge each into the local store with the same
   furthest-page-wins rule (`local = max(local_page, remote_page)`), so pull and
   push are symmetric and idempotent.
-- **Auth:** magic-link sign-in returns a session (access + refresh token)
-  persisted on-device; expired tokens refresh silently; logged-out/expired ⇒
-  read locally, queue syncs, resume after re-auth. Never hard-fail the app.
+- **Auth:** email + password sign-in (`grant_type=password`) returns a session
+  (access + refresh token) persisted on-device; expired tokens refresh silently;
+  logged-out/expired ⇒ read locally, queue syncs, resume after re-auth. Never
+  hard-fail the app.
 
 ## Deploy / apply
 
 1. Provision the Supabase project (region near the user) via the Supabase MCP
    (`create_project`), or the dashboard.
 2. Apply `supabase/migrations/0001_reading_progress.sql` (`apply_migration`).
-3. Enable Auth → Email (magic link); set the site URL / redirect for the web
-   app.
+3. Enable Auth → Email (email + password); turn on auto-confirm
+   (`mailer_autoconfirm`) so a web signup works immediately on the device.
 4. Wire clients with the project URL + anon (publishable) key; never embed the
    service-role key in the device or web app — the device only ever uses the
    anon key plus the user's JWT, and RLS does the rest.
 
 ## Auth on the device
 
-Sign-in uses **email one-time codes** (GoTrue `/auth/v1/otp` → `/auth/v1/verify`)
-rather than a magic *link*: an e-ink device has no easy way to catch a
-browser-redirect callback, but it can show a keyboard for an emailed 6-digit
-code. The returned session (access + refresh token) is persisted per profile and
-the short-lived access token is refreshed silently from the refresh token.
+Sign-in uses **email + password** (GoTrue `token?grant_type=password`): the
+account is created once on the web, and the device shows an email keyboard then
+a password keyboard and signs in — no browser-redirect callback to catch and no
+emailed code to wait for (which the free tier can't deliver without custom
+SMTP). The returned session (access + refresh token) is persisted per profile
+and the short-lived access token is refreshed silently from the refresh token.
 
 ## Concurrency (device)
 
@@ -106,9 +110,10 @@ someone-else flow is caught, not just a direct account swap. A *first* sign-in
 - ✅ Schema + RLS + furthest-page-wins RPC (this migration).
 - ✅ `sync-architect` persona (`.claude/agents/`) to guide/review the system.
 - ✅ Device sync client (`gideon-sync`): pure reconcile logic + the Supabase
-  transport (PostgREST pull, `upsert_progress` RPC push), email-OTP auth with
-  session refresh, and per-profile `Account` orchestration with the
+  transport (PostgREST pull, `upsert_progress` RPC push), email + password auth
+  with session refresh, and per-profile `Account` orchestration with the
   cross-account reset guard.
-- ⬜ Provision the live Supabase project + apply the migration, then wire the
-  project URL + anon key into the device (config) and add the account/sign-in UI.
-- ⬜ Web app (reader + the same sync).
+- ✅ Live Supabase project provisioned + migration applied; project URL + anon
+  key wired into the device, with the account/sign-in UI (email → password).
+- ✅ Web dashboard (`web/`): sign in with the same email + password, view the
+  synced `reading_progress`. Deployed to Vercel.

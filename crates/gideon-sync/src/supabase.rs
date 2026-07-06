@@ -1,9 +1,10 @@
 //! Supabase client for reading-progress sync.
 //!
 //! This is the real network layer behind the pure reconcile logic in
-//! [`crate`]: it authenticates against Supabase Auth (GoTrue) with an **email
-//! one-time code** — device-friendly, no browser redirect to catch on a Kobo —
-//! and reads/writes the `reading_progress` table through PostgREST and the
+//! [`crate`]: it authenticates against Supabase Auth (GoTrue) with **email +
+//! password** — the account is created once on the web, and the device just
+//! signs in (no email round-trip, so it works on the free tier) — and
+//! reads/writes the `reading_progress` table through PostgREST and the
 //! `upsert_progress` RPC (see `supabase/migrations/0001_reading_progress.sql`).
 //!
 //! Access is entirely scoped server-side: the device only ever holds the
@@ -156,7 +157,11 @@ fn upsert_body(update: &ProgressUpdate) -> serde_json::Value {
     })
 }
 
-/// Authenticates against Supabase Auth (GoTrue) with email one-time codes.
+/// Authenticates against Supabase Auth (GoTrue) with email + password.
+///
+/// The account is created once (on the web, from a phone); the device only ever
+/// *signs in* with the same email and password — no email round-trip, so it
+/// works on Supabase's free tier with no custom SMTP.
 pub struct AuthClient {
     config: SupabaseConfig,
     agent: ureq::Agent,
@@ -170,27 +175,16 @@ impl AuthClient {
         }
     }
 
-    /// Send a one-time login code to `email`. Creates the account on first use,
-    /// so there's no separate sign-up step.
-    pub fn request_code(&self, email: &str) -> Result<()> {
+    /// Sign in with an existing email + password and return a fresh [`Session`].
+    /// `now` is unix seconds (injected so expiry math is testable and
+    /// clock-independent).
+    pub fn sign_in(&self, email: &str, password: &str, now: u64) -> Result<Session> {
         let resp = self
             .agent
-            .post(&self.config.auth_url("otp"))
+            .post(&self.config.auth_url("token?grant_type=password"))
             .set("apikey", &self.config.anon_key)
             .set("Content-Type", "application/json")
-            .send_json(json!({ "email": email, "create_user": true }));
-        check_ok(resp).map(|_| ())
-    }
-
-    /// Verify the emailed code and return a fresh [`Session`]. `now` is unix
-    /// seconds (injected so expiry math is testable and clock-independent).
-    pub fn verify_code(&self, email: &str, code: &str, now: u64) -> Result<Session> {
-        let resp = self
-            .agent
-            .post(&self.config.auth_url("verify"))
-            .set("apikey", &self.config.anon_key)
-            .set("Content-Type", "application/json")
-            .send_json(json!({ "email": email, "token": code, "type": "email" }));
+            .send_json(json!({ "email": email, "password": password }));
         let body = read_body(check_ok(resp)?)?;
         parse_session(&body, now, email)
     }

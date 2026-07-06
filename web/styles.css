@@ -70,7 +70,9 @@ body {
 .card h1 { font-size: 20px; margin: 0 0 6px; }
 .card p { color: var(--muted); margin: 0 0 20px; }
 .field { display: flex; gap: 8px; flex-wrap: wrap; }
-input[type="email"] {
+.stack { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.actions { align-items: center; }
+input[type="email"], input[type="password"] {
   flex: 1 1 200px;
   min-width: 0;
   padding: 12px 14px;
@@ -80,7 +82,17 @@ input[type="email"] {
   border: 1px solid var(--line);
   border-radius: 10px;
 }
-input[type="email"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+button.ghost {
+  padding: 12px 14px;
+  font: inherit;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+button.ghost:disabled { opacity: 0.55; cursor: default; }
 button.primary {
   padding: 12px 18px;
   font: inherit; font-weight: 600;
