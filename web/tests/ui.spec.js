@@ -159,6 +159,75 @@ test("tapping a series card expands its chapter list", async ({ page }) => {
   await expect(subs).toHaveText(["vol1", "vol3"]);
 });
 
+// --- reader ---------------------------------------------------------------
+
+const READER_PAGES = ["p1", "p2", "p3", "p4", "p5"].map((s) => `https://cdn.test/${s}.png`);
+
+async function openReader(page, { pages = READER_PAGES, currentPage = 0 } = {}) {
+  await mockAuthOk(page);
+  await mockProgress(page, [
+    {
+      chapter_key: "Vagabond/ch1.cbz",
+      current_page: currentPage,
+      total_pages: pages.length,
+      updated_at: new Date().toISOString(),
+    },
+  ]);
+  await page.route("**/rest/v1/chapter_pages**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(pages.length ? [{ page_urls: pages }] : []),
+    })
+  );
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("item").first().locator("summary").click(); // expand
+  await page.getByTestId("chapter").first().click(); // open the reader
+}
+
+test("reading a chapter shows its pages and navigates", async ({ page }) => {
+  await openReader(page);
+  const img = page.getByTestId("reader-img");
+  await expect(page.getByTestId("reader-count")).toHaveText("1 / 5");
+  await expect(img).toHaveAttribute("src", READER_PAGES[0]);
+
+  await page.getByTestId("reader-next").click();
+  await expect(page.getByTestId("reader-count")).toHaveText("2 / 5");
+  await expect(img).toHaveAttribute("src", READER_PAGES[1]);
+
+  await page.getByTestId("reader-prev").click();
+  await expect(page.getByTestId("reader-count")).toHaveText("1 / 5");
+  await expect(img).toHaveAttribute("src", READER_PAGES[0]);
+});
+
+test("the reader resumes at the saved page", async ({ page }) => {
+  await openReader(page, { currentPage: 3 });
+  await expect(page.getByTestId("reader-count")).toHaveText("4 / 5");
+  await expect(page.getByTestId("reader-img")).toHaveAttribute("src", READER_PAGES[3]);
+});
+
+test("the reader pushes progress and Back returns to the library", async ({ page }) => {
+  const pushes = [];
+  await page.route("**/rest/v1/rpc/upsert_progress", (route) => {
+    pushes.push(JSON.parse(route.request().postData() || "{}"));
+    route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  });
+  await openReader(page);
+  await page.getByTestId("reader-next").click(); // -> page index 1
+  await page.getByTestId("reader-back").click();
+
+  await expect(page.getByTestId("signout")).toBeVisible(); // back on the library
+  expect(
+    pushes.some((p) => p.p_chapter_key === "Vagabond/ch1.cbz" && p.p_current_page === 1)
+  ).toBeTruthy();
+});
+
+test("a chapter with no published pages shows an unavailable message", async ({ page }) => {
+  await openReader(page, { pages: [] });
+  await expect(page.getByText("isn't available to read on the web yet")).toBeVisible();
+});
+
 test("empty progress shows the empty state", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, []);
