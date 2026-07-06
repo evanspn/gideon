@@ -13,7 +13,7 @@
 //! rows and merges them in (never lowering a page), then pushes the chapters
 //! the device is ahead on. A failure leaves the local store untouched.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gideon_core::ProgressStore;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,12 @@ pub struct SyncState {
     pub cursor: Option<String>,
     #[serde(default)]
     pub server_pages: BTreeMap<String, usize>,
+    /// Chapter keys whose page-URL list has already been published to
+    /// `chapter_pages` (so the device doesn't re-resolve and re-upload them
+    /// every sweep). Reset with the rest of the state on account switch /
+    /// sign-out, so re-signing re-publishes into the (possibly new) account.
+    #[serde(default)]
+    pub published_pages: BTreeSet<String>,
 }
 
 /// What a [`Syncer::sync`] did, for logging/UI.

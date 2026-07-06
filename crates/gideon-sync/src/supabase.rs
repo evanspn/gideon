@@ -157,6 +157,16 @@ fn upsert_body(update: &ProgressUpdate) -> serde_json::Value {
     })
 }
 
+/// The JSON body for one `set_chapter_pages` RPC call — publishes the page
+/// image URLs the device resolved for a chapter so the web reader can load
+/// them live. Only URLs cross the wire, never the images themselves.
+fn set_chapter_pages_body(chapter_key: &str, page_urls: &[String]) -> serde_json::Value {
+    json!({
+        "p_chapter_key": chapter_key,
+        "p_page_urls": page_urls,
+    })
+}
+
 /// Authenticates against Supabase Auth (GoTrue) with email + password.
 ///
 /// The account is created once (on the web, from a phone); the device only ever
@@ -222,6 +232,21 @@ impl SupabaseTransport {
 
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.access_token)
+    }
+
+    /// Publish a chapter's page image URLs through the `set_chapter_pages` RPC
+    /// (upsert keyed by the JWT's user + `chapter_key`). Best-effort: callers
+    /// treat any error as "try again next sweep".
+    pub fn set_chapter_pages(&self, chapter_key: &str, page_urls: &[String]) -> Result<()> {
+        let resp = self
+            .agent
+            .post(&self.config.rest_url("rpc/set_chapter_pages"))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .send_json(set_chapter_pages_body(chapter_key, page_urls));
+        check_ok(resp)?;
+        Ok(())
     }
 }
 
@@ -359,6 +384,20 @@ mod tests {
         assert_eq!(rows[0].chapter_key, "One Piece/vol1.cbz");
         assert_eq!(rows[0].current_page, 5);
         assert_eq!(rows[1].current_page, 0);
+    }
+
+    #[test]
+    fn set_chapter_pages_body_uses_the_rpc_parameter_names() {
+        let b = set_chapter_pages_body(
+            "Vagabond/ch1.cbz",
+            &[
+                "https://cdn/1.png".to_string(),
+                "https://cdn/2.png".to_string(),
+            ],
+        );
+        assert_eq!(b["p_chapter_key"], "Vagabond/ch1.cbz");
+        assert_eq!(b["p_page_urls"][0], "https://cdn/1.png");
+        assert_eq!(b["p_page_urls"][1], "https://cdn/2.png");
     }
 
     #[test]

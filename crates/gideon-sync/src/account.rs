@@ -143,14 +143,7 @@ impl Account {
     /// run this off the UI thread and treat any error as "stay local, retry
     /// later" — the local store is only written on a successful reconcile.
     pub fn sync(&self, now: u64) -> Result<SyncOutcome> {
-        let mut session = self
-            .session()
-            .ok_or_else(|| crate::Error::Transport("not signed in".into()))?;
-
-        if session.needs_refresh(now) {
-            session = AuthClient::new(self.config.clone()).refresh(&session, now)?;
-            self.save_session(&session)?;
-        }
+        let session = self.ensure_fresh_session(now)?;
 
         let mut store = ProgressStore::load(&self.progress_path()).unwrap_or_default();
         let mut state = self.load_state();
@@ -168,6 +161,55 @@ impl Account {
             .map_err(|e| crate::Error::Transport(e.to_string()))?;
         self.save_state(&state)?;
         Ok(outcome)
+    }
+
+    /// Load the signed-in session, refreshing (and persisting) the access token
+    /// if it's near expiry. Errors if signed out or the refresh fails.
+    fn ensure_fresh_session(&self, now: u64) -> Result<Session> {
+        let mut session = self
+            .session()
+            .ok_or_else(|| crate::Error::Transport("not signed in".into()))?;
+        if session.needs_refresh(now) {
+            session = AuthClient::new(self.config.clone()).refresh(&session, now)?;
+            self.save_session(&session)?;
+        }
+        Ok(session)
+    }
+
+    /// The chapter keys whose page URLs have already been published.
+    pub fn published_pages(&self) -> std::collections::BTreeSet<String> {
+        self.load_state().published_pages
+    }
+
+    /// Publish one chapter's resolved page image URLs to `chapter_pages` so the
+    /// web reader can load them. The device is the only thing that can resolve a
+    /// source's page URLs (its home IP isn't datacenter-blocked), so this is how
+    /// a downloaded chapter becomes readable on the web. Refreshes the session
+    /// if needed; best-effort — a transport error is the caller's to retry.
+    pub fn publish_chapter_pages(
+        &self,
+        now: u64,
+        chapter_key: &str,
+        page_urls: &[String],
+    ) -> Result<()> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.set_chapter_pages(chapter_key, page_urls)
+    }
+
+    /// Record that `keys` have been published, so a later sweep skips them.
+    /// Folds into the existing state (a concurrent sync may have advanced the
+    /// cursor); runs on the same background thread as the sweep, so there's no
+    /// race with that sweep's own writes.
+    pub fn mark_pages_published(&self, keys: &[String]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.load_state();
+        for k in keys {
+            state.published_pages.insert(k.clone());
+        }
+        self.save_state(&state)
     }
 
     fn load_state(&self) -> SyncState {
@@ -293,6 +335,38 @@ mod tests {
         );
         assert!(!acct.state_path().exists(), "A's cursor is gone");
         assert_eq!(acct.owner().as_deref(), Some("b@example.com"));
+    }
+
+    #[test]
+    fn published_pages_round_trip_and_reset_on_account_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let acct = Account::new(config(), dir.path());
+
+        assert!(acct.published_pages().is_empty());
+        acct.mark_pages_published(&["A/ch1.cbz".into(), "A/ch2.cbz".into()])
+            .unwrap();
+        let published = acct.published_pages();
+        assert!(published.contains("A/ch1.cbz") && published.contains("A/ch2.cbz"));
+
+        // An account switch wipes sync_state.json (see `sign_in`), which is where
+        // the published set lives — so the new account re-publishes from scratch.
+        simulate_verify(&acct, "a@example.com");
+        std::fs::remove_file(acct.state_path()).ok(); // switch clears the state
+        assert!(
+            acct.published_pages().is_empty(),
+            "a fresh account starts with nothing published"
+        );
+    }
+
+    #[test]
+    fn marking_no_pages_published_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let acct = Account::new(config(), dir.path());
+        acct.mark_pages_published(&[]).unwrap();
+        assert!(
+            !acct.state_path().exists(),
+            "empty mark writes no state file"
+        );
     }
 
     #[test]

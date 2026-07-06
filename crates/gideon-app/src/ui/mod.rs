@@ -1825,7 +1825,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Kick a best-effort background reconcile for the active profile. Never
     /// blocks (spawns a thread) and no-ops when signed out — safe on any thread.
     fn trigger_sync(&self) {
-        crate::sync::spawn_sync(&self.library_dir);
+        // Hand the sync thread a background gateway clone so it can also resolve
+        // and publish page URLs (device-publish), lighting up downloaded
+        // chapters on the web reader. `None` (test gateways) just syncs progress.
+        crate::sync::spawn_sync(&self.library_dir, self.gateway.background_clone());
     }
 
     /// Tap on the account menu: sign in (signed out), or sync-now / sign-out.
