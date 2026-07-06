@@ -61,12 +61,32 @@ See `supabase/migrations/0001_reading_progress.sql`:
    service-role key in the device or web app — the device only ever uses the
    anon key plus the user's JWT, and RLS does the rest.
 
+## Auth on the device
+
+Sign-in uses **email one-time codes** (GoTrue `/auth/v1/otp` → `/auth/v1/verify`)
+rather than a magic *link*: an e-ink device has no easy way to catch a
+browser-redirect callback, but it can show a keyboard for an emailed 6-digit
+code. The returned session (access + refresh token) is persisted per profile and
+the short-lived access token is refreshed silently from the refresh token.
+
+## Account ↔ profile binding
+
+An account's session and sync bookkeeping live **inside the profile's `.gideon`
+directory** (`sync_session.json`, `sync_state.json`), next to that profile's
+`progress.json`. So a profile is bound to exactly one cloud account: switching
+profiles switches all of it, and signing a profile into a *different* account
+resets the pull cursor (`gideon_sync::account::Account::verify`) so a previous
+user's rows can never be pulled into this profile's store. Local `progress.json`
+is never touched by sign-in/out — reading stays fully offline-first.
+
 ## Status
 
 - ✅ Schema + RLS + furthest-page-wins RPC (this migration).
 - ✅ `sync-architect` persona (`.claude/agents/`) to guide/review the system.
-- ⬜ Provision the live Supabase project + apply the migration (blocked on the
-  Supabase MCP approval).
-- ⬜ Device sync client (a `gideon-sync` module: auth/session, push/pull,
-  reconcile into `ProgressStore`).
+- ✅ Device sync client (`gideon-sync`): pure reconcile logic + the Supabase
+  transport (PostgREST pull, `upsert_progress` RPC push), email-OTP auth with
+  session refresh, and per-profile `Account` orchestration with the
+  cross-account reset guard.
+- ⬜ Provision the live Supabase project + apply the migration, then wire the
+  project URL + anon key into the device (config) and add the account/sign-in UI.
 - ⬜ Web app (reader + the same sync).

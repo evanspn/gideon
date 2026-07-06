@@ -18,6 +18,9 @@ use std::collections::BTreeMap;
 use gideon_core::ProgressStore;
 use serde::{Deserialize, Serialize};
 
+pub mod account;
+pub mod supabase;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("sync transport error: {0}")]

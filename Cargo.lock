@@ -1295,7 +1295,9 @@ dependencies = [
  "gideon-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]
