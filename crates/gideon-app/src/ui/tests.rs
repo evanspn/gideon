@@ -578,6 +578,39 @@ fn menus_render_rotated_into_the_panel() {
     }
 }
 
+#[test]
+fn leaving_the_reader_drains_the_exit_gestures_tail() {
+    // Swiping down to exit the reader can trail a stray touch that the panel
+    // reports as a separate tap; draining on exit stops it landing on the
+    // library underneath and opening a book at random.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+
+    let swipe_down_exit = UiEvent::Swipe {
+        x0: W / 2,
+        y0: H / 4,
+        x1: W / 2,
+        y1: H - 20, // well past the quarter-height exit threshold
+    };
+    let events = vec![
+        tap_row(0),        // Home -> Library
+        tap_shelf_cell0(), // open the book
+        swipe_down_exit,   // swipe down -> back to the library
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    assert!(
+        matches!(app.screen(), Screen::Library { .. }),
+        "swipe-down returns to the library"
+    );
+    assert!(
+        app.input().discard_queued_calls >= 1,
+        "leaving the reader drains the exit gesture's tail so it can't tap a book"
+    );
+}
+
 // --- reader controls sheet ---
 
 /// An up-swipe starting in the bottom eighth of the (unrotated) panel.

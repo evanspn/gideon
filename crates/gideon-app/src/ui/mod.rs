@@ -3326,6 +3326,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // Repaint the screen the reader covered. (NextChapter goes
             // straight into the next reader session — no repaint between.)
             self.render_current(RefreshMode::Full)?;
+            // The gesture that left the reader — especially a swipe-down —
+            // often trails a stray touch (the finger settling/lifting) that the
+            // panel reports as a separate tap. Without this it would land on the
+            // library underneath and open a book at random. Drain after the full
+            // repaint, by which point the tail has queued. (Menus ignore
+            // swipes, but not taps.)
+            self.input.discard_queued();
         }
         Ok(outcome)
     }

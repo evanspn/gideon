@@ -93,6 +93,10 @@ pub struct FakeInput {
     /// How often `discard_taps` ran (the post-slow-turn input flush), for
     /// tests.
     pub discard_taps_calls: usize,
+    /// How often `discard_queued` ran (e.g. the reader-exit input flush), for
+    /// tests. The script is left intact (fakes replay deterministically); only
+    /// the count is recorded.
+    pub discard_queued_calls: usize,
     /// What `resync_orientation` should report — the orientation the device
     /// is "held at" when auto-rotation re-arms (e.g. on wake). `None` mimics
     /// hardware that hasn't seen the accelerometer yet.
@@ -105,6 +109,7 @@ impl FakeInput {
             events: events.into_iter(),
             refreshes: 0,
             discard_taps_calls: 0,
+            discard_queued_calls: 0,
             resync: None,
         }
     }
@@ -135,6 +140,12 @@ impl InputSource for FakeInput {
 
     fn discard_taps(&mut self) {
         self.discard_taps_calls += 1;
+    }
+
+    fn discard_queued(&mut self) {
+        // Count it but keep the scripted events, so tests replay deterministically
+        // (real hardware drains its fds here).
+        self.discard_queued_calls += 1;
     }
 
     fn resync_orientation(&mut self) -> Option<UiEvent> {
