@@ -170,6 +170,20 @@ function renderSignIn(message) {
   document.getElementById("create").addEventListener("click", () => submit("signup"));
 }
 
+// One entry per series (like the Kobo shelf): collapse a series' chapters to
+// its most-recently-read one — "where you are" — newest activity first.
+function groupBySeries(rows) {
+  const bySeries = new Map();
+  for (const r of rows) {
+    const { series } = parseKey(r.chapter_key);
+    const current = bySeries.get(series);
+    if (!current || r.updated_at > current.updated_at) {
+      bySeries.set(series, r);
+    }
+  }
+  return [...bySeries.values()].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+}
+
 function renderLibrary(email, rows) {
   const items = rows
     .map((r) => {
@@ -211,7 +225,7 @@ async function showLibrary(session) {
   const email = session.email ?? "signed in";
   try {
     const rows = await fetchProgress(session);
-    renderLibrary(email, rows ?? []);
+    renderLibrary(email, groupBySeries(rows ?? []));
   } catch (e) {
     if (String(e.message).includes("401")) {
       clearSession();
