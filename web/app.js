@@ -94,6 +94,41 @@ async function fetchProgress(session, retry = true) {
   return res.json();
 }
 
+// Publish reading progress from the web. Furthest-page-wins server-side, so it
+// can never rewind the Kobo. Best-effort (never blocks the reader).
+function upsertProgress(session, chapterKey, currentPage, totalPages) {
+  return fetch(`${SUPABASE_URL}/rest/v1/rpc/upsert_progress`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      p_chapter_key: chapterKey,
+      p_current_page: currentPage,
+      p_total_pages: totalPages,
+    }),
+  }).catch(() => {});
+}
+
+// The page image URLs the device published for a chapter (or [] if it hasn't
+// been resolved for the web yet).
+async function fetchChapterPages(session, chapterKey) {
+  const url = `${SUPABASE_URL}/rest/v1/chapter_pages?chapter_key=eq.${encodeURIComponent(
+    chapterKey
+  )}&select=page_urls`;
+  const res = await fetch(url, {
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+  });
+  if (!res.ok) return [];
+  const rows = await res.json();
+  return rows[0]?.page_urls ?? [];
+}
+
+// Session + resume state, so the reader can push progress and return home.
+const state = { session: null, resume: {} };
+
 // --- rendering ------------------------------------------------------------
 
 function esc(s) {
@@ -207,11 +242,11 @@ function renderLibrary(email, groups) {
         .map((c) => {
           const m = progressMeta(c);
           return `
-            <div class="sub">
+            <button class="sub" data-testid="chapter" data-key="${esc(c.chapter_key)}">
               <span class="sub-title">${esc(parseKey(c.chapter_key).chapter)}</span>
               <span class="bar small"><i style="width:${m.pct}%"></i></span>
               <span class="pct">${esc(m.label)}</span>
-            </div>`;
+            </button>`;
         })
         .join("");
       return `
@@ -250,12 +285,108 @@ function renderLibrary(email, groups) {
     clearSession();
     renderSignIn("Signed out.");
   });
+  // Tapping a chapter opens the reader for it.
+  for (const btn of app.querySelectorAll('[data-testid="chapter"]')) {
+    btn.addEventListener("click", () => {
+      const key = btn.getAttribute("data-key");
+      openReader(key, parseKey(key));
+    });
+  }
+}
+
+// --- reader ---------------------------------------------------------------
+
+async function openReader(chapterKey, { series, chapter }) {
+  const title = chapter ? `${series} · ${chapter}` : series;
+  app.innerHTML = `
+    <div class="reader">
+      <div class="reader-bar">
+        <button class="ghost" data-testid="reader-back" id="r-back">‹ Library</button>
+        <div class="reader-title">${esc(title)}</div>
+        <div class="reader-count"></div>
+      </div>
+      <div class="reader-msg">Loading…</div>
+    </div>`;
+  document.getElementById("r-back").addEventListener("click", () => showLibrary(state.session));
+
+  const pages = await fetchChapterPages(state.session, chapterKey);
+  if (!pages.length) {
+    document.querySelector(".reader-msg").innerHTML =
+      "This chapter isn't available to read on the web yet.<br/>Open it on your Kobo once while signed in and it'll show up here.";
+    return;
+  }
+  renderReader(chapterKey, title, pages);
+}
+
+function renderReader(chapterKey, title, pages) {
+  const total = pages.length;
+  let page = Math.min(Math.max(state.resume[chapterKey] ?? 0, 0), total - 1);
+  let pushTimer = null;
+
+  app.innerHTML = `
+    <div class="reader" data-testid="reader">
+      <div class="reader-bar">
+        <button class="ghost" data-testid="reader-back" id="r-back">‹ Library</button>
+        <div class="reader-title">${esc(title)}</div>
+        <div class="reader-count" data-testid="reader-count"></div>
+      </div>
+      <div class="reader-page">
+        <img id="r-img" data-testid="reader-img" alt="page" referrerpolicy="no-referrer" />
+        <button class="nav-zone left" data-testid="reader-prev" aria-label="previous page"></button>
+        <button class="nav-zone right" data-testid="reader-next" aria-label="next page"></button>
+      </div>
+    </div>`;
+
+  const img = document.getElementById("r-img");
+  const count = app.querySelector(".reader-count");
+
+  function pushProgress() {
+    state.resume[chapterKey] = page;
+    upsertProgress(state.session, chapterKey, page, total);
+  }
+  function show() {
+    img.src = pages[page];
+    count.textContent = `${page + 1} / ${total}`;
+    window.scrollTo(0, 0);
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(pushProgress, 600);
+  }
+  function go(delta) {
+    const next = Math.min(Math.max(page + delta, 0), total - 1);
+    if (next !== page) {
+      page = next;
+      show();
+    }
+  }
+
+  app.querySelector('[data-testid="reader-next"]').addEventListener("click", () => go(1));
+  app.querySelector('[data-testid="reader-prev"]').addEventListener("click", () => go(-1));
+  app.querySelector('[data-testid="reader-back"]').addEventListener("click", () => {
+    clearTimeout(pushTimer);
+    pushProgress();
+    showLibrary(state.session);
+  });
+  const onKey = (e) => {
+    if (e.key === "ArrowRight" || e.key === " ") go(1);
+    else if (e.key === "ArrowLeft") go(-1);
+    else if (e.key === "Escape") app.querySelector('[data-testid="reader-back"]').click();
+  };
+  document.addEventListener("keydown", onKey);
+  // Drop the key handler when we leave the reader (back to a fresh DOM).
+  app.querySelector('[data-testid="reader-back"]').addEventListener("click", () =>
+    document.removeEventListener("keydown", onKey)
+  );
+
+  show();
 }
 
 async function showLibrary(session) {
+  state.session = session;
   const email = session.email ?? "signed in";
   try {
     const rows = await fetchProgress(session);
+    // Remember where each chapter was left off, so the reader resumes there.
+    for (const r of rows ?? []) state.resume[r.chapter_key] = r.current_page;
     renderLibrary(email, groupBySeries(rows ?? []));
   } catch (e) {
     if (String(e.message).includes("401")) {
