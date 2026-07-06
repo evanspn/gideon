@@ -13,6 +13,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gideon_sync::account::Account;
 use gideon_sync::supabase::SupabaseConfig;
 
+use crate::ui::SourceGateway;
+
+/// Chapters whose page URLs are resolved per publish sweep. Resolving hits the
+/// source over the network, so a big first-time library lights up over several
+/// sweeps (each library-open / sign-in / chapter-close triggers one) rather
+/// than in one long burst.
+const PUBLISH_SWEEP_LIMIT: usize = 25;
+
 /// True while a background reconcile is in flight, so overlapping triggers
 /// (library-open then a quick chapter-close) don't run two syncs at once —
 /// which would race each other's writes and double-spend the rotating refresh
@@ -79,7 +87,15 @@ pub fn account(library_dir: &Path) -> Option<Account> {
 /// Returns immediately; never blocks the caller. Errors (offline, expired
 /// session that can't refresh) are logged and dropped — the next trigger
 /// retries. Safe to call from the UI thread: nothing here does I/O inline.
-pub fn spawn_sync(library_dir: &Path) {
+///
+/// `gateway` (a background-thread-safe clone of the source gateway, if
+/// available) enables the page-URL publish sweep after the progress reconcile:
+/// the device resolves each downloaded chapter's page image URLs and publishes
+/// them to `chapter_pages`, which is what lets the web read them (only the
+/// device's home IP can reach the sources; a datacenter can't). Running the
+/// sweep on the same thread, right after the reconcile, reuses the just-
+/// refreshed session and never races it.
+pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Send>>) {
     let Some(account) = account(library_dir) else {
         return;
     };
@@ -91,6 +107,7 @@ pub fn spawn_sync(library_dir: &Path) {
     if SYNC_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
+    let library_dir = library_dir.to_path_buf();
     std::thread::spawn(move || {
         // Releases the in-flight flag on any exit, including a panic unwind.
         let _guard = InFlightGuard;
@@ -103,9 +120,74 @@ pub fn spawn_sync(library_dir: &Path) {
                     );
                 }
             }
-            Err(e) => eprintln!("sync: skipped ({e})"),
+            Err(e) => {
+                eprintln!("sync: skipped ({e})");
+                return; // offline: resolving/publishing pages would fail too
+            }
+        }
+        if let Some(gateway) = gateway {
+            publish_pages_sweep(&library_dir, gateway.as_ref(), &account, now());
         }
     });
+}
+
+/// Publish page URLs for downloaded chapters that haven't been published yet,
+/// so the web reader can open them. Bounded to [`PUBLISH_SWEEP_LIMIT`] source
+/// resolutions per call; the rest are picked up by later sweeps. Best-effort
+/// throughout: a chapter that can't be resolved right now is retried next
+/// sweep, and a publish (network) failure stops the sweep to retry later.
+fn publish_pages_sweep(
+    library_dir: &Path,
+    gateway: &(dyn SourceGateway + Send),
+    account: &Account,
+    now: u64,
+) {
+    // Resolving and uploading is background work — never let it contend with the
+    // reader for CPU/IO.
+    gideon_device::power::lower_current_thread_to_idle();
+
+    let index = gideon_core::SeriesIndex::load(library_dir);
+    let already = account.published_pages();
+    let mut newly: Vec<String> = Vec::new();
+    let mut resolved = 0usize;
+
+    'sweep: for (dir, series) in index.iter() {
+        for (chapter_id, file_name) in &series.downloaded {
+            let key = format!("{dir}/{file_name}");
+            if already.contains(&key) {
+                continue; // already readable on the web
+            }
+            // Skip chapters whose file was evicted/deleted; publishing URLs for
+            // a chapter no longer on the shelf would be misleading.
+            if !library_dir.join(dir).join(file_name).exists() {
+                continue;
+            }
+            if resolved >= PUBLISH_SWEEP_LIMIT {
+                break 'sweep;
+            }
+            resolved += 1;
+            let urls =
+                match gateway.resolve_page_urls(&series.source_id, &series.manga_id, chapter_id) {
+                    Ok(urls) if !urls.is_empty() => urls,
+                    _ => continue, // couldn't resolve now — try again next sweep
+                };
+            match account.publish_chapter_pages(now, &key, &urls) {
+                Ok(()) => newly.push(key),
+                Err(e) => {
+                    // Network/auth failure: stop here and let the next trigger
+                    // resume, rather than hammering a dead connection.
+                    eprintln!("sync: page publish stopped ({e})");
+                    break 'sweep;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = account.mark_pages_published(&newly) {
+        eprintln!("sync: couldn't record published pages ({e})");
+    } else if !newly.is_empty() {
+        eprintln!("sync: published page URLs for {} chapter(s)", newly.len());
+    }
 }
 
 #[cfg(test)]

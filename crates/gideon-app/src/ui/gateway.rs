@@ -113,6 +113,19 @@ pub trait SourceGateway {
         progress: &mut dyn FnMut(usize, usize),
     ) -> Result<PathBuf>;
 
+    /// Resolve a chapter's page image URLs through the source (the same call
+    /// the downloader makes), without downloading anything. Used to publish the
+    /// URL list to the sync backend so the web reader can load the chapter live.
+    /// The default returns an empty list so test gateways opt in by overriding.
+    fn resolve_page_urls(
+        &self,
+        _source_id: &str,
+        _manga_id: &str,
+        _chapter_id: &str,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// A standalone copy of this gateway that can run on a background thread,
     /// for pre-downloading chapters while the user reads. `None` (the default)
     /// means "no background pre-download" — callers fall back to a foreground
@@ -325,6 +338,26 @@ impl SourceGateway for AidokuGateway {
             library,
             progress,
         ))
+    }
+
+    fn resolve_page_urls(
+        &self,
+        source_id: &str,
+        manga_id: &str,
+        chapter_id: &str,
+    ) -> Result<Vec<String>> {
+        let source = self.source(source_id)?;
+        let runtime = self.runtime()?;
+        let pages = runtime.block_on(source.get_page_list(
+            CancellationToken::new(),
+            manga_id.to_string(),
+            chapter_id.to_string(),
+            None,
+        ))?;
+        Ok(pages
+            .into_iter()
+            .filter_map(|p| p.image_url.map(|u| u.to_string()))
+            .collect())
     }
 
     fn check_updates(&self) -> Result<UpdateCheck> {
