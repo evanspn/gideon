@@ -170,37 +170,68 @@ function renderSignIn(message) {
   document.getElementById("create").addEventListener("click", () => submit("signup"));
 }
 
-// One entry per series (like the Kobo shelf): collapse a series' chapters to
-// its most-recently-read one — "where you are" — newest activity first.
+// Progress numbers for a row: 1-based page, percent, and a compact label.
+function progressMeta(r) {
+  const total = r.total_pages || 0;
+  const page = Math.min(r.current_page + 1, total || r.current_page + 1);
+  const pct = total > 0 ? Math.round((page / total) * 100) : 0;
+  return { pct, label: total > 0 ? `${page}/${total}` : `p.${page}` };
+}
+
+// One entry per series (like the Kobo shelf): its most-recently-read chapter is
+// "where you are"; the full chapter list rides along for the expanded view.
+// Series ordered by most recent activity.
 function groupBySeries(rows) {
   const bySeries = new Map();
   for (const r of rows) {
     const { series } = parseKey(r.chapter_key);
-    const current = bySeries.get(series);
-    if (!current || r.updated_at > current.updated_at) {
-      bySeries.set(series, r);
-    }
+    if (!bySeries.has(series)) bySeries.set(series, []);
+    bySeries.get(series).push(r);
   }
-  return [...bySeries.values()].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+  const groups = [...bySeries.entries()].map(([series, chapters]) => {
+    const current = chapters.reduce((a, b) => (b.updated_at > a.updated_at ? b : a));
+    return { series, current, chapters };
+  });
+  return groups.sort((a, b) => (a.current.updated_at < b.current.updated_at ? 1 : -1));
 }
 
-function renderLibrary(email, rows) {
-  const items = rows
-    .map((r) => {
-      const { series, chapter } = parseKey(r.chapter_key);
-      const total = r.total_pages || 0;
-      const page = Math.min(r.current_page + 1, total || r.current_page + 1);
-      const pct = total > 0 ? Math.round((page / total) * 100) : 0;
+function renderLibrary(email, groups) {
+  const items = groups
+    .map((g) => {
+      const { chapter } = parseKey(g.current.chapter_key);
+      const meta = progressMeta(g.current);
+      // Expanded view: every chapter of this series in natural order.
+      const chapterRows = g.chapters
+        .slice()
+        .sort((a, b) => a.chapter_key.localeCompare(b.chapter_key, undefined, { numeric: true }))
+        .map((c) => {
+          const m = progressMeta(c);
+          return `
+            <div class="sub">
+              <span class="sub-title">${esc(parseKey(c.chapter_key).chapter)}</span>
+              <span class="bar small"><i style="width:${m.pct}%"></i></span>
+              <span class="pct">${esc(m.label)}</span>
+            </div>`;
+        })
+        .join("");
       return `
-        <div class="item" data-testid="item">
-          <div class="title">${esc(series)}</div>
-          ${chapter ? `<div class="chapter">${esc(chapter)}</div>` : ""}
-          <div class="meta">
-            <div class="bar"><i style="width:${pct}%"></i></div>
-            <div class="pct">${total > 0 ? `${page}/${total}` : `p.${page}`}</div>
-          </div>
-          <div class="ago">${esc(timeAgo(r.updated_at))}</div>
-        </div>`;
+        <details class="item" data-testid="item">
+          <summary>
+            <div class="row">
+              <div class="grow">
+                <div class="title">${esc(g.series)}</div>
+                ${chapter ? `<div class="chapter">${esc(chapter)}</div>` : ""}
+              </div>
+              <div class="chev" aria-hidden="true">›</div>
+            </div>
+            <div class="meta">
+              <div class="bar"><i style="width:${meta.pct}%"></i></div>
+              <div class="pct">${esc(meta.label)}</div>
+            </div>
+            <div class="ago">${esc(timeAgo(g.current.updated_at))}</div>
+          </summary>
+          <div class="chapters" data-testid="chapters">${chapterRows}</div>
+        </details>`;
     })
     .join("");
 
@@ -211,7 +242,7 @@ function renderLibrary(email, rows) {
     </div>
     <div class="section-label">Continue reading</div>
     ${
-      rows.length
+      groups.length
         ? `<div class="list">${items}</div>`
         : `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`
     }`;
