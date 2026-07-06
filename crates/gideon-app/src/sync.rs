@@ -19,6 +19,16 @@ use gideon_sync::supabase::SupabaseConfig;
 /// token. The next trigger after this clears will catch up.
 static SYNC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Clears [`SYNC_IN_FLIGHT`] on drop, so the flag is released even if the sync
+/// thread panics (unwinding runs `Drop`) — otherwise one panic would wedge
+/// background sync off for the rest of the process.
+struct InFlightGuard;
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        SYNC_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 /// Default Supabase project the app syncs against. The anon key is public by
 /// design — row-level security (keyed to `auth.uid()`), not this key, is what
 /// protects a user's rows — so shipping it in the binary is expected. Both can
@@ -82,6 +92,8 @@ pub fn spawn_sync(library_dir: &Path) {
         return;
     }
     std::thread::spawn(move || {
+        // Releases the in-flight flag on any exit, including a panic unwind.
+        let _guard = InFlightGuard;
         match account.sync(now()) {
             Ok(outcome) => {
                 if outcome.merged > 0 || outcome.pushed > 0 {
@@ -93,7 +105,6 @@ pub fn spawn_sync(library_dir: &Path) {
             }
             Err(e) => eprintln!("sync: skipped ({e})"),
         }
-        SYNC_IN_FLIGHT.store(false, Ordering::Release);
     });
 }
 
