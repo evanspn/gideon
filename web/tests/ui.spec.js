@@ -123,9 +123,40 @@ test("progress bar width tracks percent read", async ({ page }) => {
   await mockProgress(page, ROWS);
   await page.goto("/");
   await fillAndSubmit(page);
-  // One Piece: page 11 of 20 -> 55%.
-  const bar = page.getByTestId("item").nth(0).locator(".bar > i");
+  // One Piece: page 11 of 20 -> 55%. Target the summary's bar (the expanded
+  // list has its own per-chapter bars).
+  const bar = page.getByTestId("item").nth(0).locator("summary .bar > i");
   await expect(bar).toHaveAttribute("style", /width:\s*55%/);
+});
+
+test("tapping a series card expands its chapter list", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, [
+    {
+      chapter_key: "One Piece/vol1.cbz",
+      current_page: 19,
+      total_pages: 20,
+      updated_at: new Date(Date.now() - 5 * 86400e3).toISOString(),
+    },
+    {
+      chapter_key: "One Piece/vol3.cbz",
+      current_page: 5,
+      total_pages: 20,
+      updated_at: new Date(Date.now() - 3600e3).toISOString(),
+    },
+  ]);
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  const card = page.getByTestId("item").first();
+  const chapters = card.getByTestId("chapters");
+  // Collapsed by default, revealed on tap.
+  await expect(chapters).toBeHidden();
+  await card.locator("summary").click();
+  await expect(chapters).toBeVisible();
+  // Both chapters of the series are listed, in natural order.
+  const subs = chapters.locator(".sub-title");
+  await expect(subs).toHaveText(["vol1", "vol3"]);
 });
 
 test("empty progress shows the empty state", async ({ page }) => {
