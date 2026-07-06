@@ -3304,7 +3304,6 @@ dependencies = [
  "log",
  "once_cell",
  "rustls",
- "rustls-native-certs 0.7.3",
  "rustls-pki-types",
  "serde",
  "serde_json",

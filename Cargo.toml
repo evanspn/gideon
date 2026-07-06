@@ -27,7 +27,11 @@ url = { version = "2", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 quick-xml = "0.37"
-ureq = { version = "2", default-features = false, features = ["tls", "native-certs", "json"] }
+# Bundled webpki roots (not the device's native cert store): the Kobo's on-disk
+# CA bundle is too old to include newer roots (e.g. Let's Encrypt's ISRG Root
+# X1 that Supabase chains to), so `native-certs` failed TLS with UnknownIssuer.
+# webpki-roots is current and complete, and matches gideon-app's reqwest config.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 memmap2 = "0.9"
