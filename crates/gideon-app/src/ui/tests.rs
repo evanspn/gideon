@@ -1182,6 +1182,42 @@ fn three_chapters_of_one_series_make_one_card() {
 }
 
 #[test]
+fn library_orders_most_recently_read_first() {
+    // Top-left is the most-recently-read series, so picking up where you left
+    // off is always the first tap. Alphabetically A < B < C, but reading
+    // order should override that entirely; a series never read yet falls to
+    // the back, behind everything that has been.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("A/vol1.cbz"), 2);
+    make_cbz(&lib.join("B/vol1.cbz"), 2); // never read
+    make_cbz(&lib.join("C/vol1.cbz"), 2);
+
+    std::fs::create_dir_all(progress_path(&lib).parent().unwrap()).unwrap();
+    std::fs::write(
+        progress_path(&lib),
+        r#"{"progress":{
+            "A/vol1.cbz": {"current_page": 0, "total_pages": 2, "last_read_at": 100},
+            "C/vol1.cbz": {"current_page": 0, "total_pages": 2, "last_read_at": 300}
+        }}"#,
+    )
+    .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.open_library().unwrap();
+
+    let Screen::Library { items, .. } = app.screen() else {
+        panic!("expected library screen");
+    };
+    let titles: Vec<String> = items.iter().map(|c| c.title()).collect();
+    assert_eq!(
+        titles,
+        vec!["C", "A", "B"],
+        "most recently read (C) leads, unread (B) trails"
+    );
+}
+
+#[test]
 fn returning_to_the_library_rescans_for_newly_downloaded_chapters() {
     // The "I just read 209 but the cover opens 139" bug: a chapter downloaded
     // while the library sat on the nav stack must be in the card when you back
@@ -2209,6 +2245,74 @@ fn leaving_a_manga_cancels_its_queued_pre_downloads() {
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c4").is_none(),
         "leaving the manga cancels the not-yet-started look-ahead"
+    );
+}
+
+#[test]
+fn switching_profile_repoints_the_predownloader_at_the_new_library() {
+    // The bug: the pre-downloader's worker thread closes over the library
+    // directory it was built with and keeps writing there for its whole life.
+    // Since it's only ever built once (lazily, on first use) and switching
+    // profiles didn't drop it, a download queued after switching profiles kept
+    // landing in the *previous* profile's directory — mixing the two profiles'
+    // libraries. Now a profile switch drops it so the next queue rebuilds it
+    // against the new profile's directory.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let gateway = BgGateway::new("Manga One", 2);
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(vec![]),
+        gateway,
+        lib.clone(),
+    );
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+
+    // Spin up the worker on the default profile...
+    assert!(app.ensure_predownloader());
+    // ...then switch to a different profile before queuing anything on it.
+    app.switch_profile("bob").unwrap();
+
+    let epoch = app.predownloader.as_ref().map_or(0, |w| w.epoch());
+    // ensure_predownloader must (re)build here, scoped to bob's library.
+    assert!(app.ensure_predownloader());
+    app.predownloader.as_mut().unwrap().queue(PreloadJob {
+        source: source.clone(),
+        manga: manga.clone(),
+        chapter_id: "c1".into(),
+        epoch,
+        persistent: true,
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && app.downloaded_chapter_path(&source, &manga, "c1").is_none()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c1").is_some(),
+        "the chapter queued after switching profiles is downloaded"
+    );
+    assert!(
+        lib.join("@bob/Manga One/c1.cbz").exists(),
+        "it lands under bob's profile directory"
+    );
+    assert!(
+        !lib.join("Manga One/c1.cbz").exists(),
+        "it must not leak into the default profile's directory"
     );
 }
 

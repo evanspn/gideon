@@ -332,10 +332,9 @@ pub fn parse_storage_size(raw: &str) -> Option<u64> {
     let cleaned = raw.trim().to_ascii_uppercase();
     let (number_part, unit) = if let Some(n) = cleaned.strip_suffix("GB") {
         (n, 1024u64 * 1024 * 1024)
-    } else if let Some(n) = cleaned.strip_suffix("MB") {
-        (n, 1024u64 * 1024)
     } else {
-        return None;
+        let n = cleaned.strip_suffix("MB")?;
+        (n, 1024u64 * 1024)
     };
 
     let value: f64 = number_part.trim().parse().ok()?;
