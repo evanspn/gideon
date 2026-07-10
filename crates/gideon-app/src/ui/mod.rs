@@ -161,6 +161,17 @@ impl SeriesCard {
             .map(|(_, c)| c)
     }
 
+    /// The most recent `last_read_at` across this card's chapters, for
+    /// shelf ordering. `0` (sorts last) when nothing in it has been read.
+    fn latest_read_at(&self, store: &ProgressStore) -> u64 {
+        self.chapters
+            .iter()
+            .filter_map(|c| store.get(&c.relative_path))
+            .map(|p| p.last_read_at)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The chapter after `current` within this card, for continuous
     /// reading (entries keep their natural scan order).
     fn next_after(&self, current: &LibraryEntry) -> Option<&LibraryEntry> {
@@ -215,6 +226,14 @@ fn group_library(entries: Vec<LibraryEntry>) -> Vec<SeriesCard> {
         }
     }
     cards
+}
+
+/// Order shelf cards most-recently-read first, so the series you're in the
+/// middle of is always the top-left tap target. A stable sort keeps
+/// never-read series (all tied at `0`) in their natural (alphabetical) order,
+/// trailing behind everything that's been read.
+fn sort_library_by_recency(items: &mut [SeriesCard], store: &ProgressStore) {
+    items.sort_by_key(|card| std::cmp::Reverse(card.latest_read_at(store)));
 }
 
 /// Display order for a chapter list. The backing `Vec` always stays in the
@@ -984,6 +1003,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(Flow::Continue)
     }
 
+    /// Scan the library, group it into shelf cards, and order them
+    /// most-recently-read first (top left).
+    fn scan_library_items(&self) -> Result<Vec<SeriesCard>> {
+        let mut items = group_library(Library::new(&self.library_dir).scan()?);
+        self.with_progress(|_, store| sort_library_by_recency(&mut items, store));
+        Ok(items)
+    }
+
     /// If the current top screen is the Library, rebuild its cards from a fresh
     /// disk scan, keeping the shelf page (clamped). Cheap and only runs when the
     /// Library is actually showing.
@@ -991,7 +1018,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if !matches!(self.stack.last(), Some(Screen::Library { .. })) {
             return Ok(());
         }
-        let items = group_library(Library::new(&self.library_dir).scan()?);
+        let items = self.scan_library_items()?;
         let capacity = self.shelf_layout().capacity().max(1);
         let max_page = items.len().div_ceil(capacity).saturating_sub(1);
         if let Some(Screen::Library { items: slot, page }) = self.stack.last_mut() {
@@ -1273,7 +1300,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn refresh_library_after_delete(&mut self) -> Result<()> {
-        let items = group_library(Library::new(&self.library_dir).scan()?);
+        let items = self.scan_library_items()?;
         // Unwind whatever sits above the library (the book menu, plus the delete
         // confirmation when the delete came through it) and refresh it in place.
         while self.stack.len() > 1 && !matches!(self.stack.last(), Some(Screen::Library { .. })) {
@@ -1744,7 +1771,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // progress made on another device (and push anything we're ahead on).
         // Fully background — the shelf renders immediately regardless.
         self.trigger_sync();
-        let items = group_library(Library::new(&self.library_dir).scan()?);
+        let items = self.scan_library_items()?;
         self.push(Screen::Library { items, page: 0 })
     }
 
@@ -2132,6 +2159,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.library_dir = profile_library_dir(&self.base_library, name);
         // The progress cache belongs to the previous profile's library.
         self.invalidate_progress_cache();
+        // The pre-downloader's worker thread closes over the library dir it was
+        // built with and keeps writing (and recording into the series index)
+        // there for its whole life. Drop it so the next queue respawns a fresh
+        // worker scoped to the new profile — otherwise chapters queued after a
+        // switch would land in the *previous* profile's library, mixing the two
+        // profiles' downloads.
+        self.predownloader = None;
         std::fs::create_dir_all(&self.library_dir).with_context(|| {
             format!(
                 "couldn't create profile library {}",

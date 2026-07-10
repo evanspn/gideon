@@ -283,6 +283,8 @@ function renderLibrary(email, groups) {
     }`;
   document.getElementById("signout").addEventListener("click", () => {
     clearSession();
+    state.session = null;
+    state.resume = {};
     renderSignIn("Signed out.");
   });
   // Tapping a chapter opens the reader for it.
@@ -391,6 +393,8 @@ async function showLibrary(session) {
   } catch (e) {
     if (String(e.message).includes("401")) {
       clearSession();
+      state.session = null;
+      state.resume = {};
       renderSignIn("Session expired — please sign in again.");
       return;
     }
