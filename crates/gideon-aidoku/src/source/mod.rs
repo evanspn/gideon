@@ -93,13 +93,29 @@ pub struct Source(
     pub SourceFeatures,
 );
 
+/// Lock a source's mutex, recovering the guard even if a previous holder
+/// panicked.
+///
+/// A source is third-party WASM: any call can trap, and a trap surfaces as a
+/// `.expect("wasm call failed")` panic inside `spawn_blocking` — *while this
+/// mutex is held*, which poisons it. With a plain `.lock().unwrap()` every
+/// later call then panics on the poisoned lock, so a single trapped call kills
+/// the source for the rest of the process and chapters/search stop working for
+/// every manga on it until the app is restarted. Recovering the guard turns a
+/// trap back into what it should be — a one-off failure of that single call —
+/// and lets the next call use the source normally (a WASM trap unwinds the
+/// guest stack but leaves the host `Store` a valid, reusable Rust object).
+pub(crate) fn lock_recover<T>(mutex: &::std::sync::Mutex<T>) -> ::std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[macro_export]
 macro_rules! wrap_blocking_source_fn {
     ($fn_name:ident, $return_type:ty, $($param:ident : $type:ty),*) => {
         pub async fn $fn_name(&self, $($param: $type),*) -> $return_type {
             let blocking_source = self.0.clone();
 
-            ::tokio::task::spawn_blocking(move || blocking_source.lock().unwrap().$fn_name($($param),*)).await?
+            ::tokio::task::spawn_blocking(move || $crate::source::lock_recover(&blocking_source).$fn_name($($param),*)).await?
         }
     };
 }
@@ -165,11 +181,11 @@ impl Source {
 
     pub fn manifest(&self) -> SourceManifest {
         // FIXME we dont actually need to clone here but yeah it's easier
-        self.0.lock().unwrap().manifest.clone()
+        lock_recover(&self.0).manifest.clone()
     }
 
     pub fn setting_definitions(&self) -> Vec<SettingDefinition> {
-        self.0.lock().unwrap().setting_definitions.clone()
+        lock_recover(&self.0).setting_definitions.clone()
     }
 
     pub fn write_meta_file(path: &Path, source_of_source: String) -> anyhow::Result<()> {
@@ -1527,5 +1543,39 @@ impl BlockingSource {
         self.store.data_mut().context = OperationContext::default();
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_recover;
+    use std::sync::{Arc, Mutex};
+
+    /// A trapped WASM call panics while the source mutex is held, which poisons
+    /// it. Regression: `lock_recover` must still hand back a usable guard so the
+    /// *next* call works — otherwise one bad call kills the source until the app
+    /// is restarted (the "chapters stopped showing until I relaunched" bug).
+    #[test]
+    fn poisoned_source_lock_recovers_for_the_next_call() {
+        let source = Arc::new(Mutex::new(0u32));
+
+        // Simulate a trapped call: panic while holding the lock.
+        let poisoned = {
+            let s = Arc::clone(&source);
+            std::thread::spawn(move || {
+                let mut guard = s.lock().unwrap();
+                *guard = 1;
+                panic!("wasm call failed");
+            })
+            .join()
+            .is_err()
+        };
+        assert!(poisoned, "the worker should have panicked");
+        assert!(source.lock().is_err(), "the mutex is now poisoned");
+
+        // The next real call must still get through and see the data.
+        let mut guard = lock_recover(&source);
+        *guard += 41;
+        assert_eq!(*guard, 42, "recovered guard is fully usable");
     }
 }
