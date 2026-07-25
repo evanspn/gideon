@@ -2701,6 +2701,104 @@ fn offline_series_swaps_to_downloads_and_reads_without_network() {
 
 /// The mirror of the above: when online, the same source-linked series opens
 /// the source chapter list (so you can pull chapters you don't have yet).
+/// Count non-white pixels inside content row `i` of a composed gray frame —
+/// a proxy for "did any chapter text/icon actually draw on this row".
+fn row_ink(page: &gideon_render::GrayPage, i: usize) -> usize {
+    let l = layout();
+    let top = l.row_top(i);
+    let bottom = (top + l.row_h).min(page.height);
+    let mut ink = 0;
+    for y in top..bottom {
+        for x in 0..page.width {
+            if page.pixels[(y * page.width + x) as usize] != 0xFF {
+                ink += 1;
+            }
+        }
+    }
+    ink
+}
+
+/// Guards the display half of "chapters not showing": the shared
+/// `compose_chapter_list` is state-tested but never pixel-tested, so a blank
+/// draw would slip through. This renders the real frame for both the offline
+/// (downloaded) and online (source) lists and asserts the rows have ink.
+#[test]
+fn chapter_list_rows_render_not_blank() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    // The user's real library shapes: spaces, parens, decimal chapters.
+    make_cbz(&lib.join("Ibitsu/Chapter 6.5.cbz"), 3);
+    make_cbz(&lib.join("Ibitsu/Chapter 7.cbz"), 3);
+
+    // --- offline path: downloaded chapters ---
+    let mut offline = app(&lib, FakeGateway::default(), vec![]);
+    offline.open_series_chapters("Ibitsu").unwrap();
+    let Screen::DownloadedChapters { entries, .. } = offline.screen() else {
+        panic!("expected the downloaded-chapters list");
+    };
+    assert_eq!(entries.len(), 2, "both chapters present in state");
+    let frame = offline.compose_current().unwrap();
+    assert!(
+        row_ink(&frame, 0) > 20 && row_ink(&frame, 1) > 20,
+        "downloaded chapter rows rendered blank (row0={}, row1={})",
+        row_ink(&frame, 0),
+        row_ink(&frame, 1),
+    );
+
+    // --- online path: source chapter list ---
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Ibitsu".into(),
+        cover_url: None,
+    };
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let mut online = app(&lib, source_gateway(), vec![]).with_online_probe(Box::new(|| true));
+    online.open_chapter_list(&source, &manga).unwrap();
+    let Screen::ChapterList { chapters, .. } = online.screen() else {
+        panic!("expected the source chapter list");
+    };
+    assert_eq!(chapters.len(), 1, "source chapter present in state");
+    let frame = online.compose_current().unwrap();
+    assert!(
+        row_ink(&frame, 0) > 20,
+        "source chapter row rendered blank (row0={})",
+        row_ink(&frame, 0),
+    );
+}
+
+/// REPRO: online, a source-linked series whose source returns an EMPTY chapter
+/// list (rate-limited, outdated source, delisted manga, or a next-SDK source
+/// that yields no chapters) must not strand the reader on a blank screen — it
+/// must fall back to the chapters already downloaded on the device.
+#[test]
+fn empty_source_chapter_list_falls_back_to_downloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    offline_fixture(&lib); // Series/vol1.cbz, vol2.cbz + a "src" origin link
+
+    // Source is reachable but returns no chapters (the systemic failure mode).
+    let gateway = FakeGateway {
+        chapters: vec![],
+        ..source_gateway()
+    };
+    let mut app = app(&lib, gateway, vec![]).with_online_probe(Box::new(|| true));
+    app.open_series_chapters("Series").unwrap();
+
+    match app.screen() {
+        Screen::DownloadedChapters { entries, .. } => {
+            assert_eq!(entries.len(), 2, "fell back to the downloaded chapters");
+        }
+        Screen::ChapterList { chapters, .. } => panic!(
+            "stranded on an empty source list ({} chapters) instead of showing downloads",
+            chapters.len()
+        ),
+        other => panic!("unexpected screen: {other:?}"),
+    }
+}
+
 #[test]
 fn online_series_opens_the_source_chapter_list() {
     let dir = tempfile::tempdir().unwrap();

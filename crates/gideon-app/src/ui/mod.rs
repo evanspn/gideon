@@ -1205,9 +1205,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Like [`Self::open_chapter_list`] but assumes we're already online (the
     /// caller decides) and returns the fetch error instead of propagating, so a
     /// source failure can fall back to the offline downloaded list.
+    ///
+    /// An **empty** chapter list is treated as a soft failure too: a source that
+    /// is rate-limited, outdated, or has had the manga delisted can return no
+    /// chapters without erroring, and a next-SDK source may yield none for a
+    /// chapters-only request. Stranding the reader on a blank screen when they
+    /// have the chapters downloaded is never the right answer — bail so the
+    /// caller falls back to what's on disk.
     fn try_open_chapter_list(&mut self, source: &SourceEntry, manga: &MangaEntry) -> Result<()> {
         self.show_status(&[&format!("Loading chapters of {}…", manga.title)])?;
         let chapters = self.gateway.chapters(&source.id, &manga.id)?;
+        if chapters.is_empty() {
+            anyhow::bail!("source returned no chapters for {}", manga.title);
+        }
         self.push(Screen::ChapterList {
             source: source.clone(),
             manga: manga.clone(),
