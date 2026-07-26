@@ -5473,13 +5473,26 @@ impl Predownloader {
         }
     }
 
-    /// Enqueue a chapter, unless it's already been queued this session.
+    /// Enqueue a chapter.
+    ///
+    /// The automatic look-ahead is deduped so every reader open / page advance
+    /// doesn't re-enqueue the same chapter. An **explicit** (persistent) request
+    /// — the ⋮ menu's "Download from here…" — must NOT be deduped: it's a
+    /// deliberate download, the worker already no-ops anything on disk, and a
+    /// stale dedup entry (a prior look-ahead, or an earlier attempt that failed
+    /// on the worker and left nothing on disk) must never silently swallow it.
+    /// Without this, a batch that didn't land the first time could never be
+    /// re-requested in the same session — "it says it's downloading but never
+    /// does".
     fn queue(&mut self, job: PreloadJob) {
         let key = format!(
             "{}\u{1f}{}\u{1f}{}",
             job.source.id, job.manga.id, job.chapter_id
         );
-        if self.queued.insert(key) {
+        // Record the key regardless (so a later look-ahead won't re-add it), but
+        // only *gate* on it for non-persistent look-ahead jobs.
+        let fresh = self.queued.insert(key);
+        if job.persistent || fresh {
             // If the worker is gone the send just fails; nothing else to do.
             let _ = self.tx.send(job);
         }
