@@ -23,7 +23,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::input::{InputSource, TouchTransform, UiEvent};
@@ -66,6 +66,58 @@ const KEY_POWER_COVER: u16 = 35;
 const KEY_PAGE_BACK: u16 = 193;
 /// Physical page-forward button (KOReader: `[194] = "RPgFwd"`).
 const KEY_PAGE_FWD: u16 = 194;
+
+// --- Bluetooth page-turn remote keys (standard HID, linux/input-event-codes.h)
+//
+// Cheap BT "page turner" / camera-shutter remotes present as an HID keyboard or
+// consumer-control device and send one of a handful of common keys. There's no
+// single standard, so we accept the whole family and map each to a page turn,
+// splitting them into an intuitive "forward" (down/right/louder/next) and
+// "back" (up/left/quieter/previous). In the reader these turn the page; in a
+// list they page it — the same as the Libra's physical buttons.
+const KEY_ENTER: u16 = 28;
+const KEY_SPACE: u16 = 57;
+const KEY_UP: u16 = 103;
+const KEY_PAGEUP: u16 = 104;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_DOWN: u16 = 108;
+const KEY_PAGEDOWN: u16 = 109;
+const KEY_VOLUMEDOWN: u16 = 114;
+const KEY_VOLUMEUP: u16 = 115;
+const KEY_NEXTSONG: u16 = 163;
+const KEY_PREVIOUSSONG: u16 = 165;
+
+/// Map a Bluetooth-remote key code to the page turn it should trigger, or
+/// `None` if it isn't one of the keys these remotes send. Forward =
+/// down / right / page-down / volume-up / next; back = the opposites.
+fn remote_key_to_page(code: u16) -> Option<UiEvent> {
+    match code {
+        KEY_VOLUMEUP | KEY_PAGEDOWN | KEY_RIGHT | KEY_DOWN | KEY_SPACE | KEY_ENTER
+        | KEY_NEXTSONG => Some(UiEvent::PageForward),
+        KEY_VOLUMEDOWN | KEY_PAGEUP | KEY_LEFT | KEY_UP | KEY_PREVIOUSSONG => {
+            Some(UiEvent::PageBack)
+        }
+        _ => None,
+    }
+}
+
+/// The remote keys, for the capability probe that decides whether to open a
+/// node (a BT page-turner is otherwise none of touch/power/cover/pages/gyro).
+const REMOTE_KEYS: [u16; 12] = [
+    KEY_ENTER,
+    KEY_SPACE,
+    KEY_UP,
+    KEY_PAGEUP,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_DOWN,
+    KEY_PAGEDOWN,
+    KEY_VOLUMEDOWN,
+    KEY_VOLUMEUP,
+    KEY_NEXTSONG,
+    KEY_PREVIOUSSONG,
+];
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -266,7 +318,8 @@ impl ButtonTracker {
             KEY_POWER | KEY_SLEEP_COVER | KEY_POWER_COVER => Some(UiEvent::Sleep),
             KEY_PAGE_FWD => Some(UiEvent::PageForward),
             KEY_PAGE_BACK => Some(UiEvent::PageBack),
-            _ => None,
+            // A Bluetooth page-turn remote (see `remote_key_to_page`).
+            code => remote_key_to_page(code),
         }
     }
 }
@@ -437,6 +490,9 @@ pub struct KoboTouch {
     /// touch tracker; every device feeds the button tracker (touch nodes
     /// never emit the power/cover codes, so this is harmless).
     devices: Vec<File>,
+    /// `/dev/input/eventN` path of each device, aligned with `devices`, so a
+    /// hotplug rescan can tell which nodes are already open.
+    paths: Vec<String>,
     touch_idx: usize,
     tracker: TouchTracker,
     buttons: ButtonTracker,
@@ -447,6 +503,11 @@ pub struct KoboTouch {
     max_y: u32,
     screen_w: u32,
     screen_h: u32,
+    /// inotify watch on `/dev/input`, so a Bluetooth remote paired *after*
+    /// launch — or one that dropped its connection when idle and reconnected —
+    /// is picked up without a restart. `None` if inotify couldn't be set up
+    /// (hotplug is then simply unavailable; the rest of input still works).
+    inotify: Option<File>,
 }
 
 impl KoboTouch {
@@ -470,6 +531,7 @@ impl KoboTouch {
         let scan = scan_devices(screen_w, screen_h, transform)?;
         Ok(Self {
             devices: scan.devices,
+            paths: scan.paths,
             touch_idx: scan.touch_idx,
             tracker: TouchTracker::new(),
             buttons: ButtonTracker::new(),
@@ -480,6 +542,7 @@ impl KoboTouch {
             max_y: scan.max_y,
             screen_w,
             screen_h,
+            inotify: open_input_inotify(),
         })
     }
 
@@ -497,6 +560,7 @@ impl KoboTouch {
             match scan_devices(self.screen_w, self.screen_h, self.transform) {
                 Ok(scan) => {
                     self.devices = scan.devices;
+                    self.paths = scan.paths;
                     self.touch_idx = scan.touch_idx;
                     self.max_x = scan.max_x;
                     self.max_y = scan.max_y;
@@ -541,6 +605,9 @@ impl KoboTouch {
 /// What a device scan found.
 struct Scan {
     devices: Vec<File>,
+    /// The `/dev/input/eventN` path of each opened device, positionally aligned
+    /// with `devices`, so a hotplug rescan can skip nodes already open.
+    paths: Vec<String>,
     touch_idx: usize,
     max_x: u32,
     max_y: u32,
@@ -550,6 +617,7 @@ struct Scan {
 /// (see [`KoboTouch::open_with_transform`]).
 fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Result<Scan> {
     let mut devices: Vec<File> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
     let mut touch_idx: Option<usize> = None;
     let mut axes: Option<(u32, u32)> = None;
 
@@ -585,6 +653,13 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
             key_ok && (bit_set(&key_bits, KEY_SLEEP_COVER) || bit_set(&key_bits, KEY_POWER_COVER));
         let has_pages =
             key_ok && (bit_set(&key_bits, KEY_PAGE_FWD) || bit_set(&key_bits, KEY_PAGE_BACK));
+        // A Bluetooth page-turn remote: advertises none of the above, just one
+        // of the ordinary HID keys these remotes send (volume, arrows, page
+        // up/down…). GIDEON_BT_REMOTE=0 disables it (e.g. if a paired device
+        // spams a mapped key).
+        let remote_disabled = std::env::var("GIDEON_BT_REMOTE").is_ok_and(|v| v == "0");
+        let has_remote =
+            key_ok && !remote_disabled && REMOTE_KEYS.iter().any(|&k| bit_set(&key_bits, k));
 
         // Accelerometer (auto-rotation): a node advertising EV_MSC/MSC_RAW
         // carries the gsensor orientation reports. On the Libra Colour those
@@ -606,7 +681,7 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
             .is_some_and(|forced| forced == path);
         let is_gyro = !gyro_disabled && (forced_gyro || (msc_ok && bit_set(&msc_bits, MSC_RAW)));
 
-        if !is_touch && !has_power && !has_cover && !has_pages && !is_gyro {
+        if !is_touch && !has_power && !has_cover && !has_pages && !has_remote && !is_gyro {
             continue;
         }
 
@@ -637,10 +712,11 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
             axes = Some((max_x, max_y));
         } else {
             eprintln!(
-                    "gideon input: using {path} for buttons/sensors (power={has_power} cover={has_cover} pages={has_pages} gyro={is_gyro})"
+                    "gideon input: using {path} for buttons/sensors (power={has_power} cover={has_cover} pages={has_pages} remote={has_remote} gyro={is_gyro})"
                 );
         }
         devices.push(file);
+        paths.push(path);
     }
 
     let Some(touch_idx) = touch_idx else {
@@ -652,6 +728,7 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
 
     Ok(Scan {
         devices,
+        paths,
         touch_idx,
         max_x,
         max_y,
@@ -690,6 +767,24 @@ impl KoboTouch {
         }
     }
 
+    /// Open any button/remote node that appeared since the last scan — a
+    /// Bluetooth remote pairing, or reconnecting after it dropped its link when
+    /// idle — and add it to the polled set. Never touches the touch panel (its
+    /// loss and return go through [`Self::reopen`]).
+    fn absorb_new_devices(&mut self) {
+        for n in 0..=9 {
+            let path = format!("/dev/input/event{n}");
+            if self.paths.iter().any(|p| p == &path) {
+                continue;
+            }
+            if let Some(file) = open_button_node(&path) {
+                eprintln!("gideon input: hotplugged {path} (button/remote)");
+                self.devices.push(file);
+                self.paths.push(path);
+            }
+        }
+    }
+
     /// Block in `poll(2)` until any device is readable, then drain it
     /// through the trackers into `pending`. Devices that die (EOF or a
     /// fatal read error — drivers can re-register nodes across a
@@ -703,6 +798,7 @@ impl KoboTouch {
     /// (in addition to any pending gyro-settle deadline) so a caller can poll
     /// for input with a timeout.
     fn poll_and_read_until(&mut self, max_wait: Option<std::time::Duration>) -> Result<()> {
+        let n_devices = self.devices.len();
         let mut fds: Vec<libc::pollfd> = self
             .devices
             .iter()
@@ -712,6 +808,16 @@ impl KoboTouch {
                 revents: 0,
             })
             .collect();
+        // The inotify fd (if any) rides along in the same poll, so a BT remote
+        // appearing wakes us immediately — no polling timer, no battery cost.
+        let inotify_idx = self.inotify.as_ref().map(|f| {
+            fds.push(libc::pollfd {
+                fd: f.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fds.len() - 1
+        });
         // Wait indefinitely, unless the gyro has an orientation settling or the
         // caller capped the wait: then poll only that long, so a rotation fires
         // on its timeout and a caller-supplied timeout is honored.
@@ -730,9 +836,21 @@ impl KoboTouch {
             return Err(err.into());
         }
 
+        // A new node under /dev/input (a BT remote pairing/reconnecting): drain
+        // the notification and open it, so its keys start flowing this session.
+        if let Some(idx) = inotify_idx {
+            if fds[idx].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                if let Some(f) = self.inotify.as_ref() {
+                    drain_inotify(f.as_raw_fd());
+                }
+                self.absorb_new_devices();
+            }
+        }
+
         let mut dead: Vec<usize> = Vec::new();
         let now = std::time::Instant::now();
-        for (i, pfd) in fds.iter().enumerate() {
+        // Only the device fds (the inotify fd, handled above, sits past them).
+        for (i, pfd) in fds.iter().enumerate().take(n_devices) {
             if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
                 continue;
             }
@@ -781,6 +899,11 @@ impl KoboTouch {
         for &i in dead.iter().rev() {
             eprintln!("gideon input: device {i} went away, dropping it");
             self.devices.remove(i);
+            // Keep `paths` aligned with `devices` so the hotplug rescan can
+            // reopen this node if it comes back (e.g. a BT remote reconnecting).
+            if i < self.paths.len() {
+                self.paths.remove(i);
+            }
             if i == self.touch_idx {
                 lost_touch = true;
             } else if i < self.touch_idx {
@@ -835,6 +958,82 @@ fn drain_events(fd: libc::c_int, mut f: impl FnMut(&libc::input_event)) -> Drain
             _ => return Drain::Dead,
         }
     }
+}
+
+/// Open an inotify fd watching `/dev/input` for new nodes, so a Bluetooth
+/// remote that pairs (or reconnects from idle) after launch is noticed without
+/// a restart. Best-effort: `None` disables hotplug but leaves input working.
+fn open_input_inotify() -> Option<File> {
+    // SAFETY: inotify_init1 is a plain syscall returning a new fd or -1.
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("gideon input: inotify unavailable; BT-remote hotplug disabled");
+        return None;
+    }
+    // SAFETY: we own `fd`; wrap it so it's closed on drop.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let dir = std::ffi::CString::new("/dev/input").expect("static path has no NUL");
+    // A BT HID connecting creates its `eventN` node (IN_CREATE); IN_ATTRIB
+    // covers a permissions pass that sometimes follows, IN_MOVED_TO a
+    // create-by-rename. We don't parse the events — any of them means "rescan".
+    // SAFETY: valid fd and NUL-terminated path.
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            file.as_raw_fd(),
+            dir.as_ptr(),
+            libc::IN_CREATE | libc::IN_ATTRIB | libc::IN_MOVED_TO,
+        )
+    };
+    if wd < 0 {
+        eprintln!("gideon input: inotify watch on /dev/input failed; BT-remote hotplug disabled");
+        return None;
+    }
+    Some(file)
+}
+
+/// Read and discard everything queued on the (non-blocking) inotify fd — we
+/// treat any notification as "a node changed, rescan" rather than parsing
+/// which one.
+fn drain_inotify(fd: libc::c_int) {
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: reading into a local byte buffer on a fd we own.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
+/// Try to open `path` as a button / Bluetooth-remote node (never the touch
+/// panel — its loss and return are handled by [`KoboTouch::reopen`]). Returns
+/// the opened fd when it advertises the power button, a sleep cover, physical
+/// page buttons, or a BT-remote key — the same non-touch keys `scan_devices`
+/// accepts. Used by the hotplug rescan.
+fn open_button_node(path: &str) -> Option<File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let fd = file.as_raw_fd();
+
+    let mut key_bits = [0u8; 32];
+    // SAFETY: EVIOCGBIT with a buffer of the size encoded in the request.
+    let key_ok =
+        unsafe { ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr()) } >= 0;
+    if !key_ok {
+        return None;
+    }
+    let remote_disabled = std::env::var("GIDEON_BT_REMOTE").is_ok_and(|v| v == "0");
+    let has_remote = !remote_disabled && REMOTE_KEYS.iter().any(|&k| bit_set(&key_bits, k));
+    let wanted = bit_set(&key_bits, KEY_POWER)
+        || bit_set(&key_bits, KEY_SLEEP_COVER)
+        || bit_set(&key_bits, KEY_POWER_COVER)
+        || bit_set(&key_bits, KEY_PAGE_FWD)
+        || bit_set(&key_bits, KEY_PAGE_BACK)
+        || has_remote;
+    wanted.then_some(file)
 }
 
 fn read_axis_max(fd: libc::c_int, axis: u16) -> Result<u32> {
@@ -1054,6 +1253,81 @@ mod tests {
             Some(UiEvent::PageBack)
         );
         assert_eq!(b.push(&ev(EV_KEY, KEY_PAGE_BACK, 2)), None, "repeat");
+    }
+
+    // --- Bluetooth page-turn remote ---
+
+    #[test]
+    fn remote_keys_map_forward_and_back() {
+        // "Advance" keys → PageForward.
+        for code in [
+            KEY_VOLUMEUP,
+            KEY_PAGEDOWN,
+            KEY_RIGHT,
+            KEY_DOWN,
+            KEY_SPACE,
+            KEY_ENTER,
+            KEY_NEXTSONG,
+        ] {
+            assert_eq!(
+                remote_key_to_page(code),
+                Some(UiEvent::PageForward),
+                "key {code} should page forward"
+            );
+        }
+        // "Go back" keys → PageBack.
+        for code in [
+            KEY_VOLUMEDOWN,
+            KEY_PAGEUP,
+            KEY_LEFT,
+            KEY_UP,
+            KEY_PREVIOUSSONG,
+        ] {
+            assert_eq!(
+                remote_key_to_page(code),
+                Some(UiEvent::PageBack),
+                "key {code} should page back"
+            );
+        }
+        // Every advertised remote key maps to *some* page turn (probe ↔ map
+        // stay in sync).
+        for code in REMOTE_KEYS {
+            assert!(
+                remote_key_to_page(code).is_some(),
+                "unmapped remote key {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_keys_reach_the_button_tracker_on_press_only() {
+        let mut b = ButtonTracker::new();
+        // A camera-shutter remote's volume keys, through the same tracker that
+        // handles the physical buttons.
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_VOLUMEUP, 1)),
+            Some(UiEvent::PageForward)
+        );
+        assert_eq!(b.push(&ev(EV_KEY, KEY_VOLUMEUP, 0)), None, "release");
+        assert_eq!(b.push(&ev(EV_KEY, KEY_VOLUMEUP, 2)), None, "auto-repeat");
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_VOLUMEDOWN, 1)),
+            Some(UiEvent::PageBack)
+        );
+        // An arrow-key clicker.
+        assert_eq!(
+            b.push(&ev(EV_KEY, KEY_RIGHT, 1)),
+            Some(UiEvent::PageForward)
+        );
+        assert_eq!(b.push(&ev(EV_KEY, KEY_LEFT, 1)), Some(UiEvent::PageBack));
+    }
+
+    #[test]
+    fn non_remote_keys_are_ignored() {
+        // Keys a remote/keyboard might send that must NOT turn pages.
+        assert_eq!(remote_key_to_page(1), None, "KEY_ESC");
+        assert_eq!(remote_key_to_page(102), None, "KEY_HOME");
+        assert_eq!(remote_key_to_page(116), None, "KEY_POWER stays a sleep key");
     }
 
     // --- GyroTracker (accelerometer auto-rotation) ---
