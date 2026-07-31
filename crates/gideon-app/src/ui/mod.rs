@@ -2491,10 +2491,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn check_updates(&mut self) -> Result<()> {
         self.ensure_online()?;
         self.show_status(&["Checking for updates…"])?;
-        let check = self
-            .gateway
-            .check_updates()
-            .context("update check failed")?;
+        let check = match self.gateway.check_updates() {
+            Ok(check) => check,
+            Err(e) => {
+                // `ensure_online()` above already confirmed the connection, so a
+                // failure here is the update server (GitHub) being unreachable —
+                // not the user's Wi-Fi. Show that, and note the release may just
+                // not be out yet, instead of the misleading "check that Wi-Fi is
+                // on". The real error still goes to the log for diagnosis.
+                eprintln!("gideon: update check failed: {e:#}");
+                return self.push(Screen::Message {
+                    title: "Updates".to_string(),
+                    body: update_error_body(&e),
+                });
+            }
+        };
         if check.available {
             self.push(Screen::UpdatePrompt {
                 body: format!("{}\nTap to install, or Back to skip.", check.message),
@@ -3694,6 +3705,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 );
                 let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
                 draw_power_icon(&mut canvas, l);
+                // A Bluetooth glyph shows when a page-turn remote is connected.
+                if self.input.bluetooth_connected() {
+                    draw_bluetooth_icon(&mut canvas, l);
+                }
                 canvas
             }
             Screen::ChapterMenu {
@@ -5121,6 +5136,28 @@ fn draw_power_icon(canvas: &mut GrayPage, l: &UiLayout) {
     }
 }
 
+/// Draw the Bluetooth rune in the title bar, a comfortable gap to the left of
+/// the power icon, to show a page-turn remote is connected. The classic glyph:
+/// a vertical spine with two right-hand triangular "flags" whose long diagonals
+/// cross through the center to the left-hand tips.
+fn draw_bluetooth_icon(canvas: &mut GrayPage, l: &UiLayout) {
+    let power_cx = l.width.saturating_sub(l.title_h / 2 + l.pad) as f32;
+    let cx = power_cx - l.title_h as f32;
+    let cy = (l.title_h as f32) * 0.55;
+    let h = (l.title_h as f32) * 0.30; // half height
+    let w = (l.title_h as f32) * 0.16; // half width
+    let (y0, y1, y3, y4) = (cy - h, cy - h / 2.0, cy + h / 2.0, cy + h);
+    let (xl, xc, xr) = (cx - w, cx, cx + w);
+    let mut seg = |ax: f32, ay: f32, bx: f32, by: f32| {
+        line(canvas, ax as i32, ay as i32, bx as i32, by as i32, 0x00);
+    };
+    seg(xc, y0, xc, y4); // spine
+    seg(xc, y0, xr, y1); // top → upper-right
+    seg(xr, y1, xl, y3); // upper-right → lower-left (crossing)
+    seg(xc, y4, xr, y3); // bottom → lower-right
+    seg(xr, y3, xl, y1); // lower-right → upper-left (crossing)
+}
+
 /// 1px rectangle outline, clipped to the canvas.
 fn rect_outline(canvas: &mut GrayPage, x: u32, y: u32, w: u32, h: u32, value: u8) {
     if w == 0 || h == 0 {
@@ -5695,6 +5732,25 @@ fn label_with_last(label: String, is_last: bool) -> String {
 
 fn placeholder_cover() -> image::DynamicImage {
     image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(3, 4, image::Luma([0xCC])))
+}
+
+/// The message shown when an update check fails *after* connectivity was
+/// confirmed. A transport failure that reached here means Wi-Fi is up but the
+/// update server (GitHub) couldn't be reached — so don't blame Wi-Fi (the old
+/// error did, which is confusing when Wi-Fi is clearly on). Note the release
+/// may simply not be published yet. Any other failure keeps its detail.
+fn update_error_body(err: &anyhow::Error) -> String {
+    let unreachable = err
+        .downcast_ref::<gideon_sources::Error>()
+        .is_some_and(|e| matches!(e, gideon_sources::Error::Offline));
+    if unreachable {
+        "Couldn't reach GitHub to check for updates.\n\
+         Wi-Fi is connected, so GitHub may be temporarily unavailable — or the \
+         newest release simply isn't published yet. Try again later."
+            .to_string()
+    } else {
+        format!("Update check failed: {err:#}")
+    }
 }
 
 /// Home's title line: `gideon vX — profile — 47%`, with the battery part

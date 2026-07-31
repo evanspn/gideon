@@ -83,6 +83,13 @@ pub trait InputSource {
     fn resync_orientation(&mut self) -> Option<UiEvent> {
         None
     }
+
+    /// Whether a Bluetooth page-turn remote is currently connected (its evdev
+    /// node is open). Drives the Home bar's Bluetooth indicator. Default:
+    /// `false` — fakes and headless have nothing paired.
+    fn bluetooth_connected(&self) -> bool {
+        false
+    }
 }
 
 /// Test input source: replays a fixed list of events, then errors.
@@ -101,6 +108,8 @@ pub struct FakeInput {
     /// is "held at" when auto-rotation re-arms (e.g. on wake). `None` mimics
     /// hardware that hasn't seen the accelerometer yet.
     pub resync: Option<u32>,
+    /// What `bluetooth_connected` should report (a paired remote present).
+    pub bluetooth: bool,
 }
 
 impl FakeInput {
@@ -111,6 +120,7 @@ impl FakeInput {
             discard_taps_calls: 0,
             discard_queued_calls: 0,
             resync: None,
+            bluetooth: false,
         }
     }
 
@@ -118,6 +128,12 @@ impl FakeInput {
     /// held at that orientation when auto-rotation re-arms.
     pub fn with_resync(mut self, rotation: u32) -> Self {
         self.resync = Some(rotation);
+        self
+    }
+
+    /// Report a Bluetooth remote as connected (for the Home indicator).
+    pub fn with_bluetooth(mut self, connected: bool) -> Self {
+        self.bluetooth = connected;
         self
     }
 }
@@ -150,6 +166,10 @@ impl InputSource for FakeInput {
 
     fn resync_orientation(&mut self) -> Option<UiEvent> {
         self.resync.map(|rotation| UiEvent::Rotate { rotation })
+    }
+
+    fn bluetooth_connected(&self) -> bool {
+        self.bluetooth
     }
 }
 
