@@ -3226,45 +3226,45 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             reader.show_current_page()?;
                         }
                     }
-                    // Edge slides (panel coordinates — the physical bezel
-                    // edge, regardless of reading rotation): right edge is
-                    // brightness, left edge is night-light warmth. Sliding
-                    // up increases; the full screen height is the full
-                    // 0–100 range.
+                    // Every reader gesture follows the READING orientation, the
+                    // same as taps: map both swipe endpoints into the reading
+                    // frame FIRST, then decide edges and direction there. The
+                    // reader's right edge is brightness and its left edge is
+                    // night-light warmth at every rotation, and "up" always
+                    // increases — otherwise, in panel space, the controls land
+                    // on the wrong edge and invert when the device is turned.
                     Ok(UiEvent::Swipe { x0, y0, x1, y1 }) => {
-                        let edge = (panel.width / 8).max(1);
-                        let on_right = x0 >= panel.width - edge && x1 >= panel.width - edge;
-                        let on_left = x0 < edge && x1 < edge;
+                        let (rx0, ry0) =
+                            layout::map_reader_tap(x0, y0, panel.width, panel.height, rotation);
+                        let (rx1, ry1) =
+                            layout::map_reader_tap(x1, y1, panel.width, panel.height, rotation);
+                        let (reading_w, reading_h) = if rotation % 180 == 90 {
+                            (panel.height, panel.width)
+                        } else {
+                            (panel.width, panel.height)
+                        };
+                        let edge = (reading_w / 8).max(1);
+                        let on_right = rx0 >= reading_w - edge && rx1 >= reading_w - edge;
+                        let on_left = rx0 < edge && rx1 < edge;
                         if !on_right && !on_left {
-                            // Mid-screen gestures follow the READING
-                            // orientation (taps already do): swipe down to
-                            // leave the manga, swipe up to rotate 90°
-                            // clockwise — for reading on your side in bed.
-                            // Both demand deliberate travel (a quarter of
-                            // the reading height): a sloppy page-turn tap
-                            // drifting past the 30px slop must never exit,
+                            // Mid-screen gestures: swipe down to leave the manga,
+                            // swipe up to rotate 90° clockwise — for reading on
+                            // your side in bed. Both demand deliberate travel (a
+                            // quarter of the reading height): a sloppy page-turn
+                            // tap drifting past the 30px slop must never exit,
                             // and certainly never rotate the whole reader.
-                            let (mx0, my0) =
-                                layout::map_reader_tap(x0, y0, panel.width, panel.height, rotation);
-                            let (mx1, my1) =
-                                layout::map_reader_tap(x1, y1, panel.width, panel.height, rotation);
-                            let reading_h = if rotation % 180 == 90 {
-                                panel.width
-                            } else {
-                                panel.height
-                            };
                             let min_travel = (reading_h / 4).max(1);
-                            let vertical = my0.abs_diff(my1) > mx0.abs_diff(mx1);
-                            // An up-swipe STARTING in the bottom eighth of
-                            // the reading frame opens the controls sheet —
-                            // distinct from the mid-screen rotate gesture
-                            // below, which starts higher up. An eighth of
-                            // travel is enough: it's a flick off the bezel.
+                            let vertical = ry0.abs_diff(ry1) > rx0.abs_diff(rx1);
+                            // An up-swipe STARTING in the bottom eighth of the
+                            // reading frame opens the controls sheet — distinct
+                            // from the mid-screen rotate gesture below, which
+                            // starts higher up. An eighth of travel is enough:
+                            // it's a flick off the bezel.
                             let sheet_band = reading_h.saturating_sub((reading_h / 8).max(1));
-                            if my0 > my1
+                            if ry0 > ry1
                                 && vertical
-                                && my0 > sheet_band
-                                && my0 - my1 >= (reading_h / 8).max(1)
+                                && ry0 > sheet_band
+                                && ry0 - ry1 >= (reading_h / 8).max(1)
                             {
                                 sheet_open = true;
                                 show_controls_sheet(
@@ -3276,10 +3276,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                                 )?;
                                 continue;
                             }
-                            if my1 > my0 && vertical && my1 - my0 >= min_travel {
+                            if ry1 > ry0 && vertical && ry1 - ry0 >= min_travel {
                                 break;
                             }
-                            if my0 > my1 && vertical && my0 - my1 >= min_travel {
+                            if ry0 > ry1 && vertical && ry0 - ry1 >= min_travel {
                                 rotate_reader_90(
                                     &mut reader,
                                     &mut rotation,
@@ -3293,8 +3293,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         let Some(lights) = self.lights.as_mut() else {
                             continue;
                         };
-                        let height = panel.height.max(1);
-                        let delta = ((y0 as i64 - y1 as i64) * 100 / height as i64) as i32;
+                        // Sliding up (in the reading frame) increases; the full
+                        // reading height is the full 0–100 range.
+                        let delta =
+                            ((ry0 as i64 - ry1 as i64) * 100 / reading_h.max(1) as i64) as i32;
                         if delta == 0 {
                             continue;
                         }

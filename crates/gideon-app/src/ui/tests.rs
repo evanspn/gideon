@@ -3676,6 +3676,50 @@ fn right_edge_slide_up_raises_brightness() {
 }
 
 #[test]
+fn edge_slides_follow_reading_orientation_when_rotated() {
+    // Regression: the brightness/warmth edge slides must follow the READING
+    // orientation, not the physical panel. Upside down (180°), a slide up the
+    // reader's RIGHT edge still RAISES brightness. In panel space that same
+    // gesture lands on the left edge sliding down — so the old panel-coordinate
+    // handling adjusted warmth downward instead (inverted + wrong edge).
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+    let (levels, lights) = lights();
+
+    // Reading-right edge, sliding up by half the height at 180°. map_reader_tap
+    // at 180° is (W-1-x, H-1-y), so these panel points map to reading
+    // (597, 699) -> (597, 299): right edge, +50 up.
+    let slide = UiEvent::Swipe {
+        x0: 2,
+        y0: 100,
+        x1: 2,
+        y1: 500,
+    };
+    let events = vec![
+        tap_row_rot(0, 180),
+        tap_shelf_cell0_rot(180),
+        slide,
+        UiEvent::Tap { x: W / 2, y: H / 2 }, // center is Back at any rotation
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events)
+        .with_lights(lights)
+        .with_reader_settings(FitMode::Contain, 180);
+    app.run().unwrap();
+
+    assert_eq!(
+        levels.borrow().0,
+        70,
+        "upside down, a right-edge up-slide still raises brightness (20 + 50)"
+    );
+    assert_eq!(
+        levels.borrow().1,
+        0,
+        "warmth untouched — it's the reader's right edge"
+    );
+}
+
+#[test]
 fn left_edge_slide_adjusts_night_light() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
