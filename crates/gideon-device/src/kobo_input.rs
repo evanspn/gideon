@@ -493,6 +493,11 @@ pub struct KoboTouch {
     /// `/dev/input/eventN` path of each device, aligned with `devices`, so a
     /// hotplug rescan can tell which nodes are already open.
     paths: Vec<String>,
+    /// Paths that are Bluetooth page-turn remotes. Checked against `paths`
+    /// (the currently-open set) to drive the Home Bluetooth indicator; stale
+    /// entries for disconnected nodes are harmless because of that
+    /// intersection.
+    remote_paths: std::collections::HashSet<String>,
     touch_idx: usize,
     tracker: TouchTracker,
     buttons: ButtonTracker,
@@ -532,6 +537,7 @@ impl KoboTouch {
         Ok(Self {
             devices: scan.devices,
             paths: scan.paths,
+            remote_paths: scan.remote_paths.into_iter().collect(),
             touch_idx: scan.touch_idx,
             tracker: TouchTracker::new(),
             buttons: ButtonTracker::new(),
@@ -561,6 +567,7 @@ impl KoboTouch {
                 Ok(scan) => {
                     self.devices = scan.devices;
                     self.paths = scan.paths;
+                    self.remote_paths = scan.remote_paths.into_iter().collect();
                     self.touch_idx = scan.touch_idx;
                     self.max_x = scan.max_x;
                     self.max_y = scan.max_y;
@@ -608,6 +615,9 @@ struct Scan {
     /// The `/dev/input/eventN` path of each opened device, positionally aligned
     /// with `devices`, so a hotplug rescan can skip nodes already open.
     paths: Vec<String>,
+    /// The subset of `paths` that are Bluetooth page-turn remotes (advertise
+    /// the remote key family), for the Home connection indicator.
+    remote_paths: Vec<String>,
     touch_idx: usize,
     max_x: u32,
     max_y: u32,
@@ -618,6 +628,7 @@ struct Scan {
 fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Result<Scan> {
     let mut devices: Vec<File> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
+    let mut remote_paths: Vec<String> = Vec::new();
     let mut touch_idx: Option<usize> = None;
     let mut axes: Option<(u32, u32)> = None;
 
@@ -715,6 +726,9 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
                     "gideon input: using {path} for buttons/sensors (power={has_power} cover={has_cover} pages={has_pages} remote={has_remote} gyro={is_gyro})"
                 );
         }
+        if has_remote {
+            remote_paths.push(path.clone());
+        }
         devices.push(file);
         paths.push(path);
     }
@@ -729,6 +743,7 @@ fn scan_devices(screen_w: u32, screen_h: u32, transform: TouchTransform) -> Resu
     Ok(Scan {
         devices,
         paths,
+        remote_paths,
         touch_idx,
         max_x,
         max_y,
@@ -777,8 +792,11 @@ impl KoboTouch {
             if self.paths.iter().any(|p| p == &path) {
                 continue;
             }
-            if let Some(file) = open_button_node(&path) {
-                eprintln!("gideon input: hotplugged {path} (button/remote)");
+            if let Some((file, is_remote)) = open_button_node(&path) {
+                eprintln!("gideon input: hotplugged {path} (button/remote={is_remote})");
+                if is_remote {
+                    self.remote_paths.insert(path.clone());
+                }
                 self.devices.push(file);
                 self.paths.push(path);
             }
@@ -1007,10 +1025,11 @@ fn drain_inotify(fd: libc::c_int) {
 
 /// Try to open `path` as a button / Bluetooth-remote node (never the touch
 /// panel — its loss and return are handled by [`KoboTouch::reopen`]). Returns
-/// the opened fd when it advertises the power button, a sleep cover, physical
-/// page buttons, or a BT-remote key — the same non-touch keys `scan_devices`
+/// the opened fd, plus whether it's a BT remote (advertises the remote key
+/// family), when it advertises the power button, a sleep cover, physical page
+/// buttons, or a BT-remote key — the same non-touch keys `scan_devices`
 /// accepts. Used by the hotplug rescan.
-fn open_button_node(path: &str) -> Option<File> {
+fn open_button_node(path: &str) -> Option<(File, bool)> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -1033,7 +1052,7 @@ fn open_button_node(path: &str) -> Option<File> {
         || bit_set(&key_bits, KEY_PAGE_FWD)
         || bit_set(&key_bits, KEY_PAGE_BACK)
         || has_remote;
-    wanted.then_some(file)
+    wanted.then_some((file, has_remote))
 }
 
 fn read_axis_max(fd: libc::c_int, axis: u16) -> Result<u32> {
@@ -1081,6 +1100,13 @@ impl InputSource for KoboTouch {
 
     fn resync_orientation(&mut self) -> Option<UiEvent> {
         self.gyro.resync()
+    }
+
+    fn bluetooth_connected(&self) -> bool {
+        // A remote is connected when one of the currently-open nodes is a known
+        // remote. Intersecting with `paths` keeps a disconnected remote's stale
+        // entry from lingering as "connected".
+        self.paths.iter().any(|p| self.remote_paths.contains(p))
     }
 }
 

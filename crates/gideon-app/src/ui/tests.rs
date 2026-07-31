@@ -5766,6 +5766,46 @@ fn home_title_includes_battery_percent_when_known() {
 }
 
 #[test]
+fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout();
+    // The box just left of the power icon where draw_bluetooth_icon paints,
+    // excluding the title-bar separator row (title_h - 1) which is always drawn.
+    let power_cx = l.width.saturating_sub(l.title_h / 2 + l.pad);
+    let cx = power_cx.saturating_sub(l.title_h);
+    let half = l.title_h / 4;
+    let (x0, x1) = (cx.saturating_sub(half), (cx + half).min(l.width));
+    let (y0, y1) = (1u32, l.title_h.saturating_sub(2).min(l.height));
+    let ink = |buf: &[u8]| -> usize {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if buf[(y * l.width + x) as usize] < 0x80 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let render = |connected: bool| {
+        let mut app = UiApp::new(
+            MemoryDisplay::new(W, H),
+            FakeInput::new(vec![]).with_bluetooth(connected),
+            FakeGateway::default(),
+            dir.path().to_path_buf(),
+        );
+        app.render_once().unwrap();
+        ink(&app.display().buffer)
+    };
+
+    assert_eq!(render(false), 0, "no glyph when no remote is connected");
+    assert!(
+        render(true) > 0,
+        "the Bluetooth glyph shows when a remote is connected"
+    );
+}
+
+#[test]
 fn battery_probe_feeds_home_and_sleep_without_breaking_either() {
     let dir = tempfile::tempdir().unwrap();
     let (count, sleeper) = counting_sleeper();
