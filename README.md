@@ -28,6 +28,11 @@ The core pipeline works end to end:
   (`gideon source install` / `gideon manga search|chapters|download`)
 - **Kobo display backend** — Linux framebuffer with mxcfb e-ink refresh
   ioctls (full/partial refresh policy), behind the `kobo` feature
+- **Input** — touch (tap / swipe / long-press), the Libra's physical page
+  buttons, accelerometer auto-rotation, and **Bluetooth page-turn remotes**
+  (volume / arrow / page keys → page turns), hot-plugged via inotify so a
+  remote paired or reconnected after launch just works (`GIDEON_BT_REMOTE=0`
+  to disable)
 - **Chapter downloads** — fetched pages are packed into `.cbz` for offline
   reading, with atomic writes, a configurable storage budget and
   least-recently-read eviction, plus a pre-download engine
