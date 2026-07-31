@@ -5753,6 +5753,31 @@ fn sleep_in_the_reader_saves_progress_first_and_resumes() {
 // --- battery ---
 
 #[test]
+fn update_error_body_names_github_not_wifi_when_connected() {
+    // A transport failure that reaches the update check *after* ensure_online
+    // means Wi-Fi is up but GitHub is unreachable — the message must say so and
+    // note the release may not be out yet, never "check that Wi-Fi is on".
+    let offline = anyhow::Error::new(gideon_sources::Error::Offline);
+    let body = update_error_body(&offline);
+    assert!(
+        body.contains("Couldn't reach GitHub"),
+        "should name GitHub as unreachable: {body}"
+    );
+    assert!(
+        body.contains("isn't published yet") || body.contains("Try again later"),
+        "should note the release may not be out / to retry: {body}"
+    );
+    assert!(
+        !body.to_ascii_lowercase().contains("wi-fi is on"),
+        "must not tell the user to check Wi-Fi when it's connected: {body}"
+    );
+
+    // Non-network failures keep their detail rather than being masked.
+    let other = anyhow::anyhow!("downloaded binary is not a valid ELF executable");
+    assert!(update_error_body(&other).contains("not a valid ELF"));
+}
+
+#[test]
 fn home_title_includes_battery_percent_when_known() {
     assert_eq!(
         home_title("0.3.0", "default", Some(47)),
