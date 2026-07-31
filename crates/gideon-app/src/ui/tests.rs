@@ -1001,6 +1001,38 @@ fn physical_buttons_swap_when_upside_down() {
     );
 }
 
+#[test]
+fn bluetooth_remote_direction_is_absolute_upside_down() {
+    // Regression: the remote's next/previous must NOT flip with rotation. A
+    // remote is a separate object in your hand — it doesn't rotate with the
+    // device — so at 180° (where the bezel buttons swap, see the test above)
+    // RemoteNext still advances the page. Furthest-page-wins means a wrongly
+    // reversed turn would leave progress at 2, so reaching 3 proves it advanced.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 5);
+    let mut store = ProgressStore::default();
+    store.update("Sample/vol1.cbz", 2, 5);
+    store.save(&progress_path(&lib)).unwrap();
+
+    let events = vec![
+        tap_row_rot(0, 180),
+        tap_shelf_cell0_rot(180),
+        UiEvent::RemoteNext, // 180°: still advances -> page 3 (no swap)
+        UiEvent::Tap { x: W / 2, y: H / 2 }, // center is Back at any rotation
+    ];
+    let mut app =
+        app(&lib, FakeGateway::default(), events).with_reader_settings(FitMode::Contain, 180);
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Sample/vol1.cbz").unwrap().current_page,
+        3,
+        "the remote's Next advances even upside down — direction is absolute"
+    );
+}
+
 // --- slow-turn input debounce ---
 
 /// A display whose `flush` sleeps, to simulate a slow (big-page / full-flash)

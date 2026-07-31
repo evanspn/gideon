@@ -91,12 +91,16 @@ const KEY_PREVIOUSSONG: u16 = 165;
 /// Map a Bluetooth-remote key code to the page turn it should trigger, or
 /// `None` if it isn't one of the keys these remotes send. Forward =
 /// down / right / page-down / volume-up / next; back = the opposites.
+///
+/// These are [`UiEvent::RemoteNext`]/[`UiEvent::RemotePrev`], NOT the bezel
+/// buttons' `PageForward`/`PageBack`: a remote doesn't rotate with the device,
+/// so its direction must stay fixed no matter how the Kobo is held.
 fn remote_key_to_page(code: u16) -> Option<UiEvent> {
     match code {
         KEY_VOLUMEUP | KEY_PAGEDOWN | KEY_RIGHT | KEY_DOWN | KEY_SPACE | KEY_ENTER
-        | KEY_NEXTSONG => Some(UiEvent::PageForward),
+        | KEY_NEXTSONG => Some(UiEvent::RemoteNext),
         KEY_VOLUMEDOWN | KEY_PAGEUP | KEY_LEFT | KEY_UP | KEY_PREVIOUSSONG => {
-            Some(UiEvent::PageBack)
+            Some(UiEvent::RemotePrev)
         }
         _ => None,
     }
@@ -1285,7 +1289,8 @@ mod tests {
 
     #[test]
     fn remote_keys_map_forward_and_back() {
-        // "Advance" keys → PageForward.
+        // "Advance" keys → RemoteNext (orientation-independent, unlike the
+        // bezel buttons' PageForward).
         for code in [
             KEY_VOLUMEUP,
             KEY_PAGEDOWN,
@@ -1297,11 +1302,11 @@ mod tests {
         ] {
             assert_eq!(
                 remote_key_to_page(code),
-                Some(UiEvent::PageForward),
+                Some(UiEvent::RemoteNext),
                 "key {code} should page forward"
             );
         }
-        // "Go back" keys → PageBack.
+        // "Go back" keys → RemotePrev.
         for code in [
             KEY_VOLUMEDOWN,
             KEY_PAGEUP,
@@ -1311,7 +1316,7 @@ mod tests {
         ] {
             assert_eq!(
                 remote_key_to_page(code),
-                Some(UiEvent::PageBack),
+                Some(UiEvent::RemotePrev),
                 "key {code} should page back"
             );
         }
@@ -1329,23 +1334,21 @@ mod tests {
     fn remote_keys_reach_the_button_tracker_on_press_only() {
         let mut b = ButtonTracker::new();
         // A camera-shutter remote's volume keys, through the same tracker that
-        // handles the physical buttons.
+        // handles the physical buttons — but as orientation-independent remote
+        // events, not the bezel PageForward/PageBack.
         assert_eq!(
             b.push(&ev(EV_KEY, KEY_VOLUMEUP, 1)),
-            Some(UiEvent::PageForward)
+            Some(UiEvent::RemoteNext)
         );
         assert_eq!(b.push(&ev(EV_KEY, KEY_VOLUMEUP, 0)), None, "release");
         assert_eq!(b.push(&ev(EV_KEY, KEY_VOLUMEUP, 2)), None, "auto-repeat");
         assert_eq!(
             b.push(&ev(EV_KEY, KEY_VOLUMEDOWN, 1)),
-            Some(UiEvent::PageBack)
+            Some(UiEvent::RemotePrev)
         );
         // An arrow-key clicker.
-        assert_eq!(
-            b.push(&ev(EV_KEY, KEY_RIGHT, 1)),
-            Some(UiEvent::PageForward)
-        );
-        assert_eq!(b.push(&ev(EV_KEY, KEY_LEFT, 1)), Some(UiEvent::PageBack));
+        assert_eq!(b.push(&ev(EV_KEY, KEY_RIGHT, 1)), Some(UiEvent::RemoteNext));
+        assert_eq!(b.push(&ev(EV_KEY, KEY_LEFT, 1)), Some(UiEvent::RemotePrev));
     }
 
     #[test]

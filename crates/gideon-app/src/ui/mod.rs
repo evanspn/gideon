@@ -860,14 +860,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         Err(e) => self.show_error(&e)?,
                     }
                 }
-                // Physical page-turn buttons page through whatever list is
-                // on screen (library shelf, sources, results…).
-                Ok(UiEvent::PageForward) => {
+                // Physical page-turn buttons and the Bluetooth remote both page
+                // through whatever list is on screen (library shelf, sources,
+                // results…). Paging a list is orientation-independent, so the
+                // two are equivalent here.
+                Ok(UiEvent::PageForward | UiEvent::RemoteNext) => {
                     if let Err(e) = self.flip_page(1) {
                         self.show_error(&e)?;
                     }
                 }
-                Ok(UiEvent::PageBack) => {
+                Ok(UiEvent::PageBack | UiEvent::RemotePrev) => {
                     if let Err(e) = self.flip_page(-1) {
                         self.show_error(&e)?;
                     }
@@ -3184,9 +3186,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // physically swapped places, so the forward button goes
                     // back and vice versa (upright and landscape keep
                     // forward = next).
+                    //
+                    // A Bluetooth remote is a separate object in your hand — it
+                    // does NOT rotate with the device — so its direction is
+                    // absolute: next is always next, at every orientation.
                     Ok(ev @ (UiEvent::PageForward | UiEvent::PageBack)) => {
                         let forward = matches!(ev, UiEvent::PageForward);
                         if page_button_advances(forward, rotation) {
+                            if !turn_reader_page(&mut reader, &mut self.input, true)?
+                                && next_available
+                            {
+                                outcome = ReaderOutcome::NextChapter;
+                                break;
+                            }
+                        } else {
+                            turn_reader_page(&mut reader, &mut self.input, false)?;
+                        }
+                    }
+                    Ok(ev @ (UiEvent::RemoteNext | UiEvent::RemotePrev)) => {
+                        if matches!(ev, UiEvent::RemoteNext) {
                             if !turn_reader_page(&mut reader, &mut self.input, true)?
                                 && next_available
                             {

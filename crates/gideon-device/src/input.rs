@@ -18,9 +18,17 @@ pub enum UiEvent {
     /// A finger tapped the screen at (x, y) in screen coordinates.
     Tap { x: u32, y: u32 },
     /// Physical page-forward button (Kobo Libra family: code 194, RPgFwd).
+    /// These live on the device bezel, so the reader swaps them at 180° (held
+    /// upside down, the two keys have physically traded places).
     PageForward,
     /// Physical page-back button (Kobo Libra family: code 193, RPgBack).
     PageBack,
+    /// Next-page from a **Bluetooth remote**. Orientation-independent: a remote
+    /// is a separate object in your hand, so rotating the device must NOT change
+    /// which button turns forward (unlike the bezel buttons above).
+    RemoteNext,
+    /// Previous-page from a Bluetooth remote (orientation-independent).
+    RemotePrev,
     /// A drag from (x0, y0) to (x1, y1) in screen coordinates — emitted on
     /// finger release when the travel exceeds the tap slop. Edge slides
     /// adjust the frontlight in the reader.
