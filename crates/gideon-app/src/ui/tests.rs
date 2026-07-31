@@ -2615,6 +2615,179 @@ fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
     );
 }
 
+/// A gateway that fails each chapter's FIRST download attempt and succeeds on
+/// any later one — a stand-in for a flaky device (transient source/network
+/// error). Shared attempt-count state so the retry is observable across the
+/// background clone the worker runs on.
+#[derive(Clone)]
+struct FailFirstGateway {
+    manga_dir: String,
+    attempts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailFirstGateway {
+    fn new(manga_dir: &str) -> Self {
+        Self {
+            manga_dir: manga_dir.into(),
+            attempts: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl SourceGateway for FailFirstGateway {
+    fn installed_sources(&self) -> Result<Vec<SourceEntry>> {
+        Ok(vec![])
+    }
+    fn available_sources(&self) -> Result<Vec<SourceEntry>> {
+        Ok(vec![])
+    }
+    fn install_source(&self, _source_id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn uninstall_source(&self, _source_id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn list_manga(&self, _source_id: &str, _listing: &str) -> Result<Vec<MangaEntry>> {
+        Ok(vec![])
+    }
+    fn search_manga(&self, _source_id: &str, _query: &str) -> Result<Vec<MangaEntry>> {
+        Ok(vec![])
+    }
+    fn download_cover(&self, _url: &str, _dest: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn chapters(&self, _source_id: &str, _manga_id: &str) -> Result<Vec<ChapterEntry>> {
+        Ok(vec![])
+    }
+    fn download_chapter(
+        &self,
+        _source_id: &str,
+        _manga_id: &str,
+        chapter_id: &str,
+        library: &Path,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PathBuf> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = {
+            let mut a = self.attempts.lock().unwrap();
+            let e = a.entry(chapter_id.to_string()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        if n == 1 {
+            anyhow::bail!("transient failure on the first attempt");
+        }
+        let path = library
+            .join(&self.manga_dir)
+            .join(format!("{chapter_id}.cbz"));
+        make_cbz(&path, 2);
+        progress(2, 2);
+        Ok(path)
+    }
+    fn background_clone(&self) -> Option<Box<dyn SourceGateway + Send>> {
+        Some(Box::new(self.clone()))
+    }
+    fn check_updates(&self) -> Result<super::gateway::UpdateCheck> {
+        Ok(super::gateway::UpdateCheck {
+            message: String::new(),
+            available: false,
+        })
+    }
+    fn install_update(&self) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
+#[test]
+fn explicit_batch_retries_after_a_failed_attempt() {
+    // The bug: "Download all remaining" says it's downloading but never does.
+    // A batch that fails to land (a flaky first attempt on the device) leaves
+    // its chapters stuck in the worker's dedup set, so re-requesting them the
+    // same session silently enqueues nothing — they can never download until
+    // you leave and come back. An explicit request must always re-attempt.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let gateway = FailFirstGateway::new("Manga One");
+    let started = std::sync::Arc::clone(&gateway.started);
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(vec![]),
+        gateway,
+        lib.clone(),
+    );
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+    let chapters: Vec<ChapterEntry> = (1..=3)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: Some("en".into()),
+        })
+        .collect();
+
+    // First explicit batch: three chapters queued; every first attempt fails.
+    let queued = app
+        .queue_batch_download(&source, &manga, &chapters, 0, 3)
+        .unwrap();
+    assert_eq!(queued, 3, "all three were requested");
+
+    // Wait until the worker has attempted (and failed) all three.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while started.load(std::sync::atomic::Ordering::SeqCst) < 3
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        (1..=3).all(|i| app
+            .downloaded_chapter_path(&source, &manga, &format!("c{i}"))
+            .is_none()),
+        "first attempts failed, so nothing is on disk yet"
+    );
+
+    // Same session, no leaving: ask again. The chapters must re-attempt and,
+    // this time, succeed — not be swallowed by the dedup set.
+    let requeued = app
+        .queue_batch_download(&source, &manga, &chapters, 0, 3)
+        .unwrap();
+    assert_eq!(
+        requeued, 3,
+        "the still-missing chapters are requested again"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if (1..=3).all(|i| {
+            app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
+                .is_some()
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    for i in 1..=3 {
+        assert!(
+            app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
+                .is_some(),
+            "c{i} re-downloaded on the retry instead of being silently skipped"
+        );
+    }
+}
+
 /// A source-linked series with two downloaded chapters, recorded in the index
 /// so that — when online — "All chapters" would fetch the source list.
 fn offline_fixture(lib: &Path) {
