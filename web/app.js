@@ -190,7 +190,7 @@ function renderSignIn(message) {
     note.textContent = mode === "signup" ? "Creating account…" : "Signing in…";
     try {
       const session = mode === "signup" ? await signUp(email, password) : await signIn(email, password);
-      await showLibrary(session);
+      await showDashboard(session);
     } catch (e) {
       note.className = "note";
       note.textContent = e.message || "Sign-in failed.";
@@ -230,12 +230,218 @@ function groupBySeries(rows) {
   return groups.sort((a, b) => (a.current.updated_at < b.current.updated_at ? 1 : -1));
 }
 
-function renderLibrary(email, groups) {
+// --- reading stats --------------------------------------------------------
+//
+// Everything is derived from the `reading_progress` rows the device backs up
+// (chapter_key, current_page, total_pages, updated_at) — no extra tables. A
+// chapter is "finished" when the last page is reached; pages read is the
+// 1-based page of each tracked chapter (a chapter's progress is attributed to
+// the day it was last read). Charts are single-hue (the app accent as a
+// light→dark ramp) since they show magnitude, not identity.
+
+const pad2 = (n) => String(n).padStart(2, "0");
+// Local calendar day of a timestamp, so the heatmap lines up with the reader's
+// own days rather than UTC. `null` for an unparseable value.
+function dayKey(iso) {
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return null;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+function dateFromKey(k) {
+  const [y, m, d] = k.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function keyFromDate(dt) {
+  return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+}
+function prevDayKey(k) {
+  const dt = dateFromKey(k);
+  dt.setDate(dt.getDate() - 1);
+  return keyFromDate(dt);
+}
+function prettyDate(k) {
+  return dateFromKey(k).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+// Current streak (consecutive days up to today, or up to yesterday if today
+// hasn't been read yet) and the longest run ever.
+function streaks(daySet) {
+  if (daySet.size === 0) return { current: 0, longest: 0 };
+  const days = [...daySet].sort();
+  let longest = 1;
+  let run = 1;
+  for (let i = 1; i < days.length; i++) {
+    run = prevDayKey(days[i]) === days[i - 1] ? run + 1 : 1;
+    longest = Math.max(longest, run);
+  }
+  const today = keyFromDate(new Date());
+  let cursor = daySet.has(today) ? today : prevDayKey(today);
+  let current = 0;
+  while (daySet.has(cursor)) {
+    current++;
+    cursor = prevDayKey(cursor);
+  }
+  return { current, longest };
+}
+
+function computeStats(rows) {
+  const isFinished = (r) => r.total_pages > 0 && r.current_page + 1 >= r.total_pages;
+  const pagesOf = (r) => Math.min(r.current_page + 1, r.total_pages > 0 ? r.total_pages : r.current_page + 1);
+
+  let finished = 0;
+  let pages = 0;
+  const series = new Set();
+  const seriesFinished = new Map();
+  const byDay = new Map();
+  for (const r of rows) {
+    const { series: s } = parseKey(r.chapter_key);
+    series.add(s);
+    pages += pagesOf(r);
+    if (isFinished(r)) {
+      finished++;
+      seriesFinished.set(s, (seriesFinished.get(s) || 0) + 1);
+    }
+    const day = dayKey(r.updated_at);
+    if (day) byDay.set(day, (byDay.get(day) || 0) + pagesOf(r));
+  }
+  const top = [...seriesFinished.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 6)
+    .map(([name, count]) => ({ name, count }));
+  const dates = [...byDay.keys()].sort();
+  const { current, longest } = streaks(new Set(byDay.keys()));
+  return {
+    chapters: rows.length,
+    finished,
+    pages,
+    series: series.size,
+    activeDays: byDay.size,
+    firstDay: dates[0] || null,
+    byDay,
+    maxDay: Math.max(0, ...byDay.values()),
+    top,
+    currentStreak: current,
+    longestStreak: longest,
+  };
+}
+
+function statTilesHtml(s) {
+  const tiles = [
+    ["Chapters read", String(s.finished), `${s.chapters} tracked`],
+    ["Pages read", s.pages.toLocaleString(), `${s.series} series`],
+    ["Day streak", String(s.currentStreak), `best ${s.longestStreak}`],
+    ["Active days", String(s.activeDays), s.firstDay ? `since ${prettyDate(s.firstDay)}` : ""],
+  ];
+  return `<div class="tiles">${tiles
+    .map(
+      ([label, val, sub]) => `
+      <div class="tile" data-testid="stat">
+        <div class="tile-val">${esc(val)}</div>
+        <div class="tile-label">${esc(label)}</div>
+        ${sub ? `<div class="tile-sub">${esc(sub)}</div>` : ""}
+      </div>`
+    )
+    .join("")}</div>`;
+}
+
+// GitHub-style calendar heatmap: one column per week, seven day-cells each,
+// shaded by how many pages were read that day. Month labels ride above the
+// columns where the month changes.
+function heatmapHtml(s) {
+  const WEEKS = 18;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - (WEEKS * 7 - 1));
+  start.setDate(start.getDate() - start.getDay()); // back to Sunday
+  const months = [];
+  const cols = [];
+  const cursor = new Date(start);
+  let lastMonth = -1;
+  while (cursor <= today) {
+    const colMonth = cursor.getMonth();
+    // Label a month at its first column, but skip the very first column (it's a
+    // partial month whose label would collide with the next one).
+    const showLabel = cols.length > 0 && colMonth !== lastMonth;
+    months.push(
+      showLabel
+        ? `<span class="hm-mon">${cursor.toLocaleDateString(undefined, { month: "short" })}</span>`
+        : `<span class="hm-mon"></span>`
+    );
+    lastMonth = colMonth;
+    const cells = [];
+    for (let d = 0; d < 7; d++) {
+      if (cursor > today) {
+        cells.push(`<span class="hm-cell hm-pad"></span>`);
+      } else {
+        const key = keyFromDate(cursor);
+        const val = s.byDay.get(key) || 0;
+        const lvl = val === 0 ? 0 : Math.min(4, Math.ceil((val / (s.maxDay || 1)) * 4));
+        const label = val ? `${val} page${val === 1 ? "" : "s"} · ${prettyDate(key)}` : `No reading · ${prettyDate(key)}`;
+        cells.push(`<span class="hm-cell lvl-${lvl}" title="${esc(label)}"></span>`);
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    cols.push(`<div class="hm-col">${cells.join("")}</div>`);
+  }
+  return `
+    <div class="hm-scroll">
+      <div class="hm-months">${months.join("")}</div>
+      <div class="heatmap" data-testid="heatmap">${cols.join("")}</div>
+    </div>
+    <div class="hm-legend">Less ${[1, 2, 3, 4]
+      .map((l) => `<span class="hm-cell lvl-${l}"></span>`)
+      .join("")} More</div>`;
+}
+
+function topSeriesHtml(s) {
+  if (!s.top.length) return "";
+  const max = s.top[0].count || 1;
+  const rows = s.top
+    .map(
+      (t) => `
+      <div class="ts-row" data-testid="top-series">
+        <div class="ts-name" title="${esc(t.name)}">${esc(t.name)}</div>
+        <div class="ts-bar"><i style="width:${Math.round((t.count / max) * 100)}%"></i></div>
+        <div class="ts-val">${t.count}</div>
+      </div>`
+    )
+    .join("");
+  return `<section class="panel"><div class="section-label">Most read</div><div class="ts-list">${rows}</div></section>`;
+}
+
+function recentHtml(rows) {
+  const recent = rows.slice(0, 6);
+  const items = recent
+    .map((r) => {
+      const { series, chapter } = parseKey(r.chapter_key);
+      const m = progressMeta(r);
+      return `
+        <button class="sub" data-testid="chapter" data-key="${esc(r.chapter_key)}">
+          <span class="rc-title"><span class="rc-series">${esc(series)}</span>${chapter ? ` <span class="rc-chapter">${esc(chapter)}</span>` : ""}</span>
+          <span class="bar small"><i style="width:${m.pct}%"></i></span>
+          <span class="ago">${esc(timeAgo(r.updated_at))}</span>
+        </button>`;
+    })
+    .join("");
+  return `<section class="panel"><div class="section-label">Recently read</div><div class="chapters">${items}</div></section>`;
+}
+
+function viewStats(stats, rows) {
+  return `${statTilesHtml(stats)}
+    <section class="panel">
+      <div class="section-label">Reading activity</div>
+      ${heatmapHtml(stats)}
+    </section>
+    ${topSeriesHtml(stats)}
+    ${recentHtml(rows)}`;
+}
+
+function viewLibrary(groups) {
   const items = groups
     .map((g) => {
       const { chapter } = parseKey(g.current.chapter_key);
       const meta = progressMeta(g.current);
-      // Expanded view: every chapter of this series in natural order.
       const chapterRows = g.chapters
         .slice()
         .sort((a, b) => a.chapter_key.localeCompare(b.chapter_key, undefined, { numeric: true }))
@@ -269,25 +475,49 @@ function renderLibrary(email, groups) {
         </details>`;
     })
     .join("");
+  return `<div class="section-label">Continue reading</div><div class="list">${items}</div>`;
+}
 
+function signOut() {
+  clearSession();
+  state.session = null;
+  state.resume = {};
+  state.rows = null;
+  state.tab = "stats";
+  renderSignIn("Signed out.");
+}
+
+// The signed-in dashboard: a header, a Stats/Library tab switch, and the active
+// view. Rows are fetched once and reused across tab switches.
+function renderDashboard(email, rows) {
+  const tab = state.tab === "library" ? "library" : "stats";
+  let body;
+  if (!rows.length) {
+    body = `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`;
+  } else if (tab === "library") {
+    body = viewLibrary(groupBySeries(rows));
+  } else {
+    body = viewStats(computeStats(rows), rows);
+  }
   app.innerHTML = `
     <div class="head">
-      <div class="brand">gideon <span>· sync</span></div>
+      <div class="brand">gideon <span>· stats</span></div>
       <div class="who">${esc(email)}<button id="signout" data-testid="signout">Sign out</button></div>
     </div>
-    <div class="section-label">Continue reading</div>
-    ${
-      groups.length
-        ? `<div class="list">${items}</div>`
-        : `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`
-    }`;
-  document.getElementById("signout").addEventListener("click", () => {
-    clearSession();
-    state.session = null;
-    state.resume = {};
-    renderSignIn("Signed out.");
-  });
-  // Tapping a chapter opens the reader for it.
+    <div class="tabs" role="tablist">
+      <button class="tab ${tab === "stats" ? "on" : ""}" data-tab="stats" data-testid="tab-stats">Stats</button>
+      <button class="tab ${tab === "library" ? "on" : ""}" data-tab="library" data-testid="tab-library">Library</button>
+    </div>
+    ${body}`;
+
+  document.getElementById("signout").addEventListener("click", signOut);
+  for (const b of app.querySelectorAll(".tab")) {
+    b.addEventListener("click", () => {
+      state.tab = b.getAttribute("data-tab");
+      renderDashboard(email, rows);
+    });
+  }
+  // Tapping a chapter (library list or recent-read) opens the reader.
   for (const btn of app.querySelectorAll('[data-testid="chapter"]')) {
     btn.addEventListener("click", () => {
       const key = btn.getAttribute("data-key");
@@ -309,7 +539,7 @@ async function openReader(chapterKey, { series, chapter }) {
       </div>
       <div class="reader-msg">Loading…</div>
     </div>`;
-  document.getElementById("r-back").addEventListener("click", () => showLibrary(state.session));
+  document.getElementById("r-back").addEventListener("click", () => showDashboard(state.session));
 
   const pages = await fetchChapterPages(state.session, chapterKey);
   if (!pages.length) {
@@ -366,7 +596,7 @@ function renderReader(chapterKey, title, pages) {
   app.querySelector('[data-testid="reader-back"]').addEventListener("click", () => {
     clearTimeout(pushTimer);
     pushProgress();
-    showLibrary(state.session);
+    showDashboard(state.session);
   });
   const onKey = (e) => {
     if (e.key === "ArrowRight" || e.key === " ") go(1);
@@ -382,14 +612,15 @@ function renderReader(chapterKey, title, pages) {
   show();
 }
 
-async function showLibrary(session) {
+async function showDashboard(session) {
   state.session = session;
   const email = session.email ?? "signed in";
   try {
-    const rows = await fetchProgress(session);
+    const rows = (await fetchProgress(session)) ?? [];
     // Remember where each chapter was left off, so the reader resumes there.
-    for (const r of rows ?? []) state.resume[r.chapter_key] = r.current_page;
-    renderLibrary(email, groupBySeries(rows ?? []));
+    for (const r of rows) state.resume[r.chapter_key] = r.current_page;
+    state.rows = rows;
+    renderDashboard(email, rows);
   } catch (e) {
     if (String(e.message).includes("401")) {
       clearSession();
@@ -398,15 +629,15 @@ async function showLibrary(session) {
       renderSignIn("Session expired — please sign in again.");
       return;
     }
-    renderLibrary(email, []);
-    const label = document.querySelector(".section-label");
-    if (label) label.insertAdjacentHTML("afterend", `<div class="note">${esc(e.message)}</div>`);
+    renderDashboard(email, []);
+    const tabs = document.querySelector(".tabs");
+    if (tabs) tabs.insertAdjacentHTML("afterend", `<div class="note">${esc(e.message)}</div>`);
   }
 }
 
 function boot() {
   const session = loadSession();
-  if (session?.access_token) showLibrary(session);
+  if (session?.access_token) showDashboard(session);
   else renderSignIn("");
 }
 
