@@ -143,7 +143,7 @@ test("stat tiles and most-read reflect the data", async ({ page }) => {
   await expect(top.first()).toContainText("3");
 });
 
-test("recently read lists the newest chapters and opens the reader", async ({ page }) => {
+test("recently read lists books (not chapters) newest-first and opens the reader", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, STATS_ROWS);
   await page.route("**/rest/v1/chapter_pages**", (route) =>
@@ -156,11 +156,23 @@ test("recently read lists the newest chapters and opens the reader", async ({ pa
   await page.goto("/");
   await fillAndSubmit(page);
 
-  // Newest first: Berserk Chapter 1 (read an hour ago) is on top.
+  // One row per book, newest first: Berserk (read an hour ago) on top, and the
+  // row shows the book, not the individual chapter.
   const recent = page.getByTestId("chapter");
   await expect(recent.first()).toContainText("Berserk");
-  await recent.first().click();
+  await expect(recent.first()).not.toContainText("Chapter");
+  await recent.first().click(); // opens the book's latest chapter
   await expect(page.getByTestId("reader-img")).toBeVisible();
+});
+
+test("defaults to dark mode and the toggle switches theme", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByTestId("theme").click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 });
 
 // --- library tab ----------------------------------------------------------

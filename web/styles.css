@@ -22,6 +22,37 @@
   }
 }
 
+/* Explicit theme override (the header toggle stamps data-theme on <html>).
+   The attribute selector outweighs the media query, so it wins either way. */
+:root[data-theme="light"] {
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --ink: #1a1a18;
+  --muted: #6b6b66;
+  --line: #e7e7e2;
+  --accent: #b4633a;
+  --accent-ink: #ffffff;
+  --track: #ecece7;
+}
+:root[data-theme="dark"] {
+  --bg: #17171a;
+  --panel: #1f1f23;
+  --ink: #ececed;
+  --muted: #9a9aa2;
+  --line: #2c2c32;
+  --accent: #d0764a;
+  --accent-ink: #17171a;
+  --track: #2c2c32;
+}
+
+.theme-toggle {
+  background: none; border: 1px solid var(--line); border-radius: 999px;
+  width: 32px; height: 32px; padding: 0; cursor: pointer;
+  font-size: 15px; line-height: 1; color: var(--ink);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.theme-toggle:hover { border-color: var(--accent); }
+
 * { box-sizing: border-box; }
 html, body { margin: 0; }
 body {
@@ -51,6 +82,7 @@ body {
 }
 .brand { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
 .brand span { opacity: 0.5; font-weight: 500; }
+.head-right { display: flex; align-items: center; gap: 12px; }
 .who { color: var(--muted); font-size: 13px; text-align: right; }
 .who button {
   display: block; margin-top: 2px; margin-left: auto;

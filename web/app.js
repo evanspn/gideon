@@ -129,6 +129,32 @@ async function fetchChapterPages(session, chapterKey) {
 // Session + resume state, so the reader can push progress and return home.
 const state = { session: null, resume: {} };
 
+// --- theme (defaults to dark; a header toggle persists the choice) ---------
+
+const THEME_KEY = "gideon.theme";
+function currentTheme() {
+  return localStorage.getItem(THEME_KEY) || "dark";
+}
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+}
+function themeButtonHtml() {
+  const dark = currentTheme() === "dark";
+  return `<button class="theme-toggle" id="theme" data-testid="theme" title="Switch to ${dark ? "light" : "dark"} mode" aria-label="Toggle theme">${dark ? "☀️" : "🌙"}</button>`;
+}
+function wireThemeButton() {
+  const btn = document.getElementById("theme");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    localStorage.setItem(THEME_KEY, next);
+    applyTheme(next);
+    btn.textContent = next === "dark" ? "☀️" : "🌙";
+    btn.title = `Switch to ${next === "dark" ? "light" : "dark"} mode`;
+  });
+}
+applyTheme(currentTheme());
+
 // --- rendering ------------------------------------------------------------
 
 function esc(s) {
@@ -158,7 +184,7 @@ function timeAgo(iso) {
 
 function renderSignIn(message) {
   app.innerHTML = `
-    <div class="head"><div class="brand">gideon <span>· sync</span></div></div>
+    <div class="head"><div class="brand">gideon <span>· sync</span></div>${themeButtonHtml()}</div>
     <div class="card">
       <h1>Your reading, everywhere</h1>
       <p>Sign in to see where you left off on your Kobo. Create the account here once, then use the same email &amp; password on your device.</p>
@@ -203,6 +229,7 @@ function renderSignIn(message) {
     submit("signin");
   });
   document.getElementById("create").addEventListener("click", () => submit("signup"));
+  wireThemeButton();
 }
 
 // Progress numbers for a row: 1-based page, percent, and a compact label.
@@ -410,31 +437,33 @@ function topSeriesHtml(s) {
   return `<section class="panel"><div class="section-label">Most read</div><div class="ts-list">${rows}</div></section>`;
 }
 
-function recentHtml(rows) {
-  const recent = rows.slice(0, 6);
-  const items = recent
-    .map((r) => {
-      const { series, chapter } = parseKey(r.chapter_key);
-      const m = progressMeta(r);
+// One row per book (series), newest first — its most-recent chapter is where
+// you are. Showing every chapter here was too cluttered; the Library tab has
+// the per-chapter breakdown. Tapping opens the series' latest chapter.
+function recentHtml(groups) {
+  const items = groups
+    .slice(0, 6)
+    .map((g) => {
+      const m = progressMeta(g.current);
       return `
-        <button class="sub" data-testid="chapter" data-key="${esc(r.chapter_key)}">
-          <span class="rc-title"><span class="rc-series">${esc(series)}</span>${chapter ? ` <span class="rc-chapter">${esc(chapter)}</span>` : ""}</span>
+        <button class="sub" data-testid="chapter" data-key="${esc(g.current.chapter_key)}">
+          <span class="rc-title"><span class="rc-series">${esc(g.series)}</span></span>
           <span class="bar small"><i style="width:${m.pct}%"></i></span>
-          <span class="ago">${esc(timeAgo(r.updated_at))}</span>
+          <span class="ago">${esc(timeAgo(g.current.updated_at))}</span>
         </button>`;
     })
     .join("");
   return `<section class="panel"><div class="section-label">Recently read</div><div class="chapters">${items}</div></section>`;
 }
 
-function viewStats(stats, rows) {
+function viewStats(stats, groups) {
   return `${statTilesHtml(stats)}
     <section class="panel">
       <div class="section-label">Reading activity</div>
       ${heatmapHtml(stats)}
     </section>
     ${topSeriesHtml(stats)}
-    ${recentHtml(rows)}`;
+    ${recentHtml(groups)}`;
 }
 
 function viewLibrary(groups) {
@@ -497,12 +526,15 @@ function renderDashboard(email, rows) {
   } else if (tab === "library") {
     body = viewLibrary(groupBySeries(rows));
   } else {
-    body = viewStats(computeStats(rows), rows);
+    body = viewStats(computeStats(rows), groupBySeries(rows));
   }
   app.innerHTML = `
     <div class="head">
       <div class="brand">gideon <span>· stats</span></div>
-      <div class="who">${esc(email)}<button id="signout" data-testid="signout">Sign out</button></div>
+      <div class="head-right">
+        ${themeButtonHtml()}
+        <div class="who">${esc(email)}<button id="signout" data-testid="signout">Sign out</button></div>
+      </div>
     </div>
     <div class="tabs" role="tablist">
       <button class="tab ${tab === "stats" ? "on" : ""}" data-tab="stats" data-testid="tab-stats">Stats</button>
@@ -510,6 +542,7 @@ function renderDashboard(email, rows) {
     </div>
     ${body}`;
 
+  wireThemeButton();
   document.getElementById("signout").addEventListener("click", signOut);
   for (const b of app.querySelectorAll(".tab")) {
     b.addEventListener("click", () => {
