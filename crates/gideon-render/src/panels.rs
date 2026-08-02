@@ -339,7 +339,7 @@ fn order_reading(panels: &mut [Rect]) {
     let mut i = 0;
     for mut band in bands {
         // Right-to-left within the band (manga).
-        band.sort_by(|a, b| b.x.cmp(&a.x));
+        band.sort_by_key(|r| std::cmp::Reverse(r.x));
         for r in band {
             panels[i] = r;
             i += 1;
