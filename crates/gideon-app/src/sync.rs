@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gideon_sync::account::Account;
-use gideon_sync::supabase::SupabaseConfig;
+use gideon_sync::supabase::{SendItem, SupabaseConfig};
 
 use crate::ui::SourceGateway;
 
@@ -125,8 +125,66 @@ pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Se
                 return; // offline: resolving/publishing pages would fail too
             }
         }
+        // Pull the "send to Kobo" queue and cache it locally so the Home
+        // notification badge works offline (best-effort, like everything here).
+        match account.fetch_sends(now()) {
+            Ok(sends) => write_sends_cache(&library_dir, &sends),
+            Err(e) => eprintln!("sync: couldn't fetch sends ({e})"),
+        }
         if let Some(gateway) = gateway {
             publish_pages_sweep(&library_dir, gateway.as_ref(), &account, now());
+        }
+    });
+}
+
+/// Local cache of the pending "send to Kobo" queue, beside the sync
+/// bookkeeping. The sweep writes it; the Home screen reads it to show a
+/// notification badge without hitting the network on every render.
+const SENDS_CACHE_FILE: &str = "sends.json";
+
+fn sends_cache_path(library_dir: &Path) -> PathBuf {
+    gideon_dir(library_dir).join(SENDS_CACHE_FILE)
+}
+
+fn write_sends_cache(library_dir: &Path, sends: &[SendItem]) {
+    let path = sends_cache_path(library_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(sends) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// The pending sends cached by the last sweep (empty if none / never synced).
+pub fn cached_sends(library_dir: &Path) -> Vec<SendItem> {
+    std::fs::read(sends_cache_path(library_dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Drop a send from the local cache once it's been opened, so the badge and
+/// list update immediately rather than after the next sweep.
+pub fn forget_cached_send(library_dir: &Path, id: &str) {
+    let mut sends = cached_sends(library_dir);
+    let before = sends.len();
+    sends.retain(|s| s.id != id);
+    if sends.len() != before {
+        write_sends_cache(library_dir, &sends);
+    }
+}
+
+/// Mark a send `opened` on the server on a detached thread (best-effort), so it
+/// clears from the queue and isn't offered again on the next device.
+pub fn mark_send_opened_bg(library_dir: &Path, id: &str) {
+    let Some(account) = account(library_dir) else {
+        return;
+    };
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = account.mark_send_opened(now(), &id) {
+            eprintln!("sync: couldn't mark send opened ({e})");
         }
     });
 }

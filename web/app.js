@@ -126,8 +126,44 @@ async function fetchChapterPages(session, chapterKey) {
   return rows[0]?.page_urls ?? [];
 }
 
+// --- "Send to Kobo" queue -------------------------------------------------
+//
+// The web can't run the Kobo's source search, so we just enqueue a title; the
+// device searches for it on its next sync and offers the results to add. All
+// three calls go straight through PostgREST under row-level security (user_id
+// defaults to auth.uid() on insert).
+
+async function fetchSends(session) {
+  const url = `${SUPABASE_URL}/rest/v1/send_queue?status=eq.pending&select=id,title,created_at&order=created_at.desc`;
+  const res = await fetch(url, {
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+  });
+  if (!res.ok) return [];
+  return res.json();
+}
+async function enqueueSend(session, title) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/send_queue`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) throw new Error(`Couldn't send (${res.status})`);
+  return res.json();
+}
+async function deleteSend(session, id) {
+  return fetch(`${SUPABASE_URL}/rest/v1/send_queue?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+  });
+}
+
 // Session + resume state, so the reader can push progress and return home.
-const state = { session: null, resume: {} };
+const state = { session: null, resume: {}, sends: [] };
 
 // --- theme (defaults to dark; a header toggle persists the choice) ---------
 
@@ -456,8 +492,33 @@ function recentHtml(groups) {
   return `<section class="panel"><div class="section-label">Recently read</div><div class="chapters">${items}</div></section>`;
 }
 
-function viewStats(stats, groups) {
-  return `${statTilesHtml(stats)}
+// Enqueue-a-title panel + the list of what's still waiting on the device.
+function sendPanelHtml(sends) {
+  const list = sends.length
+    ? `<div class="sends">${sends
+        .map(
+          (s) => `
+        <div class="send-row" data-testid="send-item">
+          <span class="send-title">${esc(s.title)}</span>
+          <span class="ago">${esc(timeAgo(s.created_at))}</span>
+          <button class="send-x" data-id="${esc(s.id)}" data-testid="send-remove" aria-label="remove">×</button>
+        </div>`
+        )
+        .join("")}</div>`
+    : `<p class="send-hint">Send a manga to your Kobo: type a title and it shows up on the device as a notification — tap it there to search your sources and add it.</p>`;
+  return `<section class="panel send-panel">
+    <div class="section-label">Send to Kobo</div>
+    <form class="send-form" id="send-form">
+      <input type="text" id="send-title" data-testid="send-input" placeholder="Manga title…" maxlength="512" autocomplete="off" />
+      <button class="primary" type="submit" data-testid="send-btn">Send</button>
+    </form>
+    ${list}
+  </section>`;
+}
+
+function viewStats(stats, groups, sends) {
+  return `${sendPanelHtml(sends)}
+    ${statTilesHtml(stats)}
     <section class="panel">
       <div class="section-label">Reading activity</div>
       ${heatmapHtml(stats)}
@@ -512,6 +573,7 @@ function signOut() {
   state.session = null;
   state.resume = {};
   state.rows = null;
+  state.sends = [];
   state.tab = "stats";
   renderSignIn("Signed out.");
 }
@@ -526,7 +588,7 @@ function renderDashboard(email, rows) {
   } else if (tab === "library") {
     body = viewLibrary(groupBySeries(rows));
   } else {
-    body = viewStats(computeStats(rows), groupBySeries(rows));
+    body = viewStats(computeStats(rows), groupBySeries(rows), state.sends);
   }
   app.innerHTML = `
     <div class="head">
@@ -555,6 +617,32 @@ function renderDashboard(email, rows) {
     btn.addEventListener("click", () => {
       const key = btn.getAttribute("data-key");
       openReader(key, parseKey(key));
+    });
+  }
+  // Send-to-Kobo: enqueue a title, and remove a pending send.
+  const sendForm = document.getElementById("send-form");
+  if (sendForm) {
+    sendForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const input = document.getElementById("send-title");
+      const title = input.value.trim();
+      if (!title) return;
+      input.value = "";
+      try {
+        const [row] = await enqueueSend(state.session, title);
+        if (row) state.sends = [row, ...state.sends];
+      } catch (_) {
+        /* best-effort — the panel just won't show the new row */
+      }
+      renderDashboard(email, rows);
+    });
+  }
+  for (const btn of app.querySelectorAll('[data-testid="send-remove"]')) {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-id");
+      deleteSend(state.session, id).catch(() => {});
+      state.sends = state.sends.filter((s) => s.id !== id);
+      renderDashboard(email, rows);
     });
   }
 }
@@ -653,6 +741,7 @@ async function showDashboard(session) {
     // Remember where each chapter was left off, so the reader resumes there.
     for (const r of rows) state.resume[r.chapter_key] = r.current_page;
     state.rows = rows;
+    state.sends = await fetchSends(session).catch(() => []);
     renderDashboard(email, rows);
   } catch (e) {
     if (String(e.message).includes("401")) {

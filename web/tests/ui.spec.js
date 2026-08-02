@@ -60,8 +60,37 @@ async function fillAndSubmit(page, { email = "reader@example.com", password = "p
   await page.getByTestId(action).click();
 }
 
+// An in-memory send_queue mock (GET pending / POST enqueue / DELETE). A later
+// registration wins over the empty default in beforeEach.
+function mockSends(page, initial = []) {
+  let items = initial.slice();
+  let n = initial.length;
+  return page.route("**/rest/v1/send_queue**", (route) => {
+    const req = route.request();
+    if (req.method() === "GET") {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(items) });
+    }
+    if (req.method() === "POST") {
+      const { title } = JSON.parse(req.postData() || "{}");
+      const row = { id: `id-${++n}`, title, created_at: new Date().toISOString() };
+      items = [row, ...items];
+      return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify([row]) });
+    }
+    if (req.method() === "DELETE") {
+      const m = req.url().match(/id=eq\.([^&]+)/);
+      if (m) items = items.filter((x) => x.id !== decodeURIComponent(m[1]));
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ status: 200, body: "[]" });
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.clear());
+  // Default: no pending sends, so the dashboard's send fetch never hits the net.
+  await page.route("**/rest/v1/send_queue**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
 });
 
 // --- sign-in --------------------------------------------------------------
@@ -173,6 +202,46 @@ test("defaults to dark mode and the toggle switches theme", async ({ page }) => 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.getByTestId("theme").click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+});
+
+// --- send to Kobo ---------------------------------------------------------
+
+test("the stats view has a Send to Kobo box", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await expect(page.getByText("Send to Kobo")).toBeVisible();
+  await expect(page.getByTestId("send-input")).toBeVisible();
+  await expect(page.getByTestId("send-btn")).toBeVisible();
+});
+
+test("sending a title enqueues it and lists it", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await mockSends(page); // starts empty
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  await expect(page.getByTestId("send-item")).toHaveCount(0);
+  await page.getByTestId("send-input").fill("Berserk");
+  await page.getByTestId("send-btn").click();
+
+  const item = page.getByTestId("send-item");
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toContainText("Berserk");
+});
+
+test("a pending send can be removed", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await mockSends(page, [{ id: "id-1", title: "Vagabond", created_at: new Date().toISOString() }]);
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  await expect(page.getByTestId("send-item")).toHaveCount(1);
+  await page.getByTestId("send-remove").first().click();
+  await expect(page.getByTestId("send-item")).toHaveCount(0);
 });
 
 // --- library tab ----------------------------------------------------------

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use gideon_core::ProgressStore;
 
-use crate::supabase::{AuthClient, Session, SupabaseConfig, SupabaseTransport};
+use crate::supabase::{AuthClient, SendItem, Session, SupabaseConfig, SupabaseTransport};
 use crate::{Result, SyncOutcome, SyncState, Syncer};
 
 const SESSION_FILE: &str = "sync_session.json";
@@ -195,6 +195,23 @@ impl Account {
         let session = self.ensure_fresh_session(now)?;
         let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
         transport.set_chapter_pages(chapter_key, page_urls)
+    }
+
+    /// The pending "send to Kobo" titles the web enqueued for this account,
+    /// newest first. Refreshes the session if needed; best-effort (the caller
+    /// treats an error as "no sends this sweep").
+    pub fn fetch_sends(&self, now: u64) -> Result<Vec<SendItem>> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.fetch_pending_sends()
+    }
+
+    /// Mark a send as opened (the device has shown/handled it) so it clears from
+    /// the badge and isn't offered again.
+    pub fn mark_send_opened(&self, now: u64, id: &str) -> Result<()> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.mark_send_opened(id)
     }
 
     /// Record that `keys` have been published, so a later sweep skips them.
