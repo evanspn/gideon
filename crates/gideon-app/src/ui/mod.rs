@@ -3368,18 +3368,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         };
                         reader.show_banner(&banner)?;
                     }
-                    // Press-and-hold zooms into the comic frame under the
-                    // finger (KOReader's panel zoom); holding again re-targets
-                    // to whichever frame is now under the finger. Taps then
-                    // step frames; a centre tap leaves zoom.
+                    // Press-and-hold zooms into the comic frame under the finger
+                    // (KOReader's panel zoom); holding again leaves zoom. While
+                    // zoomed, taps step frames and a centre tap also exits.
                     Ok(UiEvent::LongPress { x, y }) => {
-                        let (rx, ry) =
-                            layout::map_reader_tap(x, y, panel.width, panel.height, rotation);
-                        let was_zoomed = reader.panel_zoom_active();
-                        if !reader.enter_panel_zoom(rx, ry)? && !was_zoomed {
-                            // No frames on this page (full-bleed art / splash):
-                            // tell the reader rather than zoom into nothing.
-                            reader.show_banner("No panels detected")?;
+                        if reader.panel_zoom_active() {
+                            reader.exit_panel_zoom()?;
+                        } else {
+                            let (rx, ry) =
+                                layout::map_reader_tap(x, y, panel.width, panel.height, rotation);
+                            if !reader.enter_panel_zoom(rx, ry)? {
+                                // No frames on this page (full-bleed art /
+                                // splash): say so rather than zoom into nothing.
+                                reader.show_banner("No panels detected")?;
+                            }
                         }
                     }
                     Ok(UiEvent::Sleep) => {

@@ -406,9 +406,13 @@ impl<D: Display> Reader<D> {
         Ok(())
     }
 
-    /// Repaint the current page with a guaranteed full refresh — for waking
-    /// from suspend, when the panel contents can't be trusted.
+    /// Repaint the current *full* page with a guaranteed full refresh — for
+    /// waking from suspend, when the panel contents can't be trusted, and for
+    /// leaving panel zoom. Always drops any panel-zoom session: a full-page
+    /// repaint and an active zoom must never coexist, or the next tap would be
+    /// misrouted (stepping frames instead of turning pages).
     pub fn repaint_full(&mut self) -> Result<()> {
+        self.panel_zoom = None;
         self.turns_since_full_refresh = 0;
         self.show_current_page()
     }
@@ -501,9 +505,7 @@ impl<D: Display> Reader<D> {
         if panels.len() == 1 && panels[0].w >= orig_w && panels[0].h >= orig_h {
             return Ok(false);
         }
-        let Some((page_x, page_y)) = self.reading_to_page(x, y, orig_w, orig_h) else {
-            return Ok(false);
-        };
+        let (page_x, page_y) = self.reading_to_page(x, y, orig_w, orig_h);
         let current = pick_panel(&panels, page_x, page_y);
         self.panel_zoom = Some(PanelZoom {
             image,
@@ -536,7 +538,10 @@ impl<D: Display> Reader<D> {
                 if let Some(pz) = self.panel_zoom.as_mut() {
                     pz.current = i;
                 }
-                self.show_panel(RefreshMode::Partial)?;
+                // Full refresh on each step: the frames are full-screen and
+                // high-contrast, so a partial refresh ghosts the old frame
+                // through the new one on Kaleido/Carta panels.
+                self.show_panel(RefreshMode::Full)?;
                 Ok(true)
             }
             None => {
@@ -552,7 +557,7 @@ impl<D: Display> Reader<D> {
         if self.panel_zoom.is_none() {
             return Ok(());
         }
-        self.panel_zoom = None;
+        // repaint_full drops the zoom session and repaints the full page.
         self.repaint_full()
     }
 
@@ -602,9 +607,10 @@ impl<D: Display> Reader<D> {
     }
 
     /// Map a reading-frame point to a pixel in the `orig_w x orig_h` page
-    /// image, inverting the fit/centre/scroll the page was laid out with.
-    /// `None` when the point falls in the letterbox margin (off the page).
-    fn reading_to_page(&self, x: u32, y: u32, orig_w: u32, orig_h: u32) -> Option<(u32, u32)> {
+    /// image, inverting the fit/centre/scroll the page was laid out with. A
+    /// point in the letterbox margin is clamped to the nearest page pixel, so
+    /// a tap just off the artwork still targets the closest frame.
+    fn reading_to_page(&self, x: u32, y: u32, orig_w: u32, orig_h: u32) -> (u32, u32) {
         let (reading_w, reading_h) = self.reading_dims();
         let (target_w, target_h) = compute_fit(orig_w, orig_h, reading_w, reading_h, self.fit);
         let canvas_w = reading_w.max(target_w);
@@ -612,19 +618,19 @@ impl<D: Display> Reader<D> {
         let off_x = (canvas_w - target_w) / 2;
         let off_y = (canvas_h - target_h) / 2;
         // The reading frame shows a screen-wide/tall window of the canvas: the
-        // blit centres horizontally and scrolls vertically, so undo both.
+        // blit centres horizontally and scrolls vertically, so undo both, then
+        // clamp into the page's content box (nearest pixel for margin taps).
         let canvas_x = (canvas_w - reading_w) / 2 + x;
         let canvas_y = self.scroll_y + y;
-        if canvas_x < off_x || canvas_y < off_y {
-            return None;
-        }
-        let (cx, cy) = (canvas_x - off_x, canvas_y - off_y);
-        if cx >= target_w || cy >= target_h {
-            return None;
-        }
+        let cx = canvas_x
+            .saturating_sub(off_x)
+            .min(target_w.saturating_sub(1));
+        let cy = canvas_y
+            .saturating_sub(off_y)
+            .min(target_h.saturating_sub(1));
         let page_x = ((cx as u64 * orig_w as u64) / target_w as u64) as u32;
         let page_y = ((cy as u64 * orig_h as u64) / target_h as u64) as u32;
-        Some((page_x.min(orig_w - 1), page_y.min(orig_h - 1)))
+        (page_x.min(orig_w - 1), page_y.min(orig_h - 1))
     }
 }
 
@@ -2094,6 +2100,21 @@ mod tests {
         reader.show_current_page().unwrap();
         assert!(!reader.enter_panel_zoom(150, 225).unwrap(), "no frames");
         assert!(!reader.panel_zoom_active());
+    }
+
+    #[test]
+    fn a_full_repaint_drops_panel_zoom() {
+        // Waking from suspend repaints the full page via repaint_full; an
+        // active zoom must not linger, or the next tap would step frames
+        // instead of turning the page.
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = paneled_reader(dir.path());
+        reader.show_current_page().unwrap();
+        assert!(reader.enter_panel_zoom(225, 112).unwrap());
+        assert!(reader.panel_zoom_active());
+        reader.repaint_full().unwrap();
+        assert!(!reader.panel_zoom_active(), "full repaint clears the zoom");
+        assert!(centre_is_white_gutter(&reader), "full page is back");
     }
 
     #[test]
