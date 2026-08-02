@@ -1,0 +1,73 @@
+name: Deploy web dashboard
+
+# Auto-publishes the reading-stats dashboard (web/) to Vercel production on
+# every push to main that touches it, so merging a web change ships it — no
+# manual `vercel deploy`. The project (gideon-sync) is static: no build step,
+# Vercel just serves the files. Auth is a single repo secret, VERCEL_TOKEN;
+# the org/project IDs below are not sensitive (they're public identifiers).
+#
+# One-time setup: add a repo secret named VERCEL_TOKEN
+#   Settings → Secrets and variables → Actions → New repository secret
+#   (create the token at https://vercel.com/account/tokens)
+# Until it's set, this workflow skips the deploy and stays green.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/deploy-web.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Vercel production
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_ORG_ID: team_SCwtDjn6cIEwuPLDC4gQBptq
+      VERCEL_PROJECT_ID: prj_Rwpku6dDxEC75ApmdsiAkjP1K7j1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for deploy token
+        id: guard
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Vercel deploy skipped::Set the VERCEL_TOKEN repo secret to enable auto-deploy (Settings → Secrets and variables → Actions)."
+          else
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy (production)
+        if: steps.guard.outputs.has_token == 'true'
+        working-directory: web
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          url=$(npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN")
+          echo "Deployed: $url"
+          echo "### 🚀 Deployed web dashboard" >> "$GITHUB_STEP_SUMMARY"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify live site
+        if: steps.guard.outputs.has_token == 'true'
+        run: |
+          # The static files must match what we just shipped, byte for byte.
+          # Retry briefly to absorb production-alias propagation.
+          for f in app.js styles.css index.html; do
+            ok=false
+            for attempt in 1 2 3 4 5; do
+              code=$(curl -s -o "/tmp/live_$f" -w "%{http_code}" "https://gideon-sync.vercel.app/$f")
+              if [ "$code" = "200" ] && cmp -s "/tmp/live_$f" "web/$f"; then
+                ok=true; break
+              fi
+              sleep 5
+            done
+            if [ "$ok" != "true" ]; then
+              echo "::error::$f on the live site did not match web/$f (last HTTP $code)"; exit 1
+            fi
+            echo "$f ✓ (matches, HTTP 200)"
+          done
