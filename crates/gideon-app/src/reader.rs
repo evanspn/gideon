@@ -22,7 +22,9 @@
 use anyhow::Result;
 use gideon_core::{CbzDocument, ProgressStore};
 use gideon_device::{Display, RefreshMode};
-use gideon_render::{render_page, FitMode, GrayPage, PageBuf, RenderOptions};
+use gideon_render::panels::{detect_panels, Rect};
+use gideon_render::{compute_fit, render_page, FitMode, GrayPage, PageBuf, RenderOptions};
+use image::DynamicImage;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -76,6 +78,19 @@ pub struct Reader<D: Display> {
     /// When set, a horizontal double-page spread (width > height) is rotated
     /// 270° to fill the screen, while the device orientation stays locked.
     auto_rotate_spreads: bool,
+    /// Active panel-zoom session (long-press to zoom into a comic frame), or
+    /// `None` when reading the full page. See [`Self::enter_panel_zoom`].
+    panel_zoom: Option<PanelZoom>,
+}
+
+/// State for the panel-zoom mode: the full-resolution page image (already
+/// spread-adjusted to match what's on screen), the frames detected on it in
+/// reading order, and which one is currently filling the screen. Holding the
+/// decoded image lets stepping between panels re-crop without re-decoding.
+struct PanelZoom {
+    image: DynamicImage,
+    panels: Vec<Rect>,
+    current: usize,
 }
 
 impl<D: Display> Reader<D> {
@@ -98,6 +113,7 @@ impl<D: Display> Reader<D> {
             last_refresh_full: false,
             forward: true,
             auto_rotate_spreads: false,
+            panel_zoom: None,
         }
     }
 
@@ -161,6 +177,8 @@ impl<D: Display> Reader<D> {
         self.spare = None;
         self.scroll_y = 0;
         self.turns_since_full_refresh = 0;
+        // The zoom framing/mapping is tied to the old orientation.
+        self.panel_zoom = None;
     }
 
     /// Access the underlying display (used by tests and debug tooling).
@@ -458,6 +476,185 @@ impl<D: Display> Reader<D> {
         }
         text
     }
+
+    // --- panel zoom (long-press to fill the screen with one comic frame) ---
+
+    /// Whether a panel-zoom session is active (one frame filling the screen).
+    pub fn panel_zoom_active(&self) -> bool {
+        self.panel_zoom.is_some()
+    }
+
+    /// Enter panel zoom at reading-frame point `(x, y)` (0..reading_w,
+    /// 0..reading_h): detect the comic frames on the current page, pick the one
+    /// under the point (or the nearest, so a tap in a gutter still zooms
+    /// somewhere sensible) and paint it filling the screen with a full refresh.
+    ///
+    /// Returns `Ok(false)` — leaving the full page untouched — when the page
+    /// has no detectable frames (full-bleed art, a splash page), so the caller
+    /// can show a hint instead of zooming into the whole page.
+    pub fn enter_panel_zoom(&mut self, x: u32, y: u32) -> Result<bool> {
+        let image = self.effective_page_image()?;
+        let (orig_w, orig_h) = (image.width(), image.height());
+        let gray = to_gray_page(&image);
+        let panels = detect_panels(&gray);
+        // A single page-sized rectangle is "no frames found".
+        if panels.len() == 1 && panels[0].w >= orig_w && panels[0].h >= orig_h {
+            return Ok(false);
+        }
+        let Some((page_x, page_y)) = self.reading_to_page(x, y, orig_w, orig_h) else {
+            return Ok(false);
+        };
+        let current = pick_panel(&panels, page_x, page_y);
+        self.panel_zoom = Some(PanelZoom {
+            image,
+            panels,
+            current,
+        });
+        self.show_panel(RefreshMode::Full)?;
+        Ok(true)
+    }
+
+    /// Step to the next frame in reading order; past the last, leave panel zoom
+    /// and repaint the full page. Returns whether a frame is still zoomed.
+    pub fn next_panel(&mut self) -> Result<bool> {
+        self.step_panel(true)
+    }
+
+    /// Step to the previous frame; before the first, leave panel zoom.
+    pub fn prev_panel(&mut self) -> Result<bool> {
+        self.step_panel(false)
+    }
+
+    fn step_panel(&mut self, forward: bool) -> Result<bool> {
+        let next = match self.panel_zoom.as_ref() {
+            None => return Ok(false),
+            Some(pz) if forward => (pz.current + 1 < pz.panels.len()).then_some(pz.current + 1),
+            Some(pz) => pz.current.checked_sub(1),
+        };
+        match next {
+            Some(i) => {
+                if let Some(pz) = self.panel_zoom.as_mut() {
+                    pz.current = i;
+                }
+                self.show_panel(RefreshMode::Partial)?;
+                Ok(true)
+            }
+            None => {
+                self.exit_panel_zoom()?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Leave panel zoom and repaint the full page (a full refresh clears any
+    /// ghosting from the zoomed frames). A no-op when not zoomed.
+    pub fn exit_panel_zoom(&mut self) -> Result<()> {
+        if self.panel_zoom.is_none() {
+            return Ok(());
+        }
+        self.panel_zoom = None;
+        self.repaint_full()
+    }
+
+    /// Crop the current frame from the full-res page, fit it to the reading
+    /// frame, rotate into the panel orientation and blit. The page cache is
+    /// never touched, so leaving panel zoom just repaints the full page.
+    fn show_panel(&mut self, mode: RefreshMode) -> Result<()> {
+        let (reading_w, reading_h) = self.reading_dims();
+        let opts = RenderOptions {
+            screen_width: reading_w,
+            screen_height: reading_h,
+            fit: FitMode::Contain,
+            dither: true,
+            // The image is already spread-adjusted; don't rotate again.
+            rotate_wide_spreads: false,
+        };
+        // Build the zoomed buffer in a scope so the panel-zoom borrow is
+        // released before the display is touched.
+        let buf = {
+            let pz = self.panel_zoom.as_ref().expect("panel zoom active");
+            let r = pz.panels[pz.current];
+            let cropped = pz.image.crop_imm(r.x, r.y, r.w.max(1), r.h.max(1));
+            render_page(&cropped, &opts)
+        };
+        let buf = if self.rotation == 0 {
+            buf
+        } else {
+            buf.rotate(self.rotation)
+        };
+        blit_page(&mut self.display, &buf, 0)?;
+        self.display.flush(mode)?;
+        Ok(())
+    }
+
+    /// Decode the current page as it appears on screen: the raw page, rotated
+    /// 270° first when a wide spread is being auto-rotated (so frame detection
+    /// and cropping line up with what's displayed).
+    fn effective_page_image(&mut self) -> Result<DynamicImage> {
+        let image = self.doc.decode_page(self.current_page)?;
+        Ok(
+            if self.rotate_spreads_now() && image.width() > image.height() {
+                image.rotate270()
+            } else {
+                image
+            },
+        )
+    }
+
+    /// Map a reading-frame point to a pixel in the `orig_w x orig_h` page
+    /// image, inverting the fit/centre/scroll the page was laid out with.
+    /// `None` when the point falls in the letterbox margin (off the page).
+    fn reading_to_page(&self, x: u32, y: u32, orig_w: u32, orig_h: u32) -> Option<(u32, u32)> {
+        let (reading_w, reading_h) = self.reading_dims();
+        let (target_w, target_h) = compute_fit(orig_w, orig_h, reading_w, reading_h, self.fit);
+        let canvas_w = reading_w.max(target_w);
+        let canvas_h = reading_h.max(target_h);
+        let off_x = (canvas_w - target_w) / 2;
+        let off_y = (canvas_h - target_h) / 2;
+        // The reading frame shows a screen-wide/tall window of the canvas: the
+        // blit centres horizontally and scrolls vertically, so undo both.
+        let canvas_x = (canvas_w - reading_w) / 2 + x;
+        let canvas_y = self.scroll_y + y;
+        if canvas_x < off_x || canvas_y < off_y {
+            return None;
+        }
+        let (cx, cy) = (canvas_x - off_x, canvas_y - off_y);
+        if cx >= target_w || cy >= target_h {
+            return None;
+        }
+        let page_x = ((cx as u64 * orig_w as u64) / target_w as u64) as u32;
+        let page_y = ((cy as u64 * orig_h as u64) / target_h as u64) as u32;
+        Some((page_x.min(orig_w - 1), page_y.min(orig_h - 1)))
+    }
+}
+
+/// The luma of a decoded page image as a [`GrayPage`], for frame detection.
+fn to_gray_page(image: &DynamicImage) -> GrayPage {
+    let luma = image.to_luma8();
+    GrayPage {
+        width: luma.width(),
+        height: luma.height(),
+        pixels: luma.into_raw(),
+    }
+}
+
+/// Index of the frame to zoom for a page point: the one containing it, else
+/// the nearest by centre (so a tap landing in a gutter still zooms a frame).
+fn pick_panel(panels: &[Rect], px: u32, py: u32) -> usize {
+    if let Some(i) = panels.iter().position(|r| r.contains(px, py)) {
+        return i;
+    }
+    panels
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, r)| {
+            let cx = r.x + r.w / 2;
+            let cy = r.y + r.h / 2;
+            let (dx, dy) = (cx.abs_diff(px) as u64, cy.abs_diff(py) as u64);
+            dx * dx + dy * dy
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 /// Normalize a rotation setting to 0/90/180/270 (anything else → 0).
@@ -1769,5 +1966,144 @@ mod tests {
             overlay.pixel(overlay.width - 2, overlay.height - 2) > 0xC0,
             "white interior"
         );
+    }
+
+    // --- panel zoom ---
+
+    /// A single 400x600 page: white background with four solid-black panels in
+    /// a 2x2 grid separated by white gutters — a clean synthetic comic page for
+    /// exercising panel zoom.
+    fn make_paneled_cbz(path: &Path) {
+        let mut img = image::RgbImage::from_pixel(400, 600, image::Rgb([255, 255, 255]));
+        let panels = [(30u32, 30u32), (220, 30), (30, 320), (220, 320)]; // tl, tr, bl, br
+        for (px, py) in panels {
+            for y in py..py + 240 {
+                for x in px..px + 150 {
+                    img.put_pixel(x, y, image::Rgb([10, 10, 10]));
+                }
+            }
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.start_file("001.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn paneled_reader(dir: &Path) -> Reader<MemoryDisplay> {
+        let path = dir.join("panels.cbz");
+        make_paneled_cbz(&path);
+        // 300x450 keeps the page's 2:3 aspect, so it fits with no letterbox:
+        // reading coords are just the page scaled by 0.75.
+        Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(300, 450),
+            FitMode::Contain,
+            0,
+        )
+    }
+
+    fn dark_fraction(reader: &Reader<MemoryDisplay>) -> f32 {
+        let buf = &reader.display().buffer;
+        buf.iter().filter(|&&p| p < 0x40).count() as f32 / buf.len() as f32
+    }
+
+    /// On the full page the screen centre lands in the white gutter cross
+    /// between the four frames; once a (solid-black) frame is zoomed it fills
+    /// the centre. This one pixel cleanly separates the two states.
+    fn centre_is_white_gutter(reader: &Reader<MemoryDisplay>) -> bool {
+        reader.display().pixel(150, 225) > 0xC0
+    }
+
+    #[test]
+    fn long_press_zooms_into_the_frame_under_the_finger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = paneled_reader(dir.path());
+        reader.show_current_page().unwrap();
+        // Full page: the centre is the white gutter between the frames.
+        assert!(
+            centre_is_white_gutter(&reader),
+            "full page shows the gutter"
+        );
+
+        // A reading-frame point inside the top-right frame (page ~300,150).
+        let entered = reader.enter_panel_zoom(225, 112).unwrap();
+        assert!(entered, "a frame was found and zoomed");
+        assert!(reader.panel_zoom_active());
+        // Zoomed into a solid-black frame: the screen is now nearly all black.
+        assert!(
+            dark_fraction(&reader) > 0.9,
+            "the black frame fills the screen"
+        );
+        assert!(
+            !centre_is_white_gutter(&reader),
+            "the frame covers the centre"
+        );
+    }
+
+    #[test]
+    fn tapping_steps_through_every_frame_then_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = paneled_reader(dir.path());
+        reader.show_current_page().unwrap();
+        assert!(reader.enter_panel_zoom(225, 112).unwrap());
+
+        // Four frames total → three successful steps, then the fourth leaves
+        // panel zoom and repaints the full page.
+        assert!(reader.next_panel().unwrap(), "1→2");
+        assert!(reader.next_panel().unwrap(), "2→3");
+        assert!(reader.next_panel().unwrap(), "3→4");
+        assert!(!reader.next_panel().unwrap(), "past the last frame → exit");
+        assert!(!reader.panel_zoom_active());
+        assert!(centre_is_white_gutter(&reader), "back to the full page");
+    }
+
+    #[test]
+    fn exiting_panel_zoom_restores_the_full_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = paneled_reader(dir.path());
+        reader.show_current_page().unwrap();
+        assert!(reader.enter_panel_zoom(225, 112).unwrap());
+        assert!(reader.panel_zoom_active());
+        assert!(
+            !centre_is_white_gutter(&reader),
+            "zoomed frame covers centre"
+        );
+        reader.exit_panel_zoom().unwrap();
+        assert!(!reader.panel_zoom_active());
+        assert!(centre_is_white_gutter(&reader), "full page repainted");
+    }
+
+    #[test]
+    fn a_full_bleed_page_reports_no_frames() {
+        // One all-black page: no gutters, so panel zoom finds nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bleed.cbz");
+        make_cbz_sized(&path, &[(400, 600)]); // page 0 is solid black
+        let mut reader = Reader::new(
+            CbzDocument::open(&path).unwrap(),
+            MemoryDisplay::new(300, 450),
+            FitMode::Contain,
+            0,
+        );
+        reader.show_current_page().unwrap();
+        assert!(!reader.enter_panel_zoom(150, 225).unwrap(), "no frames");
+        assert!(!reader.panel_zoom_active());
+    }
+
+    #[test]
+    fn changing_rotation_leaves_panel_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = paneled_reader(dir.path());
+        reader.show_current_page().unwrap();
+        assert!(reader.enter_panel_zoom(225, 112).unwrap());
+        assert!(reader.panel_zoom_active());
+        reader.set_rotation(90);
+        assert!(!reader.panel_zoom_active(), "rotation drops the zoom");
     }
 }
