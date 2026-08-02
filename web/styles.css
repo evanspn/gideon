@@ -239,6 +239,27 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 }
 .hm-legend .hm-cell { width: 12px; height: 12px; }
 
+/* Send to Kobo */
+.send-form { display: flex; gap: 8px; }
+.send-form input {
+  flex: 1; min-width: 0; padding: 11px 13px; font: inherit;
+  color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.send-form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.send-form .primary { padding: 11px 18px; }
+.send-hint { color: var(--muted); font-size: 13px; margin: 12px 0 0; line-height: 1.5; }
+.sends { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.send-row { display: flex; align-items: center; gap: 10px; }
+.send-title { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.send-row .ago { margin-top: 0; }
+.send-x {
+  flex: 0 0 auto; width: 24px; height: 24px; padding: 0; line-height: 1;
+  font-size: 18px; color: var(--muted); background: none;
+  border: 1px solid var(--line); border-radius: 999px; cursor: pointer;
+}
+.send-x:hover { color: var(--ink); border-color: var(--accent); }
+
 /* Most-read series bars */
 .ts-list { display: flex; flex-direction: column; gap: 11px; }
 .ts-row { display: grid; grid-template-columns: minmax(0, 1fr) 2fr auto; align-items: center; gap: 12px; }

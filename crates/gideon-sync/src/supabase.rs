@@ -123,6 +123,38 @@ fn parse_progress_rows(body: &str) -> Result<Vec<RemoteProgress>> {
         .collect())
 }
 
+/// One "send to Kobo" request the web enqueued: a title for the device to
+/// search for. Only a title crosses the wire (the web can't run the source
+/// search), plus the row id so the device can mark it opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendItem {
+    pub id: String,
+    pub title: String,
+}
+
+/// PostgREST query for this user's pending sends, newest first.
+fn send_pull_query() -> &'static str {
+    "send_queue?status=eq.pending&select=id,title&order=created_at.desc"
+}
+
+/// PostgREST filter selecting one send row by id (for the "opened" PATCH).
+fn mark_opened_query(id: &str) -> String {
+    format!("send_queue?id=eq.{}", encode_query_value(id))
+}
+
+fn parse_send_rows(body: &str) -> Result<Vec<SendItem>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(body).map_err(transport_err)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(SendItem {
+                id: r["id"].as_str()?.to_string(),
+                title: r["title"].as_str()?.to_string(),
+            })
+        })
+        .collect())
+}
+
 /// The PostgREST query for a pull: newest-first is *not* wanted — we page by
 /// ascending `updated_at` so the cursor advances monotonically. When `cursor`
 /// is set, only rows strictly after it are fetched.
@@ -248,6 +280,33 @@ impl SupabaseTransport {
         check_ok(resp)?;
         Ok(())
     }
+
+    /// This user's pending "send to Kobo" titles, newest first. Best-effort:
+    /// a transport error just means "no sends to show this sweep".
+    pub fn fetch_pending_sends(&self) -> Result<Vec<SendItem>> {
+        let resp = self
+            .agent
+            .get(&self.config.rest_url(send_pull_query()))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .call();
+        let body = read_body(check_ok(resp)?)?;
+        parse_send_rows(&body)
+    }
+
+    /// Mark a send row `opened` so the device's notification badge clears and
+    /// the title isn't offered again on the next sweep.
+    pub fn mark_send_opened(&self, id: &str) -> Result<()> {
+        let resp = self
+            .agent
+            .request("PATCH", &self.config.rest_url(&mark_opened_query(id)))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .send_json(json!({ "status": "opened" }));
+        check_ok(resp)?;
+        Ok(())
+    }
 }
 
 impl ProgressTransport for SupabaseTransport {
@@ -332,6 +391,39 @@ mod tests {
             q.ends_with("&updated_at=gt.2026-03-09T10%3A11%3A12%2B00%3A00"),
             "got: {q}"
         );
+    }
+
+    #[test]
+    fn send_pull_query_selects_pending_newest_first() {
+        assert_eq!(
+            send_pull_query(),
+            "send_queue?status=eq.pending&select=id,title&order=created_at.desc"
+        );
+    }
+
+    #[test]
+    fn parse_send_rows_reads_id_and_title() {
+        let body = r#"[{"id":"abc","title":"Berserk"},{"id":"def","title":"Naruto"}]"#;
+        assert_eq!(
+            parse_send_rows(body).unwrap(),
+            vec![
+                SendItem {
+                    id: "abc".into(),
+                    title: "Berserk".into()
+                },
+                SendItem {
+                    id: "def".into(),
+                    title: "Naruto".into()
+                },
+            ]
+        );
+        // A row missing a field is skipped, not a panic.
+        assert!(parse_send_rows(r#"[{"id":"x"}]"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_opened_query_targets_the_row_by_id() {
+        assert_eq!(mark_opened_query("a-b_c"), "send_queue?id=eq.a-b_c");
     }
 
     #[test]

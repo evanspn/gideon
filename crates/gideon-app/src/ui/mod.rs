@@ -444,6 +444,11 @@ enum Screen {
     },
     /// Restart/close menu, opened from the power symbol on Home.
     PowerMenu,
+    /// Manga the web queued to "send to Kobo": tap one to search for it and add
+    /// it to the library. Opened from the Home notification bell.
+    SentList {
+        items: Vec<gideon_sync::supabase::SendItem>,
+    },
     /// Wi-Fi networks from a scan: tap one to connect (or enter a password).
     WifiList {
         networks: Vec<gideon_device::network::WifiNetwork>,
@@ -1067,10 +1072,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if self.screen_has_sort() && x >= sort_button_x(&self.layout) {
                     self.cycle_chapter_sort()?;
                 } else if matches!(self.screen(), Screen::Home) {
-                    if x >= self.layout.width.saturating_sub(self.layout.title_h * 2) {
+                    let (w, th) = (self.layout.width, self.layout.title_h);
+                    let sends = crate::sync::cached_sends(&self.library_dir);
+                    // Power sits at the far right; when a notification bell is
+                    // shown (queued sends), it takes the next slot to the left.
+                    let power_zone = if sends.is_empty() { th * 2 } else { th };
+                    if x >= w.saturating_sub(power_zone) {
                         // The power symbol lives in Home's top-right corner.
                         self.push(Screen::PowerMenu)?;
-                    } else if x < self.layout.width / 2 {
+                    } else if !sends.is_empty() && x >= w.saturating_sub(th * 2) {
+                        // The bell: what the web queued to send to this device.
+                        self.push(Screen::SentList { items: sends })?;
+                    } else if x < w / 2 {
                         // The active profile name sits in the title's left
                         // half: tapping it opens the profile picker.
                         self.open_profile_menu()?;
@@ -1742,6 +1755,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 2 => Ok(Flow::Quit(Exit::Close)),
                 _ => Ok(Flow::Continue),
             },
+            Screen::SentList { items } => {
+                if let Some(item) = items.get(row).cloned() {
+                    // Mark it handled (server + local cache) so the bell clears,
+                    // then run the on-device search for the title — the reader
+                    // picks the right match on the results screen and adds it.
+                    crate::sync::mark_send_opened_bg(&self.library_dir, &item.id);
+                    crate::sync::forget_cached_send(&self.library_dir, &item.id);
+                    self.stack.pop(); // leave the sent list before searching
+                    self.run_global_search(&item.title)?;
+                }
+                Ok(Flow::Continue)
+            }
             Screen::WifiList { networks } => {
                 let n = networks.len();
                 if row == 0 {
@@ -3724,10 +3749,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     self.battery_now(),
                 );
                 let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
+                // Status-icon row, right to left: power (slot 0), then a bell
+                // when the web has queued sends, then the Bluetooth glyph when a
+                // remote is connected — each in the next slot so they never
+                // overlap.
                 draw_power_icon(&mut canvas, l);
-                // A Bluetooth glyph shows when a page-turn remote is connected.
+                let mut slot = 1;
+                if !crate::sync::cached_sends(&self.library_dir).is_empty() {
+                    draw_bell_icon(&mut canvas, l, slot);
+                    slot += 1;
+                }
                 if self.input.bluetooth_connected() {
-                    draw_bluetooth_icon(&mut canvas, l);
+                    draw_bluetooth_icon(&mut canvas, l, slot);
                 }
                 canvas
             }
@@ -3877,6 +3910,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("Close gideon".to_string(), true),
                 ];
                 compose_list(l, "Power", &rows, 0, 1)
+            }
+            Screen::SentList { items } => {
+                let rows: Vec<(String, bool)> =
+                    items.iter().map(|s| (s.title.clone(), true)).collect();
+                compose_list(l, "Sent to you — tap to find & add", &rows, 0, 1)
             }
             Screen::WifiList { networks } => {
                 let nets: Vec<WifiRow> = networks
@@ -5156,13 +5194,52 @@ fn draw_power_icon(canvas: &mut GrayPage, l: &UiLayout) {
     }
 }
 
-/// Draw the Bluetooth rune in the title bar, a comfortable gap to the left of
-/// the power icon, to show a page-turn remote is connected. The classic glyph:
-/// a vertical spine with two right-hand triangular "flags" whose long diagonals
-/// cross through the center to the left-hand tips.
-fn draw_bluetooth_icon(canvas: &mut GrayPage, l: &UiLayout) {
-    let power_cx = l.width.saturating_sub(l.title_h / 2 + l.pad) as f32;
-    let cx = power_cx - l.title_h as f32;
+/// Center x of title-bar status icon `slot`: 0 is the power symbol at the far
+/// right, higher numbers step left by one title-bar height each, so the power /
+/// notification / Bluetooth icons sit in a tidy row that never overlaps.
+fn title_icon_cx(l: &UiLayout, slot: u32) -> f32 {
+    (l.width.saturating_sub(l.title_h / 2 + l.pad) as f32) - slot as f32 * l.title_h as f32
+}
+
+/// A bell in the title bar (with a small "new" badge dot) shown when the web
+/// has queued manga to send to this device. Drawn at status-icon `slot`.
+fn draw_bell_icon(canvas: &mut GrayPage, l: &UiLayout, slot: u32) {
+    let cx = title_icon_cx(l, slot);
+    let cy = (l.title_h as f32) * 0.55;
+    let h = l.title_h as f32 * 0.32;
+    let w = l.title_h as f32 * 0.24;
+    let top = cy - h;
+    let shoulder = cy - h * 0.35;
+    let rim = cy + h * 0.5;
+    let neck = w * 0.5;
+    let mut seg = |ax: f32, ay: f32, bx: f32, by: f32| {
+        line(canvas, ax as i32, ay as i32, bx as i32, by as i32, 0x00);
+    };
+    seg(cx, top, cx, top - 2.0); // handle
+    seg(cx - neck, shoulder, cx, top); // dome left
+    seg(cx + neck, shoulder, cx, top); // dome right
+    seg(cx - neck, shoulder, cx - w, rim); // left flare
+    seg(cx + neck, shoulder, cx + w, rim); // right flare
+    seg(cx - w, rim, cx + w, rim); // rim
+    seg(cx, rim, cx, rim + h * 0.22); // clapper
+                                      // The "you've got something" badge: a filled dot at the top-right.
+    let (bx, by) = (cx + w * 0.85, top + 2.0);
+    let br = (l.title_h as f32 * 0.11).max(2.0);
+    for dy in -(br as i32)..=(br as i32) {
+        for dx in -(br as i32)..=(br as i32) {
+            if (dx * dx + dy * dy) as f32 <= br * br {
+                plot(canvas, bx as i32 + dx, by as i32 + dy, 0x00);
+            }
+        }
+    }
+}
+
+/// Draw the Bluetooth rune in the title bar (at status-icon `slot`) to show a
+/// page-turn remote is connected. The classic glyph: a vertical spine with two
+/// right-hand triangular "flags" whose long diagonals cross through the center
+/// to the left-hand tips.
+fn draw_bluetooth_icon(canvas: &mut GrayPage, l: &UiLayout, slot: u32) {
+    let cx = title_icon_cx(l, slot);
     let cy = (l.title_h as f32) * 0.55;
     let h = (l.title_h as f32) * 0.30; // half height
     let w = (l.title_h as f32) * 0.16; // half width

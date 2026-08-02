@@ -5906,6 +5906,111 @@ fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
     );
 }
 
+/// Prime the local "send to Kobo" cache the sync sweep would normally write, so
+/// Home tests can exercise the bell/list without a network round-trip.
+fn seed_sends(library_dir: &Path, items: &[(&str, &str)]) {
+    let sends: Vec<gideon_sync::supabase::SendItem> = items
+        .iter()
+        .map(|(id, title)| gideon_sync::supabase::SendItem {
+            id: (*id).to_string(),
+            title: (*title).to_string(),
+        })
+        .collect();
+    let dir = library_dir.join(".gideon");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sends.json"), serde_json::to_vec(&sends).unwrap()).unwrap();
+}
+
+#[test]
+fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
+    let l = layout();
+    // Slot 1 sits one title-bar height left of the power symbol — where the
+    // bell paints — minus the always-drawn title separator row.
+    let power_cx = l.width.saturating_sub(l.title_h / 2 + l.pad);
+    let cx = power_cx.saturating_sub(l.title_h);
+    let half = l.title_h / 4;
+    let (x0, x1) = (cx.saturating_sub(half), (cx + half).min(l.width));
+    let (y0, y1) = (1u32, l.title_h.saturating_sub(2).min(l.height));
+    let ink = |buf: &[u8]| -> usize {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if buf[(y * l.width + x) as usize] < 0x80 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let render = |seeded: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        if seeded {
+            seed_sends(dir.path(), &[("s1", "Berserk")]);
+        }
+        let mut app = app(dir.path(), FakeGateway::default(), vec![]);
+        app.render_once().unwrap();
+        ink(&app.display().buffer)
+    };
+
+    assert_eq!(render(false), 0, "no bell when nothing is queued");
+    assert!(render(true) > 0, "the bell shows when a send is waiting");
+}
+
+#[test]
+fn tapping_the_home_bell_opens_the_sent_list() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_sends(dir.path(), &[("s1", "Berserk")]);
+    let l = layout();
+    // The bell lives in slot 1: between the far-right power zone (width - th)
+    // and one more title-bar height to the left.
+    let bell = UiEvent::Tap {
+        x: l.width - l.title_h - l.title_h / 2,
+        y: 1,
+    };
+    let mut app = app(dir.path(), FakeGateway::default(), vec![bell]);
+    app.run().unwrap();
+    assert!(
+        matches!(app.screen(), Screen::SentList { items } if items.len() == 1),
+        "tapping the bell opens the list of queued sends"
+    );
+}
+
+#[test]
+fn opening_a_sent_item_searches_for_it_and_clears_the_badge() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_sends(dir.path(), &[("s1", "Berserk")]);
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        search_results: Ok(vec![MangaEntry {
+            id: "m1".into(),
+            title: "Berserk".into(),
+            cover_url: None,
+        }]),
+        ..FakeGateway::default()
+    };
+    let l = layout();
+    let bell = UiEvent::Tap {
+        x: l.width - l.title_h - l.title_h / 2,
+        y: 1,
+    };
+    let mut app =
+        app(dir.path(), gateway, vec![bell, tap_row(0)]).with_online_probe(Box::new(|| true));
+    app.run().unwrap();
+
+    let Screen::SearchResults { query, results, .. } = app.screen() else {
+        panic!("opening a sent item should land on its search results");
+    };
+    assert_eq!(query, "Berserk", "the queued title drives the search");
+    assert_eq!(results.len(), 1, "the source's hit is shown to pick from");
+    assert!(
+        crate::sync::cached_sends(dir.path()).is_empty(),
+        "opening a send clears it from the local badge cache"
+    );
+}
+
 #[test]
 fn battery_probe_feeds_home_and_sleep_without_breaking_either() {
     let dir = tempfile::tempdir().unwrap();
