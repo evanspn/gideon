@@ -3184,12 +3184,44 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         }
                     }
                 }
+                // Page-level navigation, rotation and mid-screen gestures leave
+                // panel zoom first, then run normally against the full page.
+                // Frame-stepping (taps) and re-targeting (long-press) are
+                // handled inside their own arms below.
+                if reader.panel_zoom_active()
+                    && matches!(
+                        &event,
+                        Ok(UiEvent::PageForward)
+                            | Ok(UiEvent::PageBack)
+                            | Ok(UiEvent::RemoteNext)
+                            | Ok(UiEvent::RemotePrev)
+                            | Ok(UiEvent::Rotate { .. })
+                            | Ok(UiEvent::Swipe { .. })
+                    )
+                {
+                    reader.exit_panel_zoom()?;
+                }
                 match event {
                     Err(_) => {
                         outcome = ReaderOutcome::Quit;
                         break;
                     }
                     // Tap zones follow the reading orientation, not the panel.
+                    // While zoomed, the same zones step frames instead of pages
+                    // (right → next frame, left → previous, centre → exit zoom).
+                    Ok(UiEvent::Tap { x, y }) if reader.panel_zoom_active() => {
+                        match panel.reader_zone_rotated(x, y, rotation) {
+                            ReaderZone::NextPage => {
+                                reader.next_panel()?;
+                            }
+                            ReaderZone::PrevPage => {
+                                reader.prev_panel()?;
+                            }
+                            ReaderZone::Back => {
+                                reader.exit_panel_zoom()?;
+                            }
+                        }
+                    }
                     Ok(UiEvent::Tap { x, y }) => match panel.reader_zone_rotated(x, y, rotation) {
                         ReaderZone::NextPage => {
                             // Turning past the last page continues into
@@ -3336,21 +3368,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         };
                         reader.show_banner(&banner)?;
                     }
-                    // A slow tap is still a tap in the reader.
+                    // Press-and-hold zooms into the comic frame under the finger
+                    // (KOReader's panel zoom); holding again leaves zoom. While
+                    // zoomed, taps step frames and a centre tap also exits.
                     Ok(UiEvent::LongPress { x, y }) => {
-                        match panel.reader_zone_rotated(x, y, rotation) {
-                            ReaderZone::NextPage => {
-                                if !turn_reader_page(&mut reader, &mut self.input, true)?
-                                    && next_available
-                                {
-                                    outcome = ReaderOutcome::NextChapter;
-                                    break;
-                                }
+                        if reader.panel_zoom_active() {
+                            reader.exit_panel_zoom()?;
+                        } else {
+                            let (rx, ry) =
+                                layout::map_reader_tap(x, y, panel.width, panel.height, rotation);
+                            if !reader.enter_panel_zoom(rx, ry)? {
+                                // No frames on this page (full-bleed art /
+                                // splash): say so rather than zoom into nothing.
+                                reader.show_banner("No panels detected")?;
                             }
-                            ReaderZone::PrevPage => {
-                                turn_reader_page(&mut reader, &mut self.input, false)?;
-                            }
-                            ReaderZone::Back => break,
                         }
                     }
                     Ok(UiEvent::Sleep) => {
