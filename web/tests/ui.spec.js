@@ -26,6 +26,14 @@ const ROWS = [
   },
 ];
 
+// Data with finished chapters, for the stat-tile / most-read assertions.
+const STATS_ROWS = [
+  { chapter_key: "Berserk/Chapter 1.cbz", current_page: 19, total_pages: 20, updated_at: new Date(Date.now() - 3600e3).toISOString() },
+  { chapter_key: "Berserk/Chapter 2.cbz", current_page: 21, total_pages: 22, updated_at: new Date(Date.now() - 2 * 3600e3).toISOString() },
+  { chapter_key: "Berserk/Chapter 3.cbz", current_page: 17, total_pages: 18, updated_at: new Date(Date.now() - 26 * 3600e3).toISOString() },
+  { chapter_key: "Naruto/Chapter 1.cbz", current_page: 4, total_pages: 18, updated_at: new Date(Date.now() - 50 * 3600e3).toISOString() },
+];
+
 function mockAuthOk(page) {
   return page.route("**/auth/v1/**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
@@ -56,7 +64,7 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.clear());
 });
 
-// --- functionality --------------------------------------------------------
+// --- sign-in --------------------------------------------------------------
 
 test("shows the sign-in form on first load", async ({ page }) => {
   await page.goto("/");
@@ -67,180 +75,9 @@ test("shows the sign-in form on first load", async ({ page }) => {
   await expect(page.getByTestId("create")).toBeVisible();
 });
 
-test("signing in shows the continue-reading list", async ({ page }) => {
-  await mockAuthOk(page);
-  await mockProgress(page, ROWS);
-  await page.goto("/");
-  await fillAndSubmit(page);
-
-  await expect(page.getByText("Continue reading")).toBeVisible();
-  const items = page.getByTestId("item");
-  await expect(items).toHaveCount(2);
-  // Newest-first order + page shown as 1-based.
-  await expect(items.nth(0)).toContainText("One Piece");
-  await expect(items.nth(0)).toContainText("11/20");
-  await expect(items.nth(1)).toContainText("Naruto");
-  await expect(page.getByTestId("signout")).toBeVisible();
-  await expect(page.getByText("reader@example.com")).toBeVisible();
-});
-
-test("chapters of the same series collapse to one card (most recent)", async ({ page }) => {
-  await mockAuthOk(page);
-  await mockProgress(page, [
-    {
-      chapter_key: "One Piece/vol1.cbz",
-      current_page: 19,
-      total_pages: 20,
-      updated_at: new Date(Date.now() - 5 * 86400e3).toISOString(),
-    },
-    {
-      chapter_key: "One Piece/vol3.cbz",
-      current_page: 5,
-      total_pages: 20,
-      updated_at: new Date(Date.now() - 3600e3).toISOString(),
-    },
-    {
-      chapter_key: "Naruto/vol1.cbz",
-      current_page: 2,
-      total_pages: 18,
-      updated_at: new Date(Date.now() - 2 * 86400e3).toISOString(),
-    },
-  ]);
-  await page.goto("/");
-  await fillAndSubmit(page);
-
-  const items = page.getByTestId("item");
-  // Two series -> two cards, even though One Piece has two chapters.
-  await expect(items).toHaveCount(2);
-  // The One Piece card shows its most-recent chapter (vol3), newest first.
-  await expect(items.nth(0)).toContainText("One Piece");
-  await expect(items.nth(0)).toContainText("vol3");
-  await expect(items.nth(1)).toContainText("Naruto");
-});
-
-test("progress bar width tracks percent read", async ({ page }) => {
-  await mockAuthOk(page);
-  await mockProgress(page, ROWS);
-  await page.goto("/");
-  await fillAndSubmit(page);
-  // One Piece: page 11 of 20 -> 55%. Target the summary's bar (the expanded
-  // list has its own per-chapter bars).
-  const bar = page.getByTestId("item").nth(0).locator("summary .bar > i");
-  await expect(bar).toHaveAttribute("style", /width:\s*55%/);
-});
-
-test("tapping a series card expands its chapter list", async ({ page }) => {
-  await mockAuthOk(page);
-  await mockProgress(page, [
-    {
-      chapter_key: "One Piece/vol1.cbz",
-      current_page: 19,
-      total_pages: 20,
-      updated_at: new Date(Date.now() - 5 * 86400e3).toISOString(),
-    },
-    {
-      chapter_key: "One Piece/vol3.cbz",
-      current_page: 5,
-      total_pages: 20,
-      updated_at: new Date(Date.now() - 3600e3).toISOString(),
-    },
-  ]);
-  await page.goto("/");
-  await fillAndSubmit(page);
-
-  const card = page.getByTestId("item").first();
-  const chapters = card.getByTestId("chapters");
-  // Collapsed by default, revealed on tap.
-  await expect(chapters).toBeHidden();
-  await card.locator("summary").click();
-  await expect(chapters).toBeVisible();
-  // Both chapters of the series are listed, in natural order.
-  const subs = chapters.locator(".sub-title");
-  await expect(subs).toHaveText(["vol1", "vol3"]);
-});
-
-// --- reader ---------------------------------------------------------------
-
-const READER_PAGES = ["p1", "p2", "p3", "p4", "p5"].map((s) => `https://cdn.test/${s}.png`);
-
-async function openReader(page, { pages = READER_PAGES, currentPage = 0 } = {}) {
-  await mockAuthOk(page);
-  await mockProgress(page, [
-    {
-      chapter_key: "Vagabond/ch1.cbz",
-      current_page: currentPage,
-      total_pages: pages.length,
-      updated_at: new Date().toISOString(),
-    },
-  ]);
-  await page.route("**/rest/v1/chapter_pages**", (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(pages.length ? [{ page_urls: pages }] : []),
-    })
-  );
-  await page.goto("/");
-  await fillAndSubmit(page);
-  await page.getByTestId("item").first().locator("summary").click(); // expand
-  await page.getByTestId("chapter").first().click(); // open the reader
-}
-
-test("reading a chapter shows its pages and navigates", async ({ page }) => {
-  await openReader(page);
-  const img = page.getByTestId("reader-img");
-  await expect(page.getByTestId("reader-count")).toHaveText("1 / 5");
-  await expect(img).toHaveAttribute("src", READER_PAGES[0]);
-
-  await page.getByTestId("reader-next").click();
-  await expect(page.getByTestId("reader-count")).toHaveText("2 / 5");
-  await expect(img).toHaveAttribute("src", READER_PAGES[1]);
-
-  await page.getByTestId("reader-prev").click();
-  await expect(page.getByTestId("reader-count")).toHaveText("1 / 5");
-  await expect(img).toHaveAttribute("src", READER_PAGES[0]);
-});
-
-test("the reader resumes at the saved page", async ({ page }) => {
-  await openReader(page, { currentPage: 3 });
-  await expect(page.getByTestId("reader-count")).toHaveText("4 / 5");
-  await expect(page.getByTestId("reader-img")).toHaveAttribute("src", READER_PAGES[3]);
-});
-
-test("the reader pushes progress and Back returns to the library", async ({ page }) => {
-  const pushes = [];
-  await page.route("**/rest/v1/rpc/upsert_progress", (route) => {
-    pushes.push(JSON.parse(route.request().postData() || "{}"));
-    route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
-  });
-  await openReader(page);
-  await page.getByTestId("reader-next").click(); // -> page index 1
-  await page.getByTestId("reader-back").click();
-
-  await expect(page.getByTestId("signout")).toBeVisible(); // back on the library
-  expect(
-    pushes.some((p) => p.p_chapter_key === "Vagabond/ch1.cbz" && p.p_current_page === 1)
-  ).toBeTruthy();
-});
-
-test("a chapter with no published pages shows an unavailable message", async ({ page }) => {
-  await openReader(page, { pages: [] });
-  await expect(page.getByText("isn't available to read on the web yet")).toBeVisible();
-});
-
-test("empty progress shows the empty state", async ({ page }) => {
-  await mockAuthOk(page);
-  await mockProgress(page, []);
-  await page.goto("/");
-  await fillAndSubmit(page);
-  await expect(page.getByTestId("empty")).toContainText("No reading progress yet");
-});
-
 test("bad credentials show an error and stay on sign-in", async ({ page }) => {
   await mockAuthFail(page, "Invalid login credentials");
   await page.goto("/");
-  // ≥6 chars so the field's own minlength validation passes and the request
-  // actually goes out to be rejected.
   await fillAndSubmit(page, { password: "wrongpass" });
   await expect(page.getByTestId("note")).toContainText("Invalid login credentials");
   await expect(page.locator("input[type=email]")).toBeVisible();
@@ -265,6 +102,213 @@ test("sign out returns to the sign-in screen", async ({ page }) => {
   await expect(page.getByTestId("signin")).toBeVisible();
 });
 
+test("empty progress shows the empty state", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, []);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await expect(page.getByTestId("empty")).toContainText("No reading progress yet");
+});
+
+// --- stats (default view) -------------------------------------------------
+
+test("signing in lands on the stats dashboard", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  await expect(page.getByTestId("tab-stats")).toHaveClass(/on/);
+  await expect(page.getByTestId("stat")).toHaveCount(4);
+  await expect(page.getByTestId("heatmap")).toBeVisible();
+  await expect(page.getByText("Reading activity")).toBeVisible();
+  await expect(page.getByText("reader@example.com")).toBeVisible();
+});
+
+test("stat tiles and most-read reflect the data", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, STATS_ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  // 3 of the 4 chapters are finished; 20+22+18+5 = 65 pages; 2 series.
+  await expect(page.getByTestId("stat").filter({ hasText: "Chapters read" })).toContainText("3");
+  await expect(page.getByTestId("stat").filter({ hasText: "Pages read" })).toContainText("65");
+  await expect(page.getByTestId("stat").filter({ hasText: "Pages read" })).toContainText("2 series");
+
+  // Most-read: all 3 finished chapters are Berserk.
+  const top = page.getByTestId("top-series");
+  await expect(top).toHaveCount(1);
+  await expect(top.first()).toContainText("Berserk");
+  await expect(top.first()).toContainText("3");
+});
+
+test("recently read lists books (not chapters) newest-first and opens the reader", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, STATS_ROWS);
+  await page.route("**/rest/v1/chapter_pages**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([{ page_urls: ["https://cdn.test/p1.png"] }]),
+    })
+  );
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  // One row per book, newest first: Berserk (read an hour ago) on top, and the
+  // row shows the book, not the individual chapter.
+  const recent = page.getByTestId("chapter");
+  await expect(recent.first()).toContainText("Berserk");
+  await expect(recent.first()).not.toContainText("Chapter");
+  await recent.first().click(); // opens the book's latest chapter
+  await expect(page.getByTestId("reader-img")).toBeVisible();
+});
+
+test("defaults to dark mode and the toggle switches theme", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByTestId("theme").click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+});
+
+// --- library tab ----------------------------------------------------------
+
+test("the Library tab shows the continue-reading list", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  await expect(page.getByText("Continue reading")).toBeVisible();
+  const items = page.getByTestId("item");
+  await expect(items).toHaveCount(2);
+  await expect(items.nth(0)).toContainText("One Piece");
+  await expect(items.nth(0)).toContainText("11/20");
+  await expect(items.nth(1)).toContainText("Naruto");
+});
+
+test("chapters of the same series collapse to one card (most recent)", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, [
+    { chapter_key: "One Piece/vol1.cbz", current_page: 19, total_pages: 20, updated_at: new Date(Date.now() - 5 * 86400e3).toISOString() },
+    { chapter_key: "One Piece/vol3.cbz", current_page: 5, total_pages: 20, updated_at: new Date(Date.now() - 3600e3).toISOString() },
+    { chapter_key: "Naruto/vol1.cbz", current_page: 2, total_pages: 18, updated_at: new Date(Date.now() - 2 * 86400e3).toISOString() },
+  ]);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  const items = page.getByTestId("item");
+  await expect(items).toHaveCount(2);
+  await expect(items.nth(0)).toContainText("One Piece");
+  await expect(items.nth(0)).toContainText("vol3");
+  await expect(items.nth(1)).toContainText("Naruto");
+});
+
+test("progress bar width tracks percent read", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+  const bar = page.getByTestId("item").nth(0).locator("summary .bar > i");
+  await expect(bar).toHaveAttribute("style", /width:\s*55%/);
+});
+
+test("tapping a series card expands its chapter list", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, [
+    { chapter_key: "One Piece/vol1.cbz", current_page: 19, total_pages: 20, updated_at: new Date(Date.now() - 5 * 86400e3).toISOString() },
+    { chapter_key: "One Piece/vol3.cbz", current_page: 5, total_pages: 20, updated_at: new Date(Date.now() - 3600e3).toISOString() },
+  ]);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  const card = page.getByTestId("item").first();
+  const chapters = card.getByTestId("chapters");
+  await expect(chapters).toBeHidden();
+  await card.locator("summary").click();
+  await expect(chapters).toBeVisible();
+  const subs = chapters.locator(".sub-title");
+  await expect(subs).toHaveText(["vol1", "vol3"]);
+});
+
+// --- reader ---------------------------------------------------------------
+
+const READER_PAGES = ["p1", "p2", "p3", "p4", "p5"].map((s) => `https://cdn.test/${s}.png`);
+
+// Opens the reader from the stats "recently read" list (a chapter row), which
+// is the default view after sign-in.
+async function openReader(page, { pages = READER_PAGES, currentPage = 0 } = {}) {
+  await mockAuthOk(page);
+  await mockProgress(page, [
+    {
+      chapter_key: "Vagabond/ch1.cbz",
+      current_page: currentPage,
+      total_pages: pages.length,
+      updated_at: new Date().toISOString(),
+    },
+  ]);
+  await page.route("**/rest/v1/chapter_pages**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(pages.length ? [{ page_urls: pages }] : []),
+    })
+  );
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("chapter").first().click(); // recently-read → reader
+}
+
+test("reading a chapter shows its pages and navigates", async ({ page }) => {
+  await openReader(page);
+  const img = page.getByTestId("reader-img");
+  await expect(page.getByTestId("reader-count")).toHaveText("1 / 5");
+  await expect(img).toHaveAttribute("src", READER_PAGES[0]);
+
+  await page.getByTestId("reader-next").click();
+  await expect(page.getByTestId("reader-count")).toHaveText("2 / 5");
+  await expect(img).toHaveAttribute("src", READER_PAGES[1]);
+
+  await page.getByTestId("reader-prev").click();
+  await expect(page.getByTestId("reader-count")).toHaveText("1 / 5");
+  await expect(img).toHaveAttribute("src", READER_PAGES[0]);
+});
+
+test("the reader resumes at the saved page", async ({ page }) => {
+  await openReader(page, { currentPage: 3 });
+  await expect(page.getByTestId("reader-count")).toHaveText("4 / 5");
+  await expect(page.getByTestId("reader-img")).toHaveAttribute("src", READER_PAGES[3]);
+});
+
+test("the reader pushes progress and Back returns to the dashboard", async ({ page }) => {
+  const pushes = [];
+  await page.route("**/rest/v1/rpc/upsert_progress", (route) => {
+    pushes.push(JSON.parse(route.request().postData() || "{}"));
+    route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  });
+  await openReader(page);
+  await page.getByTestId("reader-next").click(); // -> page index 1
+  await page.getByTestId("reader-back").click();
+
+  await expect(page.getByTestId("signout")).toBeVisible(); // back on the dashboard
+  expect(
+    pushes.some((p) => p.p_chapter_key === "Vagabond/ch1.cbz" && p.p_current_page === 1)
+  ).toBeTruthy();
+});
+
+test("a chapter with no published pages shows an unavailable message", async ({ page }) => {
+  await openReader(page, { pages: [] });
+  await expect(page.getByText("isn't available to read on the web yet")).toBeVisible();
+});
+
 test("a persisted session skips the sign-in screen", async ({ page }) => {
   await mockProgress(page, ROWS);
   await page.addInitScript(() => {
@@ -279,7 +323,8 @@ test("a persisted session skips the sign-in screen", async ({ page }) => {
     );
   });
   await page.goto("/");
-  await expect(page.getByText("Continue reading")).toBeVisible();
+  await expect(page.getByTestId("heatmap")).toBeVisible();
+  await page.getByTestId("tab-library").click();
   await expect(page.getByTestId("item")).toHaveCount(2);
 });
 
@@ -291,11 +336,21 @@ test("sign-in screen looks right", async ({ page }) => {
   await expect(page).toHaveScreenshot("signin.png", { maxDiffPixelRatio: 0.02 });
 });
 
-test("library screen looks right", async ({ page }) => {
+test("stats dashboard looks right", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, STATS_ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await expect(page.getByTestId("heatmap")).toBeVisible();
+  await expect(page).toHaveScreenshot("stats.png", { maxDiffPixelRatio: 0.02 });
+});
+
+test("library tab looks right", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, ROWS);
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
   await expect(page.getByTestId("item").first()).toBeVisible();
   await expect(page).toHaveScreenshot("library.png", { maxDiffPixelRatio: 0.02 });
 });
