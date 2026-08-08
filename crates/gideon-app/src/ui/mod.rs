@@ -2324,13 +2324,42 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
+    /// Search one source for `query`, retrying with its known title variants
+    /// (from MyAnimeList) when the raw query finds nothing — a source often
+    /// lists a manga under its romanised Japanese title while the user typed
+    /// the English one, or the other way around. The variant list is looked
+    /// up lazily (once per search, only after a miss) and cached in
+    /// `variants`, so a query that hits everywhere never pays for the lookup.
+    /// A variant that errors is skipped; only the raw query's error
+    /// propagates.
+    fn search_with_variants(
+        &self,
+        source_id: &str,
+        query: &str,
+        variants: &mut Option<Vec<String>>,
+    ) -> Result<Vec<MangaEntry>> {
+        let mangas = self.gateway.search_manga(source_id, query)?;
+        if !mangas.is_empty() {
+            return Ok(mangas);
+        }
+        let variants = variants.get_or_insert_with(|| self.gateway.title_variants(query));
+        for variant in variants.iter() {
+            if let Ok(mangas) = self.gateway.search_manga(source_id, variant) {
+                if !mangas.is_empty() {
+                    return Ok(mangas);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// Search one source; results open as a normal manga list.
     fn run_source_search(&mut self, source: &SourceEntry, query: &str) -> Result<()> {
         self.ensure_online()?;
         self.show_status(&[&format!("Searching for \"{query}\"…")])?;
+        let mut variants = None;
         let mangas = self
-            .gateway
-            .search_manga(&source.id, query)
+            .search_with_variants(&source.id, query, &mut variants)
             .with_context(|| format!("search on {} failed", source.name))?;
         if mangas.is_empty() {
             // Stay on the keyboard so the user can refine the query.
@@ -2356,6 +2385,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let sources = self.gateway.installed_sources()?;
         let mut results: Vec<(SourceEntry, MangaEntry)> = Vec::new();
         let mut tried: Vec<String> = Vec::new();
+        let mut variants = None;
         for (i, source) in sources.iter().enumerate() {
             // One status screen for the whole search, partially updated
             // per source — N full flashes made an N-source search strobe.
@@ -2364,7 +2394,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 &format!("{}/{}: {}…", i + 1, sources.len(), source.name),
             ])?;
             tried.push(source.id.clone());
-            match self.gateway.search_manga(&source.id, query) {
+            match self.search_with_variants(&source.id, query, &mut variants) {
                 Ok(mangas) => {
                     results.extend(mangas.into_iter().map(|m| (source.clone(), m)));
                 }
@@ -2435,6 +2465,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             .collect();
         let before = results.len();
         let mut failures = 0usize;
+        let mut variants = None;
         for (i, source) in candidates.iter().enumerate() {
             self.show_status(&[
                 &format!("Searching more for \"{query}\"…"),
@@ -2452,7 +2483,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 continue;
             }
-            match self.gateway.search_manga(&source.id, &query) {
+            match self.search_with_variants(&source.id, &query, &mut variants) {
                 Ok(mangas) if !mangas.is_empty() => {
                     // Had a hit — keep it installed and merge its results.
                     results.extend(mangas.into_iter().map(|m| (source.clone(), m)));

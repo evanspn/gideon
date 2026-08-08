@@ -50,6 +50,12 @@ struct FakeGateway {
     searches: RefCell<Vec<String>>,
     /// Source ids passed to `search_manga`, in order.
     searched_sources: RefCell<Vec<String>>,
+    /// Canned MyAnimeList title variants returned by `title_variants`.
+    variants: Vec<String>,
+    /// When set, `search_manga` only returns `search_results` for exactly
+    /// this query (any other query gets no hits) — lets a test model a
+    /// source that knows a manga under one name only.
+    hit_query: Option<String>,
     chapters: Vec<ChapterEntry>,
     download: Option<DownloadFn>,
     update_message: String,
@@ -71,6 +77,8 @@ impl Default for FakeGateway {
             search_results: Ok(Vec::new()),
             searches: RefCell::new(Vec::new()),
             searched_sources: RefCell::new(Vec::new()),
+            variants: Vec::new(),
+            hit_query: None,
             chapters: Vec::new(),
             download: None,
             update_message: "up to date".to_string(),
@@ -129,7 +137,16 @@ impl SourceGateway for FakeGateway {
         self.searched_sources
             .borrow_mut()
             .push(source_id.to_string());
+        if let Some(hit) = &self.hit_query {
+            if query != hit {
+                return Ok(Vec::new());
+            }
+        }
         self.search_results.clone().map_err(|e| anyhow!(e))
+    }
+
+    fn title_variants(&self, _query: &str) -> Vec<String> {
+        self.variants.clone()
     }
 
     fn chapters(&self, _source_id: &str, _manga_id: &str) -> Result<Vec<ChapterEntry>> {
@@ -5014,6 +5031,49 @@ fn global_search_with_no_hits_opens_results_then_back_to_keyboard() {
         panic!("expected to land back on the keyboard");
     };
     assert_eq!(query, "z");
+}
+
+#[test]
+fn global_search_retries_with_title_variants_on_a_miss() {
+    // The source lists the manga under its Japanese title only; the user
+    // typed the English one. The search misses, is retried with the
+    // MyAnimeList name variants, and finds it under "ジャッジ".
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.variants = vec!["ジャッジ".into()];
+    gateway.hit_query = Some("ジャッジ".into());
+    let events = vec![tap_row(1), tap_key(Key::Char('j')), tap_key(Key::Search)];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    assert_eq!(
+        *app.gateway().searches.borrow(),
+        vec!["j".to_string(), "ジャッジ".to_string()],
+        "the miss must be retried with the variant"
+    );
+    let Screen::SearchResults { results, .. } = app.screen() else {
+        panic!("expected the results screen");
+    };
+    assert_eq!(results.len(), 1, "the variant's hit is the result");
+    assert_eq!(results[0].1.title, "Naruto");
+}
+
+#[test]
+fn global_search_with_a_hit_never_looks_up_variants() {
+    // The raw query matched, so no variant retries: every extra search is
+    // another network round-trip per source on the device.
+    let dir = tempfile::tempdir().unwrap();
+    let mut gateway = search_gateway();
+    gateway.variants = vec!["Some Other Name".into()];
+    let events = vec![tap_row(1), tap_key(Key::Char('n')), tap_key(Key::Search)];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    assert_eq!(
+        *app.gateway().searches.borrow(),
+        vec!["n".to_string()],
+        "a hit must not trigger variant searches"
+    );
 }
 
 #[test]

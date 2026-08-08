@@ -30,6 +30,83 @@ pub struct PopularManga {
 /// rather than score, which is what "popular" means here.
 const JIKAN_TOP_MANGA: &str = "https://api.jikan.moe/v4/top/manga?type=manga&filter=bypopularity";
 
+/// Jikan's manga-search endpoint, used to look up a title's known name
+/// variants (English, romanised, Japanese, synonyms).
+const JIKAN_SEARCH_MANGA: &str = "https://api.jikan.moe/v4/manga";
+
+/// How many name variants a lookup returns at most. Each variant a source
+/// gets retried with is another network round-trip on the device, so the
+/// list stays short.
+const MAX_TITLE_VARIANTS: usize = 6;
+
+/// Look up alternative titles for `query` on MyAnimeList: a manga is often
+/// listed under its romanised Japanese title on one source and its English
+/// title on another (e.g. "Judge" vs "Jajji"), so a search that misses with
+/// the user's spelling can be retried with the names the catalogue knows.
+///
+/// Returns the variants (deduplicated, without the query itself), best
+/// matches first. An empty list just means "nothing to retry with".
+pub fn search_title_variants(fetcher: &dyn Fetcher, query: &str) -> Result<Vec<String>> {
+    let mut url = Url::parse(JIKAN_SEARCH_MANGA).expect("valid static URL");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("limit", "5");
+    let body = fetcher
+        .get(&url)
+        .context("fetching MyAnimeList title variants")?;
+    parse_title_variants(&body, query)
+}
+
+/// Parse a Jikan `/manga?q=` response into alternative titles for `query`.
+///
+/// Jikan's search is fuzzy, so only entries where one of the titles actually
+/// contains the query (case-insensitively) contribute — that keeps a search
+/// for "judge" from dragging in every courtroom manga's synonyms.
+pub fn parse_title_variants(body: &[u8], query: &str) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct Response {
+        data: Vec<Entry>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Entry {
+        title: Option<String>,
+        title_english: Option<String>,
+        title_japanese: Option<String>,
+        #[serde(default)]
+        title_synonyms: Vec<String>,
+    }
+
+    let response: Response =
+        serde_json::from_slice(body).context("parsing MyAnimeList search response")?;
+    let needle = query.trim().to_lowercase();
+
+    let mut variants: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(needle.clone());
+    for entry in response.data {
+        let titles: Vec<String> = entry
+            .title
+            .into_iter()
+            .chain(entry.title_english)
+            .chain(entry.title_japanese)
+            .chain(entry.title_synonyms)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        // Only take variants from an entry the query plausibly meant.
+        if !titles.iter().any(|t| t.to_lowercase().contains(&needle)) {
+            continue;
+        }
+        for title in titles {
+            if seen.insert(title.to_lowercase()) {
+                variants.push(title);
+            }
+        }
+    }
+    variants.truncate(MAX_TITLE_VARIANTS);
+    Ok(variants)
+}
+
 /// Fetch the popular-manga ranking from MyAnimeList (one page, ~25 titles, in
 /// rank order).
 pub fn fetch_popular(fetcher: &dyn Fetcher) -> Result<Vec<PopularManga>> {
@@ -141,5 +218,59 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(parse_popular(b"not json").is_err());
+    }
+
+    const SEARCH_SAMPLE: &str = r#"{
+        "data": [
+            {
+                "title": "Judge",
+                "title_english": "Judge",
+                "title_japanese": "ジャッジ",
+                "title_synonyms": []
+            },
+            {
+                "title": "Shingeki no Kyojin",
+                "title_english": "Attack on Titan",
+                "title_japanese": "進撃の巨人",
+                "title_synonyms": ["AoT"]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn variants_come_from_matching_entries_only() {
+        // "judge" matches the first entry; the unrelated fuzzy hit is
+        // ignored, and the query itself is not echoed back as a variant.
+        let out = parse_title_variants(SEARCH_SAMPLE.as_bytes(), "judge").unwrap();
+        assert_eq!(out, vec!["ジャッジ".to_string()]);
+    }
+
+    #[test]
+    fn variants_include_synonyms_and_both_scripts() {
+        let out = parse_title_variants(SEARCH_SAMPLE.as_bytes(), "Attack on Titan").unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "Shingeki no Kyojin".to_string(),
+                "進撃の巨人".to_string(),
+                "AoT".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_matching_entry_means_no_variants() {
+        let out = parse_title_variants(SEARCH_SAMPLE.as_bytes(), "one piece").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn variant_fetch_uses_the_jikan_search_endpoint() {
+        let fetcher = FakeFetcher::new().with(
+            "https://api.jikan.moe/v4/manga?q=judge&limit=5",
+            SEARCH_SAMPLE,
+        );
+        let out = search_title_variants(&fetcher, "judge").unwrap();
+        assert_eq!(out, vec!["ジャッジ".to_string()]);
     }
 }

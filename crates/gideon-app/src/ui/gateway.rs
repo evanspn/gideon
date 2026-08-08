@@ -87,6 +87,16 @@ pub trait SourceGateway {
     /// Search a source for manga matching `query`.
     fn search_manga(&self, source_id: &str, query: &str) -> Result<Vec<MangaEntry>>;
 
+    /// Alternative titles for `query` from the MyAnimeList catalogue
+    /// (English / romanised / Japanese / synonyms), used to retry a search
+    /// on a source that lists the manga under a different name than the one
+    /// the user typed. Best-effort: a lookup failure is just an empty list,
+    /// never an error. The default is empty so gateways that don't support
+    /// it (tests) opt in by overriding.
+    fn title_variants(&self, _query: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Popular manga from MyAnimeList, for the Home "Popular manga" tab. These
     /// are catalogue entries (title + cover), independent of installed
     /// sources; the UI searches the installed sources by title to download
@@ -280,6 +290,13 @@ impl SourceGateway for AidokuGateway {
                 id: m.id,
             })
             .collect())
+    }
+
+    fn title_variants(&self, query: &str) -> Vec<String> {
+        // Same public Jikan API as the Popular tab; a lookup failure only
+        // means the search runs with the user's spelling alone.
+        let fetcher = UreqFetcher::new();
+        crate::mal::search_title_variants(&fetcher, query).unwrap_or_default()
     }
 
     fn popular_manga(&self) -> Result<Vec<MangaEntry>> {
