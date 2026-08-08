@@ -196,24 +196,21 @@ pub fn send(mut caller: Caller<'_, WasmStore>, request_descriptor_i32: i32) -> R
     // with our lives; but DNS resolution takes forever (~5s or so) when we have no connection
     // available - due to musl's `getaddrinfo()` call not realizing we have no connection and
     // timing out (EAI_AGAIN). The overhead of checking for a connection here seems worth it.
-    let has_internet_connection =
-        executor::block_on(cancellation_token.run_until_cancelled(has_internet_connection()))
-            .context("failed to check internet connection")?;
-    if !has_internet_connection {
-        anyhow::bail!("no internet connection available");
+    //
+    // But the probe itself is two TCP connects (up to ~6s when the probe IPs
+    // are filtered), so paying it on *every* request made a multi-source
+    // search crawl. A request that completed in the last few seconds already
+    // proves we're online, so skip the probe in that window — only the first
+    // request of a burst pays it.
+    if !recently_online() {
+        let has_internet_connection =
+            executor::block_on(cancellation_token.run_until_cancelled(has_internet_connection()))
+                .context("failed to check internet connection")?;
+        if !has_internet_connection {
+            anyhow::bail!("no internet connection available");
+        }
     }
 
-    // Timeouts are mandatory: a stalled TCP connection must surface as a
-    // source error, never hang the device forever. Invalid certificates are
-    // tolerated to match the image downloader (bobo's tolerance) — manga
-    // mirrors routinely have broken TLS.
-    #[cfg(feature = "all")]
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .context("failed to build HTTP client")?;
     #[cfg(feature = "all")]
     let request =
         reqwest::Request::try_from(&*request_builder).context("failed to build request")?;
@@ -227,19 +224,20 @@ pub fn send(mut caller: Caller<'_, WasmStore>, request_descriptor_i32: i32) -> R
     };
 
     #[cfg(feature = "all")]
-    let response =
-        match executor::block_on(cancellation_token.run_until_cancelled(client.execute(request))) {
-            Some(response) => response
-                .map_err(|err| {
-                    println!("request failed: {err}");
-                    err
-                })
-                .context("failed to execute request")?,
-            _ => {
-                warn_cancellation();
-                anyhow::bail!("request was cancelled mid-flight");
-            }
-        };
+    let response = match executor::block_on(
+        cancellation_token.run_until_cancelled(shared_client().execute(request)),
+    ) {
+        Some(response) => response
+            .map_err(|err| {
+                println!("request failed: {err}");
+                err
+            })
+            .context("failed to execute request")?,
+        _ => {
+            warn_cancellation();
+            anyhow::bail!("request was cancelled mid-flight");
+        }
+    };
     #[cfg(feature = "all")]
     let response_data = ResponseData {
         url: response.url().clone(),
@@ -267,10 +265,61 @@ pub fn send(mut caller: Caller<'_, WasmStore>, request_descriptor_i32: i32) -> R
             })
             .context("failed to execute request")?;
 
+    // A completed request proves we're online: record it so the next request
+    // in this burst can skip the connectivity probe.
+    mark_online();
+
     *wasm_store
         .get_mut_request(request_descriptor_i32)
         .context("failed to get request state")? = RequestState::Sent(response_data);
     Ok(())
+}
+
+/// The single, process-wide HTTP client. Building a client (TLS config, cert
+/// store, connection pool) cost seconds per call on the device and defeated
+/// keep-alive, so every request in a multi-source search paid it; sharing one
+/// client reuses connections and TLS sessions across requests and sources.
+#[cfg(feature = "all")]
+fn shared_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        // Timeouts are mandatory: a stalled TCP connection must surface as a
+        // source error, never hang the device forever. Invalid certificates
+        // are tolerated to match the image downloader (bobo's tolerance) —
+        // manga mirrors routinely have broken TLS.
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("failed to build shared HTTP client")
+    })
+}
+
+/// Unix time in milliseconds of the last request that completed successfully
+/// (0 = none yet), used to short-circuit the per-request connectivity probe.
+static LAST_ONLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a successful request vouches for connectivity. Long enough to
+/// cover a whole multi-source search burst, short enough that a network that
+/// drops is re-probed promptly.
+const ONLINE_CACHE_MS: u64 = 15_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether a request succeeded recently enough to skip the connectivity probe.
+fn recently_online() -> bool {
+    let last = LAST_ONLINE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    last != 0 && now_ms().saturating_sub(last) < ONLINE_CACHE_MS
+}
+
+fn mark_online() {
+    LAST_ONLINE_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 }
 
 #[aidoku_wasm_function]
