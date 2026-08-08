@@ -61,6 +61,17 @@ pub fn latest_release_url(repo: &str) -> Result<Url> {
     ))?)
 }
 
+/// URL of the GitHub API endpoint listing `repo`'s releases, newest first.
+/// Unlike `/releases/latest`, this enumerates the actual releases, so the
+/// check can pick the highest version itself instead of trusting GitHub's
+/// single "latest" pointer (which is mutable and served through a CDN that
+/// can lag a fresh release).
+pub fn releases_list_url(repo: &str) -> Result<Url> {
+    Ok(Url::parse(&format!(
+        "https://api.github.com/repos/{repo}/releases?per_page=30"
+    ))?)
+}
+
 /// Base URL for release asset downloads. Defaults to github.com; tests and
 /// mirrors can point elsewhere.
 pub fn release_base() -> Url {
@@ -131,6 +142,28 @@ pub fn is_auto_installable(current: &str, candidate: &str) -> bool {
     }
 }
 
+/// Turn one API release into a [`ReleaseInfo`], or `None` when it's a
+/// draft/prerelease, has no parseable version, or ships no Kobo bundle. The
+/// asset URL is the release's own version-pinned `browser_download_url`, never
+/// a `latest/download` link, so a download can't be served stale either.
+fn release_info_from(release: &ApiRelease) -> Option<ReleaseInfo> {
+    if release.draft || release.prerelease {
+        return None;
+    }
+    let version = release.tag_name.trim_start_matches('v').to_string();
+    parse_semver(&version)?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name.starts_with("gideon-kobo-") && a.name.ends_with(".zip"))?;
+    Some(ReleaseInfo {
+        version,
+        tag: release.tag_name.clone(),
+        asset_url: Url::parse(&asset.browser_download_url).ok()?,
+        notes: release.body.clone().filter(|b| !b.trim().is_empty()),
+    })
+}
+
 /// Parse a GitHub /releases/latest response into a [`ReleaseInfo`], looking
 /// for the Kobo bundle asset. Returns `Ok(None)` for drafts/prereleases or
 /// releases without a bundle.
@@ -139,26 +172,39 @@ pub fn parse_latest_release(body: &[u8]) -> Result<Option<ReleaseInfo>> {
         url: "releases/latest".into(),
         message: e.to_string(),
     })?;
+    Ok(release_info_from(&release))
+}
 
-    if release.draft || release.prerelease {
-        return Ok(None);
-    }
-
-    let version = release.tag_name.trim_start_matches('v').to_string();
-    let Some(asset) = release
-        .assets
+/// Parse a GitHub /releases list and return the **highest-version** release
+/// that ships a Kobo bundle and is newer than `current` — independent of which
+/// release GitHub flags as "latest". `Ok(None)` when nothing beats `current`.
+pub fn parse_release_list(body: &[u8], current: &str) -> Result<Option<ReleaseInfo>> {
+    let releases: Vec<ApiRelease> = serde_json::from_slice(body).map_err(|e| Error::ParseList {
+        url: "releases".into(),
+        message: e.to_string(),
+    })?;
+    let best = releases
         .iter()
-        .find(|a| a.name.starts_with("gideon-kobo-") && a.name.ends_with(".zip"))
-    else {
-        return Ok(None);
-    };
+        .filter_map(release_info_from)
+        .filter_map(|info| parse_semver(&info.version).map(|v| (v, info)))
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, info)| info);
+    match best {
+        Some(info) if is_newer(current, &info.version) => Ok(Some(info)),
+        _ => Ok(None),
+    }
+}
 
-    Ok(Some(ReleaseInfo {
-        version,
-        tag: release.tag_name.clone(),
-        asset_url: Url::parse(&asset.browser_download_url)?,
-        notes: release.body.clone().filter(|b| !b.trim().is_empty()),
-    }))
+/// Check for updates by enumerating the release list and taking the highest
+/// version — the primary, cache-resilient mechanism. Robust against a stale
+/// or unset GitHub "latest" pointer.
+pub fn check_update_via_list(
+    fetcher: &dyn Fetcher,
+    repo: &str,
+    current_version: &str,
+) -> Result<Option<ReleaseInfo>> {
+    let body = fetcher.get(&releases_list_url(repo)?)?;
+    parse_release_list(&body, current_version)
 }
 
 /// Semantic comparison: is `candidate` newer than `current`?
@@ -327,6 +373,63 @@ mod tests {
         // Garbage never updates.
         assert!(!is_newer("0.1.0", "latest"));
         assert!(!is_newer("???", "0.2.0"));
+    }
+
+    /// A releases-list JSON with the given `(tag, has_bundle)` entries, in the
+    /// order GitHub would return them (newest first, but order must not
+    /// matter to the picker).
+    fn release_list_json(entries: &[(&str, bool)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(tag, has_bundle)| {
+                let assets = if *has_bundle {
+                    format!(
+                        r#"[{{"name": "gideon-kobo-{tag}.zip",
+                              "browser_download_url": "https://github.com/evanspn/gideon/releases/download/{tag}/gideon-kobo-{tag}.zip"}}]"#
+                    )
+                } else {
+                    "[]".to_string()
+                };
+                format!(
+                    r#"{{"tag_name": "{tag}", "body": "notes", "draft": false, "prerelease": false, "assets": {assets}}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    #[test]
+    fn release_list_picks_the_highest_version_not_the_first() {
+        // GitHub's "latest" pointer is irrelevant: the picker takes the
+        // highest bundled version even if it isn't first in the list.
+        let body = release_list_json(&[("v0.1.90", true), ("v0.1.92", true), ("v0.1.91", true)]);
+        let info = parse_release_list(body.as_bytes(), "0.1.90")
+            .unwrap()
+            .expect("a newer release");
+        assert_eq!(info.version, "0.1.92");
+        assert!(info
+            .asset_url
+            .as_str()
+            .ends_with("v0.1.92/gideon-kobo-v0.1.92.zip"));
+    }
+
+    #[test]
+    fn release_list_ignores_versions_without_a_bundle() {
+        // The highest version has no Kobo bundle (e.g. assets still
+        // uploading) → fall to the highest one that does.
+        let body = release_list_json(&[("v0.1.93", false), ("v0.1.92", true)]);
+        let info = parse_release_list(body.as_bytes(), "0.1.90")
+            .unwrap()
+            .expect("the highest bundled release");
+        assert_eq!(info.version, "0.1.92");
+    }
+
+    #[test]
+    fn release_list_returns_none_when_nothing_is_newer() {
+        let body = release_list_json(&[("v0.1.92", true), ("v0.1.91", true)]);
+        assert!(parse_release_list(body.as_bytes(), "0.1.92")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

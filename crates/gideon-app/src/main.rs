@@ -498,20 +498,26 @@ fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
 
     let fetcher = UreqFetcher::new();
 
-    // Primary: the VERSION asset on the latest release (no API, no rate
-    // limits). Fallback: the GitHub API, the way bobo checks.
+    // Primary: enumerate the release list and take the highest version, so a
+    // stale/cached GitHub "latest" pointer can't hide a newer release.
+    // Fallbacks: the latest-release VERSION asset (no API, no rate limits),
+    // then the latest-release API, the way bobo checks.
     let base = update::release_base();
-    let release = match update::check_update_via_assets(&fetcher, &base, &repo, current) {
+    let release = match update::check_update_via_list(&fetcher, &repo, current) {
         Ok(release) => release,
-        Err(assets_err) => match update::check_update(&fetcher, &repo, current) {
+        Err(list_err) => match update::check_update_via_assets(&fetcher, &base, &repo, current) {
             Ok(release) => release,
-            Err(api_err) => bail!(
-                "couldn't check releases for {repo}.\n\
-                 - asset check failed: {assets_err}\n\
-                 - API check failed: {api_err}\n\
-                 If the repository is private, OTA updates need a public repo \
-                 or a GIDEON_GITHUB_TOKEN environment variable."
-            ),
+            Err(assets_err) => match update::check_update(&fetcher, &repo, current) {
+                Ok(release) => release,
+                Err(api_err) => bail!(
+                    "couldn't check releases for {repo}.\n\
+                     - release list failed: {list_err}\n\
+                     - asset check failed: {assets_err}\n\
+                     - API check failed: {api_err}\n\
+                     If the repository is private, OTA updates need a public repo \
+                     or a GIDEON_GITHUB_TOKEN environment variable."
+                ),
+            },
         },
     };
 
