@@ -439,7 +439,12 @@ fn latest_release() -> Result<Option<gideon_sources::update::ReleaseInfo>> {
     let current = env!("CARGO_PKG_VERSION");
     let fetcher = UreqFetcher::new();
     let base = update::release_base();
-    let release = update::check_update_via_assets(&fetcher, &base, &repo, current)
+    // Primary: enumerate the release list and take the highest version, so a
+    // stale/cached GitHub "latest" pointer can't hide a newer release. Fall
+    // back to the latest-release VERSION asset (no API, no rate limits), then
+    // the latest-release API.
+    let release = update::check_update_via_list(&fetcher, &repo, current)
+        .or_else(|_| update::check_update_via_assets(&fetcher, &base, &repo, current))
         .or_else(|_| update::check_update(&fetcher, &repo, current))?;
     Ok(release)
 }
