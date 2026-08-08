@@ -126,3 +126,23 @@ plugin path crashes, and menu entries leaking into KOReader's file manager.
 **gideon:** standalone binary. The only host integration is one NickelMenu
 launcher line, installed as our own file and never editing anyone else's
 config.
+
+## 10. Killing nickel early trips NickelMenu's failsafe (it "uninstalls itself")
+
+NickelMenu has an anti-bootloop failsafe: while nickel's first ~20 seconds
+tick down, `libnm.so` is parked at `libnm.so.failsafe` and only renamed
+back once nickel survived the window. If nickel dies inside that window the
+library stays parked, and on the next boot NickelMenu is simply gone — from
+the user's point of view it "uninstalled itself", taking the gideon menu
+entry with it.
+
+This became easy to hit the moment gideon's exit started restarting nickel
+in place (fast) instead of rebooting (slow): leave gideon, nickel is back in
+seconds, tap gideon again — and the launcher killed a nickel that was still
+inside its failsafe window.
+
+**gideon:** `gideon-launch.sh` never kills nickel while the failsafe is
+armed (it waits, bounded at ~25 s, checking both the parked-library marker
+and nickel's process age), and after gideon exits it restores a parked
+`libnm.so` before nickel — or the reboot fallback — comes up, so even a
+tripped failsafe self-heals instead of silently removing NickelMenu.

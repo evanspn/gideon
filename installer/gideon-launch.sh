@@ -88,6 +88,45 @@ restart_nickel() {
     return 0
 }
 
+# --- NickelMenu failsafe guard -------------------------------------------
+# NickelMenu uninstalls itself if nickel dies within ~20 s of starting: its
+# anti-bootloop failsafe parks libnm.so at libnm.so.failsafe while the
+# window is open and only renames it back once nickel survived it. Killing
+# nickel inside that window strands the library and NickelMenu is gone on
+# the next boot. Since gideon's exit restarts nickel in place, re-entering
+# gideon seconds after leaving it is exactly that scenario — so never kill
+# nickel while the failsafe is armed.
+NM_LIB=/usr/local/Kobo/imageformats/libnm.so
+
+nm_failsafe_armed() {
+    # The parked library is the authoritative marker when present…
+    [ -e "$NM_LIB.failsafe" ] && return 0
+    # …and nickel's process age covers NickelMenu versions whose failsafe
+    # works differently: field 22 of /proc/<pid>/stat is the start time in
+    # clock ticks (100 Hz on these kernels).
+    pid=$(pidof -s nickel) || return 1
+    age=$(awk -v up="$(cut -d' ' -f1 /proc/uptime)" \
+        '{print int(up - $22 / 100)}' "/proc/$pid/stat" 2>/dev/null)
+    [ -n "$age" ] && [ "$age" -lt 25 ]
+}
+
+# Restore a library the failsafe left parked (nickel died inside the
+# window, so NickelMenu never got to rename it back). Without this,
+# NickelMenu has silently uninstalled itself come the next boot.
+nm_failsafe_heal() {
+    if [ -e "$NM_LIB.failsafe" ] && [ ! -e "$NM_LIB" ]; then
+        mv "$NM_LIB.failsafe" "$NM_LIB" 2>/dev/null
+        sync
+    fi
+}
+
+i=0
+while nm_failsafe_armed; do
+    i=$((i + 1))
+    [ "$i" -ge 100 ] && break # ~25 s upper bound; never hang the launch
+    usleep 250000 2>/dev/null || sleep 1
+done
+
 # Stop nickel and its watchdog/helper daemons so the screen is ours, and
 # wait for nickel to actually exit (up to ~4s) instead of guessing — both
 # processes fighting over the framebuffer stomps gideon's first paint.
@@ -107,8 +146,11 @@ rm -f /tmp/nickel-hardware-status
 /mnt/onboard/.adds/gideon/bin/gideon browse --library /mnt/onboard/Manga \
     >>/mnt/onboard/.adds/gideon/browse.log 2>&1
 
-# Recover the stock UI in place; flush writes first.
+# Recover the stock UI in place; flush writes first. If the failsafe
+# tripped anyway (a race, or an older gideon killed nickel inside the
+# window), put NickelMenu's library back before nickel comes up.
 sync
+nm_failsafe_heal
 restart_nickel
 
 # Fallback: if nickel didn't appear within ~10s, reboot — that reliably
@@ -117,6 +159,9 @@ i=0
 while ! pidof nickel >/dev/null 2>&1; do
     i=$((i + 1))
     if [ "$i" -ge 40 ]; then
+        # Rebooting can also catch a half-started nickel inside its
+        # failsafe window — restore the library first.
+        nm_failsafe_heal
         sync
         sleep 1
         reboot
