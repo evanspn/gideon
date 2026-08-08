@@ -79,3 +79,31 @@ back to a full reboot, which always recovers the device.
   backups/       # automatic pre-upgrade archives of data/
 .adds/nm/gideon  # NickelMenu launcher entry (only if NickelMenu is present)
 ```
+
+## Known issues
+
+### The gideon menu entry disappears from Home after a Kobo firmware update
+
+Kobo firmware updates reset the device's system partition, which is where
+NickelMenu's own hook into Nickel lives. Your `.adds/` folder (everything
+under it, including `.adds/gideon/` and `.adds/nm/gideon`) is on the FAT32
+user partition and is untouched by a firmware update — so your reading
+progress and settings are never at risk here. What's gone is just
+NickelMenu's ability to read `.adds/nm/gideon` and add the entry to Home.
+
+**Fix: reinstall NickelMenu, not gideon.**
+
+1. Plug the Kobo into your computer and let it mount as `KOBOeReader`.
+2. Download the latest `KoboRoot.tgz` from
+   <https://github.com/pgaskin/NickelMenu/releases/latest/download/KoboRoot.tgz>.
+3. Copy it into the device's `.kobo` folder (enable hidden files in Finder/
+   Explorer if you don't see `.kobo`), overwriting any existing
+   `KoboRoot.tgz` there.
+4. Eject safely and unplug. The Kobo applies the update and reboots on its
+   own — this only patches the system side, it never touches `.adds/`.
+5. Check Home for the **gideon** entry. It should reappear immediately,
+   since `.adds/nm/gideon` was never removed.
+
+If it's still missing after that, re-run gideon's own `install.sh` — per
+the data-safety rules above it's safe to run any time and will not touch
+`.adds/gideon/data/`.
