@@ -303,7 +303,10 @@ impl SourceGateway for AidokuGateway {
         // MyAnimeList's public Jikan API — a plain HTTPS GET, so it reuses the
         // blocking source-list fetcher rather than the async download runtime.
         let fetcher = UreqFetcher::new();
-        let popular = crate::mal::fetch_popular(&fetcher)?;
+        // Cached so a MyAnimeList outage serves the last good ranking.
+        let cache = self.data_dir.join("popular.json");
+        let popular =
+            crate::mal::popular_with_cache(&cache, || crate::mal::fetch_popular(&fetcher))?;
         Ok(popular
             .into_iter()
             .map(|p| MangaEntry {

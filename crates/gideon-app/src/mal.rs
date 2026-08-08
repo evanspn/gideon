@@ -9,14 +9,18 @@
 //! The JSON parsing is split from the HTTP fetch so it's unit-testable with a
 //! `FakeFetcher` and canned bodies — no network in tests.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use gideon_sources::Fetcher;
 
-/// One popular manga title from MyAnimeList.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One popular manga title from MyAnimeList. Serialisable so the last
+/// successfully fetched list can be cached on disk and served through a
+/// MyAnimeList outage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PopularManga {
     /// Display title (the English title when MyAnimeList has one, else the
     /// romanised default).
@@ -105,6 +109,35 @@ pub fn parse_title_variants(body: &[u8], query: &str) -> Result<Vec<String>> {
     }
     variants.truncate(MAX_TITLE_VARIANTS);
     Ok(variants)
+}
+
+/// Run `fetch` and cache a non-empty result at `cache`; on a failed (or
+/// empty) fetch, fall back to the previously cached list. MyAnimeList goes
+/// down often enough (its API answers 504 for every request while it does)
+/// that the Popular tab serves yesterday's ranking through an outage rather
+/// than an error — only a first-ever failure, with nothing cached yet,
+/// surfaces to the caller.
+pub fn popular_with_cache(
+    cache: &Path,
+    fetch: impl FnOnce() -> Result<Vec<PopularManga>>,
+) -> Result<Vec<PopularManga>> {
+    match fetch() {
+        Ok(popular) if !popular.is_empty() => {
+            // Best-effort: failing to write the cache must not fail the fetch.
+            if let Ok(json) = serde_json::to_vec(&popular) {
+                let _ = std::fs::write(cache, json);
+            }
+            Ok(popular)
+        }
+        fresh => match std::fs::read(cache)
+            .ok()
+            .and_then(|json| serde_json::from_slice::<Vec<PopularManga>>(&json).ok())
+            .filter(|cached| !cached.is_empty())
+        {
+            Some(cached) => Ok(cached),
+            None => fresh,
+        },
+    }
 }
 
 /// Fetch the popular-manga ranking from MyAnimeList (one page, ~25 titles, in
@@ -218,6 +251,35 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(parse_popular(b"not json").is_err());
+    }
+
+    #[test]
+    fn popular_cache_serves_the_last_good_list_through_an_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("popular.json");
+        let berserk = vec![PopularManga {
+            title: "Berserk".into(),
+            cover_url: None,
+        }];
+
+        // First fetch succeeds and populates the cache.
+        let out = popular_with_cache(&cache, || Ok(berserk.clone())).unwrap();
+        assert_eq!(out, berserk);
+
+        // MyAnimeList goes down: the cached list is served, not the error.
+        let out = popular_with_cache(&cache, || anyhow::bail!("MAL is down")).unwrap();
+        assert_eq!(out, berserk);
+
+        // An empty response falls back to the cache too.
+        let out = popular_with_cache(&cache, || Ok(Vec::new())).unwrap();
+        assert_eq!(out, berserk);
+    }
+
+    #[test]
+    fn popular_cache_first_ever_failure_still_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("popular.json");
+        assert!(popular_with_cache(&cache, || anyhow::bail!("MAL is down")).is_err());
     }
 
     const SEARCH_SAMPLE: &str = r#"{

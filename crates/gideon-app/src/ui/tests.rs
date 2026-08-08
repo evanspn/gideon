@@ -4902,6 +4902,25 @@ fn home_popular_empty_explains_instead_of_a_blank_tab() {
     assert_eq!(title, "Popular manga");
 }
 
+#[test]
+fn home_popular_outage_explains_instead_of_an_error_screen() {
+    // MyAnimeList down (its API 504s): the user gets a message naming the
+    // likely cause, not a raw error screen.
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        popular: Err("Jikan 504".into()),
+        ..FakeGateway::default()
+    };
+    let mut app = app(dir.path(), gateway, vec![tap_row(5)]);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected a message for a popular-manga outage");
+    };
+    assert_eq!(title, "Popular manga");
+    assert!(body.contains("MyAnimeList"), "the cause is named: {body}");
+}
+
 // --- search keyboard ---
 
 /// Tap the center of a keyboard key.

@@ -2226,14 +2226,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn open_popular(&mut self) -> Result<()> {
         self.ensure_online()?;
         self.show_status(&["Loading popular manga…"])?;
-        let mangas = self
-            .gateway
-            .popular_manga()
-            .context("loading popular manga from MyAnimeList")?;
+        // A fetch failure here is almost always MyAnimeList itself being
+        // down (its API answers 504 for every request), not a bug or a local
+        // connectivity problem — explain that instead of an error screen.
+        let mangas = self.gateway.popular_manga().unwrap_or_else(|e| {
+            eprintln!("gideon: popular manga failed: {e:#}");
+            Vec::new()
+        });
         if mangas.is_empty() {
             return self.push(Screen::Message {
                 title: "Popular manga".to_string(),
-                body: "Couldn't load popular manga.\nCheck your connection and try again.".into(),
+                body: "Couldn't load the popular list.\n\
+                       MyAnimeList (which provides it) may be down —\n\
+                       try again later. Search still works."
+                    .into(),
             });
         }
         self.push(Screen::Popular { mangas, page: 0 })
