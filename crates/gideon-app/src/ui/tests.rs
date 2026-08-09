@@ -3581,6 +3581,63 @@ fn settings_rows_cycle_and_persist_to_disk() {
 }
 
 #[test]
+fn idle_suspend_setting_cycles_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    // Default 15 min -> 30 min (the Nickel/KOReader increments).
+    let events = vec![tap_row(3), tap_row(9)];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.idle_suspend_minutes, 30, "15 min cycles to 30 min");
+    assert_eq!(
+        app.idle_suspend,
+        std::time::Duration::from_secs(30 * 60),
+        "the live event loops must pick the new timeout up immediately"
+    );
+}
+
+#[test]
+fn idle_suspend_cycles_past_an_hour_to_never() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        idle_suspend_minutes: 60,
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let events = vec![tap_row(3), tap_row(9)];
+    let mut app =
+        app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(settings.idle_suspend_minutes, 0, "60 min cycles to never");
+}
+
+#[test]
+fn idle_suspend_never_stays_awake() {
+    // "Sleep when idle: never": quiet polls must not suspend, no matter
+    // how long the device sits.
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![])
+        .with_sleeper(sleeper)
+        .with_idle_suspend_minutes(0);
+    app.input_mut().idle_timeouts = 5;
+    app.run().unwrap();
+    assert_eq!(count.get(), 0, "never means never");
+}
+
+#[test]
 fn storage_limit_cycle_wraps_around() {
     let dir = tempfile::tempdir().unwrap();
     let settings_dir = dir.path().join("data");

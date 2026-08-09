@@ -67,12 +67,12 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
     5 * 1024 * 1024 * 1024,
 ];
 /// Index of the trailing "Storage" row on the Settings screen — appended after
-/// the nine cycling rows ([`settings_rows`]), it opens the storage detail
+/// the ten cycling rows ([`settings_rows`]), it opens the storage detail
 /// screen instead of cycling a value.
-const SETTINGS_STORAGE_ROW: usize = 9;
+const SETTINGS_STORAGE_ROW: usize = 10;
 /// Index of the trailing "Account" row on the Settings screen — appended after
 /// the storage row, it opens the sync account menu (sign in / sync / sign out).
-const SETTINGS_ACCOUNT_ROW: usize = 10;
+const SETTINGS_ACCOUNT_ROW: usize = 11;
 /// Row of the "Free up space now" action on the Storage screen (after three
 /// read-only info rows). Shared by the renderer and the tap handler.
 const STORAGE_FREE_ROW: usize = 3;
@@ -545,6 +545,29 @@ const IDLE_SUSPEND: std::time::Duration = std::time::Duration::from_secs(15 * 60
 /// How long each idle-detection poll waits between wall-clock checks.
 const IDLE_SUSPEND_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Idle-suspend choices the Settings row cycles through, in minutes — the
+/// same increments Nickel and KOReader offer. 0 means "never".
+const IDLE_SUSPEND_STEPS: [u32; 6] = [5, 10, 15, 30, 60, 0];
+
+/// The idle-suspend duration for a minutes setting; 0 ("never") maps to a
+/// threshold no uptime can reach.
+fn idle_suspend_duration(minutes: u32) -> std::time::Duration {
+    if minutes == 0 {
+        std::time::Duration::MAX
+    } else {
+        std::time::Duration::from_secs(u64::from(minutes) * 60)
+    }
+}
+
+/// The Settings-row label for an idle-suspend minutes value.
+fn idle_suspend_label(minutes: u32) -> String {
+    if minutes == 0 {
+        "never".to_string()
+    } else {
+        format!("{minutes} min")
+    }
+}
+
 /// What the wait-for-unplug loop ended with.
 enum UnplugWait {
     /// The charger was pulled and the suspend hook ran; carry its result.
@@ -863,6 +886,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// title and the sleep notice show the charge percentage.
     pub fn with_battery(mut self, battery: Box<dyn Fn() -> Option<u8>>) -> Self {
         self.battery = Some(battery);
+        self
+    }
+
+    /// Apply the saved idle-suspend timeout (minutes; 0 = never). Enforced
+    /// only when a suspend hook is installed.
+    pub fn with_idle_suspend_minutes(mut self, minutes: u32) -> Self {
+        self.idle_suspend = idle_suspend_duration(minutes);
         self
     }
 
@@ -2283,6 +2313,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // Rotate wide spreads on/off — applies to the next opened book.
                 settings.auto_rotate_spreads = !settings.auto_rotate_spreads;
                 self.auto_rotate_spreads = settings.auto_rotate_spreads;
+            }
+            9 => {
+                // Cycle the idle auto-suspend timeout (5/10/15/30/60 min,
+                // never) and apply it to the live event loops immediately.
+                settings.idle_suspend_minutes =
+                    cycle(&IDLE_SUSPEND_STEPS, settings.idle_suspend_minutes);
+                self.idle_suspend = idle_suspend_duration(settings.idle_suspend_minutes);
             }
             _ => return Ok(()),
         }
@@ -6176,6 +6213,13 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
             format!(
                 "Rotate wide spreads: {}",
                 if s.auto_rotate_spreads { "on" } else { "off" }
+            ),
+            true,
+        ),
+        (
+            format!(
+                "Sleep when idle: {}",
+                idle_suspend_label(s.idle_suspend_minutes)
             ),
             true,
         ),

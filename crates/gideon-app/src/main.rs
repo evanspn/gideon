@@ -683,6 +683,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         .with_settings_dir(data_dir)
         .with_battery(Box::new(gideon_device::power::battery_percent))
         .with_charger(Box::new(gideon_device::power::plugged_in))
+        .with_idle_suspend_minutes(saved.idle_suspend_minutes)
         .run();
     match &result {
         Err(e) => {
