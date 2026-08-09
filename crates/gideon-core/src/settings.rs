@@ -94,6 +94,13 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_bool_true")]
     pub wifi_auto_connect: bool,
 
+    /// Minutes of inactivity before the device suspends on its own, as if
+    /// the sleep cover closed. 0 disables the idle suspend ("never").
+    /// Parsed leniently — wrong-typed values fall back to the default (15,
+    /// the same timeout Nickel and KOReader default to).
+    #[serde(deserialize_with = "lenient_idle_suspend")]
+    pub idle_suspend_minutes: u32,
+
     /// Frontlight brightness percent (0–100), restored at startup and
     /// updated from the reader's right-edge slide. Parsed leniently.
     #[serde(deserialize_with = "lenient_percent")]
@@ -122,10 +129,23 @@ impl Default for Settings {
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
+            idle_suspend_minutes: 15,
             frontlight_brightness: 20,
             frontlight_warmth: 0,
         }
     }
+}
+
+/// Lenient `idle_suspend_minutes` parsing: any non-negative JSON number
+/// passes through (0 = never); anything else means the default (15).
+fn lenient_idle_suspend<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(15))
 }
 
 /// Lenient bool defaulting to `false`: a JSON bool passes through; anything
@@ -364,6 +384,22 @@ mod tests {
         assert_eq!(s.reader_full_refresh_interval, 8);
         assert!(s.wifi_auto_connect);
         assert!(!s.auto_rotate_spreads);
+        assert_eq!(s.idle_suspend_minutes, 15);
+    }
+
+    #[test]
+    fn idle_suspend_minutes_parses_leniently() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap().idle_suspend_minutes
+        };
+        assert_eq!(load(r#"{"idle_suspend_minutes": 5}"#), 5);
+        assert_eq!(load(r#"{"idle_suspend_minutes": 0}"#), 0, "0 = never");
+        // Wrong-typed / negative / missing default to 15.
+        assert_eq!(load(r#"{"idle_suspend_minutes": "soon"}"#), 15);
+        assert_eq!(load(r#"{"idle_suspend_minutes": -3}"#), 15);
+        assert_eq!(load(r#"{}"#), 15);
     }
 
     #[test]
@@ -454,6 +490,7 @@ mod tests {
             reader_full_refresh_interval: 12,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
+            idle_suspend_minutes: 5,
             frontlight_brightness: 65,
             frontlight_warmth: 40,
         };

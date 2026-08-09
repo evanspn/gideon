@@ -42,6 +42,12 @@ reference behavior).
    read as "not plugged in" — the exact charger-in kernel-hang case. A
    fallback scan now finds any supply of `type: Battery`.
 
+6. **"Sleep when idle" setting.** The idle timeout is user-configurable
+   from Settings, cycling the same increments Nickel and KOReader offer —
+   5 / 10 / 15 / 30 / 60 minutes / never (default 15). Applied to the
+   live event loops immediately and persisted in `settings.json`
+   (`idle_suspend_minutes`, 0 = never, parsed leniently).
+
 ## Backlog (next iterations)
 
 - **Low-battery handling**: warn at a threshold, auto-shutdown at critical
