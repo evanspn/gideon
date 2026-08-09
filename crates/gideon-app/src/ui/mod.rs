@@ -529,14 +529,21 @@ const SKIP_NOTICE_HOLD: std::time::Duration = std::time::Duration::from_millis(1
 /// was refused while plugged in. Charger power covers the polling.
 const UNPLUG_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Idle auto-suspend: with no input for `IDLE_SUSPEND_TICKS` ×
-/// `IDLE_SUSPEND_TICK` (15 minutes), suspend as if the sleep cover closed —
-/// the same timeout Nickel and KOReader default to. A static e-ink page
-/// costs nothing, but the CPU stays scheduled and Wi-Fi stays fully up for
-/// the whole idle stretch; a user who walks away without closing the cover
-/// otherwise drains the battery for hours.
+/// Idle auto-suspend: with no input for [`IDLE_SUSPEND`] (15 minutes),
+/// suspend as if the sleep cover closed — the same timeout Nickel and
+/// KOReader default to. A static e-ink page costs nothing, but the CPU
+/// stays scheduled and Wi-Fi stays fully up for the whole idle stretch; a
+/// user who walks away without closing the cover otherwise drains the
+/// battery for hours.
+///
+/// Idle is measured in WALL-CLOCK time since the last delivered event, not
+/// in poll timeouts: on hardware `poll_event` can return "no event" long
+/// before its timeout (mid-gesture touch traffic, gyro chatter, inotify),
+/// so counting returns would accrue "idle" while a finger is on the glass.
+const IDLE_SUSPEND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How long each idle-detection poll waits between wall-clock checks.
 const IDLE_SUSPEND_TICK: std::time::Duration = std::time::Duration::from_secs(60);
-const IDLE_SUSPEND_TICKS: u32 = 15;
 
 /// What the wait-for-unplug loop ended with.
 enum UnplugWait {
@@ -680,6 +687,10 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
     /// hides the percentage from the Home title and the sleep notice.
     battery: Option<Box<dyn Fn() -> Option<u8>>>,
+    /// Wall-clock inactivity before an automatic suspend (default
+    /// [`IDLE_SUSPEND`]); only enforced when a sleeper is installed. Tests
+    /// shrink it to zero to exercise the path.
+    idle_suspend: std::time::Duration,
     /// Charger-plugged probe (sysfs on hardware). With one installed, a
     /// suspend refused while charging waits for the unplug and then sleeps
     /// (see [`sleep_once_unplugged`]); `None` (tests, headless) keeps the
@@ -749,6 +760,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             lights: None,
             settings_dir: None,
             battery: None,
+            idle_suspend: IDLE_SUSPEND,
             charger: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
             progress_cache: std::cell::RefCell::new(None),
@@ -903,21 +915,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// the power menu (or the input source ends). Returns how to exit.
     pub fn run(&mut self) -> Result<Exit> {
         self.render_current(RefreshMode::Full)?;
+        let mut last_activity = std::time::Instant::now();
         loop {
             // With a suspend hook installed, wait in ticks instead of
             // blocking forever, and auto-suspend after 15 idle minutes —
             // a user who walks away without closing the cover otherwise
             // leaves the CPU scheduled and Wi-Fi up for hours (Nickel and
-            // KOReader both do this).
+            // KOReader both do this). Idle is wall-clock time since the
+            // last delivered event: on hardware a poll can return "no
+            // event" long before its timeout (mid-gesture touch traffic,
+            // gyro chatter), so counting returns would suspend mid-drag.
             let event = if self.sleeper.is_some() {
-                let mut idle_ticks = 0u32;
                 loop {
                     match self.input.poll_event(IDLE_SUSPEND_TICK) {
-                        Ok(Some(event)) => break Ok(event),
+                        Ok(Some(event)) => {
+                            last_activity = std::time::Instant::now();
+                            break Ok(event);
+                        }
                         Ok(None) => {
-                            idle_ticks += 1;
-                            if idle_ticks >= IDLE_SUSPEND_TICKS {
-                                idle_ticks = 0;
+                            if last_activity.elapsed() >= self.idle_suspend {
+                                last_activity = std::time::Instant::now();
                                 if let Err(e) = self.sleep_now() {
                                     self.show_error(&e)?;
                                 }
@@ -3223,20 +3240,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // thread, and the first paint just takes the finished render.
             reader.warm();
             reader.show_current_page()?;
+            let mut last_activity = std::time::Instant::now();
             loop {
                 // Same idle auto-suspend as the menu loop: a reader left
                 // open (user fell asleep, device without a sleep cover)
                 // suspends after 15 idle minutes instead of burning the
                 // battery all night. Synthesizes a Sleep event so the arm
-                // below saves progress exactly like a cover close.
+                // below saves progress exactly like a cover close. Idle is
+                // wall-clock time since the last delivered event — polls
+                // can return early on hardware (see the menu loop).
                 let event = if self.sleeper.is_some() {
-                    let mut idle_ticks = 0u32;
                     loop {
                         match self.input.poll_event(IDLE_SUSPEND_TICK) {
-                            Ok(Some(event)) => break Ok(event),
+                            Ok(Some(event)) => {
+                                last_activity = std::time::Instant::now();
+                                break Ok(event);
+                            }
                             Ok(None) => {
-                                idle_ticks += 1;
-                                if idle_ticks >= IDLE_SUSPEND_TICKS {
+                                if last_activity.elapsed() >= self.idle_suspend {
+                                    last_activity = std::time::Instant::now();
                                     break Ok(UiEvent::Sleep);
                                 }
                             }

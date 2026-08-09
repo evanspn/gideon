@@ -5799,25 +5799,32 @@ fn charging_wait_aborts_when_the_user_is_using_the_device() {
 
 #[test]
 fn idle_menus_auto_suspend_after_the_timeout() {
-    // No input for the idle window: suspend as if the cover closed — a user
-    // who walks away without a sleep cover otherwise leaves the CPU and
-    // Wi-Fi burning all night.
+    // No input past the idle window: suspend as if the cover closed — a
+    // user who walks away without a sleep cover otherwise leaves the CPU
+    // and Wi-Fi burning all night. A zero threshold makes the first quiet
+    // poll cross the wall-clock window immediately.
     let dir = tempfile::tempdir().unwrap();
     let (count, sleeper) = counting_sleeper();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]).with_sleeper(sleeper);
-    app.input_mut().idle_timeouts = IDLE_SUSPEND_TICKS as usize;
+    app.idle_suspend = std::time::Duration::ZERO;
+    app.input_mut().idle_timeouts = 1;
     app.run().unwrap();
-    assert_eq!(count.get(), 1, "idle must suspend after the full window");
+    assert_eq!(count.get(), 1, "idle past the window must suspend");
 }
 
 #[test]
-fn short_idle_does_not_suspend() {
+fn quiet_polls_within_the_idle_window_do_not_suspend() {
+    // Idle is wall-clock time, not a count of empty polls: on hardware a
+    // poll can return "no event" long before its timeout (mid-gesture
+    // touch traffic, gyro chatter), and a burst of those must not read as
+    // 15 minutes of inactivity — that suspended mid-page-drag.
     let dir = tempfile::tempdir().unwrap();
     let (count, sleeper) = counting_sleeper();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]).with_sleeper(sleeper);
-    app.input_mut().idle_timeouts = (IDLE_SUSPEND_TICKS - 1) as usize;
+    // Default (15 min) threshold; 100 instant empty polls stay far under it.
+    app.input_mut().idle_timeouts = 100;
     app.run().unwrap();
-    assert_eq!(count.get(), 0, "an under-threshold idle must stay awake");
+    assert_eq!(count.get(), 0, "empty-poll bursts must not count as idle");
 }
 
 #[test]
