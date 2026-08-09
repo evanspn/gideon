@@ -525,6 +525,63 @@ const SLEEP_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long the "staying awake" notice stays up when suspend is skipped.
 const SKIP_NOTICE_HOLD: std::time::Duration = std::time::Duration::from_millis(1200);
 
+/// How often the wait-for-unplug loop re-probes the charger after a suspend
+/// was refused while plugged in. Charger power covers the polling.
+const UNPLUG_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Idle auto-suspend: with no input for [`IDLE_SUSPEND`] (15 minutes),
+/// suspend as if the sleep cover closed — the same timeout Nickel and
+/// KOReader default to. A static e-ink page costs nothing, but the CPU
+/// stays scheduled and Wi-Fi stays fully up for the whole idle stretch; a
+/// user who walks away without closing the cover otherwise drains the
+/// battery for hours.
+///
+/// Idle is measured in WALL-CLOCK time since the last delivered event, not
+/// in poll timeouts: on hardware `poll_event` can return "no event" long
+/// before its timeout (mid-gesture touch traffic, gyro chatter, inotify),
+/// so counting returns would accrue "idle" while a finger is on the glass.
+const IDLE_SUSPEND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How long each idle-detection poll waits between wall-clock checks.
+const IDLE_SUSPEND_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the wait-for-unplug loop ended with.
+enum UnplugWait {
+    /// The charger was pulled and the suspend hook ran; carry its result.
+    Slept(Result<SleepResult>),
+    /// The user pressed/tapped something — they're using the device, so the
+    /// pending sleep is dropped.
+    Aborted,
+}
+
+/// A suspend was refused because the charger is plugged in (an MTK suspend
+/// with the charger in hangs the kernel). Instead of giving up — which left
+/// a device closed in its cover awake FOREVER once unplugged — wait for the
+/// unplug and finish the nap the user asked for. Any input except another
+/// sleep request aborts the wait (the user is clearly using the device); a
+/// repeated cover-close/power-press just keeps waiting.
+///
+/// A free function taking the fields it needs, because the reader session
+/// holds a partial borrow of the app and can't call `&mut self` methods.
+fn sleep_once_unplugged<I: InputSource>(
+    input: &mut I,
+    charger: &dyn Fn() -> bool,
+    sleeper: &mut SleepFn,
+) -> Result<UnplugWait> {
+    loop {
+        // Probe first, poll second: the charger may already be out by the
+        // time we get here (or in tests, immediately).
+        if !charger() {
+            return Ok(UnplugWait::Slept(sleeper()));
+        }
+        match input.poll_event(UNPLUG_POLL)? {
+            Some(UiEvent::Sleep) => {} // already trying to sleep; keep waiting
+            Some(_) => return Ok(UnplugWait::Aborted),
+            None => {}
+        }
+    }
+}
+
 /// Force a full e-ink refresh every Nth keyboard repaint, so ghosting
 /// can't accumulate over a long editing session.
 const KEYBOARD_FULL_REFRESH_INTERVAL: u32 = 8;
@@ -630,6 +687,15 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
     /// hides the percentage from the Home title and the sleep notice.
     battery: Option<Box<dyn Fn() -> Option<u8>>>,
+    /// Wall-clock inactivity before an automatic suspend (default
+    /// [`IDLE_SUSPEND`]); only enforced when a sleeper is installed. Tests
+    /// shrink it to zero to exercise the path.
+    idle_suspend: std::time::Duration,
+    /// Charger-plugged probe (sysfs on hardware). With one installed, a
+    /// suspend refused while charging waits for the unplug and then sleeps
+    /// (see [`sleep_once_unplugged`]); `None` (tests, headless) keeps the
+    /// old behavior — stay awake.
+    charger: Option<Box<dyn Fn() -> bool>>,
     /// Cell-sized cover thumbnails for the library shelf: Library repaints
     /// (page flips, returning from the reader) re-compose the shelf, and
     /// re-decoding every cover JPEG each time made repaints visibly slow.
@@ -694,6 +760,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             lights: None,
             settings_dir: None,
             battery: None,
+            idle_suspend: IDLE_SUSPEND,
+            charger: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
             progress_cache: std::cell::RefCell::new(None),
             index_guard: Arc::new(Mutex::new(())),
@@ -798,6 +866,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self
     }
 
+    /// Install the charger probe (sysfs status on hardware): a suspend
+    /// refused while plugged in then waits out the charger and finishes the
+    /// nap once the cable is pulled, instead of staying awake forever.
+    pub fn with_charger(mut self, charger: Box<dyn Fn() -> bool>) -> Self {
+        self.charger = Some(charger);
+        self
+    }
+
     /// The current battery percentage, when a probe is installed and a
     /// battery reports one.
     fn battery_now(&self) -> Option<u8> {
@@ -839,8 +915,38 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// the power menu (or the input source ends). Returns how to exit.
     pub fn run(&mut self) -> Result<Exit> {
         self.render_current(RefreshMode::Full)?;
+        let mut last_activity = std::time::Instant::now();
         loop {
-            match self.input.next_event() {
+            // With a suspend hook installed, wait in ticks instead of
+            // blocking forever, and auto-suspend after 15 idle minutes —
+            // a user who walks away without closing the cover otherwise
+            // leaves the CPU scheduled and Wi-Fi up for hours (Nickel and
+            // KOReader both do this). Idle is wall-clock time since the
+            // last delivered event: on hardware a poll can return "no
+            // event" long before its timeout (mid-gesture touch traffic,
+            // gyro chatter), so counting returns would suspend mid-drag.
+            let event = if self.sleeper.is_some() {
+                loop {
+                    match self.input.poll_event(IDLE_SUSPEND_TICK) {
+                        Ok(Some(event)) => {
+                            last_activity = std::time::Instant::now();
+                            break Ok(event);
+                        }
+                        Ok(None) => {
+                            if last_activity.elapsed() >= self.idle_suspend {
+                                last_activity = std::time::Instant::now();
+                                if let Err(e) = self.sleep_now() {
+                                    self.show_error(&e)?;
+                                }
+                            }
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
+            } else {
+                self.input.next_event()
+            };
+            match event {
                 Err(_) => return Ok(Exit::Close), // input source closed
                 // Every pointer event funnels through map_menu_point first
                 // (the one chokepoint), so taps land where the rotated
@@ -926,15 +1032,46 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         lines.push("Press power or open the cover to wake.".to_string());
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         self.show_status_full(&lines)?;
-        let result = self.sleeper.as_mut().expect("checked above")();
+        let mut result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
-            // Pressing power while plugged in does nothing visible
-            // otherwise — say why before restoring the screen.
-            self.show_status_full(&["Plugged in — staying awake."])?;
-            std::thread::sleep(SKIP_NOTICE_HOLD);
-            self.render_current(RefreshMode::Full)?;
-            return Ok(());
+            if self.charger.is_none() {
+                // No charger probe (tests, headless): pressing power while
+                // plugged in does nothing visible otherwise — say why
+                // before restoring the screen.
+                self.show_status_full(&["Plugged in — staying awake."])?;
+                std::thread::sleep(SKIP_NOTICE_HOLD);
+                self.render_current(RefreshMode::Full)?;
+                return Ok(());
+            }
+            // The user asked for sleep; the charger refused it. Wait out
+            // the charger (any other input aborts) and finish the nap once
+            // the cable is pulled — otherwise a device closed in its cover
+            // and unplugged later stays awake until the battery is dead.
+            self.show_status_full(&[
+                "Plugged in — will sleep once unplugged.",
+                "Tap anywhere to stay awake.",
+            ])?;
+            match sleep_once_unplugged(
+                &mut self.input,
+                self.charger.as_ref().expect("checked above"),
+                self.sleeper.as_mut().expect("checked above"),
+            )? {
+                UnplugWait::Aborted => {
+                    self.render_current(RefreshMode::Full)?;
+                    return Ok(());
+                }
+                UnplugWait::Slept(slept) => {
+                    self.last_wake = Some(std::time::Instant::now());
+                    result = slept;
+                }
+            }
+            // Re-plugged in the instant between our probe and the hook's
+            // own check: give up rather than loop.
+            if matches!(result, Ok(SleepResult::Skipped)) {
+                self.render_current(RefreshMode::Full)?;
+                return Ok(());
+            }
         }
         // Drop the key press that woke us, THEN reopen the (possibly
         // re-registered) input nodes — in that order. Reopening can take up
@@ -961,8 +1098,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Proactively rejoin Wi-Fi (unless auto-connect is off): a suspend
         // usually leaves the radio un-associated / lease-less, so kick a
         // (detached, non-blocking) scan + re-associate now rather than waiting
-        // for the next network action.
-        if self.wifi_auto_connect {
+        // for the next network action. A FAILED suspend also took the radio
+        // down before dying, so restore it even with auto-connect off — the
+        // user turned off auto-connect, not the radio.
+        if self.wifi_auto_connect || result.is_err() {
             gideon_device::network::reconnect_after_wake();
         }
         // Suspend powers the frontlight down; bring it back to its levels.
@@ -3101,8 +3240,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // thread, and the first paint just takes the finished render.
             reader.warm();
             reader.show_current_page()?;
+            let mut last_activity = std::time::Instant::now();
             loop {
-                let event = self.input.next_event();
+                // Same idle auto-suspend as the menu loop: a reader left
+                // open (user fell asleep, device without a sleep cover)
+                // suspends after 15 idle minutes instead of burning the
+                // battery all night. Synthesizes a Sleep event so the arm
+                // below saves progress exactly like a cover close. Idle is
+                // wall-clock time since the last delivered event — polls
+                // can return early on hardware (see the menu loop).
+                let event = if self.sleeper.is_some() {
+                    loop {
+                        match self.input.poll_event(IDLE_SUSPEND_TICK) {
+                            Ok(Some(event)) => {
+                                last_activity = std::time::Instant::now();
+                                break Ok(event);
+                            }
+                            Ok(None) => {
+                                if last_activity.elapsed() >= self.idle_suspend {
+                                    last_activity = std::time::Instant::now();
+                                    break Ok(UiEvent::Sleep);
+                                }
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    }
+                } else {
+                    self.input.next_event()
+                };
                 // While the controls sheet is up, taps go to its rows; any
                 // other event closes it (Sleep still suspends below).
                 if sheet_open {
@@ -3433,13 +3598,37 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // down — a dead battery must not lose it.
                         reader.save_progress(&mut store, key);
                         store.merge_save(&progress_file)?;
-                        let result = self.sleeper.as_mut().expect("checked above")();
+                        let mut result = self.sleeper.as_mut().expect("checked above")();
                         self.last_wake = Some(std::time::Instant::now());
+                        if matches!(result, Ok(SleepResult::Skipped)) {
+                            let Some(charger) = self.charger.as_ref() else {
+                                continue; // still awake, screen untouched
+                            };
+                            // Wait out the charger and finish the nap once
+                            // unplugged — same as the menu path, but with a
+                            // reader banner instead of a status screen.
+                            reader.show_banner("Plugged in — will sleep once unplugged")?;
+                            match sleep_once_unplugged(
+                                &mut self.input,
+                                charger,
+                                self.sleeper.as_mut().expect("checked above"),
+                            )? {
+                                UnplugWait::Aborted => {
+                                    reader.repaint_full()?;
+                                    continue;
+                                }
+                                UnplugWait::Slept(slept) => {
+                                    self.last_wake = Some(std::time::Instant::now());
+                                    result = slept;
+                                }
+                            }
+                            if matches!(result, Ok(SleepResult::Skipped)) {
+                                reader.repaint_full()?;
+                                continue;
+                            }
+                        }
                         if let Err(e) = &result {
                             eprintln!("gideon: suspend failed: {e:#}");
-                        }
-                        if matches!(result, Ok(SleepResult::Skipped)) {
-                            continue; // still awake, screen untouched
                         }
                         // Drop the wake key press FIRST, then reopen the
                         // possibly re-registered input nodes — reopening hands
@@ -3470,8 +3659,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // Proactively rejoin Wi-Fi after the suspend (detached,
                         // non-blocking; no-op if still connected) so a download
                         // at the end of the chapter just works — unless the
-                        // user turned auto-connect off.
-                        if self.wifi_auto_connect {
+                        // user turned auto-connect off. A FAILED suspend also
+                        // took the radio down before dying, so restore it even
+                        // then: the user turned off auto-connect, not the radio.
+                        if self.wifi_auto_connect || result.is_err() {
                             gideon_device::network::reconnect_after_wake();
                         }
                         if let Some(lights) = self.lights.as_mut() {
@@ -3589,17 +3780,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let start = std::time::Instant::now();
         let mut last_kick = start;
         let mut online = gideon_device::network::is_online();
+        let mut sleep_requested = false;
         while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
             self.show_status(&[
                 &format!("Connecting to {ssid}…"),
                 &format!("({}s) · tap to cancel", start.elapsed().as_secs()),
             ])?;
-            if self
-                .input
-                .poll_event(std::time::Duration::from_secs(1))?
-                .is_some()
-            {
-                break;
+            // A cover close is not a cancel — sleep after leaving the loop.
+            match self.input.poll_event(std::time::Duration::from_secs(1))? {
+                Some(UiEvent::Sleep) => {
+                    sleep_requested = true;
+                    break;
+                }
+                Some(_) => break,
+                None => {}
             }
             online = gideon_device::network::is_online();
             // Re-issue the connect if it hasn't taken yet (the first associate
@@ -3611,6 +3805,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if matches!(self.stack.last(), Some(Screen::WifiPassword { .. })) {
             self.stack.pop();
+        }
+        if sleep_requested {
+            self.sleep_now()?;
         }
         self.refresh_wifi_list()
     }
@@ -3681,20 +3878,28 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut last_kick = start;
         let mut online = gideon_device::network::is_online();
         let mut cancelled = false;
+        let mut sleep_requested = false;
         while !online && start.elapsed() < WIFI_CONNECT_TIMEOUT {
             self.show_status(&[
                 "Connecting to Wi-Fi…",
                 &format!("({}s) · tap to cancel", start.elapsed().as_secs()),
             ])?;
             // Poll input for ~1s rather than sleeping blind: a deliberate
-            // press means "stop waiting, I'll deal with it".
-            if self
-                .input
-                .poll_event(std::time::Duration::from_secs(1))?
-                .is_some()
-            {
-                cancelled = true;
-                break;
+            // press means "stop waiting, I'll deal with it". A cover close
+            // is NOT a cancel to swallow — the device must still sleep
+            // (handled after the loop; every other drain in the app is
+            // equally careful to preserve Sleep).
+            match self.input.poll_event(std::time::Duration::from_secs(1))? {
+                Some(UiEvent::Sleep) => {
+                    sleep_requested = true;
+                    cancelled = true;
+                    break;
+                }
+                Some(_) => {
+                    cancelled = true;
+                    break;
+                }
+                None => {}
             }
             online = gideon_device::network::is_online();
             // Keep nudging the chip to re-scan/re-associate instead of waiting
@@ -3707,6 +3912,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Back off after a failure OR a cancel, so the next tap doesn't
         // immediately re-enter a long wait the user just dismissed.
         self.last_wifi_fail = (!online).then(std::time::Instant::now);
+        if sleep_requested {
+            // The cover closed mid-connect: honor it now instead of
+            // silently staying awake in a bag.
+            return self.sleep_now();
+        }
         if cancelled {
             self.show_status(&["Wi-Fi cancelled."])?;
         }

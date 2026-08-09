@@ -214,26 +214,10 @@ impl KoboSuspend {
         self.step("sync".to_string());
     }
 
-    /// `true` unless every known battery reports exactly `Discharging` —
-    /// KOReader's polarity (`powerd.lua`: charging means status
-    /// `~= "Discharging"`). A plugged-in charger can report `Charging`,
-    /// `Full`, `Not charging` or `Unknown`; all of those must block the
-    /// suspend, because an MTK suspend with the charger in hangs the
-    /// kernel. Only a missing status file (tests, dev machines) suspends.
+    /// The charging probe, shared with the public [`plugged_in`] so the UI
+    /// and the suspend guard can never disagree about "is the charger in".
     fn is_plugged_in(&self) -> bool {
-        // Libra Colour / Clara family use bd71827_bat; older NTX boards
-        // (and KOReader's generic fallback) use "battery".
-        for name in ["battery", "bd71827_bat"] {
-            let path = self
-                .root
-                .join("sys/class/power_supply")
-                .join(name)
-                .join("status");
-            if let Ok(status) = std::fs::read_to_string(&path) {
-                return !status.trim().eq_ignore_ascii_case("discharging");
-            }
-        }
-        false
+        plugged_in_at(&self.root)
     }
 }
 
@@ -241,6 +225,50 @@ impl Default for KoboSuspend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether a charger is plugged in right now — the same probe the suspend
+/// path uses to refuse an MTK suspend. Public so the UI can wait out a
+/// charger after a refused suspend (cover closed while charging) and finish
+/// the nap once the cable is pulled.
+pub fn plugged_in() -> bool {
+    plugged_in_at(Path::new("/"))
+}
+
+/// [`plugged_in`] rooted at `root`, so tests can point it at a tempdir laid
+/// out like `/`. `true` unless every known battery reports exactly
+/// `Discharging` — KOReader's polarity (`powerd.lua`): a plugged-in charger
+/// can report `Charging`, `Full`, `Not charging` or `Unknown`, and all of
+/// those must block a suspend because an MTK suspend with the charger in
+/// hangs the kernel. Unknown board names are covered by a fallback scan of
+/// every supply whose `type` is `Battery`; only a machine with no readable
+/// battery status at all (tests, dev machines) reports unplugged.
+pub fn plugged_in_at(root: &Path) -> bool {
+    let supplies = root.join("sys/class/power_supply");
+    // Libra Colour / Clara family use bd71827_bat; older NTX boards
+    // (and KOReader's generic fallback) use "battery".
+    for name in ["battery", "bd71827_bat"] {
+        if let Ok(status) = std::fs::read_to_string(supplies.join(name).join("status")) {
+            return !status.trim().eq_ignore_ascii_case("discharging");
+        }
+    }
+    // Neither known name: scan for any battery-typed supply, so a new board
+    // with a different driver name still refuses to suspend while charging
+    // (failing "unplugged" here risks the MTK charger-in kernel hang).
+    let Ok(entries) = std::fs::read_dir(&supplies) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let is_battery = std::fs::read_to_string(entry.path().join("type"))
+            .is_ok_and(|t| t.trim().eq_ignore_ascii_case("battery"));
+        if !is_battery {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+            return !status.trim().eq_ignore_ascii_case("discharging");
+        }
+    }
+    false
 }
 
 /// Battery charge percent from sysfs, `None` when no battery reports one
@@ -311,6 +339,33 @@ mod tests {
         std::fs::write(dir.path().join("sys/power/state"), "").unwrap();
         let suspend = KoboSuspend::with_root(dir.path()).settle(Duration::ZERO);
         (dir, suspend)
+    }
+
+    #[test]
+    fn unknown_battery_name_still_blocks_suspend_while_charging() {
+        // A board whose battery driver uses neither known name: the
+        // type=Battery fallback scan must still see the charger, because
+        // suspending while plugged in hangs MTK kernels.
+        let dir = tempfile::tempdir().unwrap();
+        let supply = dir.path().join("sys/class/power_supply/rt9471_bat");
+        std::fs::create_dir_all(&supply).unwrap();
+        std::fs::write(supply.join("type"), "Battery\n").unwrap();
+        std::fs::write(supply.join("status"), "Charging\n").unwrap();
+        assert!(plugged_in_at(dir.path()));
+
+        std::fs::write(supply.join("status"), "Discharging\n").unwrap();
+        assert!(!plugged_in_at(dir.path()));
+    }
+
+    #[test]
+    fn non_battery_supplies_are_ignored_by_the_fallback_scan() {
+        // A Mains/USB supply must not be read as a battery status.
+        let dir = tempfile::tempdir().unwrap();
+        let supply = dir.path().join("sys/class/power_supply/usb");
+        std::fs::create_dir_all(&supply).unwrap();
+        std::fs::write(supply.join("type"), "USB\n").unwrap();
+        std::fs::write(supply.join("status"), "Charging\n").unwrap();
+        assert!(!plugged_in_at(dir.path()));
     }
 
     #[test]

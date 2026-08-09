@@ -5747,6 +5747,87 @@ fn skipped_suspend_explains_itself_and_stays_awake() {
 }
 
 #[test]
+fn charging_sleep_finishes_once_unplugged() {
+    // Cover closed while charging: the suspend is refused (MTK kernels hang
+    // otherwise), but the sleep request must not be forgotten — the moment
+    // the charger reads unplugged, the suspend runs. Without this, a device
+    // closed in its cover and unplugged later stayed awake until the
+    // battery died.
+    let dir = tempfile::tempdir().unwrap();
+    let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let c = count.clone();
+    let sleeper: SleepFn = Box::new(move || {
+        c.set(c.get() + 1);
+        Ok(if c.get() == 1 {
+            SleepResult::Skipped // charger was in during the first attempt
+        } else {
+            SleepResult::Slept
+        })
+    });
+    // …and out again by the time the wait loop probes.
+    let charger = Box::new(|| false);
+    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
+        .with_sleeper(sleeper)
+        .with_charger(charger);
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 2, "the refused suspend must be retried");
+    assert!(matches!(app.screen(), Screen::Home));
+}
+
+#[test]
+fn charging_wait_aborts_when_the_user_is_using_the_device() {
+    // Still plugged in, and the user taps: they're using it — drop the
+    // pending sleep instead of suspending under their fingers later.
+    let dir = tempfile::tempdir().unwrap();
+    let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let c = count.clone();
+    let sleeper: SleepFn = Box::new(move || {
+        c.set(c.get() + 1);
+        Ok(SleepResult::Skipped)
+    });
+    let charger = Box::new(|| true);
+    let events = vec![UiEvent::Sleep, UiEvent::Tap { x: 1, y: 1 }];
+    let mut app = app(dir.path(), FakeGateway::default(), events)
+        .with_sleeper(sleeper)
+        .with_charger(charger);
+    app.run().unwrap();
+
+    assert_eq!(count.get(), 1, "a tap must abort the wait, not re-suspend");
+    assert!(matches!(app.screen(), Screen::Home));
+}
+
+#[test]
+fn idle_menus_auto_suspend_after_the_timeout() {
+    // No input past the idle window: suspend as if the cover closed — a
+    // user who walks away without a sleep cover otherwise leaves the CPU
+    // and Wi-Fi burning all night. A zero threshold makes the first quiet
+    // poll cross the wall-clock window immediately.
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![]).with_sleeper(sleeper);
+    app.idle_suspend = std::time::Duration::ZERO;
+    app.input_mut().idle_timeouts = 1;
+    app.run().unwrap();
+    assert_eq!(count.get(), 1, "idle past the window must suspend");
+}
+
+#[test]
+fn quiet_polls_within_the_idle_window_do_not_suspend() {
+    // Idle is wall-clock time, not a count of empty polls: on hardware a
+    // poll can return "no event" long before its timeout (mid-gesture
+    // touch traffic, gyro chatter), and a burst of those must not read as
+    // 15 minutes of inactivity — that suspended mid-page-drag.
+    let dir = tempfile::tempdir().unwrap();
+    let (count, sleeper) = counting_sleeper();
+    let mut app = app(dir.path(), FakeGateway::default(), vec![]).with_sleeper(sleeper);
+    // Default (15 min) threshold; 100 instant empty polls stay far under it.
+    app.input_mut().idle_timeouts = 100;
+    app.run().unwrap();
+    assert_eq!(count.get(), 0, "empty-poll bursts must not count as idle");
+}
+
+#[test]
 fn sleep_right_after_a_download_suspends_in_the_reader() {
     // A cover closed while a chapter downloaded surfaces as the first
     // event the reader sees; it must suspend, not be treated as a tap.
