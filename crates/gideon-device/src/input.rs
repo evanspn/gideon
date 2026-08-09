@@ -118,6 +118,9 @@ pub struct FakeInput {
     pub resync: Option<u32>,
     /// What `bluetooth_connected` should report (a paired remote present).
     pub bluetooth: bool,
+    /// How many `poll_event` calls report a timeout (no event) before the
+    /// script continues. Lets tests exercise idle-timeout behavior.
+    pub idle_timeouts: usize,
 }
 
 impl FakeInput {
@@ -129,7 +132,15 @@ impl FakeInput {
             discard_queued_calls: 0,
             resync: None,
             bluetooth: false,
+            idle_timeouts: 0,
         }
+    }
+
+    /// Make the first `count` calls to `poll_event` time out (report no
+    /// event) before the script resumes — simulates an idle user.
+    pub fn with_idle_timeouts(mut self, count: usize) -> Self {
+        self.idle_timeouts = count;
+        self
     }
 
     /// Make `resync_orientation` report `rotation` (degrees) — the device is
@@ -154,8 +165,17 @@ impl InputSource for FakeInput {
     }
 
     fn poll_event(&mut self, _timeout: std::time::Duration) -> crate::Result<Option<UiEvent>> {
-        // Replay the script without sleeping: the next event if any, else None.
-        Ok(self.events.next())
+        // Scripted timeouts first (idle simulation), then replay the script
+        // without sleeping. An exhausted script errors like `next_event` —
+        // otherwise a poll loop in the code under test would spin forever.
+        if self.idle_timeouts > 0 {
+            self.idle_timeouts -= 1;
+            return Ok(None);
+        }
+        self.events
+            .next()
+            .map(Some)
+            .ok_or_else(|| crate::Error::Display("fake input exhausted".to_string()))
     }
 
     fn refresh_devices(&mut self) {
@@ -376,16 +396,18 @@ mod tests {
     }
 
     #[test]
-    fn poll_event_returns_a_pending_event_then_none() {
-        // The cancellable-connect poll: a queued event surfaces (would cancel
-        // the wait), and an empty queue reports no event without blocking.
-        let mut input = FakeInput::new(vec![UiEvent::Tap { x: 5, y: 6 }]);
+    fn poll_event_replays_timeouts_then_events_then_errors() {
+        // Scripted idle timeouts surface first (no event), then the script,
+        // and an exhausted script errors like `next_event` — a poll loop in
+        // code under test must terminate, not spin on `None` forever.
+        let mut input = FakeInput::new(vec![UiEvent::Tap { x: 5, y: 6 }]).with_idle_timeouts(1);
         let t = std::time::Duration::from_millis(10);
+        assert_eq!(input.poll_event(t).unwrap(), None);
         assert_eq!(
             input.poll_event(t).unwrap(),
             Some(UiEvent::Tap { x: 5, y: 6 })
         );
-        assert_eq!(input.poll_event(t).unwrap(), None);
+        assert!(input.poll_event(t).is_err());
     }
 
     // Raw panel: 0..=1000 both axes. Screen: 101x201 so scaled coordinates
