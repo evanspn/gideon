@@ -209,6 +209,16 @@ fn tap_row(i: usize) -> UiEvent {
     }
 }
 
+/// A long press centered on menu row `i` (the row-targeted twin of
+/// [`tap_row`]).
+fn long_press_row(i: usize) -> UiEvent {
+    let l = layout();
+    UiEvent::LongPress {
+        x: l.width / 2,
+        y: l.row_top(i) + l.row_h / 2,
+    }
+}
+
 fn tap_back() -> UiEvent {
     let l = layout();
     UiEvent::Tap {
@@ -3543,6 +3553,92 @@ fn picking_the_active_profile_just_closes_the_menu() {
     assert!(matches!(app.screen(), Screen::Home));
     let settings = gideon_core::Settings::load(&settings_dir).unwrap();
     assert_eq!(settings.active_profile, "default");
+}
+
+// --- removing sources ---
+
+fn one_installed_source_gateway() -> FakeGateway {
+    FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        available: Ok(Vec::new()),
+        ..FakeGateway::default()
+    }
+}
+
+#[test]
+fn long_press_removes_an_installed_source_after_confirming() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(2),        // Home -> Sources
+        long_press_row(0), // installed "Src" -> confirmation
+        tap_row(0),        // "Remove source"
+    ];
+    let mut app = app(dir.path(), one_installed_source_gateway(), events);
+    app.run().unwrap();
+
+    assert_eq!(
+        *app.gateway().uninstalled.borrow(),
+        vec!["src".to_string()],
+        "confirming must uninstall the source"
+    );
+    let Screen::Sources { rows, .. } = app.screen() else {
+        panic!("expected to land back on the Sources screen");
+    };
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, SourceRow::Installed(s) if s.id == "src")),
+        "the removed source must be gone from the list"
+    );
+}
+
+#[test]
+fn cancelling_the_source_removal_keeps_it_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(2),        // Home -> Sources
+        long_press_row(0), // installed "Src" -> confirmation
+        tap_row(1),        // Cancel
+    ];
+    let mut app = app(dir.path(), one_installed_source_gateway(), events);
+    app.run().unwrap();
+
+    assert!(
+        app.gateway().uninstalled.borrow().is_empty(),
+        "cancel must not uninstall anything"
+    );
+    assert!(matches!(app.screen(), Screen::Sources { .. }));
+}
+
+#[test]
+fn long_press_on_an_available_source_is_just_a_tap() {
+    // Only installed rows get the removal menu; long-pressing an available
+    // source behaves like tapping it (installs it), same as everywhere else.
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = FakeGateway {
+        available: Ok(vec![SourceEntry {
+            id: "new".into(),
+            name: "New".into(),
+        }]),
+        ..FakeGateway::default()
+    };
+    // Row 0 is the "— available —" separator; the source sits on row 1.
+    let events = vec![tap_row(2), long_press_row(1)];
+    let mut app = app(dir.path(), gateway, events);
+    app.run().unwrap();
+
+    assert!(
+        app.gateway()
+            .installed
+            .borrow()
+            .iter()
+            .any(|s| s.id == "new"),
+        "long press on an available source installs it, like a tap"
+    );
+    assert!(app.gateway().uninstalled.borrow().is_empty());
 }
 
 // --- settings screen ---
