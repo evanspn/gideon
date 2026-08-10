@@ -413,6 +413,12 @@ enum Screen {
         series_dir: String,
         scope: DeleteScope,
     },
+    /// Confirmation before removing an installed source (long press on its
+    /// row in Sources). Only the source package is removed — downloaded
+    /// chapters and reading progress stay in the library.
+    ConfirmRemoveSource {
+        source: SourceEntry,
+    },
     /// Profile picker, opened from the left half of Home's title bar.
     ProfileMenu {
         profiles: Vec<String>,
@@ -1350,6 +1356,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Screen::Sources { rows, page } => {
+                // Long press on an installed source offers to remove it —
+                // mirroring the library's long-press book menu. Anywhere
+                // else on the screen it's just a slow tap.
+                let paged = self.current_page_count() > 1;
+                if let TapTarget::Row(row) = self.layout.tap_target(x, y, paged) {
+                    let index = page * self.layout.rows_per_page() + row;
+                    if let Some(SourceRow::Installed(source)) = rows.get(index).cloned() {
+                        self.push(Screen::ConfirmRemoveSource { source })?;
+                        return Ok(Flow::Continue);
+                    }
+                }
+                self.handle_tap(x, y)
+            }
             _ => self.handle_tap(x, y),
         }
     }
@@ -1867,6 +1887,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Screen::ConfirmRemoveSource { source } => {
+                // Row 0 removes the source; anything else backs out to the
+                // Sources screen, touching nothing.
+                if row == 0 {
+                    self.remove_source(&source)?;
+                } else {
+                    self.pop()?;
+                }
+                Ok(Flow::Continue)
+            }
             Screen::Settings => {
                 self.tap_setting(row)?;
                 Ok(Flow::Continue)
@@ -2022,6 +2052,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             .install_source(&source.id)
             .with_context(|| format!("failed to install {}", source.name))?;
         // Rebuild the sources screen in place so the new source shows up.
+        let rows = self.build_source_rows()?;
+        if let Some(screen @ Screen::Sources { .. }) = self.stack.last_mut() {
+            *screen = Screen::Sources { rows, page: 0 };
+        }
+        self.render_current(RefreshMode::Full)
+    }
+
+    /// Remove an installed source (from its confirmation screen), then land
+    /// back on a rebuilt Sources screen. Only the source package goes —
+    /// downloaded chapters and reading progress stay in the library.
+    fn remove_source(&mut self, source: &SourceEntry) -> Result<()> {
+        self.show_status(&[&format!("Removing {}…", source.name)])?;
+        self.gateway
+            .uninstall_source(&source.id)
+            .with_context(|| format!("failed to remove {}", source.name))?;
+        self.stack.pop(); // leave the confirmation screen (repainted below)
+                          // Rebuild the sources screen in place so the row disappears; if the
+                          // list fetch fails (offline), fall back to just repainting.
         let rows = self.build_source_rows()?;
         if let Some(screen @ Screen::Sources { .. }) = self.stack.last_mut() {
             *screen = Screen::Sources { rows, page: 0 };
@@ -4139,6 +4187,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 };
                 let rows = vec![(confirm.to_string(), true), ("Cancel".to_string(), true)];
                 compose_list(l, &title, &rows, 0, 1)
+            }
+            Screen::ConfirmRemoveSource { source } => {
+                let rows = vec![
+                    ("Remove source".to_string(), true),
+                    ("Cancel".to_string(), true),
+                    // Not tappable — reassurance that the library is safe.
+                    ("(downloaded chapters stay)".to_string(), false),
+                ];
+                compose_list(l, &format!("Remove \"{}\"?", source.name), &rows, 0, 1)
             }
             Screen::ProfileMenu { profiles } => {
                 let mut rows: Vec<(String, bool)> = profiles
