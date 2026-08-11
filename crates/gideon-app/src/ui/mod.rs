@@ -111,10 +111,12 @@ struct SeriesCard {
 }
 
 impl SeriesCard {
-    /// Card title: the series directory name, or the loose file's stem.
+    /// Card title: the series directory name, or the loose file's stem —
+    /// tidied for display (the dir name is the FAT32-sanitized form, where
+    /// characters like ':' and '?' became underscores).
     fn title(&self) -> String {
         match &self.series {
-            Some(dir) => dir.clone(),
+            Some(dir) => tidy_title(dir),
             None => entry_title(&self.chapters[0].relative_path),
         }
     }
@@ -6173,8 +6175,40 @@ fn entry_title(relative_path: &str) -> String {
         .or_else(|| file.strip_suffix(".CBZ"))
         .unwrap_or(file);
     match parts.next() {
-        Some(series) if !series.is_empty() => format!("{series} — {stem}"),
-        _ => stem.to_string(),
+        Some(series) if !series.is_empty() => {
+            format!("{} — {}", tidy_title(series), tidy_title(stem))
+        }
+        _ => tidy_title(stem),
+    }
+}
+
+/// Display cleanup for names that came through the FAT32-safe filename
+/// sanitizer (`gideon_sources::storage::sanitize`): characters like ':',
+/// '?' and '*' in a source's title were stored as '_' in the directory name,
+/// which then read as gibberish on the shelf ("Frieren_ Beyond Journey_s
+/// End"). Collapse underscore runs to a single space for DISPLAY only —
+/// paths and progress keys stay untouched. A name that was all underscores
+/// keeps its original form rather than vanishing.
+fn tidy_title(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_space = false;
+    for c in raw.chars() {
+        let c = if c == '_' { ' ' } else { c };
+        if c == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        raw.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
