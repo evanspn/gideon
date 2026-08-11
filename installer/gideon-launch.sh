@@ -76,12 +76,15 @@ restart_nickel() {
         umount /mnt/sd 2>/dev/null
     fi
 
-    # Relaunch the stock stack: hindenburg, sickel (the watchdog newer
-    # firmwares — FW5 / Libra Colour — ship) and nickel itself.
+    # Relaunch the stock stack exactly like the reference implementation,
+    # KOReader's platform/kobo/nickel.sh: hindenburg + nickel + udevadm
+    # trigger, and NOTHING else. In particular do NOT relaunch sickel (the
+    # FW watchdog): KOReader kills it on entry (koreader.sh) but never
+    # restarts it, and that recipe is what ships to every KOReader user on
+    # this hardware. Relaunching it ourselves was an unsourced deviation —
+    # and a watchdog restarted outside init is a plausible culler of the
+    # freshly started nickel (which would strand NickelMenu's failsafe).
     /usr/local/Kobo/hindenburg &
-    if [ -x /usr/local/Kobo/sickel ]; then
-        /usr/local/Kobo/sickel &
-    fi
     LIBC_FATAL_STDERR_=1 /usr/local/Kobo/nickel -platform kobo -skipFontLoad &
     [ "${PLATFORM}" != "freescale" ] && udevadm trigger &
 
@@ -89,13 +92,19 @@ restart_nickel() {
 }
 
 # --- NickelMenu failsafe guard -------------------------------------------
-# NickelMenu uninstalls itself if nickel dies within ~20 s of starting: its
-# anti-bootloop failsafe parks libnm.so at libnm.so.failsafe while the
-# window is open and only renames it back once nickel survived it. Killing
-# nickel inside that window strands the library and NickelMenu is gone on
-# the next boot. Since gideon's exit restarts nickel in place, re-entering
-# gideon seconds after leaving it is exactly that scenario — so never kill
-# nickel while the failsafe is armed.
+# Verified against the source (NickelHook nh.c + NickelMenu nickelmenu.cc):
+#   * nh_init is a shared-library constructor, so it runs when nickel's Qt
+#     plugin loader dlopens /usr/local/Kobo/imageformats/libnm.so during
+#     startup (install path: NickelHook.mk, KOBOROOT rule).
+#   * nh_failsafe_create renames libnm.so -> libnm.so.failsafe ("parks" it).
+#   * At the END of nh_init — on the success AND the error path — a detached
+#     thread is scheduled that sleeps failsafe_delay (NickelMenu: 3 s) and
+#     renames the library back.
+#   * If nickel dies before that thread fires, the library stays parked and
+#     NickelMenu is simply absent on the next boot ("uninstalled itself").
+#     Nothing but that thread — or us — ever restores it.
+# So: never kill nickel while the library is parked, and never walk away
+# from a nickel we started while it is still parked.
 NM_LIB=/usr/local/Kobo/imageformats/libnm.so
 
 nm_failsafe_armed() {
@@ -170,10 +179,10 @@ while ! pidof nickel >/dev/null 2>&1; do
     usleep 250000 2>/dev/null || sleep 1
 done
 
-# Nickel is up — but NickelMenu's failsafe is armed again: at library load
-# it parks libnm.so at libnm.so.failsafe and only renames it back ~3 s
-# after its init finishes (NickelHook nh.c, failsafe_delay=3). If nickel
-# dies inside that window — a crash, or sickel's watchdog culling it —
+# Nickel is up — but NickelMenu's failsafe is armed again: the library was
+# parked when nickel's plugin loader pulled libnm.so in, and only the
+# disarm thread (fires 3 s after nh_init returns — see the guard comment
+# above for the sourced details) puts it back. If nickel dies before that,
 # the library stays parked and NickelMenu has "uninstalled itself" come
 # the next boot, with nobody left to notice. So don't exit yet: babysit
 # the window until the failsafe disarms, and restore the library ourselves
