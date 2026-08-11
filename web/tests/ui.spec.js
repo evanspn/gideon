@@ -91,6 +91,11 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/rest/v1/send_queue**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
+  // Default: no published chapter pages (library covers) — same reason. Reader
+  // tests override this with their own routes (later registrations win).
+  await page.route("**/rest/v1/chapter_pages**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
 });
 
 // --- sign-in --------------------------------------------------------------

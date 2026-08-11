@@ -81,17 +81,35 @@ async function refreshSession(session) {
   return next;
 }
 
-async function fetchProgress(session, retry = true) {
-  const url = `${SUPABASE_URL}/rest/v1/reading_progress?select=chapter_key,current_page,total_pages,updated_at&order=updated_at.desc`;
+async function fetchProgress(session, retry = true, withStartedAt = true) {
+  // started_at (migration 0004) powers the per-series insights; fall back to
+  // the original column set if the migration hasn't been applied yet.
+  const cols = withStartedAt
+    ? "chapter_key,current_page,total_pages,updated_at,started_at"
+    : "chapter_key,current_page,total_pages,updated_at";
+  const url = `${SUPABASE_URL}/rest/v1/reading_progress?select=${cols}&order=updated_at.desc`;
   const res = await fetch(url, {
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
   });
   if (res.status === 401 && retry && session.refresh_token) {
     const next = await refreshSession(session).catch(() => null);
-    if (next) return fetchProgress(next, false);
+    if (next) return fetchProgress(next, false, withStartedAt);
   }
+  if (!res.ok && withStartedAt) return fetchProgress(session, retry, false);
   if (!res.ok) throw new Error(`Couldn't load progress (${res.status})`);
   return res.json();
+}
+
+// Every published chapter-page row at once, for the library's cover art: a
+// series' cover is the first page of its first chapter that the device has
+// published page URLs for. One request; [] on any failure (covers are decor).
+async function fetchAllChapterPages(session) {
+  const url = `${SUPABASE_URL}/rest/v1/chapter_pages?select=chapter_key,page_urls`;
+  const res = await fetch(url, {
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+  });
+  if (!res.ok) return [];
+  return res.json().catch(() => []);
 }
 
 // Publish reading progress from the web. Furthest-page-wins server-side, so it
@@ -195,6 +213,33 @@ applyTheme(currentTheme());
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Display cleanup for titles that came through the device's FAT32-safe
+// filename sanitizer: characters like ':' '?' '*' were stored as '_' in the
+// directory name (which is also the sync key). Collapse underscore runs to a
+// space for DISPLAY only — keys stay untouched, so progress and grouping are
+// unaffected. A title that was all underscores keeps its original form rather
+// than vanishing.
+function displayTitle(s) {
+  const tidy = String(s).replace(/_+/g, " ").replace(/\s+/g, " ").trim();
+  return tidy || String(s);
+}
+
+// --- hidden titles (per account, local to this browser) --------------------
+
+function hiddenKey(email) {
+  return `gideon.hidden.${email || "anon"}`;
+}
+function loadHidden(email) {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(hiddenKey(email))) || []);
+  } catch {
+    return new Set();
+  }
+}
+function saveHidden(email, set) {
+  localStorage.setItem(hiddenKey(email), JSON.stringify([...set]));
 }
 
 // "One Piece/vol1.cbz" -> { series: "One Piece", chapter: "vol1" }
@@ -347,8 +392,61 @@ function streaks(daySet) {
   return { current, longest };
 }
 
+// A chapter is "finished" when the last page has been reached.
+function isFinished(r) {
+  return r.total_pages > 0 && r.current_page + 1 >= r.total_pages;
+}
+
+// Compact "3 days" / "5 hours" / "under an hour" for time-to-completion.
+function humanDuration(ms) {
+  const hours = ms / 3600000;
+  if (hours < 1) return "under an hour";
+  if (hours < 48) return `${Math.round(hours)} hour${Math.round(hours) === 1 ? "" : "s"}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+// Per-series insights for the library card, from the synced rows alone:
+// first-read day (earliest started_at, falling back to updated_at for rows
+// that predate migration 0004), completion across the *tracked* chapters, and
+// — once every tracked chapter is finished — how long start-to-finish took.
+function seriesInsights(g) {
+  const startOf = (c) => c.started_at || c.updated_at;
+  const started = g.chapters.map(startOf).sort()[0];
+  const finished = g.chapters.filter(isFinished);
+  const complete = g.chapters.length > 0 && finished.length === g.chapters.length;
+  const lastFinish = finished.map((c) => c.updated_at).sort().at(-1);
+  const span =
+    complete && started && lastFinish
+      ? humanDuration(Math.max(0, new Date(lastFinish) - new Date(started)))
+      : null;
+  const day = started ? dayKey(started) : null;
+  return {
+    firstRead: day ? prettyDate(day) : null,
+    finished: finished.length,
+    tracked: g.chapters.length,
+    complete,
+    span,
+  };
+}
+
+// A series' cover: the first page of its numerically-first chapter with
+// published page URLs. Empty map when nothing is published yet.
+function coverBySeries(pageRows) {
+  const best = new Map();
+  for (const row of pageRows || []) {
+    const url = row?.page_urls?.[0];
+    if (!url || typeof row.chapter_key !== "string") continue;
+    const { series } = parseKey(row.chapter_key);
+    const prev = best.get(series);
+    if (!prev || row.chapter_key.localeCompare(prev.key, undefined, { numeric: true }) < 0) {
+      best.set(series, { key: row.chapter_key, url });
+    }
+  }
+  return new Map([...best].map(([s, v]) => [s, v.url]));
+}
+
 function computeStats(rows) {
-  const isFinished = (r) => r.total_pages > 0 && r.current_page + 1 >= r.total_pages;
   const pagesOf = (r) => Math.min(r.current_page + 1, r.total_pages > 0 ? r.total_pages : r.current_page + 1);
 
   let finished = 0;
@@ -464,7 +562,7 @@ function topSeriesHtml(s) {
     .map(
       (t) => `
       <div class="ts-row" data-testid="top-series">
-        <div class="ts-name" title="${esc(t.name)}">${esc(t.name)}</div>
+        <div class="ts-name" title="${esc(displayTitle(t.name))}">${esc(displayTitle(t.name))}</div>
         <div class="ts-bar"><i style="width:${Math.round((t.count / max) * 100)}%"></i></div>
         <div class="ts-val">${t.count}</div>
       </div>`
@@ -483,7 +581,7 @@ function recentHtml(groups) {
       const m = progressMeta(g.current);
       return `
         <button class="sub" data-testid="chapter" data-key="${esc(g.current.chapter_key)}">
-          <span class="rc-title"><span class="rc-series">${esc(g.series)}</span></span>
+          <span class="rc-title"><span class="rc-series">${esc(displayTitle(g.series))}</span></span>
           <span class="bar small"><i style="width:${m.pct}%"></i></span>
           <span class="ago">${esc(timeAgo(g.current.updated_at))}</span>
         </button>`;
@@ -527,45 +625,80 @@ function viewStats(stats, groups, sends) {
     ${recentHtml(groups)}`;
 }
 
-function viewLibrary(groups) {
-  const items = groups
-    .map((g) => {
-      const { chapter } = parseKey(g.current.chapter_key);
-      const meta = progressMeta(g.current);
-      const chapterRows = g.chapters
-        .slice()
-        .sort((a, b) => a.chapter_key.localeCompare(b.chapter_key, undefined, { numeric: true }))
-        .map((c) => {
-          const m = progressMeta(c);
-          return `
-            <button class="sub" data-testid="chapter" data-key="${esc(c.chapter_key)}">
-              <span class="sub-title">${esc(parseKey(c.chapter_key).chapter)}</span>
-              <span class="bar small"><i style="width:${m.pct}%"></i></span>
-              <span class="pct">${esc(m.label)}</span>
-            </button>`;
-        })
-        .join("");
+// One library card: cover (published page art, or a lettered placeholder),
+// title, per-series insights (first read day · completion · time to
+// completion), progress, and a hide/unhide control.
+function libraryCardHtml(g, covers, hidden) {
+  const { chapter } = parseKey(g.current.chapter_key);
+  const meta = progressMeta(g.current);
+  const ins = seriesInsights(g);
+  const title = displayTitle(g.series);
+  const cover = covers.get(g.series);
+  const coverHtml = cover
+    ? `<img class="cover" src="${esc(cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+    : `<span class="cover cover-ph">${esc([...title][0] || "?")}</span>`;
+  const badge = ins.complete
+    ? `<span class="badge done" data-testid="completed">Completed</span>`
+    : `<span class="badge">${ins.finished}/${ins.tracked} chapters</span>`;
+  const facts = [
+    ins.firstRead ? `First read ${ins.firstRead}` : null,
+    ins.complete && ins.span ? `Finished in ${ins.span}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const chapterRows = g.chapters
+    .slice()
+    .sort((a, b) => a.chapter_key.localeCompare(b.chapter_key, undefined, { numeric: true }))
+    .map((c) => {
+      const m = progressMeta(c);
       return `
-        <details class="item" data-testid="item">
-          <summary>
-            <div class="row">
-              <div class="grow">
-                <div class="title">${esc(g.series)}</div>
-                ${chapter ? `<div class="chapter">${esc(chapter)}</div>` : ""}
-              </div>
-              <div class="chev" aria-hidden="true">›</div>
-            </div>
-            <div class="meta">
-              <div class="bar"><i style="width:${meta.pct}%"></i></div>
-              <div class="pct">${esc(meta.label)}</div>
-            </div>
-            <div class="ago">${esc(timeAgo(g.current.updated_at))}</div>
-          </summary>
-          <div class="chapters" data-testid="chapters">${chapterRows}</div>
-        </details>`;
+        <button class="sub" data-testid="chapter" data-key="${esc(c.chapter_key)}">
+          <span class="sub-title">${esc(displayTitle(parseKey(c.chapter_key).chapter))}</span>
+          <span class="bar small"><i style="width:${m.pct}%"></i></span>
+          <span class="pct">${esc(m.label)}</span>
+        </button>`;
     })
     .join("");
-  return `<div class="section-label">Continue reading</div><div class="list">${items}</div>`;
+  return `
+    <details class="item" data-testid="item">
+      <summary>
+        <div class="row">
+          ${coverHtml}
+          <div class="grow">
+            <div class="title">${esc(title)}</div>
+            ${chapter ? `<div class="chapter">${esc(displayTitle(chapter))}</div>` : ""}
+            <div class="facts">${badge}${facts ? `<span class="fact">${esc(facts)}</span>` : ""}</div>
+          </div>
+          <button class="hide-btn" data-testid="hide" data-series="${esc(g.series)}" title="${
+            hidden ? "Unhide this title" : "Hide this title"
+          }">${hidden ? "Unhide" : "Hide"}</button>
+          <div class="chev" aria-hidden="true">›</div>
+        </div>
+        <div class="meta">
+          <div class="bar"><i style="width:${meta.pct}%"></i></div>
+          <div class="pct">${esc(meta.label)}</div>
+        </div>
+        <div class="ago">${esc(timeAgo(g.current.updated_at))}</div>
+      </summary>
+      <div class="chapters" data-testid="chapters">${chapterRows}</div>
+    </details>`;
+}
+
+function viewLibrary(groups, covers, hiddenSet, showHidden) {
+  const visible = groups.filter((g) => !hiddenSet.has(g.series));
+  const hiddenGroups = groups.filter((g) => hiddenSet.has(g.series));
+  const items = visible.map((g) => libraryCardHtml(g, covers, false)).join("");
+  const hiddenToggle = hiddenGroups.length
+    ? `<button class="ghost hidden-toggle" data-testid="hidden-toggle">${
+        showHidden ? "Hide" : "Show"
+      } hidden titles (${hiddenGroups.length})</button>`
+    : "";
+  const hiddenItems = showHidden
+    ? `<div class="section-label">Hidden</div><div class="list">${hiddenGroups
+        .map((g) => libraryCardHtml(g, covers, true))
+        .join("")}</div>`
+    : "";
+  return `<div class="section-label">Continue reading</div><div class="list">${items}</div>${hiddenToggle}${hiddenItems}`;
 }
 
 function signOut() {
@@ -586,7 +719,12 @@ function renderDashboard(email, rows) {
   if (!rows.length) {
     body = `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`;
   } else if (tab === "library") {
-    body = viewLibrary(groupBySeries(rows));
+    body = viewLibrary(
+      groupBySeries(rows),
+      state.covers || new Map(),
+      loadHidden(email),
+      !!state.showHidden
+    );
   } else {
     body = viewStats(computeStats(rows), groupBySeries(rows), state.sends);
   }
@@ -617,6 +755,27 @@ function renderDashboard(email, rows) {
     btn.addEventListener("click", () => {
       const key = btn.getAttribute("data-key");
       openReader(key, parseKey(key));
+    });
+  }
+  // Hide/unhide a title (persists per account in this browser); the button
+  // sits inside a <summary>, so stop the click from toggling the card open.
+  for (const btn of app.querySelectorAll('[data-testid="hide"]')) {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const series = btn.getAttribute("data-series");
+      const hidden = loadHidden(email);
+      if (hidden.has(series)) hidden.delete(series);
+      else hidden.add(series);
+      saveHidden(email, hidden);
+      renderDashboard(email, rows);
+    });
+  }
+  const hiddenToggle = app.querySelector('[data-testid="hidden-toggle"]');
+  if (hiddenToggle) {
+    hiddenToggle.addEventListener("click", () => {
+      state.showHidden = !state.showHidden;
+      renderDashboard(email, rows);
     });
   }
   // Send-to-Kobo: enqueue a title, and remove a pending send.
@@ -650,7 +809,9 @@ function renderDashboard(email, rows) {
 // --- reader ---------------------------------------------------------------
 
 async function openReader(chapterKey, { series, chapter }) {
-  const title = chapter ? `${series} · ${chapter}` : series;
+  const title = chapter
+    ? `${displayTitle(series)} · ${displayTitle(chapter)}`
+    : displayTitle(series);
   app.innerHTML = `
     <div class="reader">
       <div class="reader-bar">
@@ -742,6 +903,8 @@ async function showDashboard(session) {
     for (const r of rows) state.resume[r.chapter_key] = r.current_page;
     state.rows = rows;
     state.sends = await fetchSends(session).catch(() => []);
+    // Covers for the library shelf (best-effort decor).
+    state.covers = coverBySeries(await fetchAllChapterPages(session).catch(() => []));
     renderDashboard(email, rows);
   } catch (e) {
     if (String(e.message).includes("401")) {

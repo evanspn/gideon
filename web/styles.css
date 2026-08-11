@@ -157,6 +157,65 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .item > summary::-webkit-details-marker { display: none; }
 .item > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .item .row { display: flex; align-items: flex-start; gap: 10px; }
+
+/* Library cover art: the first published page of the series' first chapter,
+   or a lettered placeholder while nothing is published yet. */
+.item .cover {
+  width: 44px;
+  height: 62px;
+  flex: none;
+  border-radius: 6px;
+  object-fit: cover;
+  background: var(--bar-bg, rgba(127, 127, 127, 0.15));
+}
+.item .cover-ph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 22px;
+  color: var(--muted);
+}
+
+/* Per-series insight line: completion badge + first-read / time-to-finish. */
+.item .facts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.item .badge {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.item .badge.done {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.item .fact { font-size: 12px; color: var(--muted); }
+
+/* Hide/unhide control on each card. */
+.item .hide-btn {
+  flex: none;
+  font-size: 12px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.item .hide-btn:hover { border-color: var(--muted); }
+.hidden-toggle {
+  display: block;
+  margin: 14px auto 0;
+  font-size: 13px;
+}
 .item .grow { flex: 1; min-width: 0; }
 .item .title { font-weight: 600; letter-spacing: -0.01em; }
 .item .chapter { color: var(--muted); font-size: 14px; margin-top: 1px; }

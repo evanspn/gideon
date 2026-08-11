@@ -3641,6 +3641,40 @@ fn long_press_on_an_available_source_is_just_a_tap() {
     assert!(app.gateway().uninstalled.borrow().is_empty());
 }
 
+// --- title display cleanup ---
+
+#[test]
+fn tidy_title_collapses_sanitizer_underscores() {
+    // "Frieren: Beyond Journey's End" was stored as
+    // "Frieren_ Beyond Journey_s End" by the FAT32 sanitizer.
+    assert_eq!(
+        tidy_title("Frieren_ Beyond Journey_s End"),
+        "Frieren Beyond Journey s End"
+    );
+    assert_eq!(tidy_title("One___Piece"), "One Piece");
+    assert_eq!(tidy_title("_Judge_"), "Judge");
+    // Unicode passes through untouched.
+    assert_eq!(tidy_title("ジャッジ"), "ジャッジ");
+    // All-underscore names keep their original form instead of vanishing.
+    assert_eq!(tidy_title("___"), "___");
+}
+
+#[test]
+fn entry_and_card_titles_are_tidied() {
+    assert_eq!(
+        entry_title("Dr. STONE_ reboot/vol_1.cbz"),
+        "Dr. STONE reboot — vol 1"
+    );
+    let card = SeriesCard {
+        series: Some("Kaguya-sama_ Love Is War".into()),
+        chapters: vec![LibraryEntry {
+            path: PathBuf::from("/lib/Kaguya-sama_ Love Is War/ch1.cbz"),
+            relative_path: "Kaguya-sama_ Love Is War/ch1.cbz".into(),
+        }],
+    };
+    assert_eq!(card.title(), "Kaguya-sama Love Is War");
+}
+
 // --- settings screen ---
 
 #[test]
