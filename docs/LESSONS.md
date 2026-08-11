@@ -147,11 +147,37 @@ and nickel's process age), and after gideon exits it restores a parked
 `libnm.so` before nickel — or the reboot fallback — comes up, so even a
 tripped failsafe self-heals instead of silently removing NickelMenu.
 
-**Verified internals** (NickelHook `nh.c`, which NickelMenu builds on): at
-library load the failsafe renames `libnm.so` → `libnm.so.failsafe`; a
-detached thread renames it back `failsafe_delay` (= 3 for NickelMenu)
-seconds *after init completes*. There is no marker file beyond the parked
-library itself, and a trip means "the rename-back never ran".
+**Verified internals** — primary sources, so future fixes don't run on
+folklore (all in [pgaskin/NickelHook](https://github.com/pgaskin/NickelHook)
+`nh.c` and [pgaskin/NickelMenu](https://github.com/pgaskin/NickelMenu)
+unless noted):
+
+- `nh_init` is `__attribute__((constructor))` (`nh.c`, declaration block),
+  so the failsafe arms when nickel's Qt plugin loader dlopens the library.
+- Install path `/usr/local/Kobo/imageformats/libnm.so`: `NickelHook.mk`,
+  `KOBOROOT += $(LIBRARY):/usr/local/Kobo/imageformats/...`.
+- `nh_failsafe_create` parks the lib: `rename(orig, orig.failsafe)`.
+- Disarm: `nh_failsafe_destroy(fs, failsafe_delay)` at the end of
+  `nh_init` — reached from the success *and* the error label — spawns a
+  detached thread that sleeps then renames back; a failed rename-back only
+  logs (so our restoring first is harmless). NickelMenu sets
+  `failsafe_delay = 3` (`nickelmenu.cc`).
+- A trip means "the disarm thread never fired". Nothing else restores the
+  library; explicit uninstall is a separate flag file
+  (`/mnt/onboard/.adds/nm/uninstall`).
+- The reference nickel restart (KOReader `platform/kobo/nickel.sh`)
+  launches hindenburg + nickel + `udevadm trigger` only — it kills
+  `sickel` on entry (`koreader.sh`) and never restarts it. gideon now
+  matches; relaunching sickel ourselves was an unsourced deviation.
+- **The reboot that actually strands the failsafe** (gideon issue #120):
+  on the MediaTek Libra Colour family, exiting a reader app to Nickel
+  with a Bluetooth device still connected can spontaneously reboot the
+  device (koreader/koreader#12739 — clean exit logs, then a reboot;
+  pgaskin/NickelMenu#220 reports the resulting NickelMenu loss). No
+  in-script babysitter survives a reboot, so the launcher now soft-blocks
+  the BT radio before restarting nickel, via the kernel's stable rfkill
+  sysfs ABI (`Documentation/ABI/stable/sysfs-class-rfkill`); Nickel
+  re-enables Bluetooth itself on next use.
 
 That exposed a second hole, hit after the first guard shipped: the window
 re-arms on OUR restart too. When gideon exits and relaunches nickel in
