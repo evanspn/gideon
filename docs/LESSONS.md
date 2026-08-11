@@ -169,6 +169,15 @@ unless noted):
   launches hindenburg + nickel + `udevadm trigger` only — it kills
   `sickel` on entry (`koreader.sh`) and never restarts it. gideon now
   matches; relaunching sickel ourselves was an unsourced deviation.
+- **The reboot that actually strands the failsafe** (gideon issue #120):
+  on the MediaTek Libra Colour family, exiting a reader app to Nickel
+  with a Bluetooth device still connected can spontaneously reboot the
+  device (koreader/koreader#12739 — clean exit logs, then a reboot;
+  pgaskin/NickelMenu#220 reports the resulting NickelMenu loss). No
+  in-script babysitter survives a reboot, so the launcher now soft-blocks
+  the BT radio before restarting nickel, via the kernel's stable rfkill
+  sysfs ABI (`Documentation/ABI/stable/sysfs-class-rfkill`); Nickel
+  re-enables Bluetooth itself on next use.
 
 That exposed a second hole, hit after the first guard shipped: the window
 re-arms on OUR restart too. When gideon exits and relaunches nickel in
