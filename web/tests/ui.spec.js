@@ -257,6 +257,7 @@ test("the Library tab shows the continue-reading list", async ({ page }) => {
   await page.goto("/");
   await fillAndSubmit(page);
   await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
 
   await expect(page.getByText("Continue reading")).toBeVisible();
   const items = page.getByTestId("item");
@@ -264,6 +265,40 @@ test("the Library tab shows the continue-reading list", async ({ page }) => {
   await expect(items.nth(0)).toContainText("One Piece");
   await expect(items.nth(0)).toContainText("11/20");
   await expect(items.nth(1)).toContainText("Naruto");
+});
+
+test("the Library tab defaults to the cover shelf and a tile opens the reader", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  // Grid by default: one tile per series, no list cards.
+  await expect(page.getByTestId("shelf")).toBeVisible();
+  await expect(page.getByTestId("tile")).toHaveCount(2);
+  await expect(page.getByTestId("item")).toHaveCount(0);
+  await expect(page.getByTestId("tile").nth(0)).toContainText("One Piece");
+
+  // Tapping a tile goes straight to the reader for the current chapter.
+  await page.getByTestId("tile").first().click();
+  await expect(page.getByTestId("reader-back")).toBeVisible();
+});
+
+test("the library view choice persists across renders", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
+  await expect(page.getByTestId("item")).toHaveCount(2);
+
+  // Leave and come back: still the list view.
+  await page.getByTestId("tab-stats").click();
+  await page.getByTestId("tab-library").click();
+  await expect(page.getByTestId("item")).toHaveCount(2);
+  await expect(page.getByTestId("shelf")).toHaveCount(0);
 });
 
 test("chapters of the same series collapse to one card (most recent)", async ({ page }) => {
@@ -276,6 +311,7 @@ test("chapters of the same series collapse to one card (most recent)", async ({ 
   await page.goto("/");
   await fillAndSubmit(page);
   await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
 
   const items = page.getByTestId("item");
   await expect(items).toHaveCount(2);
@@ -290,6 +326,7 @@ test("progress bar width tracks percent read", async ({ page }) => {
   await page.goto("/");
   await fillAndSubmit(page);
   await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
   const bar = page.getByTestId("item").nth(0).locator("summary .bar > i");
   await expect(bar).toHaveAttribute("style", /width:\s*55%/);
 });
@@ -303,6 +340,7 @@ test("tapping a series card expands its chapter list", async ({ page }) => {
   await page.goto("/");
   await fillAndSubmit(page);
   await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
 
   const card = page.getByTestId("item").first();
   const chapters = card.getByTestId("chapters");
@@ -399,7 +437,7 @@ test("a persisted session skips the sign-in screen", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("heatmap")).toBeVisible();
   await page.getByTestId("tab-library").click();
-  await expect(page.getByTestId("item")).toHaveCount(2);
+  await expect(page.getByTestId("tile")).toHaveCount(2);
 });
 
 // --- UI regression (visual snapshots) -------------------------------------
@@ -425,6 +463,17 @@ test("library tab looks right", async ({ page }) => {
   await page.goto("/");
   await fillAndSubmit(page);
   await page.getByTestId("tab-library").click();
-  await expect(page.getByTestId("item").first()).toBeVisible();
+  await expect(page.getByTestId("tile").first()).toBeVisible();
   await expect(page).toHaveScreenshot("library.png", { maxDiffPixelRatio: 0.02 });
+});
+
+test("library list view looks right", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
+  await expect(page.getByTestId("item").first()).toBeVisible();
+  await expect(page).toHaveScreenshot("library-list.png", { maxDiffPixelRatio: 0.02 });
 });

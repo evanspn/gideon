@@ -226,6 +226,13 @@ function displayTitle(s) {
   return tidy || String(s);
 }
 
+// --- library view (cover shelf by default, list on demand) -----------------
+
+const LIBVIEW_KEY = "gideon.libview";
+function libView() {
+  return localStorage.getItem(LIBVIEW_KEY) === "list" ? "list" : "grid";
+}
+
 // --- hidden titles (per account, local to this browser) --------------------
 
 function hiddenKey(email) {
@@ -684,9 +691,46 @@ function libraryCardHtml(g, covers, hidden) {
     </details>`;
 }
 
-function viewLibrary(groups, covers, hiddenSet, showHidden) {
+// One shelf tile: cover art (or a lettered placeholder), a thin progress
+// bar, a check for completed series, and the title beneath. Tapping opens
+// the series' current chapter in the reader.
+function tileHtml(g, covers) {
+  const title = displayTitle(g.series);
+  const m = progressMeta(g.current);
+  const ins = seriesInsights(g);
+  const cover = covers.get(g.series);
+  const art = cover
+    ? `<img class="tile-cover" src="${esc(cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+    : `<span class="tile-cover tile-ph">${esc([...title][0] || "?")}</span>`;
+  return `
+    <button class="tile" data-testid="tile" data-key="${esc(g.current.chapter_key)}" title="${esc(title)}">
+      <span class="tile-art">
+        ${art}
+        ${ins.complete ? `<span class="tile-done" title="Completed">✓</span>` : ""}
+        <span class="tile-bar"><i style="width:${m.pct}%"></i></span>
+      </span>
+      <span class="tile-title">${esc(title)}</span>
+    </button>`;
+}
+
+function viewLibrary(groups, covers, hiddenSet, showHidden, view) {
   const visible = groups.filter((g) => !hiddenSet.has(g.series));
   const hiddenGroups = groups.filter((g) => hiddenSet.has(g.series));
+  const toggle = `
+    <div class="view-toggle" role="group" aria-label="Library view">
+      <button class="vt ${view === "grid" ? "on" : ""}" data-testid="view-grid" title="Cover shelf">⊞</button>
+      <button class="vt ${view === "list" ? "on" : ""}" data-testid="view-list" title="List">☰</button>
+    </div>`;
+  const head = `<div class="lib-head"><div class="section-label">Continue reading</div>${toggle}</div>`;
+
+  // Default: the cover shelf — a 3-row grid of tiles that scrolls
+  // horizontally, three columns to a screen. Hidden titles are managed
+  // from the list view.
+  if (view === "grid") {
+    const tiles = visible.map((g) => tileHtml(g, covers)).join("");
+    return `${head}<div class="shelf" data-testid="shelf">${tiles}</div>`;
+  }
+
   const items = visible.map((g) => libraryCardHtml(g, covers, false)).join("");
   const hiddenToggle = hiddenGroups.length
     ? `<button class="ghost hidden-toggle" data-testid="hidden-toggle">${
@@ -698,7 +742,7 @@ function viewLibrary(groups, covers, hiddenSet, showHidden) {
         .map((g) => libraryCardHtml(g, covers, true))
         .join("")}</div>`
     : "";
-  return `<div class="section-label">Continue reading</div><div class="list">${items}</div>${hiddenToggle}${hiddenItems}`;
+  return `${head}<div class="list">${items}</div>${hiddenToggle}${hiddenItems}`;
 }
 
 function signOut() {
@@ -723,7 +767,8 @@ function renderDashboard(email, rows) {
       groupBySeries(rows),
       state.covers || new Map(),
       loadHidden(email),
-      !!state.showHidden
+      !!state.showHidden,
+      libView()
     );
   } else {
     body = viewStats(computeStats(rows), groupBySeries(rows), state.sends);
@@ -750,8 +795,19 @@ function renderDashboard(email, rows) {
       renderDashboard(email, rows);
     });
   }
-  // Tapping a chapter (library list or recent-read) opens the reader.
-  for (const btn of app.querySelectorAll('[data-testid="chapter"]')) {
+  // Grid/list view switch, persisted.
+  for (const btn of app.querySelectorAll(".view-toggle .vt")) {
+    btn.addEventListener("click", () => {
+      localStorage.setItem(
+        LIBVIEW_KEY,
+        btn.getAttribute("data-testid") === "view-list" ? "list" : "grid"
+      );
+      renderDashboard(email, rows);
+    });
+  }
+  // Tapping a chapter (library list or recent-read) or a shelf tile opens
+  // the reader.
+  for (const btn of app.querySelectorAll('[data-testid="chapter"], [data-testid="tile"]')) {
     btn.addEventListener("click", () => {
       const key = btn.getAttribute("data-key");
       openReader(key, parseKey(key));
