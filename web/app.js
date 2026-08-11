@@ -144,6 +144,29 @@ async function fetchChapterPages(session, chapterKey) {
   return rows[0]?.page_urls ?? [];
 }
 
+// Remove every synced row for a series (reading progress + published pages).
+// Row-level security already scopes deletes to the signed-in user, so this
+// needs no backend change. The device is untouched — only the synced copy
+// goes, which is exactly what clearing stale rows from an old library needs.
+async function deleteSeries(session, series) {
+  const headers = {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${session.access_token}`,
+  };
+  const filters = [
+    `chapter_key=eq.${encodeURIComponent(series)}`, // a loose root chapter
+    `chapter_key=like.${encodeURIComponent(series + "/*")}`, // series/…
+  ];
+  for (const table of ["reading_progress", "chapter_pages"]) {
+    for (const filter of filters) {
+      await fetch(`${SUPABASE_URL}/rest/v1/${table}?${filter}`, {
+        method: "DELETE",
+        headers,
+      }).catch(() => {});
+    }
+  }
+}
+
 // --- "Send to Kobo" queue -------------------------------------------------
 //
 // The web can't run the Kobo's source search, so we just enqueue a title; the
@@ -667,7 +690,7 @@ function libraryCardHtml(g, covers, hidden) {
     })
     .join("");
   return `
-    <details class="item" data-testid="item">
+    <details class="item" data-testid="item" data-series="${esc(g.series)}">
       <summary>
         <div class="row">
           ${coverHtml}
@@ -745,6 +768,186 @@ function viewLibrary(groups, covers, hiddenSet, showHidden, view) {
   return `${head}<div class="list">${items}</div>${hiddenToggle}${hiddenItems}`;
 }
 
+// --- book action sheet (long press on a tile / list card) ------------------
+//
+// An iOS-style bottom sheet: grouped rounded options over a dimmed backdrop,
+// a separate Cancel, destructive action in red. Everything it offers reuses
+// existing plumbing — open (reader), per-series stats (seriesInsights),
+// hide/unhide (localStorage), and remove (RLS-scoped row deletes).
+
+function closeSheet() {
+  document.getElementById("sheet-backdrop")?.remove();
+}
+
+function sheetHtml(inner) {
+  return `
+    <div class="sheet-backdrop" id="sheet-backdrop" data-testid="sheet">
+      <div class="sheet" role="dialog" aria-modal="true">${inner}</div>
+    </div>`;
+}
+
+function openBookSheet(g, email, rows) {
+  closeSheet();
+  const title = displayTitle(g.series);
+  const hidden = loadHidden(email).has(g.series);
+  const ins = seriesInsights(g);
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    sheetHtml(`
+      <div class="sheet-group">
+        <div class="sheet-head">
+          <div class="sheet-title">${esc(title)}</div>
+          <div class="sheet-sub">${ins.finished}/${ins.tracked} chapters${
+            ins.complete ? " · Completed" : ""
+          }</div>
+        </div>
+        <button class="sheet-btn" data-act="open" data-testid="sheet-open">Open</button>
+        <button class="sheet-btn" data-act="stats" data-testid="sheet-stats">View stats</button>
+        <button class="sheet-btn" data-act="hide" data-testid="sheet-hide">${
+          hidden ? "Unhide title" : "Hide title"
+        }</button>
+        <button class="sheet-btn destructive" data-act="remove" data-testid="sheet-remove">Remove from library</button>
+      </div>
+      <div class="sheet-group">
+        <button class="sheet-btn cancel" data-act="cancel" data-testid="sheet-cancel">Cancel</button>
+      </div>`)
+  );
+  const backdrop = document.getElementById("sheet-backdrop");
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) closeSheet();
+  });
+  backdrop.querySelectorAll(".sheet-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const act = btn.getAttribute("data-act");
+      if (act === "open") {
+        closeSheet();
+        openReader(g.current.chapter_key, parseKey(g.current.chapter_key));
+      } else if (act === "stats") {
+        openStatsSheet(g);
+      } else if (act === "hide") {
+        const set = loadHidden(email);
+        if (set.has(g.series)) set.delete(g.series);
+        else set.add(g.series);
+        saveHidden(email, set);
+        closeSheet();
+        renderDashboard(email, rows);
+      } else if (act === "remove") {
+        openRemoveSheet(g, email, rows);
+      } else {
+        closeSheet();
+      }
+    })
+  );
+}
+
+// Per-series stats: everything the synced rows can answer, in one card.
+function openStatsSheet(g) {
+  closeSheet();
+  const ins = seriesInsights(g);
+  const pages = g.chapters.reduce(
+    (n, c) => n + Math.min(c.current_page + 1, c.total_pages > 0 ? c.total_pages : c.current_page + 1),
+    0
+  );
+  const lastRead = g.chapters.map((c) => c.updated_at).sort().at(-1);
+  const facts = [
+    ["Chapters", `${ins.finished} finished · ${ins.tracked} tracked`],
+    ["Pages read", pages.toLocaleString()],
+    ["First read", ins.firstRead || "—"],
+    ["Last read", lastRead ? timeAgo(lastRead) : "—"],
+    ["Status", ins.complete ? `Completed${ins.span ? ` in ${ins.span}` : ""}` : "In progress"],
+  ];
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    sheetHtml(`
+      <div class="sheet-group">
+        <div class="sheet-head">
+          <div class="sheet-title">${esc(displayTitle(g.series))}</div>
+          <div class="sheet-sub">Reading stats</div>
+        </div>
+        ${facts
+          .map(
+            ([k, v]) => `
+          <div class="sheet-fact" data-testid="sheet-fact">
+            <span class="sf-k">${esc(k)}</span><span class="sf-v">${esc(v)}</span>
+          </div>`
+          )
+          .join("")}
+      </div>
+      <div class="sheet-group">
+        <button class="sheet-btn cancel" data-act="cancel" data-testid="sheet-cancel">Done</button>
+      </div>`)
+  );
+  const backdrop = document.getElementById("sheet-backdrop");
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop || e.target.closest("[data-act=cancel]")) closeSheet();
+  });
+}
+
+// Destructive confirm, iOS-alert style. Removes the synced rows (progress +
+// published pages) for the series and re-renders from the updated local state.
+function openRemoveSheet(g, email, rows) {
+  closeSheet();
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    sheetHtml(`
+      <div class="sheet-group">
+        <div class="sheet-head">
+          <div class="sheet-title">Remove "${esc(displayTitle(g.series))}"?</div>
+          <div class="sheet-sub">Removes this title's synced reading data from the web library. Your Kobo's downloads and progress are untouched.</div>
+        </div>
+        <button class="sheet-btn destructive" data-act="confirm" data-testid="sheet-confirm-remove">Remove</button>
+      </div>
+      <div class="sheet-group">
+        <button class="sheet-btn cancel" data-act="cancel" data-testid="sheet-cancel">Cancel</button>
+      </div>`)
+  );
+  const backdrop = document.getElementById("sheet-backdrop");
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop || e.target.closest("[data-act=cancel]")) closeSheet();
+  });
+  backdrop.querySelector("[data-act=confirm]").addEventListener("click", () => {
+    closeSheet();
+    deleteSeries(state.session, g.series); // fire-and-forget; UI updates now
+    const keep = (r) => parseKey(r.chapter_key).series !== g.series;
+    state.rows = (state.rows || rows).filter(keep);
+    renderDashboard(email, state.rows);
+  });
+}
+
+// Long-press (touch) and right-click both open the sheet; a completed long
+// press swallows the click that follows so the reader doesn't also open.
+function wireBookSheet(el, group, email, rows) {
+  let timer = null;
+  let fired = false;
+  const start = () => {
+    fired = false;
+    timer = setTimeout(() => {
+      fired = true;
+      openBookSheet(group, email, rows);
+    }, 450);
+  };
+  const cancel = () => clearTimeout(timer);
+  el.addEventListener("pointerdown", start);
+  el.addEventListener("pointerup", cancel);
+  el.addEventListener("pointerleave", cancel);
+  el.addEventListener("pointermove", cancel);
+  el.addEventListener(
+    "click",
+    (e) => {
+      if (fired) {
+        e.preventDefault();
+        e.stopPropagation();
+        fired = false;
+      }
+    },
+    true
+  );
+  el.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openBookSheet(group, email, rows);
+  });
+}
+
 function signOut() {
   clearSession();
   state.session = null;
@@ -794,6 +997,20 @@ function renderDashboard(email, rows) {
       state.tab = b.getAttribute("data-tab");
       renderDashboard(email, rows);
     });
+  }
+  // Long-press (or right-click) a tile / list card for the book action
+  // sheet (open, stats, hide, remove).
+  {
+    const groups = groupBySeries(rows);
+    const bySeries = new Map(groups.map((g) => [g.series, g]));
+    for (const tile of app.querySelectorAll('[data-testid="tile"]')) {
+      const g = bySeries.get(parseKey(tile.getAttribute("data-key")).series);
+      if (g) wireBookSheet(tile, g, email, rows);
+    }
+    for (const item of app.querySelectorAll('[data-testid="item"]')) {
+      const g = bySeries.get(item.getAttribute("data-series"));
+      if (g) wireBookSheet(item.querySelector("summary"), g, email, rows);
+    }
   }
   // Grid/list view switch, persisted.
   for (const btn of app.querySelectorAll(".view-toggle .vt")) {

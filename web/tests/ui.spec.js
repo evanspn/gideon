@@ -301,6 +301,78 @@ test("the library view choice persists across renders", async ({ page }) => {
   await expect(page.getByTestId("shelf")).toHaveCount(0);
 });
 
+test("long-press sheet: right-click a tile opens the book actions", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  await page.getByTestId("tile").first().click({ button: "right" });
+  await expect(page.getByTestId("sheet")).toBeVisible();
+  await expect(page.getByTestId("sheet-open")).toBeVisible();
+  await expect(page.getByTestId("sheet-stats")).toBeVisible();
+  await expect(page.getByTestId("sheet-hide")).toBeVisible();
+  await expect(page.getByTestId("sheet-remove")).toBeVisible();
+  await page.getByTestId("sheet-cancel").click();
+  await expect(page.getByTestId("sheet")).toHaveCount(0);
+});
+
+test("book sheet: View stats shows the per-series numbers", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, STATS_ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  await page.getByTestId("tile").first().click({ button: "right" });
+  await page.getByTestId("sheet-stats").click();
+  const facts = page.getByTestId("sheet-fact");
+  await expect(facts.filter({ hasText: "Chapters" })).toContainText("3 finished · 3 tracked");
+  await expect(facts.filter({ hasText: "Status" })).toContainText("Completed");
+});
+
+test("book sheet: Remove deletes the synced rows and drops the card", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  const deletes = [];
+  await page.route("**/rest/v1/reading_progress**", (route) => {
+    if (route.request().method() === "DELETE") {
+      deletes.push(route.request().url());
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) });
+  });
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  await expect(page.getByTestId("tile")).toHaveCount(2);
+  await page.getByTestId("tile").first().click({ button: "right" });
+  await page.getByTestId("sheet-remove").click();
+  await page.getByTestId("sheet-confirm-remove").click();
+
+  await expect(page.getByTestId("tile")).toHaveCount(1);
+  await expect(page.getByTestId("tile").first()).toContainText("Naruto");
+  await expect
+    .poll(() => deletes.some((u) => u.includes("chapter_key=like.One%20Piece")))
+    .toBeTruthy();
+});
+
+test("book sheet works from the list view too", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
+
+  await page.getByTestId("item").first().locator("summary").click({ button: "right" });
+  await expect(page.getByTestId("sheet")).toBeVisible();
+  await page.getByTestId("sheet-hide").click();
+  await expect(page.getByTestId("item")).toHaveCount(1);
+});
+
 test("chapters of the same series collapse to one card (most recent)", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, [
