@@ -155,22 +155,15 @@ rm -f /tmp/nickel-hardware-status
 /mnt/onboard/.adds/gideon/bin/gideon browse --library /mnt/onboard/Manga \
     >>/mnt/onboard/.adds/gideon/browse.log 2>&1
 
-# Power the Bluetooth radio down BEFORE handing control back to Nickel: on
-# the MediaTek Libra Colour family, exiting a reader app to Nickel with a
-# BT device still connected can spontaneously reboot the whole device
-# (koreader/koreader#12739 — clean exit logs, then a reboot; also reported
-# as the NickelMenu-entry killer in pgaskin/NickelMenu#220 and gideon
-# issue #120). That reboot is unsurvivable for the failsafe babysitter
-# below, so prevention is the only defense. Soft-block via the kernel's
-# stable rfkill sysfs ABI (Documentation/ABI/stable/sysfs-class-rfkill:
-# writing 0 to `state` = soft blocked); Nickel re-enables the radio itself
-# when the user next uses Bluetooth.
-for rf in /sys/class/rfkill/rfkill*; do
-    [ -e "$rf/type" ] || continue
-    if [ "$(cat "$rf/type" 2>/dev/null)" = "bluetooth" ]; then
-        echo 0 > "$rf/state" 2>/dev/null
-    fi
-done
+# Bluetooth is deliberately NOT touched here. The rfkill soft-block that
+# briefly lived at this spot (PR #121, for the exit-with-BT-connected
+# reboot in koreader/koreader#12739 / issue #120) ran on EVERY exit and
+# made things worse in the field — constant crashes on exit, reported on
+# the Libra Colour 2 — so radio manipulation is off the table. The
+# platform reboot risk when a BT device is connected at exit is upstream
+# (it reproduces in KOReader too, without any rfkill writes); NickelMenu
+# survival is instead protected by the failsafe guard/heal/babysit in
+# this script, which are plain file checks and renames.
 
 # Recover the stock UI in place; flush writes first. If the failsafe
 # tripped anyway (a race, or an older gideon killed nickel inside the
