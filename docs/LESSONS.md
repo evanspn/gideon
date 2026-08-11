@@ -146,3 +146,18 @@ armed (it waits, bounded at ~25 s, checking both the parked-library marker
 and nickel's process age), and after gideon exits it restores a parked
 `libnm.so` before nickel — or the reboot fallback — comes up, so even a
 tripped failsafe self-heals instead of silently removing NickelMenu.
+
+**Verified internals** (NickelHook `nh.c`, which NickelMenu builds on): at
+library load the failsafe renames `libnm.so` → `libnm.so.failsafe`; a
+detached thread renames it back `failsafe_delay` (= 3 for NickelMenu)
+seconds *after init completes*. There is no marker file beyond the parked
+library itself, and a trip means "the rename-back never ran".
+
+That exposed a second hole, hit after the first guard shipped: the window
+re-arms on OUR restart too. When gideon exits and relaunches nickel in
+place, NickelMenu parks the library again — and the launcher used to exit
+as soon as `pidof nickel` succeeded, i.e. *inside* that window. If nickel
+then crashed (or `sickel`, the FW5 watchdog we also relaunch, culled it),
+the library stayed parked with nobody left to restore it. The launcher now
+babysits the restart: it only exits once `libnm.so.failsafe` is gone, and
+if nickel dies first it restores the library and reboots (~30 s bound).

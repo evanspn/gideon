@@ -170,4 +170,34 @@ while ! pidof nickel >/dev/null 2>&1; do
     usleep 250000 2>/dev/null || sleep 1
 done
 
+# Nickel is up — but NickelMenu's failsafe is armed again: at library load
+# it parks libnm.so at libnm.so.failsafe and only renames it back ~3 s
+# after its init finishes (NickelHook nh.c, failsafe_delay=3). If nickel
+# dies inside that window — a crash, or sickel's watchdog culling it —
+# the library stays parked and NickelMenu has "uninstalled itself" come
+# the next boot, with nobody left to notice. So don't exit yet: babysit
+# the window until the failsafe disarms, and restore the library ourselves
+# if nickel dies first (or the disarm never comes within ~30 s).
+i=0
+while [ -e "$NM_LIB.failsafe" ]; do
+    i=$((i + 1))
+    if [ "$i" -ge 120 ]; then
+        # Init hung with the failsafe still armed: keep NickelMenu alive
+        # (a double restore is harmless — NM's own rename just no-ops).
+        nm_failsafe_heal
+        break
+    fi
+    if ! pidof nickel >/dev/null 2>&1; then
+        # Nickel died inside its window: restore the library, then reboot —
+        # a clean boot reliably brings the stock UI back with NickelMenu
+        # intact.
+        nm_failsafe_heal
+        sync
+        sleep 1
+        reboot
+        exit 0
+    fi
+    usleep 250000 2>/dev/null || sleep 1
+done
+
 exit 0
