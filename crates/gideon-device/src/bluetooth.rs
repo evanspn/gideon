@@ -218,6 +218,45 @@ fn restore_blocking() {
     }
 }
 
+/// Hand the Bluetooth stack back to Nickel in the state Nickel left it.
+/// Called on the way out of the app (before the launcher restarts Nickel):
+/// if a suspend powered the stack down and no wake restore finished the
+/// job, Nickel would come up believing Bluetooth is on while the stack is
+/// actually dead underneath — and toggling Bluetooth from its settings can
+/// then crash the device. Bounded (~8s) and best-effort: waits briefly for
+/// an in-flight restore thread, then powers the stack back up itself if
+/// still owed. This runs through the same D-Bus management interface as
+/// the rest of this module — it is a *state handover*, not the rfkill
+/// radio-kill that PR #121 shipped and PR #122 reverted.
+pub fn restore_for_exit() {
+    if !on_device() {
+        return;
+    }
+    SUSPENDING.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    // Let a running restore thread finish first — it may complete the
+    // handover for us (and re-arms RESUME_PENDING if it fails).
+    while RECONNECTING.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !RESUME_PENDING.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!("gideon bluetooth: restoring power for the Nickel handover");
+    while std::time::Instant::now() < deadline {
+        power_on();
+        if is_powered() {
+            eprintln!("gideon bluetooth: handover restore complete");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!("gideon bluetooth: handover restore did not complete in time");
+}
+
 /// Parse a `dbus-send --print-reply` `GetManagedObjects` reply into the
 /// object paths of the *paired* devices. The reply lists each device as
 /// `object path "/org/bluez/hci0/dev_..."` followed by its properties as

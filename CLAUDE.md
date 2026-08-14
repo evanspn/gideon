@@ -10,7 +10,14 @@ the stack's own D-Bus interface (`com.kobo.mtk.bluedroid`,
 kobo.koplugin uses. Power down before suspend, power up + `Device1.Connect`
 paired devices after wake (`GIDEON_SUSPEND_BT=0` opts out). The MTK BT stack
 needs the shared Wi-Fi radio up to start, so the wake path ties the two
-restores together.
+restores together. On exit, `bluetooth::restore_for_exit` (main.rs + the
+panic hook) powers the stack back up if a suspend left it down, so Nickel
+gets the radios back in the state it left them — a state handover via the
+same D-Bus interface, still never rfkill/sysfs.
+
+Crashes: panics and fatal errors draw a smiley crash screen and append
+details to `/mnt/onboard/.adds/gideon/crash.log` (`install_panic_screen`
+/ `show_fatal_on_display` in gideon-app/src/main.rs).
 
 How it works:
 - A paired BT page-turn remote shows up as a Linux evdev node. Device discovery

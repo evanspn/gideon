@@ -619,6 +619,12 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     // writes the new binary to the same place.
     let restart_exe = std::env::current_exe().ok().map(sanitize_exe_path);
 
+    // Panics must never leave the user staring at a frozen page: log the
+    // full panic to crash.log, hand the Bluetooth stack back to Nickel,
+    // and put the crash screen (smiley + details) on the panel before the
+    // process dies and the launcher restarts Nickel.
+    install_panic_screen();
+
     // OTA updates only replace the binary: self-heal the launcher script
     // and NickelMenu entries on every browse startup, best-effort — the UI
     // must come up regardless.
@@ -718,8 +724,15 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
                 panic_message(payload.as_ref())
             ))
         });
+    // Whatever happens next — clean close, error screen, or a restart that
+    // fails and falls through to the launcher — leave the Bluetooth stack
+    // the way Nickel expects it (bounded, no-op unless a suspend left it
+    // powered down). Restart re-execs gideon, but the in-memory "we owe a
+    // restore" flag would not survive the exec, so hand over here too.
+    gideon_device::bluetooth::restore_for_exit();
     match &result {
         Err(e) => {
+            log_crash(&format!("gideon stopped:\n{e:#}"));
             // The UiApp owns the display; reopen for the error screen.
             if let Ok(mut d) = KoboDisplay::open() {
                 show_fatal_on_display(&mut d, &format!("gideon stopped:\n{e:#}"));
@@ -830,8 +843,19 @@ fn show_fatal_on_display(display: &mut impl gideon_device::Display, message: &st
 
     let (w, h) = (display.width(), display.height());
     let mut page = GrayPage::new_white(w, h);
-    draw_text(&mut page, 40, 60, 34.0, "gideon error", w - 80, true);
-    let mut y = 130;
+    // The friendly face first — something went wrong, but the device is
+    // fine and Nickel is coming right back.
+    draw_text(&mut page, 40, 130, 120.0, ":)", w - 80, true);
+    draw_text(
+        &mut page,
+        40,
+        230,
+        34.0,
+        "gideon ran into a problem",
+        w - 80,
+        true,
+    );
+    let mut y = 300;
     for line in message.lines().flat_map(|l| {
         // crude wrap at ~46 chars so long errors stay on screen
         l.as_bytes()
@@ -850,13 +874,55 @@ fn show_fatal_on_display(display: &mut impl gideon_device::Display, message: &st
         40,
         h - 70,
         24.0,
-        "Also logged to .adds/gideon/browse.log — returning to the Kobo home screen.",
+        "Details in .adds/gideon/crash.log — returning to the Kobo home screen.",
         w - 80,
         false,
     );
     let _ = display.blit(&page, 0);
     let _ = display.flush(gideon_device::RefreshMode::Full);
-    std::thread::sleep(std::time::Duration::from_secs(20));
+    // Long enough to read/photograph, short enough that exiting doesn't
+    // feel broken (this delay is part of the perceived exit time).
+    std::thread::sleep(std::time::Duration::from_secs(10));
+}
+
+/// Where crash details are written so the crash screen can point at a
+/// stable, user-visible path.
+#[cfg(feature = "kobo")]
+const CRASH_LOG: &str = "/mnt/onboard/.adds/gideon/crash.log";
+
+/// Append a crash report (panic or fatal error) to [`CRASH_LOG`],
+/// best-effort. Keeps the file from growing without bound by truncating
+/// it once it passes ~256 KB — the newest crash is the one that matters.
+#[cfg(feature = "kobo")]
+fn log_crash(report: &str) {
+    use std::io::Write;
+    let truncate = std::fs::metadata(CRASH_LOG).is_ok_and(|m| m.len() > 256 * 1024);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(!truncate)
+        .truncate(truncate)
+        .write(true)
+        .open(CRASH_LOG);
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "==== gideon crash ====\n{report}\n");
+    }
+}
+
+/// Chain crash-log capture onto the panic hook: every panic (any thread)
+/// lands in [`CRASH_LOG`] with a backtrace. Logging only — a background
+/// thread's panic doesn't kill the app, so the hook must not draw over a
+/// live screen or touch the Bluetooth stack; the main thread's crash
+/// screen and Nickel handover run on the `catch_unwind` exit path in
+/// `cmd_browse`, where the app is genuinely done.
+#[cfg(feature = "kobo")]
+fn install_panic_screen() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log_crash(&format!("{info}\n\nbacktrace:\n{backtrace}"));
+        // Keep the earlier hook's stderr line for browse.log.
+        previous_hook(info);
+    }));
 }
 
 #[cfg(not(feature = "kobo"))]
