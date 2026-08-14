@@ -167,7 +167,12 @@ fn read_buffer(
             };
 
             if size <= buffer.len() {
-                write_bytes(&memory, &mut caller, &buffer, offset).expect("REASON");
+                // The guest picked the offset; an out-of-bounds write target
+                // is its bug, not a host panic.
+                if write_bytes(&memory, &mut caller, &buffer, offset).is_none() {
+                    eprintln!("read_buffer: memory write failed (offset {offset} out of bounds)");
+                    return Ok(-1);
+                }
             };
         }
         Err(error) => {

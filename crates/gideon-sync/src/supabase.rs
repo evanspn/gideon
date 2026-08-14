@@ -213,7 +213,7 @@ impl AuthClient {
     pub fn new(config: SupabaseConfig) -> Self {
         Self {
             config,
-            agent: ureq::Agent::new(),
+            agent: sync_agent(),
         }
     }
 
@@ -258,7 +258,7 @@ impl SupabaseTransport {
         Self {
             config,
             access_token,
-            agent: ureq::Agent::new(),
+            agent: sync_agent(),
         }
     }
 
@@ -337,6 +337,17 @@ impl ProgressTransport for SupabaseTransport {
         }
         Ok(())
     }
+}
+
+/// A `ureq` agent with connect/overall timeouts: sync runs on a background
+/// thread guarded by an in-flight flag, so a request that never completes
+/// (captive portal, half-open TCP after an AP handoff) would otherwise wedge
+/// that thread — and with it every future sync — until the app restarts.
+fn sync_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
 }
 
 /// Turn a `ureq` result into an error on any non-2xx status, attaching the

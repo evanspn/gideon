@@ -86,6 +86,17 @@ fn new_context(mut caller: Caller<'_, WasmStore>, width: f32, height: f32) -> Re
     if width <= 0.0 || height <= 0.0 {
         bail!("Invalid bougus")
     }
+    // Guest-controlled dimensions: an absurd canvas (NaN/huge) would try to
+    // allocate width*height*4 bytes and OOM-kill the process on the device.
+    // Cap side length and total area (32 M px = 128 MiB of ARGB) instead.
+    if !width.is_finite()
+        || !height.is_finite()
+        || width > 8192.0
+        || height > 8192.0
+        || width * height > 32_000_000.0
+    {
+        bail!("canvas dimensions too large: {width}x{height}")
+    }
 
     Ok(store.create_canvas(width, height) as i32)
 }
@@ -490,9 +501,11 @@ fn get_image_data(mut caller: Caller<'_, WasmStore>, img_id: i32) -> Result<i32>
         let mut png_data: Vec<u8> = Vec::<u8>::new();
         let encoder = PngEncoder::new(&mut png_data);
 
+        // A guest-supplied image whose data length doesn't match its claimed
+        // dimensions must fail the call, not panic the host.
         encoder
             .write_image(&rgba_pixels, width, height, ColorType::Rgba8.into())
-            .expect("PNG encode failed");
+            .map_err(|e| anyhow::anyhow!("PNG encode failed: {e}"))?;
 
         png_data
     };

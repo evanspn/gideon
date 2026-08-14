@@ -37,7 +37,12 @@ fn print(caller: Caller<'_, WasmStore>, string: Option<String>) -> Result<()> {
 }
 #[aidoku_wasm_function]
 pub fn sleep(_caller: Caller<'_, WasmStore>, seconds: i32) {
-    std::thread::sleep(std::time::Duration::from_secs(seconds as u64));
+    // Guest-controlled: the UI thread blocks on source calls, so an
+    // unclamped (or negative → huge u64) sleep would freeze the app for as
+    // long as the source likes. 30s is plenty for legitimate rate-limiting.
+    std::thread::sleep(std::time::Duration::from_secs(
+        seconds.clamp(0, 30) as u64
+    ));
 }
 #[aidoku_wasm_function]
 fn send_partial_result(mut _caller: Caller<'_, WasmStore>, _i: i32) -> Result<()> {
