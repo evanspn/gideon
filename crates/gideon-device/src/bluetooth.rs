@@ -46,6 +46,13 @@ static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
 /// A resume is already running in a background thread (debounced wakes).
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
 
+/// A suspend is in progress: the restore thread must stop powering the
+/// stack up (a quick sleep–wake–sleep could otherwise race a lingering
+/// restore into re-powering Bluetooth right as the kernel suspends —
+/// exactly the unclean state this module exists to prevent). Set by
+/// [`power_down_for_suspend`], cleared by [`reconnect_after_wake`].
+static SUSPENDING: AtomicBool = AtomicBool::new(false);
+
 /// How long the post-wake enable keeps retrying. Wi-Fi restore (which the
 /// MTK BT stack piggybacks on) can itself take ~15s.
 const RESUME_RETRY_FOR: Duration = Duration::from_secs(20);
@@ -118,7 +125,15 @@ fn power_off() {
 /// [`reconnect_after_wake`] will then power it back up. No-op (and `false`)
 /// off-device, when opted out, or when Bluetooth is already off.
 pub fn power_down_for_suspend() -> bool {
-    if !on_device() || opted_out() || !is_powered() {
+    if !on_device() || opted_out() {
+        return false;
+    }
+    // Stop any in-flight restore thread first, even when the adapter reads
+    // as off right now (a restore mid-retry keeps calling power-on and must
+    // not do so into the suspend). A pending-but-unfinished restore keeps
+    // its RESUME_PENDING, so the next wake picks it back up.
+    SUSPENDING.store(true, Ordering::SeqCst);
+    if !is_powered() {
         return false;
     }
     power_off();
@@ -139,11 +154,15 @@ pub fn resume_pending() -> bool {
 /// own instead of needing a trip to Nickel. Runs in a background thread;
 /// returns immediately. No-op when nothing is pending.
 pub fn reconnect_after_wake() {
+    SUSPENDING.store(false, Ordering::SeqCst);
     if !RESUME_PENDING.swap(false, Ordering::SeqCst) {
         return;
     }
     if RECONNECTING.swap(true, Ordering::SeqCst) {
-        // A previous wake's restore is still running; let it finish.
+        // A previous wake's restore is still running; re-arm so this
+        // wake's restore isn't lost if that thread's window has expired —
+        // the next wake (or the running thread) will service it.
+        RESUME_PENDING.store(true, Ordering::SeqCst);
         return;
     }
     let spawned = std::thread::Builder::new()
@@ -153,8 +172,10 @@ pub fn reconnect_after_wake() {
             RECONNECTING.store(false, Ordering::SeqCst);
         });
     if spawned.is_err() {
+        // Never restore inline — this is the UI thread and the retry loop
+        // can block for many seconds. Re-arm and let the next wake try.
         RECONNECTING.store(false, Ordering::SeqCst);
-        restore_blocking();
+        RESUME_PENDING.store(true, Ordering::SeqCst);
     }
 }
 
@@ -164,12 +185,24 @@ pub fn reconnect_after_wake() {
 fn restore_blocking() {
     let deadline = std::time::Instant::now() + RESUME_RETRY_FOR;
     loop {
+        if SUSPENDING.load(Ordering::SeqCst) {
+            // A new suspend started while we were restoring: stop powering
+            // the stack up into it, and leave the restore pending so the
+            // wake that follows finishes the job.
+            RESUME_PENDING.store(true, Ordering::SeqCst);
+            eprintln!("gideon bluetooth: restore paused by a new suspend");
+            return;
+        }
         power_on();
         if is_powered() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("gideon bluetooth: adapter did not power up after wake");
+            // Give up for now but re-arm: the next wake retries instead of
+            // leaving Bluetooth off forever. A few dbus calls per wake
+            // against a genuinely dead chip is the cheap side of that trade.
+            RESUME_PENDING.store(true, Ordering::SeqCst);
+            eprintln!("gideon bluetooth: adapter did not power up; will retry on next wake");
             return;
         }
         std::thread::sleep(Duration::from_secs(1));
