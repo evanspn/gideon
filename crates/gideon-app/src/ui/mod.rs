@@ -1141,9 +1141,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // for the next network action. A FAILED suspend also took the radio
         // down before dying, so restore it even with auto-connect off — the
         // user turned off auto-connect, not the radio.
-        if self.wifi_auto_connect || result.is_err() {
+        // Bluetooth (if it was on) also needs Wi-Fi: the MTK BT stack rides
+        // the shared radio, so its restore below depends on this bring-up.
+        if self.wifi_auto_connect || result.is_err() || gideon_device::bluetooth::resume_pending() {
             gideon_device::network::reconnect_after_wake();
         }
+        // Restore Bluetooth and re-connect the page-turn remote (detached,
+        // no-op unless the suspend powered it down).
+        gideon_device::bluetooth::reconnect_after_wake();
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -3749,9 +3754,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // user turned auto-connect off. A FAILED suspend also
                         // took the radio down before dying, so restore it even
                         // then: the user turned off auto-connect, not the radio.
-                        if self.wifi_auto_connect || result.is_err() {
+                        // Bluetooth (if it was on) also needs the shared
+                        // radio, so a pending BT resume forces the bring-up.
+                        if self.wifi_auto_connect
+                            || result.is_err()
+                            || gideon_device::bluetooth::resume_pending()
+                        {
                             gideon_device::network::reconnect_after_wake();
                         }
+                        // Restore Bluetooth and re-connect the page-turn
+                        // remote (detached, no-op unless suspend took it down).
+                        gideon_device::bluetooth::reconnect_after_wake();
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
                         }

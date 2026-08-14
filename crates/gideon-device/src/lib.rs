@@ -8,6 +8,7 @@
 
 use gideon_render::{GrayPage, RgbPage};
 
+pub mod bluetooth;
 pub mod input;
 #[cfg(feature = "kobo")]
 pub mod kobo;

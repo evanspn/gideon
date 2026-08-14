@@ -2,9 +2,15 @@
 
 ## Bluetooth
 
-gideon does NOT manage the Bluetooth radio at all — no rfkill, no bluetoothctl,
-no hci*, no sysfs writes. Pairing and radio power are Nickel's job; gideon only
-*reads* already-connected devices.
+gideon does NOT touch the Bluetooth radio at the kernel level — no rfkill, no
+bluetoothctl, no hci*, no sysfs writes. Pairing is Nickel's job; gideon reads
+already-connected devices, and manages BT power ONLY around suspend, ONLY via
+the stack's own D-Bus interface (`com.kobo.mtk.bluedroid`,
+`crates/gideon-device/src/bluetooth.rs`) — the mechanism the field-tested
+kobo.koplugin uses. Power down before suspend, power up + `Device1.Connect`
+paired devices after wake (`GIDEON_SUSPEND_BT=0` opts out). The MTK BT stack
+needs the shared Wi-Fi radio up to start, so the wake path ties the two
+restores together.
 
 How it works:
 - A paired BT page-turn remote shows up as a Linux evdev node. Device discovery

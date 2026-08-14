@@ -117,6 +117,7 @@ impl KoboSuspend {
         // `restore-wifi-async` enable. A live SDIO radio is the classic source
         // of EBUSY and post-resume breakage, and powering off here (rather than
         // power-cycling at resume) is what makes the reconnect reliable.
+        self.bluetooth_down();
         self.wifi_down();
 
         let mut last_err = None;
@@ -167,6 +168,20 @@ impl KoboSuspend {
             crate::network::disable_wifi();
         }
         self.step("wifi down".to_string());
+    }
+
+    /// Cleanly power Bluetooth down before suspending — the same idea as
+    /// [`Self::wifi_down`], one layer over: an MTK suspend kills the BT
+    /// stack uncleanly and the chip doesn't come back usable on resume, so
+    /// a paired page-turn remote never reconnects. Shutting the stack down
+    /// through its own D-Bus interface (see [`crate::bluetooth`]) lets the
+    /// post-wake `bluetooth::reconnect_after_wake` bring it back cleanly
+    /// and re-connect the remote. `GIDEON_SUSPEND_BT=0` opts out; no-op
+    /// when Bluetooth is off. Only touched on real hardware, like Wi-Fi.
+    fn bluetooth_down(&mut self) {
+        if self.root == Path::new("/") && crate::bluetooth::power_down_for_suspend() {
+            self.step("bluetooth down".to_string());
+        }
     }
 
     /// One `1 → settle → sync → mem` attempt. Returns once the device has
