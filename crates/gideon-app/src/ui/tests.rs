@@ -5349,6 +5349,74 @@ fn typing_builds_the_query_with_partial_refreshes() {
 }
 
 #[test]
+fn queued_keyboard_taps_batch_into_one_repaint() {
+    // A burst of taps that queued up behind slow e-ink repaints (frantic
+    // deleting especially) must collapse into ONE edit batch + repaint:
+    // every tap still edits exactly once, but editing stops the moment the
+    // queue is empty — no stale deletes landing after the finger stops.
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(2),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('a')),
+        tap_key(Key::Char('b')),
+        tap_key(Key::Char('c')),
+        tap_key(Key::Backspace),
+        tap_key(Key::Backspace),
+    ];
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(events).with_queued_taps(),
+        search_gateway(),
+        dir.path().to_path_buf(),
+    );
+    app.run().unwrap();
+
+    let Screen::Search { query, .. } = app.screen() else {
+        panic!("expected search screen");
+    };
+    // abc minus two backspaces — each queued tap applied exactly once.
+    assert_eq!(query, "a");
+    // The whole burst repainted once: keyboard-open flush, then a single
+    // partial for the batch.
+    let flushes = &app.display().flushes;
+    assert_eq!(flushes[flushes.len() - 1], RefreshMode::Partial);
+    assert_eq!(
+        flushes[flushes.len() - 2],
+        RefreshMode::Full,
+        "keyboard open"
+    );
+}
+
+#[test]
+fn queued_action_tap_after_edits_still_runs() {
+    // A queued tap on the action key ends the batch and still fires (the
+    // search runs) — batching must not swallow it.
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        tap_row(2),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Char('a')),
+        tap_key(Key::Search),
+    ];
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(events).with_queued_taps(),
+        search_gateway(),
+        dir.path().to_path_buf(),
+    );
+    app.run().unwrap();
+
+    let Screen::MangaList { mangas, .. } = app.screen() else {
+        panic!("expected the search's manga list, got another screen");
+    };
+    assert!(!mangas.is_empty(), "the queued Search tap ran the search");
+}
+
+#[test]
 fn every_eighth_keystroke_flashes_the_panel_clean() {
     let dir = tempfile::tempdir().unwrap();
     let mut events = vec![tap_row(2), tap_row(0), tap_row(2)];

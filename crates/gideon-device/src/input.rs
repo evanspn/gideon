@@ -121,6 +121,11 @@ pub struct FakeInput {
     /// How many `poll_event` calls report a timeout (no event) before the
     /// script continues. Lets tests exercise idle-timeout behavior.
     pub idle_timeouts: usize,
+    /// Whether zero-timeout polls (queue drains, e.g. the keyboard's
+    /// edit batching) see the scripted events. Off by default: scripted
+    /// events model a user tapping at their own pace, with nothing queued
+    /// behind a repaint. Turn on to model a burst of taps that queued up.
+    pub queued_taps: bool,
 }
 
 impl FakeInput {
@@ -133,7 +138,15 @@ impl FakeInput {
             resync: None,
             bluetooth: false,
             idle_timeouts: 0,
+            queued_taps: false,
         }
+    }
+
+    /// Make zero-timeout polls (queue drains) see the scripted events —
+    /// models taps that queued up behind a slow repaint.
+    pub fn with_queued_taps(mut self) -> Self {
+        self.queued_taps = true;
+        self
     }
 
     /// Make the first `count` calls to `poll_event` time out (report no
@@ -164,7 +177,13 @@ impl InputSource for FakeInput {
             .ok_or_else(|| crate::Error::Display("fake input exhausted".to_string()))
     }
 
-    fn poll_event(&mut self, _timeout: std::time::Duration) -> crate::Result<Option<UiEvent>> {
+    fn poll_event(&mut self, timeout: std::time::Duration) -> crate::Result<Option<UiEvent>> {
+        // A zero-timeout poll is a queue drain: by default nothing is
+        // "queued" — scripted events model a user tapping at their own
+        // pace and arrive through the normal waits only.
+        if timeout.is_zero() && !self.queued_taps {
+            return Ok(None);
+        }
         // Scripted timeouts first (idle simulation), then replay the script
         // without sleeping. An exhausted script errors like `next_event` —
         // otherwise a poll loop in the code under test would spin forever.

@@ -2168,10 +2168,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         if let Some(v) = key.and_then(|key| apply_key_edit(email, key, self.keyboard_shift)) {
+            let (v, leftover) = self.drain_keyboard_edits(v);
             if let Some(Screen::AccountEmail { email }) = self.stack.last_mut() {
                 *email = v;
             }
             self.keyboard_repaint()?;
+            self.finish_keyboard_batch(leftover)?;
         }
         Ok(())
     }
@@ -2209,10 +2211,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         if let Some(v) = key.and_then(|key| apply_key_edit(password, key, self.keyboard_shift)) {
+            let (v, leftover) = self.drain_keyboard_edits(v);
             if let Some(Screen::AccountPassword { password, .. }) = self.stack.last_mut() {
                 *password = v;
             }
             self.keyboard_repaint()?;
+            self.finish_keyboard_batch(leftover)?;
         }
         Ok(())
     }
@@ -2238,10 +2242,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         if let Some(q) = key.and_then(|key| apply_key_edit(query, key, self.keyboard_shift)) {
+            let (q, leftover) = self.drain_keyboard_edits(q);
             if let Some(Screen::Search { query, .. }) = self.stack.last_mut() {
                 *query = q;
             }
             self.keyboard_repaint()?;
+            self.finish_keyboard_batch(leftover)?;
         }
         Ok(())
     }
@@ -2261,10 +2267,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         if let Some(n) = key.and_then(|key| apply_key_edit(name, key, self.keyboard_shift)) {
+            let (n, leftover) = self.drain_keyboard_edits(n);
             if let Some(Screen::NewProfile { name }) = self.stack.last_mut() {
                 *name = n;
             }
             self.keyboard_repaint()?;
+            self.finish_keyboard_batch(leftover)?;
         }
         Ok(())
     }
@@ -2283,6 +2291,58 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             RefreshMode::Partial
         };
         self.render_current(mode)
+    }
+
+    /// After one keyboard edit was applied, fold in every tap that queued up
+    /// behind the (slow, e-ink) repaints and apply them to `buffer` too — the
+    /// caller then repaints ONCE for the whole batch. Without this, rapid
+    /// taps (frantic deleting especially) queue a full repaint each and the
+    /// buffer keeps changing long after the finger stops; batched, editing
+    /// tracks the finger and stops the moment tapping stops, like holding
+    /// and releasing a delete key. Each queued tap still edits exactly once —
+    /// nothing auto-repeats. The batch ends at the first event that isn't an
+    /// edit-key tap; that event is returned for [`Self::finish_keyboard_batch`]
+    /// so a queued action tap or a sleep-cover close is not swallowed.
+    fn drain_keyboard_edits(&mut self, mut buffer: String) -> (String, Option<UiEvent>) {
+        loop {
+            match self.input.poll_event(std::time::Duration::ZERO) {
+                Ok(Some(UiEvent::Tap { x, y })) => {
+                    let (mx, my) = self.map_menu_point(x, y);
+                    match self.layout.key_at(mx, my) {
+                        Some(Key::Shift) => self.keyboard_shift = !self.keyboard_shift,
+                        Some(key @ (Key::Char(_) | Key::Space | Key::Backspace)) => {
+                            if let Some(b) = apply_key_edit(&buffer, key, self.keyboard_shift) {
+                                buffer = b;
+                            }
+                        }
+                        // Action key or off-keyboard: end the batch, let the
+                        // caller route it through the normal tap path.
+                        _ => return (buffer, Some(UiEvent::Tap { x, y })),
+                    }
+                }
+                Ok(Some(other)) => return (buffer, Some(other)),
+                // No queued event (or the input source ended): batch done.
+                _ => return (buffer, None),
+            }
+        }
+    }
+
+    /// Handle the event that ended a keyboard edit batch, after the batch
+    /// repaint: a sleep request still sleeps, a tap (the action key, back…)
+    /// goes through the normal tap path. Everything else — a swipe or a
+    /// rotation mid-typing — is dropped, same as the pre-batching behavior
+    /// of those events on keyboard screens.
+    fn finish_keyboard_batch(&mut self, leftover: Option<UiEvent>) -> Result<()> {
+        match leftover {
+            Some(UiEvent::Sleep) => self.sleep_now(),
+            Some(UiEvent::Tap { x, y }) => {
+                let (x, y) = self.map_menu_point(x, y);
+                // Quit flows are unreachable from keyboard screens (quitting
+                // goes through the power menu), so the flow can be dropped.
+                self.handle_tap(x, y).map(|_| ())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// If `key` is Shift, flip the keyboard's case mode and repaint, returning
@@ -3863,10 +3923,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         if let Some(p) = key.and_then(|key| apply_key_edit(password, key, self.keyboard_shift)) {
+            let (p, leftover) = self.drain_keyboard_edits(p);
             if let Some(Screen::WifiPassword { password, .. }) = self.stack.last_mut() {
                 *password = p;
             }
             self.keyboard_repaint()?;
+            self.finish_keyboard_batch(leftover)?;
         }
         Ok(())
     }
