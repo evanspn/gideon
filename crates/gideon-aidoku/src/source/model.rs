@@ -257,7 +257,12 @@ impl Page {
             chapter_id,
             index,
             image_url: match &page.content {
-                aidoku::PageContent::Url(ref url, _) => Some(url::Url::parse(url).unwrap()),
+                // The URL string comes from third-party WASM: a malformed one
+                // must not panic the host — the page just has no image URL
+                // (the reader shows its per-page error path).
+                aidoku::PageContent::Url(ref url, _) => url::Url::parse(url)
+                    .map_err(|e| eprintln!("gideon: source returned invalid page URL {url:?}: {e}"))
+                    .ok(),
                 _ => None,
             },
             base64: None,
@@ -314,5 +319,35 @@ impl Filter {
         match &self {
             Filter::Title(_) => "Title".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Page;
+
+    #[test]
+    fn page_from_keeps_a_valid_url() {
+        let page = aidoku::Page {
+            content: aidoku::PageContent::Url("https://example.com/p/1.jpg".into(), None),
+            ..Default::default()
+        };
+        let page = Page::from(0, page, "src".into(), "ch".into());
+        assert_eq!(
+            page.image_url.map(|u| u.to_string()),
+            Some("https://example.com/p/1.jpg".to_string())
+        );
+    }
+
+    /// A malicious/broken source returning a malformed page URL must not
+    /// panic the host — the page just has no image URL.
+    #[test]
+    fn page_from_survives_an_invalid_url() {
+        let page = aidoku::Page {
+            content: aidoku::PageContent::Url("not a url at all".into(), None),
+            ..Default::default()
+        };
+        let page = Page::from(0, page, "src".into(), "ch".into());
+        assert!(page.image_url.is_none());
     }
 }

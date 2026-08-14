@@ -72,6 +72,12 @@ impl UreqFetcher {
     pub fn new() -> Self {
         let agent = ureq::AgentBuilder::new()
             .user_agent(concat!("gideon/", env!("CARGO_PKG_VERSION")))
+            // Without timeouts a stalled connection (captive portal, AP
+            // handoff mid-request) blocks the calling thread forever — and
+            // several callers sit on the UI thread. Overall cap is generous
+            // for the update bundle on slow hotel Wi-Fi.
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
             .tls_config(std::sync::Arc::new(tls_config()))
             .build();
         Self { agent }

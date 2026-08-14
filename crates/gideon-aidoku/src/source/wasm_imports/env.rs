@@ -52,7 +52,17 @@ fn abort(
     // For some stupid reason, unlike _all_ of the Aidoku WASM function exports, this
     // specifically receives the offsets of the beginning of the stream, and the length comes
     // before the offset (?)
-    let memory = get_memory(&mut caller).unwrap();
+    // A module without an exported memory can still call abort; report it
+    // without the message rather than panicking the host.
+    let Some(memory) = get_memory(&mut caller) else {
+        error!("{}: env.abort called (no guest memory)", caller.data().id);
+        return Err(wasmi::Error::host(AbortError {
+            message: String::new(),
+            file_name: String::new(),
+            line,
+            column,
+        }));
+    };
     let msg_length = read_bytes(&memory, &caller, (msg_offset - 4) as usize, 1)
         .and_then(|bytes| bytes.first().cloned())
         .unwrap_or(0) as usize;

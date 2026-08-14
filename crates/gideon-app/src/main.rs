@@ -179,6 +179,21 @@ enum MangaCommand {
 }
 
 fn main() -> Result<()> {
+    // Any panic must at least land in browse.log with its location — the
+    // default hook's output is fine on a terminal, but on the device stderr
+    // is the only trace of why the app died. The hook runs before unwinding,
+    // so this also covers panics on background threads (which would
+    // otherwise die silently).
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        eprintln!(
+            "gideon: PANIC at {location}: {}",
+            panic_message(info.payload())
+        );
+    }));
     let cli = Cli::parse();
     match cli.command {
         Command::Info { path } => cmd_info(path),
@@ -675,7 +690,7 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     display.set_color_post_process(gideon_device::ColorPostProcess::from_setting(
         &saved.color_post_process,
     ));
-    let result = ui::UiApp::new(display, input, gateway, library)
+    let mut app = ui::UiApp::new(display, input, gateway, library)
         .with_profile(&saved.active_profile)
         .with_reader_settings(fit, rotation)
         .with_sleeper(sleeper)
@@ -683,8 +698,19 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
         .with_settings_dir(data_dir)
         .with_battery(Box::new(gideon_device::power::battery_percent))
         .with_charger(Box::new(gideon_device::power::plugged_in))
-        .with_idle_suspend_minutes(saved.idle_suspend_minutes)
-        .run();
+        .with_idle_suspend_minutes(saved.idle_suspend_minutes);
+    // The UI's contract is "never die on an error", but a bug (or a panic
+    // smuggled out of a dependency) must still not blank the panel and
+    // silently reboot to Nickel: catch the unwind and route it through the
+    // same on-panel error screen a Result error takes. The panic hook above
+    // has already logged the location to browse.log.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.run()))
+        .unwrap_or_else(|payload| {
+            Err(anyhow::anyhow!(
+                "internal error (panic): {} — see browse.log for the location",
+                panic_message(payload.as_ref())
+            ))
+        });
     match &result {
         Err(e) => {
             // The UiApp owns the display; reopen for the error screen.
@@ -761,6 +787,18 @@ impl gideon_device::LightControl for PersistedLights {
     fn set_warmth(&mut self, percent: u8) {
         self.inner.set_warmth(percent);
         self.persist();
+    }
+}
+
+/// Best-effort text of a panic payload (`&str` and `String` cover what
+/// `panic!` and `expect`/`unwrap` produce).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -937,6 +975,20 @@ mod tests {
         ] {
             assert_eq!(sanitize_exe_path(PathBuf::from(path)), PathBuf::from(path));
         }
+    }
+
+    #[test]
+    fn panic_message_reads_str_and_string_payloads() {
+        // Silence the default hook's backtrace chatter for these deliberate
+        // panics; the process-wide hook from main() isn't installed in tests.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(|| panic!("boom")).expect_err("must panic");
+        assert_eq!(panic_message(caught.as_ref()), "boom");
+        let caught = std::panic::catch_unwind(|| panic!("{}", String::from("dynamic")))
+            .expect_err("must panic");
+        assert_eq!(panic_message(caught.as_ref()), "dynamic");
+        std::panic::set_hook(prev);
     }
 
     #[test]
