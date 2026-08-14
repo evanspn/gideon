@@ -96,6 +96,21 @@ pub fn uninstall_source(data_dir: &Path, source_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `gideon source remove <id>` — the CLI face of [`uninstall_source`],
+/// with a name check first so a typo'd id reports "not installed" instead
+/// of silently succeeding.
+pub fn cmd_source_remove(data_dir: &Path, source_id: &str) -> Result<()> {
+    let installed = installed_sources(data_dir)?;
+    let Some(source) = installed.iter().find(|s| s.id == source_id) else {
+        println!("{source_id} is not installed. Installed sources:");
+        return cmd_source_installed(data_dir);
+    };
+    let name = source.name.clone();
+    uninstall_source(data_dir, source_id)?;
+    println!("Removed {name} ({source_id}). Downloaded chapters and progress stay in the library.");
+    Ok(())
+}
+
 pub fn cmd_source_install(data_dir: &Path, source_id: &str) -> Result<()> {
     println!("Downloading {source_id}...");
     let manifest = install_source(data_dir, source_id)?;

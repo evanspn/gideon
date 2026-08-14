@@ -3,3 +3,6 @@
 *.png
 !docs/**/*.png
 .gideon/
+
+# Claude Code agent worktrees (session-local)
+.claude/worktrees/
