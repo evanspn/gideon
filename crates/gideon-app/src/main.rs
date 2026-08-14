@@ -145,6 +145,10 @@ enum SourceCommand {
     Install { source_id: String },
     /// List installed sources.
     Installed,
+    /// Remove an installed source (downloaded chapters and reading
+    /// progress stay in the library). On the device this is also available
+    /// by long-pressing a source on the Sources screen.
+    Remove { source_id: String },
 }
 
 #[derive(Subcommand)]
@@ -207,6 +211,9 @@ fn main() -> Result<()> {
                 manga::cmd_source_install(&data_dir(), &source_id)
             }
             SourceCommand::Installed => manga::cmd_source_installed(&data_dir()),
+            SourceCommand::Remove { source_id } => {
+                manga::cmd_source_remove(&data_dir(), &source_id)
+            }
         },
         Command::Manga(cmd) => match cmd {
             MangaCommand::Search {
