@@ -294,6 +294,53 @@ test("a browse outage shows an inline error with a working Retry", async ({ page
   await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2);
 });
 
+test("a 429 from Jikan is retried once after a pause", async ({ page }) => {
+  await mockSends(page);
+  let topCalls = 0;
+  await page.route(/api\.jikan\.moe/, (route) => {
+    const p = new URL(route.request().url()).pathname;
+    const json = (data) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data }) });
+    if (!p.includes("/top/manga")) return json([]);
+    topCalls++;
+    if (topCalls === 1) {
+      return route.fulfill({
+        status: 429,
+        contentType: "application/json",
+        body: JSON.stringify({ status: 429, message: "You are being rate-limited." }),
+      });
+    }
+    return json(TOP);
+  });
+  await signInAnd(page, "tab-discover");
+
+  // The single transparent retry absorbs the 429 — the user just sees cards.
+  await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2, {
+    timeout: 10000,
+  });
+  expect(topCalls).toBe(2);
+});
+
+test("concurrent features share one Jikan rate limit (requests are spaced)", async ({ page }) => {
+  await mockSends(page);
+  const times = [];
+  await page.route(/api\.jikan\.moe/, (route) => {
+    times.push(Date.now());
+    const p = new URL(route.request().url()).pathname;
+    const data = p.includes("/top/manga") ? TOP : [{ score: 9.2 }];
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data }) });
+  });
+  // Signing in kicks the library-ratings lookup; opening Discover kicks the
+  // browse row — two features hitting Jikan at once. The global limiter must
+  // space them out instead of letting them fire together.
+  await signInAnd(page, "tab-discover");
+  await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2);
+  await expect.poll(() => times.length, { timeout: 10000 }).toBeGreaterThanOrEqual(2);
+
+  const gaps = times.slice(1).map((t, i) => t - times[i]);
+  for (const gap of gaps) expect(gap).toBeGreaterThanOrEqual(300);
+});
+
 test("the browse row arriving does not wipe a half-typed username", async ({ page }) => {
   await mockSends(page);
   // Delay only the browse query so it lands after typing has started.

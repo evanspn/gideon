@@ -248,13 +248,39 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // -- MyAnimeList via Jikan (REST mirror; sequential + throttled) --
 
-async function jikanGet(path) {
-  const res = await fetch(`${JIKAN_URL}/${path}`);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || (data.status && data.status >= 400)) {
-    throw new Error(data.message || `MyAnimeList error (${data.status || res.status})`);
-  }
-  return data.data;
+// One global throttle for every Jikan call in the app. Jikan's per-IP budget
+// is ~3 req/s / 60 req/min; ratings, browse, search and the recommendation
+// flow can all be in flight at once, and if each paces only itself their
+// combined rate blows the budget and everything starts seeing 429s. So: all
+// requests go through one chain, spaced ≥450ms apart, with a single paused
+// retry when a 429 slips through anyway.
+let jikanChain = Promise.resolve();
+let jikanLastAt = 0;
+const JIKAN_GAP_MS = 450;
+
+function jikanGet(path) {
+  const run = jikanChain.then(async () => {
+    const wait = jikanLastAt + JIKAN_GAP_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    let res = await fetch(`${JIKAN_URL}/${path}`);
+    if (res.status === 429) {
+      await sleep(1600);
+      res = await fetch(`${JIKAN_URL}/${path}`);
+    }
+    jikanLastAt = Date.now();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || (data.status && data.status >= 400)) {
+      throw new Error(
+        res.status === 429 || data.status === 429
+          ? "Too many requests right now — give it a few seconds and retry."
+          : data.message || `MyAnimeList error (${data.status || res.status})`
+      );
+    }
+    return data.data;
+  });
+  // Keep the chain alive after a failure so later calls still run (spaced).
+  jikanChain = run.catch(() => {});
+  return run;
 }
 
 async function malRecommend(username, onStatus) {
@@ -265,7 +291,6 @@ async function malRecommend(username, onStatus) {
 
   // Their manga list too, so we never recommend something they already read.
   // Best-effort: no manga list (or an endpoint hiccup) just means no exclusions.
-  await sleep(350);
   const mangalist = await jikanGet(`users/${encodeURIComponent(username)}/mangalist`).catch(() => []);
   const alreadyReading = new Set(
     (mangalist || []).map((e) => normTitle(e?.manga?.title)).filter(Boolean)
@@ -279,7 +304,6 @@ async function malRecommend(username, onStatus) {
   onStatus("Finding the manga behind your favorites…");
   const sources = [];
   for (const e of seeds) {
-    await sleep(350); // Jikan is rate-limited (~3 req/s shared) — be polite
     const full = await jikanGet(`anime/${e.anime.mal_id}/full`).catch(() => null);
     const adaptation = (full?.relations || [])
       .filter((r) => r.relation === "Adaptation")
@@ -299,7 +323,6 @@ async function malRecommend(username, onStatus) {
 
   onStatus("Fetching covers…");
   for (const s of sources) {
-    await sleep(350);
     const manga = await jikanGet(`manga/${s.id}`).catch(() => null);
     if (manga) {
       s.cover = manga.images?.jpg?.large_image_url || manga.images?.jpg?.image_url || null;
@@ -310,7 +333,6 @@ async function malRecommend(username, onStatus) {
   onStatus("Looking for more like what you love…");
   const similar = [];
   for (const s of sources.slice(0, 3)) {
-    await sleep(350);
     const recs = await jikanGet(`manga/${s.id}/recommendations`).catch(() => []);
     for (const r of (recs || []).slice(0, 4)) {
       similar.push({
@@ -453,9 +475,11 @@ async function fetchLibraryRatings(titles) {
   const fresh = (t) => cache[normTitle(t)] && nowMs - cache[normTitle(t)].at < RATING_TTL_MS;
   const missing = [...new Set(titles.filter((t) => !fresh(t)))];
   for (const t of missing) {
-    await sleep(350); // Jikan rate limit (~3 req/s shared)
     const rows = await jikanGet(`manga?q=${encodeURIComponent(t)}&limit=1&sfw=true`).catch(() => null);
-    if (rows === null) continue; // outage: leave uncached so a later visit retries
+    // Outage or rate limit: stop the whole sweep — hammering a down API only
+    // makes the 429s worse. Unresolved titles stay uncached, so a later visit
+    // picks up where this one stopped.
+    if (rows === null) break;
     const m = rows?.[0];
     cache[normTitle(t)] = { s: m?.score ? Math.round(m.score * 10) : null, at: nowMs };
   }
