@@ -1,10 +1,10 @@
 import { test, expect } from "@playwright/test";
 
-// Discover tab: manga recommendations from a public anime list (AniList
-// GraphQL, or MyAnimeList via the Jikan mirror), with one-tap Send to Kobo.
-// Both providers are mocked at the HTTP boundary, like the Supabase mocks in
-// ui.spec.js — fully offline and deterministic even while the real services
-// are having outages.
+// Discover tab: manga recommendations from a public MyAnimeList (read via the
+// community Jikan mirror), plus search and trending/top browse — all with
+// one-tap Send to Kobo. Jikan and Supabase are mocked at the HTTP boundary,
+// so these run fully offline and deterministically even while the real
+// services are having outages. tests/live.spec.js covers the real Jikan API.
 
 const SESSION = {
   access_token: "test-access-token",
@@ -24,162 +24,69 @@ const ROWS = [
   },
 ];
 
-// --- AniList fixtures -------------------------------------------------------
+// --- Jikan fixtures ---------------------------------------------------------
 
-const ANIME_LIST = {
-  lists: [
-    {
-      entries: [
-        { score: 9, media: { id: 1, title: { romaji: "Sousou no Frieren", english: "Frieren: Beyond Journey's End" } } },
-        { score: 8, media: { id: 2, title: { romaji: "One Piece" } } },
-      ],
-    },
+const img = (name) => ({ jpg: { large_image_url: `https://img.test/${name}.jpg` } });
+
+const ANIMELIST = [
+  { score: 10, anime: { mal_id: 51, title: "Sousou no Frieren" } },
+  { score: 8, anime: { mal_id: 52, title: "One Piece" } },
+];
+// They already read Vagabond on MAL — excluded from "similar".
+const MANGALIST = [{ manga: { title: "Vagabond" } }];
+const RELATIONS = {
+  51: { relations: [{ relation: "Adaptation", entry: [{ mal_id: 101, type: "manga", name: "Frieren: Beyond Journey's End" }] }] },
+  52: { relations: [{ relation: "Adaptation", entry: [{ mal_id: 102, type: "manga", name: "One Piece" }] }] },
+};
+const MANGA = {
+  101: { images: img("frieren"), score: 8.6 },
+  102: { images: img("op"), score: 9.0 },
+};
+const RECOMMENDATIONS = {
+  101: [
+    { entry: { mal_id: 201, title: "Yokohama Kaidashi Kikou", images: img("ykk") } },
+    { entry: { mal_id: 900, title: "Vagabond", images: img("vag") } }, // excluded via mangalist
   ],
+  102: [],
 };
-// They already read Vagabond on AniList — excluded from "similar".
-const MANGA_LIST = {
-  lists: [{ entries: [{ score: 7, media: { id: 900, title: { romaji: "Vagabond" } } }] }],
-};
-const RELATIONS = [
-  {
-    id: 1,
-    title: { romaji: "Sousou no Frieren" },
-    relations: {
-      edges: [
-        {
-          relationType: "SOURCE",
-          node: {
-            id: 101,
-            type: "MANGA",
-            format: "MANGA",
-            title: { romaji: "Sousou no Frieren", english: "Frieren: Beyond Journey's End" },
-            coverImage: { large: "https://img.test/frieren.jpg" },
-            averageScore: 86,
-          },
-        },
-      ],
-    },
-  },
-  {
-    id: 2,
-    title: { romaji: "One Piece" },
-    relations: {
-      edges: [
-        {
-          relationType: "SOURCE",
-          node: {
-            id: 102,
-            type: "MANGA",
-            format: "MANGA",
-            title: { romaji: "One Piece" },
-            coverImage: { large: "https://img.test/op.jpg" },
-            averageScore: 90,
-          },
-        },
-      ],
-    },
-  },
-];
-const SIMILAR = [
-  {
-    id: 101,
-    title: { romaji: "Sousou no Frieren" },
-    recommendations: {
-      nodes: [
-        {
-          rating: 140,
-          mediaRecommendation: {
-            id: 201,
-            type: "MANGA",
-            format: "MANGA",
-            title: { romaji: "Yokohama Kaidashi Kikou" },
-            coverImage: { large: "https://img.test/ykk.jpg" },
-            averageScore: 84,
-          },
-        },
-        {
-          // Already on their AniList manga list — must be excluded.
-          rating: 120,
-          mediaRecommendation: {
-            id: 900,
-            type: "MANGA",
-            format: "MANGA",
-            title: { romaji: "Vagabond" },
-            coverImage: { large: "https://img.test/vag.jpg" },
-            averageScore: 92,
-          },
-        },
-        {
-          // A light novel — not manga, must be excluded.
-          rating: 100,
-          mediaRecommendation: {
-            id: 301,
-            type: "MANGA",
-            format: "NOVEL",
-            title: { romaji: "Some Light Novel" },
-            coverImage: { large: "" },
-            averageScore: 70,
-          },
-        },
-      ],
-    },
-  },
-];
-
-// Browse/search fixtures: one light novel that must be filtered out, and
-// scores on the 0-100 AniList scale.
-const BROWSE = [
-  { id: 501, format: "MANGA", title: { romaji: "Chainsaw Man" }, coverImage: { large: "https://img.test/csm.jpg" }, averageScore: 86, genres: ["Action", "Horror"] },
-  { id: 502, format: "NOVEL", title: { romaji: "A Light Novel" }, coverImage: { large: "" }, averageScore: 70, genres: [] },
-  { id: 503, format: "MANGA", title: { romaji: "Vagabond" }, coverImage: { large: "https://img.test/vag2.jpg" }, averageScore: 92, genres: ["Drama"] },
+const TOP = [
+  { mal_id: 501, type: "Manga", title: "Chainsaw Man", images: img("csm"), score: 8.6, genres: [{ name: "Action" }, { name: "Horror" }] },
+  { mal_id: 502, type: "Light Novel", title: "A Light Novel", images: img("ln"), score: 7.0, genres: [] },
+  { mal_id: 503, type: "Manga", title: "Vagabond", images: img("vag2"), score: 9.2, genres: [{ name: "Drama" }] },
 ];
 const SEARCH_RES = [
-  { id: 601, format: "MANGA", title: { romaji: "Berserk" }, coverImage: { large: "https://img.test/berserk.jpg" }, averageScore: 93, genres: ["Dark Fantasy"] },
+  { mal_id: 601, type: "Manga", title: "Berserk", images: img("berserk"), score: 9.3, genres: [{ name: "Dark Fantasy" }] },
 ];
 
-function mockAniList(page, { failWith } = {}) {
-  return page.route(/graphql\.anilist\.co/, (route) => {
-    const json = (body) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
-    if (failWith) return json({ errors: [{ message: failWith, status: 403 }] });
-    const { query, variables } = JSON.parse(route.request().postData() || "{}");
-    if (query.includes("MediaListCollection")) {
-      return json({ data: { MediaListCollection: variables.type === "MANGA" ? MANGA_LIST : ANIME_LIST } });
-    }
-    if (/q\d+: Page/.test(query)) {
-      // Library-ratings batch: one aliased sub-query per series.
-      const n = (query.match(/q\d+: Page/g) || []).length;
-      const data = {};
-      for (let i = 0; i < n; i++) data[`q${i}`] = { media: [{ averageScore: 92 }] };
-      return json({ data });
-    }
-    if (query.includes("$search")) return json({ data: { Page: { media: SEARCH_RES } } });
-    if (query.includes("$sort")) return json({ data: { Page: { media: BROWSE } } });
-    if (query.includes("recommendations")) return json({ data: { Page: { media: SIMILAR } } });
-    return json({ data: { Page: { media: RELATIONS } } });
-  });
-}
-
-// --- Jikan (MyAnimeList) fixtures -------------------------------------------
-
-function mockJikan(page) {
+// One dispatcher for the whole Jikan surface the app uses. Overrides let a
+// test fail a single endpoint (e.g. the animelist) while the rest works.
+function mockJikan(page, { overrides = {} } = {}) {
   return page.route(/api\.jikan\.moe/, (route) => {
-    const path = new URL(route.request().url()).pathname;
+    const url = new URL(route.request().url());
+    const p = url.pathname;
     const json = (data) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data }) });
-    if (path.includes("/users/")) {
-      return json([{ score: 10, anime: { mal_id: 51, title: "Vinland Saga" } }]);
-    }
-    if (path.includes("/anime/51/full")) {
-      return json({
-        relations: [{ relation: "Adaptation", entry: [{ mal_id: 642, type: "manga", name: "Vinland Saga" }] }],
+    const outage = () =>
+      route.fulfill({
+        status: 504,
+        contentType: "application/json",
+        body: JSON.stringify({ status: 504, message: "Jikan failed to connect to MyAnimeList. MyAnimeList may be down/unavailable or refuses to connect" }),
       });
+    for (const [key, kind] of Object.entries(overrides)) {
+      if (p.includes(key)) return kind === "outage" ? outage() : json(kind);
     }
-    if (path.includes("/manga/642/recommendations")) {
-      return json([{ entry: { mal_id: 656, title: "Berserk", images: { jpg: { large_image_url: "https://img.test/berserk.jpg" } } } }]);
-    }
-    if (path.includes("/manga/642")) {
-      return json({ images: { jpg: { large_image_url: "https://img.test/vinland.jpg" } }, score: 8.8 });
+    if (p.includes("/animelist")) return json(ANIMELIST);
+    if (p.includes("/mangalist")) return json(MANGALIST);
+    const anime = p.match(/\/anime\/(\d+)\/full/);
+    if (anime) return json(RELATIONS[anime[1]] || { relations: [] });
+    const recs = p.match(/\/manga\/(\d+)\/recommendations/);
+    if (recs) return json(RECOMMENDATIONS[recs[1]] || []);
+    const manga = p.match(/\/manga\/(\d+)$/);
+    if (manga) return json(MANGA[manga[1]] || {});
+    if (p.includes("/top/manga")) return json(TOP);
+    if (p.endsWith("/manga")) {
+      // limit=1 is the library-ratings lookup; larger limits are the search box.
+      return json(url.searchParams.get("limit") === "1" ? [{ score: 9.2 }] : SEARCH_RES);
     }
     return json([]);
   });
@@ -210,7 +117,7 @@ function mockSends(page, posted) {
   });
 }
 
-async function signInToDiscover(page) {
+async function signInAnd(page, tab) {
   await page.route("**/auth/v1/**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
   );
@@ -221,7 +128,7 @@ async function signInToDiscover(page) {
   await page.locator("input[type=email]").fill("reader@example.com");
   await page.locator("input[type=password]").fill("password123");
   await page.getByTestId("signin").click();
-  await page.getByTestId("tab-discover").click();
+  if (tab) await page.getByTestId(tab).click();
 }
 
 test.beforeEach(async ({ page }) => {
@@ -229,65 +136,66 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/rest/v1/chapter_pages**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
-  // Default AniList: empty everything, so the background ratings lookup and
-  // the auto-loaded browse row never touch the real network. Tests that need
-  // data re-route with mockAniList (later registrations win).
-  await page.route(/graphql\.anilist\.co/, (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: '{"data":{}}' })
+  // Default Jikan: empty everything, so the background ratings lookup and the
+  // auto-loaded browse row never touch the real network. Tests that need data
+  // re-route with mockJikan (later registrations win).
+  await page.route(/api\.jikan\.moe/, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: '{"data":[]}' })
   );
 });
 
 // --- tests --------------------------------------------------------------------
 
-test("the Discover tab shows the connect form", async ({ page }) => {
+test("the Discover tab shows the MyAnimeList connect form", async ({ page }) => {
   await mockSends(page);
-  await signInToDiscover(page);
+  await signInAnd(page, "tab-discover");
 
   await expect(page.getByTestId("disc-user")).toBeVisible();
+  await expect(page.getByTestId("disc-user")).toHaveAttribute("placeholder", /MyAnimeList/);
   await expect(page.getByTestId("disc-go")).toBeVisible();
-  await expect(page.getByTestId("disc-anilist")).toHaveClass(/on/); // default provider
-  await expect(page.getByTestId("disc-mal")).toBeVisible();
 });
 
-test("AniList: recommends the source manga and similar reads, filtered", async ({ page }) => {
+test("recommends the source manga and similar reads, filtered", async ({ page }) => {
   await mockSends(page);
-  await mockAniList(page);
-  await signInToDiscover(page);
+  await mockJikan(page);
+  await signInAnd(page, "tab-discover");
 
-  await page.getByTestId("disc-user").fill("evan");
+  await page.getByTestId("disc-user").fill("evan_mal");
   await page.getByTestId("disc-go").click();
 
-  // "Read the source": Frieren (their 9/10) is in; One Piece is dropped
+  // "Read the source": Frieren (their 10/10) is in, with cover art and the
+  // community score resolved from its manga entry; One Piece is dropped
   // because it's already in the gideon library.
   const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
-  await expect(sources).toHaveCount(1);
+  await expect(sources).toHaveCount(1, { timeout: 15000 });
   await expect(sources.first()).toContainText("Frieren");
-  await expect(sources.first()).toContainText("You rated the anime 9/10");
+  await expect(sources.first()).toContainText("You rated the anime 10/10");
+  await expect(sources.first()).toContainText("★ 8.6");
 
   // "More like what you love": Yokohama is in; Vagabond is dropped (already
-  // on their AniList manga list) and the light novel is dropped (not manga).
+  // on their MAL manga list).
   const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
   await expect(similar).toHaveCount(1);
   await expect(similar.first()).toContainText("Yokohama");
 
-  // The list is remembered for next time, and "Change" reopens the form
-  // prefilled.
-  await expect(page.getByTestId("disc-who")).toContainText("evan");
+  // The username is remembered, and "Change" reopens the form prefilled.
+  await expect(page.getByTestId("disc-who")).toContainText("evan_mal");
+  await expect(page.getByTestId("disc-who")).toContainText("MyAnimeList");
   await page.getByTestId("disc-change").click();
-  await expect(page.getByTestId("disc-user")).toHaveValue("evan");
+  await expect(page.getByTestId("disc-user")).toHaveValue("evan_mal");
 });
 
 test("a card's Send to Kobo enqueues title + cover and shows in pending sends", async ({ page }) => {
   const posted = [];
   await mockSends(page, posted);
-  await mockAniList(page);
-  await signInToDiscover(page);
+  await mockJikan(page);
+  await signInAnd(page, "tab-discover");
 
-  await page.getByTestId("disc-user").fill("evan");
+  await page.getByTestId("disc-user").fill("evan_mal");
   await page.getByTestId("disc-go").click();
 
   const card = page.getByTestId("rec-sources").getByTestId("rec-card").first();
-  await card.getByTestId("rec-send").click();
+  await card.getByTestId("rec-send").click({ timeout: 15000 });
   await expect(card.getByTestId("rec-send")).toHaveText(/Sent to Kobo/);
   await expect(card.getByTestId("rec-send")).toBeDisabled();
 
@@ -304,28 +212,26 @@ test("a card's Send to Kobo enqueues title + cover and shows in pending sends", 
   await expect(item.locator(".send-cover")).toHaveAttribute("src", "https://img.test/frieren.jpg");
 });
 
-test("a provider outage shows a clear error, not an endless spinner", async ({ page }) => {
+test("a MyAnimeList outage shows a clear error, not an endless spinner", async ({ page }) => {
   await mockSends(page);
-  await mockAniList(page, {
-    failWith: "The AniList API has been temporarily disabled due to severe stability issues.",
-  });
-  await signInToDiscover(page);
+  await mockJikan(page, { overrides: { "/animelist": "outage" } });
+  await signInAnd(page, "tab-discover");
 
-  await page.getByTestId("disc-user").fill("evan");
+  await page.getByTestId("disc-user").fill("evan_mal");
   await page.getByTestId("disc-go").click();
 
-  await expect(page.getByTestId("disc-error")).toContainText("temporarily disabled");
+  await expect(page.getByTestId("disc-error")).toContainText("MyAnimeList may be down");
   await expect(page.getByTestId("disc-go")).toBeVisible(); // form is back for a retry
 });
 
 test("browse loads trending automatically, filters novels, shows ratings, and sends", async ({ page }) => {
   const posted = [];
   await mockSends(page, posted);
-  await mockAniList(page);
-  await signInToDiscover(page);
+  await mockJikan(page);
+  await signInAnd(page, "tab-discover");
 
   // Trending loads on tab open with no interaction. The light novel is
-  // filtered; the manga carry ★ badges on the AniList 0-100 scale ÷ 10.
+  // filtered; the manga carry ★ badges (MAL's 0-10 scale).
   const cards = page.getByTestId("browse-results").getByTestId("rec-card");
   await expect(cards).toHaveCount(2);
   await expect(cards.nth(0)).toContainText("Chainsaw Man");
@@ -345,8 +251,8 @@ test("browse loads trending automatically, filters novels, shows ratings, and se
 
 test("search shows rated results and Clear restores the tab", async ({ page }) => {
   await mockSends(page);
-  await mockAniList(page);
-  await signInToDiscover(page);
+  await mockJikan(page);
+  await signInAnd(page, "tab-discover");
 
   await page.getByTestId("search-input").fill("berserk");
   await page.getByTestId("search-btn").click();
@@ -366,18 +272,24 @@ test("search shows rated results and Clear restores the tab", async ({ page }) =
 test("a browse outage shows an inline error with a working Retry", async ({ page }) => {
   await mockSends(page);
   let calls = 0;
-  await page.route(/graphql\.anilist\.co/, (route) => {
-    const { query } = JSON.parse(route.request().postData() || "{}");
-    const json = (body) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
-    if (!query.includes("$sort")) return json({ data: {} }); // ratings batch etc.
+  await page.route(/api\.jikan\.moe/, (route) => {
+    const p = new URL(route.request().url()).pathname;
+    const json = (data) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data }) });
+    if (!p.includes("/top/manga")) return json([]);
     calls++;
-    if (calls === 1) return json({ errors: [{ message: "The AniList API has been temporarily disabled due to severe stability issues." }] });
-    return json({ data: { Page: { media: BROWSE } } });
+    if (calls === 1) {
+      return route.fulfill({
+        status: 504,
+        contentType: "application/json",
+        body: JSON.stringify({ status: 504, message: "Jikan failed to connect to MyAnimeList. MyAnimeList may be down/unavailable or refuses to connect" }),
+      });
+    }
+    return json(TOP);
   });
-  await signInToDiscover(page);
+  await signInAnd(page, "tab-discover");
 
-  await expect(page.getByTestId("browse-error")).toContainText("temporarily disabled");
+  await expect(page.getByTestId("browse-error")).toContainText("MyAnimeList may be down");
   await page.getByTestId("browse-retry").click();
   await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2);
 });
@@ -385,17 +297,17 @@ test("a browse outage shows an inline error with a working Retry", async ({ page
 test("the browse row arriving does not wipe a half-typed username", async ({ page }) => {
   await mockSends(page);
   // Delay only the browse query so it lands after typing has started.
-  await page.route(/graphql\.anilist\.co/, async (route) => {
-    const { query } = JSON.parse(route.request().postData() || "{}");
-    const json = (body) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
-    if (query.includes("$sort")) {
+  await page.route(/api\.jikan\.moe/, async (route) => {
+    const p = new URL(route.request().url()).pathname;
+    const json = (data) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data }) });
+    if (p.includes("/top/manga")) {
       await new Promise((r) => setTimeout(r, 800));
-      return json({ data: { Page: { media: BROWSE } } });
+      return json(TOP);
     }
-    return json({ data: {} });
+    return json([]);
   });
-  await signInToDiscover(page);
+  await signInAnd(page, "tab-discover");
 
   await page.getByTestId("disc-user").fill("halftyped");
   await expect(page.getByTestId("browse-results")).toBeVisible();
@@ -404,18 +316,8 @@ test("the browse row arriving does not wipe a half-typed username", async ({ pag
 
 test("library cards and the stats sheet show the community rating", async ({ page }) => {
   await mockSends(page);
-  await mockAniList(page); // ratings batch answers ★ 9.2 for every series
-  await page.route("**/auth/v1/**", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
-  );
-  await page.route("**/rest/v1/reading_progress**", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
-  );
-  await page.goto("/");
-  await page.locator("input[type=email]").fill("reader@example.com");
-  await page.locator("input[type=password]").fill("password123");
-  await page.getByTestId("signin").click();
-  await page.getByTestId("tab-library").click();
+  await mockJikan(page); // the limit=1 lookup answers ★ 9.2 for every series
+  await signInAnd(page, "tab-library");
   await page.getByTestId("view-list").click();
 
   await expect(page.getByTestId("rating").first()).toContainText("★ 9.2");
@@ -424,25 +326,4 @@ test("library cards and the stats sheet show the community rating", async ({ pag
   await page.getByTestId("item").first().locator("summary").click({ button: "right" });
   await page.getByTestId("sheet-stats").click();
   await expect(page.getByTestId("sheet-fact").filter({ hasText: "Community score" })).toContainText("★ 9.2 / 10");
-});
-
-test("MyAnimeList (via Jikan): the full flow produces sendable cards", async ({ page }) => {
-  await mockSends(page);
-  await mockJikan(page);
-  await signInToDiscover(page);
-
-  await page.getByTestId("disc-mal").click();
-  await page.getByTestId("disc-user").fill("evan_mal");
-  await page.getByTestId("disc-go").click();
-
-  // Jikan is throttled client-side (350ms between calls), so allow a bit more
-  // time than the default for the cards to arrive.
-  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
-  await expect(sources).toHaveCount(1, { timeout: 15000 });
-  await expect(sources.first()).toContainText("Vinland Saga");
-  await expect(sources.first()).toContainText("You rated the anime 10/10");
-
-  const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
-  await expect(similar).toHaveCount(1);
-  await expect(similar.first()).toContainText("Berserk");
 });

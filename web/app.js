@@ -203,25 +203,23 @@ async function deleteSend(id) {
   return authedFetch(`send_queue?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
-// --- Discover: manga recommendations from your anime list ------------------
+// --- Discover: manga recommendations from your MyAnimeList -----------------
 //
-// The user points us at their public anime list (AniList username, or a
-// MyAnimeList username via the Jikan mirror — MAL's own API doesn't allow
-// browser calls). From the list we recommend two kinds of manga, each with a
-// one-tap "Send to Kobo" that drops the title into the existing send_queue:
+// The user points us at their public MyAnimeList username, read through the
+// community Jikan mirror (MAL's own API doesn't allow browser calls). From
+// the list we recommend two kinds of manga, each with a one-tap "Send to
+// Kobo" that drops the title into the existing send_queue:
 //
 //   1. "Read the source" — the source manga of the anime they rated highest
-//      (adaptation → manga relation edges).
+//      (the "Adaptation" relation on the anime entry).
 //   2. "More like what you love" — community recommendations for those manga.
 //
-// Everything runs client-side against public, CORS-open, no-key APIs, in the
-// same no-SDK plain-fetch style as the Supabase calls. Both providers can be
-// down (they're scraped/community infra), so every step degrades to a clear
-// error state instead of a spinner that never ends.
+// Everything runs client-side against Jikan's public, CORS-open, no-key REST
+// API, in the same no-SDK plain-fetch style as the Supabase calls. Jikan is
+// community infra and can be down, so every step degrades to a clear error
+// state instead of a spinner that never ends.
 
-const REC_PROVIDER_KEY = "gideon.rec.provider"; // "anilist" | "mal"
 const REC_USER_KEY = "gideon.rec.username";
-const ANILIST_URL = "https://graphql.anilist.co";
 const JIKAN_URL = "https://api.jikan.moe/v4";
 
 // How many top-rated anime seed the recommendations, and how many cards we
@@ -230,18 +228,14 @@ const JIKAN_URL = "https://api.jikan.moe/v4";
 const REC_SEEDS = 8;
 const REC_MAX_PER_SECTION = 12;
 
-function recPrefs() {
-  return {
-    provider: localStorage.getItem(REC_PROVIDER_KEY) === "mal" ? "mal" : "anilist",
-    username: localStorage.getItem(REC_USER_KEY) || "",
-  };
+function recUsername() {
+  return localStorage.getItem(REC_USER_KEY) || "";
 }
-function saveRecPrefs(provider, username) {
-  localStorage.setItem(REC_PROVIDER_KEY, provider);
+function saveRecUsername(username) {
   localStorage.setItem(REC_USER_KEY, username);
 }
 
-// Titles compare loosely across providers/library dirs ("Frieren: Beyond
+// Titles compare loosely across MAL/library dirs ("Frieren: Beyond
 // Journey's End" vs "Frieren_ Beyond Journey's End").
 function normTitle(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -249,116 +243,8 @@ function normTitle(s) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// One recommendation card: { title, cover, score (0-100 community score or
-// null), reason }. Both providers reduce to this.
-
-// -- AniList (GraphQL; 3 requests total) --
-
-async function anilistQuery(query, variables) {
-  const res = await fetch(ANILIST_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (data.errors?.length) throw new Error(data.errors[0].message || "AniList error");
-  if (!res.ok) throw new Error(`AniList error (${res.status})`);
-  return data.data;
-}
-
-const ANILIST_LIST_Q = `query ($name: String, $type: MediaType) {
-  MediaListCollection(userName: $name, type: $type,
-      status_in: [CURRENT, COMPLETED, REPEATING, PAUSED]) {
-    lists { entries { score(format: POINT_10) media { id title { romaji english } } } }
-  }
-}`;
-const ANILIST_REL_Q = `query ($ids: [Int]) {
-  Page(perPage: 50) { media(id_in: $ids, type: ANIME) {
-    id title { romaji english }
-    relations { edges { relationType node {
-      id type format title { romaji english } coverImage { large } averageScore
-    } } }
-  } }
-}`;
-const ANILIST_SIM_Q = `query ($ids: [Int]) {
-  Page(perPage: 50) { media(id_in: $ids, type: MANGA) {
-    id title { romaji english }
-    recommendations(sort: RATING_DESC, perPage: 4) { nodes { rating mediaRecommendation {
-      id type format title { romaji english } coverImage { large } averageScore
-    } } }
-  } }
-}`;
-
-const anilistTitle = (m) => m?.title?.english || m?.title?.romaji || "";
-// Manga we can actually read (not light novels).
-const isMangaNode = (n) => n?.type === "MANGA" && n?.format !== "NOVEL";
-
-async function anilistRecommend(username, onStatus) {
-  onStatus("Reading your AniList…");
-  const animeData = await anilistQuery(ANILIST_LIST_Q, { name: username, type: "ANIME" });
-  const entries = (animeData?.MediaListCollection?.lists || [])
-    .flatMap((l) => l.entries || [])
-    .filter((e) => e?.media?.id);
-  if (!entries.length) throw new Error("That AniList has no anime on it (or it's private).");
-
-  // Their manga list too, so we never recommend something they already read.
-  // Best-effort: a user with no manga list just gets no exclusions.
-  const mangaData = await anilistQuery(ANILIST_LIST_Q, { name: username, type: "MANGA" }).catch(() => null);
-  const alreadyReading = new Set(
-    (mangaData?.MediaListCollection?.lists || [])
-      .flatMap((l) => l.entries || [])
-      .map((e) => normTitle(anilistTitle(e.media)))
-      .filter(Boolean)
-  );
-
-  // Highest-rated first; unscored entries keep list order after the scored.
-  const seeds = entries
-    .slice()
-    .sort((a, b) => (b.score || 0) - (a.score || 0))
-    .slice(0, REC_SEEDS);
-
-  onStatus("Finding the manga behind your favorites…");
-  const rel = await anilistQuery(ANILIST_REL_Q, { ids: seeds.map((e) => e.media.id) });
-  const scoreByAnime = new Map(seeds.map((e) => [e.media.id, e.score || 0]));
-  const sources = [];
-  for (const anime of rel?.Page?.media || []) {
-    const edges = (anime.relations?.edges || []).filter((e) => isMangaNode(e.node));
-    // Prefer the true SOURCE edge; fall back to any manga relation (some
-    // entries only carry ADAPTATION/PARENT edges).
-    const edge = edges.find((e) => e.relationType === "SOURCE") || edges[0];
-    if (!edge) continue;
-    const yourScore = scoreByAnime.get(anime.id) || 0;
-    sources.push({
-      id: edge.node.id,
-      title: anilistTitle(edge.node),
-      cover: edge.node.coverImage?.large || null,
-      score: edge.node.averageScore ?? null,
-      reason: yourScore
-        ? `You rated the anime ${yourScore}/10 — read the source`
-        : `You watched ${anilistTitle(anime)} — read the source`,
-    });
-  }
-
-  onStatus("Looking for more like what you love…");
-  let similar = [];
-  if (sources.length) {
-    const sim = await anilistQuery(ANILIST_SIM_Q, { ids: sources.map((s) => s.id) }).catch(() => null);
-    for (const manga of sim?.Page?.media || []) {
-      for (const n of manga.recommendations?.nodes || []) {
-        const m = n?.mediaRecommendation;
-        if (!isMangaNode(m)) continue;
-        similar.push({
-          id: m.id,
-          title: anilistTitle(m),
-          cover: m.coverImage?.large || null,
-          score: m.averageScore ?? null,
-          reason: `Loved by readers of ${anilistTitle(manga)}`,
-        });
-      }
-    }
-  }
-  return { sources, similar, alreadyReading };
-}
+// One recommendation card everywhere: { title, cover, score (0-100 community
+// score or null), reason }.
 
 // -- MyAnimeList via Jikan (REST mirror; sequential + throttled) --
 
@@ -376,6 +262,14 @@ async function malRecommend(username, onStatus) {
   const list = await jikanGet(`users/${encodeURIComponent(username)}/animelist?status=completed`);
   const entries = (list || []).filter((e) => e?.anime?.mal_id);
   if (!entries.length) throw new Error("That MyAnimeList has no completed anime (or it's private).");
+
+  // Their manga list too, so we never recommend something they already read.
+  // Best-effort: no manga list (or an endpoint hiccup) just means no exclusions.
+  await sleep(350);
+  const mangalist = await jikanGet(`users/${encodeURIComponent(username)}/mangalist`).catch(() => []);
+  const alreadyReading = new Set(
+    (mangalist || []).map((e) => normTitle(e?.manga?.title)).filter(Boolean)
+  );
 
   const seeds = entries
     .slice()
@@ -428,43 +322,14 @@ async function malRecommend(username, onStatus) {
       });
     }
   }
-  return { sources, similar, alreadyReading: new Set() };
+  return { sources, similar, alreadyReading };
 }
 
-// -- browse / search (both providers) --
+// -- browse / search --
 //
 // One card shape everywhere: { title, cover, score (0-100 or null), reason }.
 // Browse and search don't filter against the library — you're allowed to look
 // at what you own — the card just shows "queued" instead of a Send button.
-
-const ANILIST_SEARCH_Q = `query ($search: String) {
-  Page(perPage: 18) { media(type: MANGA, search: $search, isAdult: false) {
-    id format title { romaji english } coverImage { large } averageScore genres
-  } }
-}`;
-const ANILIST_BROWSE_Q = `query ($sort: [MediaSort]) {
-  Page(perPage: 18) { media(type: MANGA, sort: $sort, isAdult: false) {
-    id format title { romaji english } coverImage { large } averageScore genres
-  } }
-}`;
-
-function anilistCard(m) {
-  return {
-    title: anilistTitle(m),
-    cover: m.coverImage?.large || null,
-    score: m.averageScore ?? null,
-    reason: (m.genres || []).slice(0, 3).join(" · "),
-  };
-}
-
-async function anilistBrowse({ search, mode }) {
-  const data = search
-    ? await anilistQuery(ANILIST_SEARCH_Q, { search })
-    : await anilistQuery(ANILIST_BROWSE_Q, {
-        sort: mode === "top" ? ["SCORE_DESC"] : ["TRENDING_DESC"],
-      });
-  return (data?.Page?.media || []).filter((m) => m.format !== "NOVEL").map(anilistCard);
-}
 
 async function jikanBrowse({ search, mode }) {
   const path = search
@@ -483,15 +348,11 @@ async function jikanBrowse({ search, mode }) {
     }));
 }
 
-function providerBrowse(opts) {
-  return recPrefs().provider === "mal" ? jikanBrowse(opts) : anilistBrowse(opts);
-}
-
 async function runBrowse(mode, email, rows) {
   state.browse = { phase: "loading", mode };
   patchBrowse(email, rows);
   try {
-    const cards = await providerBrowse({ mode });
+    const cards = await jikanBrowse({ mode });
     state.browse = { phase: "done", mode, cards };
   } catch (e) {
     state.browse = { phase: "error", mode, error: e.message || "Couldn't load." };
@@ -558,7 +419,7 @@ async function runSearch(q, email, rows) {
   state.search = { phase: "loading", q };
   renderDashboard(email, rows);
   try {
-    const cards = await providerBrowse({ search: q });
+    const cards = await jikanBrowse({ search: q });
     state.search = cards.length
       ? { phase: "done", q, cards }
       : { phase: "error", q, error: `Nothing found for “${q}”.` };
@@ -568,11 +429,12 @@ async function runSearch(q, email, rows) {
   if (state.tab === "discover") renderDashboard(email, rows);
 }
 
-// -- community ratings for the library (decor; AniList only, cached) --
+// -- community ratings for the library (decor; cached) --
 //
-// Library titles come from the device's directory names, so we resolve each
-// one with a search — batched via GraphQL aliases (8 per request) and cached
-// in localStorage for a week. Failures (AniList outages) just mean no stars.
+// Library titles come from the device's directory names, so each one is
+// resolved with a Jikan search (throttled — one request per unresolved title
+// per week; the localStorage cache absorbs the rest). Failures (Jikan/MAL
+// outages) just mean no stars.
 
 const RATING_CACHE_KEY = "gideon.ratings";
 const RATING_TTL_MS = 7 * 86400e3;
@@ -590,18 +452,12 @@ async function fetchLibraryRatings(titles) {
   const nowMs = Date.now();
   const fresh = (t) => cache[normTitle(t)] && nowMs - cache[normTitle(t)].at < RATING_TTL_MS;
   const missing = [...new Set(titles.filter((t) => !fresh(t)))];
-  for (let i = 0; i < missing.length; i += 8) {
-    const chunk = missing.slice(i, i + 8);
-    const q = `query { ${chunk
-      .map(
-        (t, j) =>
-          `q${j}: Page(perPage: 1) { media(search: ${JSON.stringify(t)}, type: MANGA) { averageScore } }`
-      )
-      .join(" ")} }`;
-    const data = await anilistQuery(q, {});
-    chunk.forEach((t, j) => {
-      cache[normTitle(t)] = { s: data?.[`q${j}`]?.media?.[0]?.averageScore ?? null, at: nowMs };
-    });
+  for (const t of missing) {
+    await sleep(350); // Jikan rate limit (~3 req/s shared)
+    const rows = await jikanGet(`manga?q=${encodeURIComponent(t)}&limit=1&sfw=true`).catch(() => null);
+    if (rows === null) continue; // outage: leave uncached so a later visit retries
+    const m = rows?.[0];
+    cache[normTitle(t)] = { s: m?.score ? Math.round(m.score * 10) : null, at: nowMs };
   }
   localStorage.setItem(RATING_CACHE_KEY, JSON.stringify(cache));
   return new Map(titles.map((t) => [normTitle(t), cache[normTitle(t)]?.s ?? null]));
@@ -636,8 +492,8 @@ function buildRecommendations({ sources, similar, alreadyReading }) {
   return { sources: take(sources), similar: take(similar) };
 }
 
-async function runDiscover(provider, username, email, rows) {
-  state.discover = { phase: "loading", status: "Connecting…", provider, username };
+async function runDiscover(username, email, rows) {
+  state.discover = { phase: "loading", status: "Connecting…", username };
   renderDashboard(email, rows);
   const onStatus = (msg) => {
     state.discover.status = msg;
@@ -645,16 +501,15 @@ async function runDiscover(provider, username, email, rows) {
     if (el) el.textContent = msg;
   };
   try {
-    const raw =
-      provider === "mal" ? await malRecommend(username, onStatus) : await anilistRecommend(username, onStatus);
+    const raw = await malRecommend(username, onStatus);
     const recs = buildRecommendations(raw);
     if (!recs.sources.length && !recs.similar.length) {
       throw new Error("Nothing new to recommend — everything we found is already in your library or queue.");
     }
-    state.discover = { phase: "done", provider, username, recs };
-    saveRecPrefs(provider, username);
+    state.discover = { phase: "done", username, recs };
+    saveRecUsername(username);
   } catch (e) {
-    state.discover = { phase: "error", provider, username, error: e.message || "Something went wrong." };
+    state.discover = { phase: "error", username, error: e.message || "Something went wrong." };
   }
   renderDashboard(email, rows);
 }
@@ -1152,24 +1007,19 @@ function recSectionHtml(label, recs, testid) {
   </section>`;
 }
 
-// The connect form doubles as the "change list" form; provider is a two-way
-// segmented control (AniList / MyAnimeList).
-function discoverConnectHtml(prefs, intro) {
+// The connect form doubles as the "change list" form.
+function discoverConnectHtml(username, intro) {
   return `<section class="panel">
     <div class="section-label">Discover</div>
     ${intro ? `<p class="send-hint">${intro}</p>` : ""}
     <form id="disc-form" class="disc-form">
-      <div class="seg" role="group" aria-label="List provider">
-        <button type="button" class="seg-btn ${prefs.provider === "anilist" ? "on" : ""}" data-provider="anilist" data-testid="disc-anilist">AniList</button>
-        <button type="button" class="seg-btn ${prefs.provider === "mal" ? "on" : ""}" data-provider="mal" data-testid="disc-mal">MyAnimeList</button>
-      </div>
       <div class="disc-row">
-        <input type="text" id="disc-user" data-testid="disc-user" placeholder="your username" autocomplete="off"
-          autocapitalize="none" spellcheck="false" value="${esc(prefs.username)}" />
+        <input type="text" id="disc-user" data-testid="disc-user" placeholder="MyAnimeList username" autocomplete="off"
+          autocapitalize="none" spellcheck="false" value="${esc(username)}" />
         <button class="primary" type="submit" data-testid="disc-go">Get recommendations</button>
       </div>
     </form>
-    <p class="send-hint">Your list must be public. Keep your list on MyAnimeList? It's read through the community Jikan mirror — a bit slower.</p>
+    <p class="send-hint">Your MyAnimeList must be public (it's read through the community Jikan mirror — no sign-in, no keys).</p>
   </section>`;
 }
 
@@ -1236,8 +1086,8 @@ function viewDiscover() {
   let recs;
   if (!d || d.phase === "idle") {
     recs = discoverConnectHtml(
-      recPrefs(),
-      "Point gideon at your anime list and get manga picks — the source manga of what you loved, and what readers of those loved next. One tap sends a pick to your Kobo."
+      recUsername(),
+      "Point gideon at your MyAnimeList and get manga picks — the source manga of what you loved, and what readers of those loved next. One tap sends a pick to your Kobo."
     );
   } else if (d.phase === "loading") {
     recs = `<section class="panel disc-loading" data-testid="disc-loading">
@@ -1245,11 +1095,11 @@ function viewDiscover() {
       <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
     </section>`;
   } else if (d.phase === "error") {
-    recs = `${discoverConnectHtml({ provider: d.provider, username: d.username }, "")}
+    recs = `${discoverConnectHtml(d.username, "")}
       <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>`;
   } else {
     const who = `<div class="disc-who" data-testid="disc-who">
-        Picks for <b>${esc(d.username)}</b> · ${d.provider === "mal" ? "MyAnimeList" : "AniList"}
+        Picks for <b>${esc(d.username)}</b> · MyAnimeList
         <button class="ghost" id="disc-change" data-testid="disc-change">Change</button>
       </div>`;
     recs = `${who}
@@ -1701,22 +1551,15 @@ function renderDashboard(email, rows) {
       renderDashboard(email, rows);
     });
   }
-  // Discover: connect form (provider toggle + username), change-list link,
+  // Discover: connect form (username), change-list link,
   // and the per-card Send to Kobo buttons.
   const discForm = document.getElementById("disc-form");
   if (discForm) {
-    let provider = discForm.querySelector(".seg-btn.on")?.getAttribute("data-provider") || "anilist";
-    for (const seg of discForm.querySelectorAll(".seg-btn")) {
-      seg.addEventListener("click", () => {
-        provider = seg.getAttribute("data-provider");
-        discForm.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("on", b === seg));
-      });
-    }
     discForm.addEventListener("submit", (e) => {
       e.preventDefault();
       const username = document.getElementById("disc-user").value.trim();
       if (!username) return;
-      runDiscover(provider, username, email, rows);
+      runDiscover(username, email, rows);
     });
   }
   document.getElementById("disc-change")?.addEventListener("click", () => {

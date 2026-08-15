@@ -87,10 +87,10 @@ function mockSends(page, initial = []) {
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.clear());
-  // The dashboard resolves community ratings via AniList in the background;
+  // The dashboard resolves community ratings via Jikan in the background;
   // keep that offline and empty for every test.
-  await page.route(/graphql\.anilist\.co/, (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: '{"data":{}}' })
+  await page.route(/api\.jikan\.moe/, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: '{"data":[]}' })
   );
   // Default: no pending sends, so the dashboard's send fetch never hits the net.
   await page.route("**/rest/v1/send_queue**", (route) =>
