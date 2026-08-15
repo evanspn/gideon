@@ -13,9 +13,12 @@ Two write paths exist, both through `send_queue`: the **Send to Kobo** box on
 Stats, and the **Discover** tab — point it at a public AniList or MyAnimeList
 (via the Jikan mirror) username and it recommends manga from your anime list
 (the source manga of your top-rated anime, plus community picks seeded from
-those), each with a one-tap Send to Kobo. Recommendations run entirely
-client-side against public, no-key, CORS-open APIs; provider outages surface
-as a retryable error state.
+those), each with a one-tap Send to Kobo. The tab also carries a manga search
+box and Trending / Top-rated browse rows — every card shows its community
+★ score — and library titles get a rating chip (batch-resolved via AniList,
+cached in localStorage for a week). Everything runs client-side against
+public, no-key, CORS-open APIs; provider outages surface as retryable error
+states, and missing ratings just don't render.
 
 Live at **https://gideon-sync.vercel.app**.
 

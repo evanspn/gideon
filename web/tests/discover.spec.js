@@ -126,6 +126,17 @@ const SIMILAR = [
   },
 ];
 
+// Browse/search fixtures: one light novel that must be filtered out, and
+// scores on the 0-100 AniList scale.
+const BROWSE = [
+  { id: 501, format: "MANGA", title: { romaji: "Chainsaw Man" }, coverImage: { large: "https://img.test/csm.jpg" }, averageScore: 86, genres: ["Action", "Horror"] },
+  { id: 502, format: "NOVEL", title: { romaji: "A Light Novel" }, coverImage: { large: "" }, averageScore: 70, genres: [] },
+  { id: 503, format: "MANGA", title: { romaji: "Vagabond" }, coverImage: { large: "https://img.test/vag2.jpg" }, averageScore: 92, genres: ["Drama"] },
+];
+const SEARCH_RES = [
+  { id: 601, format: "MANGA", title: { romaji: "Berserk" }, coverImage: { large: "https://img.test/berserk.jpg" }, averageScore: 93, genres: ["Dark Fantasy"] },
+];
+
 function mockAniList(page, { failWith } = {}) {
   return page.route(/graphql\.anilist\.co/, (route) => {
     const json = (body) =>
@@ -135,6 +146,15 @@ function mockAniList(page, { failWith } = {}) {
     if (query.includes("MediaListCollection")) {
       return json({ data: { MediaListCollection: variables.type === "MANGA" ? MANGA_LIST : ANIME_LIST } });
     }
+    if (/q\d+: Page/.test(query)) {
+      // Library-ratings batch: one aliased sub-query per series.
+      const n = (query.match(/q\d+: Page/g) || []).length;
+      const data = {};
+      for (let i = 0; i < n; i++) data[`q${i}`] = { media: [{ averageScore: 92 }] };
+      return json({ data });
+    }
+    if (query.includes("$search")) return json({ data: { Page: { media: SEARCH_RES } } });
+    if (query.includes("$sort")) return json({ data: { Page: { media: BROWSE } } });
     if (query.includes("recommendations")) return json({ data: { Page: { media: SIMILAR } } });
     return json({ data: { Page: { media: RELATIONS } } });
   });
@@ -208,6 +228,12 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.clear());
   await page.route("**/rest/v1/chapter_pages**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
+  // Default AniList: empty everything, so the background ratings lookup and
+  // the auto-loaded browse row never touch the real network. Tests that need
+  // data re-route with mockAniList (later registrations win).
+  await page.route(/graphql\.anilist\.co/, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: '{"data":{}}' })
   );
 });
 
@@ -290,6 +316,114 @@ test("a provider outage shows a clear error, not an endless spinner", async ({ p
 
   await expect(page.getByTestId("disc-error")).toContainText("temporarily disabled");
   await expect(page.getByTestId("disc-go")).toBeVisible(); // form is back for a retry
+});
+
+test("browse loads trending automatically, filters novels, shows ratings, and sends", async ({ page }) => {
+  const posted = [];
+  await mockSends(page, posted);
+  await mockAniList(page);
+  await signInToDiscover(page);
+
+  // Trending loads on tab open with no interaction. The light novel is
+  // filtered; the manga carry ★ badges on the AniList 0-100 scale ÷ 10.
+  const cards = page.getByTestId("browse-results").getByTestId("rec-card");
+  await expect(cards).toHaveCount(2);
+  await expect(cards.nth(0)).toContainText("Chainsaw Man");
+  await expect(cards.nth(0)).toContainText("★ 8.6");
+  await expect(cards.nth(0)).toContainText("Action · Horror");
+
+  // Cards in browse are sendable like recommendation cards.
+  await cards.nth(0).getByTestId("rec-send").click();
+  await expect(cards.nth(0).getByTestId("rec-send")).toHaveText(/Sent to Kobo/);
+  expect(posted).toEqual([{ title: "Chainsaw Man", cover_url: "https://img.test/csm.jpg" }]);
+
+  // The Top rated chip re-queries and keeps the section alive.
+  await page.getByTestId("browse-top").click();
+  await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2);
+  await expect(page.getByTestId("browse-top")).toHaveClass(/on/);
+});
+
+test("search shows rated results and Clear restores the tab", async ({ page }) => {
+  await mockSends(page);
+  await mockAniList(page);
+  await signInToDiscover(page);
+
+  await page.getByTestId("search-input").fill("berserk");
+  await page.getByTestId("search-btn").click();
+
+  const results = page.getByTestId("search-results").getByTestId("rec-card");
+  await expect(results).toHaveCount(1);
+  await expect(results.first()).toContainText("Berserk");
+  await expect(results.first()).toContainText("★ 9.3");
+  // Search results hide the browse/recs sections until cleared.
+  await expect(page.getByTestId("browse-results")).toHaveCount(0);
+
+  await page.getByTestId("search-clear").click();
+  await expect(page.getByTestId("search-results")).toHaveCount(0);
+  await expect(page.getByTestId("browse-results")).toBeVisible();
+});
+
+test("a browse outage shows an inline error with a working Retry", async ({ page }) => {
+  await mockSends(page);
+  let calls = 0;
+  await page.route(/graphql\.anilist\.co/, (route) => {
+    const { query } = JSON.parse(route.request().postData() || "{}");
+    const json = (body) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    if (!query.includes("$sort")) return json({ data: {} }); // ratings batch etc.
+    calls++;
+    if (calls === 1) return json({ errors: [{ message: "The AniList API has been temporarily disabled due to severe stability issues." }] });
+    return json({ data: { Page: { media: BROWSE } } });
+  });
+  await signInToDiscover(page);
+
+  await expect(page.getByTestId("browse-error")).toContainText("temporarily disabled");
+  await page.getByTestId("browse-retry").click();
+  await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2);
+});
+
+test("the browse row arriving does not wipe a half-typed username", async ({ page }) => {
+  await mockSends(page);
+  // Delay only the browse query so it lands after typing has started.
+  await page.route(/graphql\.anilist\.co/, async (route) => {
+    const { query } = JSON.parse(route.request().postData() || "{}");
+    const json = (body) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    if (query.includes("$sort")) {
+      await new Promise((r) => setTimeout(r, 800));
+      return json({ data: { Page: { media: BROWSE } } });
+    }
+    return json({ data: {} });
+  });
+  await signInToDiscover(page);
+
+  await page.getByTestId("disc-user").fill("halftyped");
+  await expect(page.getByTestId("browse-results")).toBeVisible();
+  await expect(page.getByTestId("disc-user")).toHaveValue("halftyped");
+});
+
+test("library cards and the stats sheet show the community rating", async ({ page }) => {
+  await mockSends(page);
+  await mockAniList(page); // ratings batch answers ★ 9.2 for every series
+  await page.route("**/auth/v1/**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
+  );
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  await page.goto("/");
+  await page.locator("input[type=email]").fill("reader@example.com");
+  await page.locator("input[type=password]").fill("password123");
+  await page.getByTestId("signin").click();
+  await page.getByTestId("tab-library").click();
+  await page.getByTestId("view-list").click();
+
+  await expect(page.getByTestId("rating").first()).toContainText("★ 9.2");
+
+  // Same number in the long-press sheet's stats view.
+  await page.getByTestId("item").first().locator("summary").click({ button: "right" });
+  await page.getByTestId("sheet-stats").click();
+  await expect(page.getByTestId("sheet-fact").filter({ hasText: "Community score" })).toContainText("★ 9.2 / 10");
 });
 
 test("MyAnimeList (via Jikan): the full flow produces sendable cards", async ({ page }) => {

@@ -431,6 +431,187 @@ async function malRecommend(username, onStatus) {
   return { sources, similar, alreadyReading: new Set() };
 }
 
+// -- browse / search (both providers) --
+//
+// One card shape everywhere: { title, cover, score (0-100 or null), reason }.
+// Browse and search don't filter against the library — you're allowed to look
+// at what you own — the card just shows "queued" instead of a Send button.
+
+const ANILIST_SEARCH_Q = `query ($search: String) {
+  Page(perPage: 18) { media(type: MANGA, search: $search, isAdult: false) {
+    id format title { romaji english } coverImage { large } averageScore genres
+  } }
+}`;
+const ANILIST_BROWSE_Q = `query ($sort: [MediaSort]) {
+  Page(perPage: 18) { media(type: MANGA, sort: $sort, isAdult: false) {
+    id format title { romaji english } coverImage { large } averageScore genres
+  } }
+}`;
+
+function anilistCard(m) {
+  return {
+    title: anilistTitle(m),
+    cover: m.coverImage?.large || null,
+    score: m.averageScore ?? null,
+    reason: (m.genres || []).slice(0, 3).join(" · "),
+  };
+}
+
+async function anilistBrowse({ search, mode }) {
+  const data = search
+    ? await anilistQuery(ANILIST_SEARCH_Q, { search })
+    : await anilistQuery(ANILIST_BROWSE_Q, {
+        sort: mode === "top" ? ["SCORE_DESC"] : ["TRENDING_DESC"],
+      });
+  return (data?.Page?.media || []).filter((m) => m.format !== "NOVEL").map(anilistCard);
+}
+
+async function jikanBrowse({ search, mode }) {
+  const path = search
+    ? `manga?q=${encodeURIComponent(search)}&sfw=true&limit=18&order_by=members&sort=desc`
+    : mode === "top"
+      ? "top/manga?limit=18"
+      : "top/manga?filter=publishing&limit=18";
+  const rows = await jikanGet(path);
+  return (rows || [])
+    .filter((m) => (m.type || "").toLowerCase() !== "light novel")
+    .map((m) => ({
+      title: m.title || "",
+      cover: m.images?.jpg?.large_image_url || m.images?.jpg?.image_url || null,
+      score: m.score ? Math.round(m.score * 10) : null,
+      reason: (m.genres || []).slice(0, 3).map((g) => g.name).join(" · "),
+    }));
+}
+
+function providerBrowse(opts) {
+  return recPrefs().provider === "mal" ? jikanBrowse(opts) : anilistBrowse(opts);
+}
+
+async function runBrowse(mode, email, rows) {
+  state.browse = { phase: "loading", mode };
+  patchBrowse(email, rows);
+  try {
+    const cards = await providerBrowse({ mode });
+    state.browse = { phase: "done", mode, cards };
+  } catch (e) {
+    state.browse = { phase: "error", mode, error: e.message || "Couldn't load." };
+  }
+  patchBrowse(email, rows);
+}
+
+// Update just the Browse panel in place. A full renderDashboard here would
+// wipe whatever the reader is typing into the username or search box while
+// the auto-loaded browse row arrives — patch the one section instead.
+function patchBrowse(email, rows) {
+  if (state.tab !== "discover" || state.search) return;
+  const body = document.getElementById("browse-body");
+  if (!body) {
+    renderDashboard(email, rows);
+    return;
+  }
+  body.innerHTML = browseBodyHtml();
+  wireBrowse(email, rows);
+}
+
+// Handlers for everything inside #browse-body (mode chips, retry, card
+// sends) — called after both a full render and an in-place patch.
+function wireBrowse(email, rows) {
+  const body = document.getElementById("browse-body");
+  if (!body) return;
+  for (const chip of body.querySelectorAll(".browse-seg .seg-btn")) {
+    chip.addEventListener("click", () => runBrowse(chip.getAttribute("data-mode"), email, rows));
+  }
+  body.querySelector("#browse-retry")?.addEventListener("click", () =>
+    runBrowse(state.browse?.mode || "trending", email, rows)
+  );
+  for (const btn of body.querySelectorAll('[data-testid="rec-send"]')) wireRecSend(btn);
+}
+
+// One card's Send button: optimistic in-place states (Sending… → Sent ✓),
+// with an inline error and re-arm on failure — no re-render, so the grid
+// never jumps back to the top.
+function wireRecSend(btn) {
+  btn.addEventListener("click", async () => {
+    const title = btn.getAttribute("data-title");
+    const cover = btn.getAttribute("data-cover") || null;
+    btn.disabled = true;
+    btn.textContent = "Sending…";
+    try {
+      const [row] = await enqueueSend(title, cover);
+      if (row) state.sends = [row, ...state.sends];
+      (state.sentTitles ||= new Set()).add(normTitle(title));
+      btn.textContent = "Sent to Kobo ✓";
+      btn.classList.add("sent");
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Send to Kobo";
+      btn.insertAdjacentHTML(
+        "afterend",
+        `<div class="note rec-error" data-testid="rec-error">${esc(err.message || "Couldn't send.")}</div>`
+      );
+      setTimeout(() => btn.parentElement?.querySelector(".rec-error")?.remove(), 4000);
+    }
+  });
+}
+
+async function runSearch(q, email, rows) {
+  state.search = { phase: "loading", q };
+  renderDashboard(email, rows);
+  try {
+    const cards = await providerBrowse({ search: q });
+    state.search = cards.length
+      ? { phase: "done", q, cards }
+      : { phase: "error", q, error: `Nothing found for “${q}”.` };
+  } catch (e) {
+    state.search = { phase: "error", q, error: e.message || "Search failed." };
+  }
+  if (state.tab === "discover") renderDashboard(email, rows);
+}
+
+// -- community ratings for the library (decor; AniList only, cached) --
+//
+// Library titles come from the device's directory names, so we resolve each
+// one with a search — batched via GraphQL aliases (8 per request) and cached
+// in localStorage for a week. Failures (AniList outages) just mean no stars.
+
+const RATING_CACHE_KEY = "gideon.ratings";
+const RATING_TTL_MS = 7 * 86400e3;
+
+function loadRatingCache() {
+  try {
+    return JSON.parse(localStorage.getItem(RATING_CACHE_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+
+async function fetchLibraryRatings(titles) {
+  const cache = loadRatingCache();
+  const nowMs = Date.now();
+  const fresh = (t) => cache[normTitle(t)] && nowMs - cache[normTitle(t)].at < RATING_TTL_MS;
+  const missing = [...new Set(titles.filter((t) => !fresh(t)))];
+  for (let i = 0; i < missing.length; i += 8) {
+    const chunk = missing.slice(i, i + 8);
+    const q = `query { ${chunk
+      .map(
+        (t, j) =>
+          `q${j}: Page(perPage: 1) { media(search: ${JSON.stringify(t)}, type: MANGA) { averageScore } }`
+      )
+      .join(" ")} }`;
+    const data = await anilistQuery(q, {});
+    chunk.forEach((t, j) => {
+      cache[normTitle(t)] = { s: data?.[`q${j}`]?.media?.[0]?.averageScore ?? null, at: nowMs };
+    });
+  }
+  localStorage.setItem(RATING_CACHE_KEY, JSON.stringify(cache));
+  return new Map(titles.map((t) => [normTitle(t), cache[normTitle(t)]?.s ?? null]));
+}
+
+// The community score for a library series, if we've resolved one.
+function seriesRating(series) {
+  return state.ratings?.get(normTitle(displayTitle(series))) ?? null;
+}
+
 // Dedupe, drop what they already have (gideon library, pending sends, their
 // own manga list), cap each section.
 function buildRecommendations({ sources, similar, alreadyReading }) {
@@ -470,7 +651,7 @@ async function runDiscover(provider, username, email, rows) {
     if (!recs.sources.length && !recs.similar.length) {
       throw new Error("Nothing new to recommend — everything we found is already in your library or queue.");
     }
-    state.discover = { phase: "done", provider, username, recs, sent: new Set() };
+    state.discover = { phase: "done", provider, username, recs };
     saveRecPrefs(provider, username);
   } catch (e) {
     state.discover = { phase: "error", provider, username, error: e.message || "Something went wrong." };
@@ -934,8 +1115,17 @@ function viewStats(stats, groups, sends) {
 
 // --- Discover view ----------------------------------------------------------
 
+// Whether a title is already on its way to the Kobo (sent this session, or
+// still pending in the queue) — shared by every card grid.
+function isQueued(title) {
+  const key = normTitle(title);
+  return !!(
+    state.sentTitles?.has(key) || (state.sends || []).some((s) => normTitle(s.title) === key)
+  );
+}
+
 function recCardHtml(rec) {
-  const sent = !!state.discover?.sent?.has(normTitle(rec.title));
+  const sent = isQueued(rec.title);
   const art = rec.cover
     ? `<img class="rec-cover" src="${esc(rec.cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
     : `<span class="rec-cover rec-ph">${esc([...rec.title][0] || "?")}</span>`;
@@ -983,32 +1173,90 @@ function discoverConnectHtml(prefs, intro) {
   </section>`;
 }
 
+// The search bar sits above everything on the Discover tab; results replace
+// the recommendation/browse sections until cleared.
+function searchPanelHtml() {
+  const s = state.search;
+  return `<section class="panel">
+    <form class="search-form" id="search-form">
+      <input type="search" id="search-q" data-testid="search-input" placeholder="Search manga…"
+        autocomplete="off" value="${esc(s?.q || "")}" />
+      <button class="primary" type="submit" data-testid="search-btn">Search</button>
+      ${s ? `<button class="ghost" type="button" id="search-clear" data-testid="search-clear">Clear</button>` : ""}
+    </form>
+  </section>`;
+}
+
+function searchResultsHtml() {
+  const s = state.search;
+  if (s.phase === "loading") {
+    return `<section class="panel disc-loading" data-testid="search-loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="disc-status">Searching…</div>
+    </section>`;
+  }
+  if (s.phase === "error") {
+    return `<div class="note disc-error" data-testid="search-error">${esc(s.error)}</div>`;
+  }
+  return recSectionHtml(`Results for “${s.q}”`, s.cards, "search-results");
+}
+
+// Trending / top-rated browse rows — available even before a list is
+// connected, so the tab is useful on day one. The inner markup lives in its
+// own function because patchBrowse re-renders it in place.
+function browseBodyHtml() {
+  const b = state.browse;
+  const mode = b?.mode || "trending";
+  const chips = `
+    <div class="seg browse-seg" role="group" aria-label="Browse">
+      <button type="button" class="seg-btn ${mode === "trending" ? "on" : ""}" data-mode="trending" data-testid="browse-trending">Trending</button>
+      <button type="button" class="seg-btn ${mode === "top" ? "on" : ""}" data-mode="top" data-testid="browse-top">Top rated</button>
+    </div>`;
+  let body;
+  if (!b || b.phase === "loading") {
+    body = `<div class="disc-loading" data-testid="browse-loading"><div class="spinner" aria-hidden="true"></div></div>`;
+  } else if (b.phase === "error") {
+    body = `<div class="note disc-error" data-testid="browse-error">${esc(b.error)}
+      <button class="ghost" id="browse-retry" data-testid="browse-retry">Retry</button></div>`;
+  } else {
+    body = `<div class="rec-grid" data-testid="browse-results">${b.cards.map(recCardHtml).join("")}</div>`;
+  }
+  return `<div class="lib-head"><div class="section-label">Browse</div>${chips}</div>${body}`;
+}
+
+function browseSectionHtml() {
+  return `<section class="panel"><div id="browse-body">${browseBodyHtml()}</div></section>`;
+}
+
 function viewDiscover() {
+  const search = searchPanelHtml();
+  if (state.search) return `${search}${searchResultsHtml()}`;
+
   const d = state.discover;
+  let recs;
   if (!d || d.phase === "idle") {
-    return discoverConnectHtml(
+    recs = discoverConnectHtml(
       recPrefs(),
       "Point gideon at your anime list and get manga picks — the source manga of what you loved, and what readers of those loved next. One tap sends a pick to your Kobo."
     );
-  }
-  if (d.phase === "loading") {
-    return `<section class="panel disc-loading" data-testid="disc-loading">
+  } else if (d.phase === "loading") {
+    recs = `<section class="panel disc-loading" data-testid="disc-loading">
       <div class="spinner" aria-hidden="true"></div>
       <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
     </section>`;
-  }
-  if (d.phase === "error") {
-    return `${discoverConnectHtml({ provider: d.provider, username: d.username }, "")}
+  } else if (d.phase === "error") {
+    recs = `${discoverConnectHtml({ provider: d.provider, username: d.username }, "")}
       <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>`;
+  } else {
+    const who = `<div class="disc-who" data-testid="disc-who">
+        Picks for <b>${esc(d.username)}</b> · ${d.provider === "mal" ? "MyAnimeList" : "AniList"}
+        <button class="ghost" id="disc-change" data-testid="disc-change">Change</button>
+      </div>`;
+    recs = `${who}
+      ${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
+      ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
   }
-  // done
-  const who = `<div class="disc-who" data-testid="disc-who">
-      Picks for <b>${esc(d.username)}</b> · ${d.provider === "mal" ? "MyAnimeList" : "AniList"}
-      <button class="ghost" id="disc-change" data-testid="disc-change">Change</button>
-    </div>`;
-  return `${who}
-    ${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
-    ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
+  return `${search}${recs}${browseSectionHtml()}`;
 }
 
 // One library card: cover (published page art, or a lettered placeholder),
@@ -1026,6 +1274,10 @@ function libraryCardHtml(g, covers, hidden) {
   const badge = ins.complete
     ? `<span class="badge done" data-testid="completed">Completed</span>`
     : `<span class="badge">${ins.finished}/${ins.tracked} chapters</span>`;
+  const rating = seriesRating(g.series);
+  const ratingHtml = rating
+    ? `<span class="badge rating" data-testid="rating" title="Community score">★ ${(rating / 10).toFixed(1)}</span>`
+    : "";
   const facts = [
     ins.firstRead ? `First read ${ins.firstRead}` : null,
     ins.complete && ins.span ? `Finished in ${ins.span}` : null,
@@ -1053,7 +1305,7 @@ function libraryCardHtml(g, covers, hidden) {
           <div class="grow">
             <div class="title">${esc(title)}</div>
             ${chapter ? `<div class="chapter">${esc(displayTitle(chapter))}</div>` : ""}
-            <div class="facts">${badge}${facts ? `<span class="fact">${esc(facts)}</span>` : ""}</div>
+            <div class="facts">${badge}${ratingHtml}${facts ? `<span class="fact">${esc(facts)}</span>` : ""}</div>
           </div>
           <button class="hide-btn" data-testid="hide" data-series="${esc(g.series)}" title="${
             hidden ? "Unhide this title" : "Hide this title"
@@ -1205,12 +1457,14 @@ function openStatsSheet(g) {
     0
   );
   const lastRead = g.chapters.map((c) => c.updated_at).sort().at(-1);
+  const rating = seriesRating(g.series);
   const facts = [
     ["Chapters", `${ins.finished} finished · ${ins.tracked} tracked`],
     ["Pages read", pages.toLocaleString()],
     ["First read", ins.firstRead || "—"],
     ["Last read", lastRead ? timeAgo(lastRead) : "—"],
     ["Status", ins.complete ? `Completed${ins.span ? ` in ${ins.span}` : ""}` : "In progress"],
+    ...(rating ? [["Community score", `★ ${(rating / 10).toFixed(1)} / 10`]] : []),
   ];
   document.body.insertAdjacentHTML(
     "beforeend",
@@ -1311,6 +1565,10 @@ function signOut() {
   state.rows = null;
   state.sends = [];
   state.discover = null;
+  state.search = null;
+  state.browse = null;
+  state.sentTitles = null;
+  state.ratings = null;
   state.tab = "stats";
   renderSignIn("Signed out.");
 }
@@ -1465,30 +1723,25 @@ function renderDashboard(email, rows) {
     state.discover = { phase: "idle" };
     renderDashboard(email, rows);
   });
-  for (const btn of app.querySelectorAll('[data-testid="rec-send"]')) {
-    btn.addEventListener("click", async () => {
-      const title = btn.getAttribute("data-title");
-      const cover = btn.getAttribute("data-cover") || null;
-      btn.disabled = true;
-      btn.textContent = "Sending…";
-      try {
-        const [row] = await enqueueSend(title, cover);
-        if (row) state.sends = [row, ...state.sends];
-        state.discover?.sent?.add(normTitle(title));
-        btn.textContent = "Sent to Kobo ✓";
-        btn.classList.add("sent");
-      } catch (err) {
-        // In-place failure: re-arm the button and say why, no re-render (a
-        // re-render would scroll the grid back to the top).
-        btn.disabled = false;
-        btn.textContent = "Send to Kobo";
-        btn.insertAdjacentHTML(
-          "afterend",
-          `<div class="note rec-error" data-testid="rec-error">${esc(err.message || "Couldn't send.")}</div>`
-        );
-        setTimeout(() => btn.parentElement?.querySelector(".rec-error")?.remove(), 4000);
-      }
+  // Search: submit runs it, Clear returns to recommendations + browse.
+  const searchForm = document.getElementById("search-form");
+  if (searchForm) {
+    searchForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const q = document.getElementById("search-q").value.trim();
+      if (q) runSearch(q, email, rows);
     });
+    document.getElementById("search-clear")?.addEventListener("click", () => {
+      state.search = null;
+      renderDashboard(email, rows);
+    });
+  }
+  for (const btn of app.querySelectorAll('[data-testid="rec-send"]')) {
+    if (!btn.closest("#browse-body")) wireRecSend(btn); // browse's own wiring covers the rest
+  }
+  wireBrowse(email, rows);
+  if (tab === "discover" && !state.search && !state.browse) {
+    runBrowse("trending", email, rows);
   }
 }
 
@@ -1592,6 +1845,17 @@ async function showDashboard(session) {
     // Covers for the library shelf (best-effort decor).
     state.covers = coverBySeries(await fetchAllChapterPages().catch(() => []));
     renderDashboard(email, rows);
+    // Community ratings for the shelf (decor): resolved in the background,
+    // then the library re-renders if it's on screen. Never blocks sign-in.
+    const seriesTitles = [...new Set(rows.map((r) => displayTitle(parseKey(r.chapter_key).series)))];
+    if (seriesTitles.length) {
+      fetchLibraryRatings(seriesTitles)
+        .then((map) => {
+          state.ratings = map;
+          if (state.session && state.tab === "library") renderDashboard(email, state.rows || rows);
+        })
+        .catch(() => {});
+    }
   } catch (e) {
     if (String(e.message).includes("401")) {
       clearSession();

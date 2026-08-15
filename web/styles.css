@@ -617,3 +617,18 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .rec-send:disabled { cursor: default; }
 .rec-send.sent { background: var(--track); color: var(--muted); }
 .rec-error { font-size: 11.5px; margin-top: 6px; color: #e5484d; }
+
+/* Search + browse */
+.search-form { display: flex; gap: 8px; flex-wrap: wrap; }
+.search-form input {
+  flex: 1 1 160px; min-width: 0; padding: 11px 13px; font: inherit;
+  color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.search-form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.search-form .primary { padding: 11px 16px; }
+.browse-seg { margin-bottom: 0; }
+.disc-error .ghost { margin-left: 10px; padding: 4px 10px; font-size: 12.5px; }
+
+/* Community-score badge on library cards */
+.item .badge.rating { border-color: var(--accent); color: var(--accent); }
