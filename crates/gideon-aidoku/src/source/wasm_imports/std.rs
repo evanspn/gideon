@@ -224,13 +224,7 @@ fn read_int(caller: Caller<'_, WasmStore>, descriptor_i32: i32) -> Result<i64> {
         .get_std_value(descriptor)
         .context("failed to get value in read_int")?;
     let result = match value.as_ref() {
-        Value::Bool(b) => {
-            if *b {
-                1i64
-            } else {
-                0i64
-            }
-        }
+        Value::Bool(b) => i64::from(*b),
         Value::Int(i) => *i,
         Value::Float(f) => f.trunc() as i64,
         Value::String(s) => s.parse().unwrap_or(0),

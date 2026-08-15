@@ -5,9 +5,20 @@ A tiny static web dashboard for gideon's cross-platform reading-progress sync
 where you left off on your Kobo — the same `reading_progress` rows the device
 syncs, newest first. The device signs in with the same email + password.
 
-It is **read-only**: the device is the writer, so the web can't rewind your
-place. The Supabase anon key is embedded on purpose (public by design — RLS,
-keyed to `auth.uid()`, is what scopes every row to its owner).
+It is **read-only** for progress: the device is the writer, so the web can't
+rewind your place. The Supabase anon key is embedded on purpose (public by
+design — RLS, keyed to `auth.uid()`, is what scopes every row to its owner).
+
+Two write paths exist, both through `send_queue`: the **Send to Kobo** box on
+Stats, and the **Discover** tab — point it at a public AniList or MyAnimeList
+(via the Jikan mirror) username and it recommends manga from your anime list
+(the source manga of your top-rated anime, plus community picks seeded from
+those), each with a one-tap Send to Kobo. The tab also carries a manga search
+box and Trending / Top-rated browse rows — every card shows its community
+★ score — and library titles get a rating chip (batch-resolved via AniList,
+cached in localStorage for a week). Everything runs client-side against
+public, no-key, CORS-open APIs; provider outages surface as retryable error
+states, and missing ratings just don't render.
 
 Live at **https://gideon-sync.vercel.app**.
 
@@ -34,9 +45,18 @@ They mock Supabase at the HTTP boundary, so they run fully offline against a
 local static server — no real backend.
 
 ```sh
-npm install            # installs @playwright/test (browser is preinstalled in CI images)
+npm install            # installs @playwright/test
+npx playwright install chromium   # dev machines only; CI images have it preinstalled
 npm test               # run the suite
 npm run test:update    # re-baseline the UI snapshots after an intentional design change
+```
+
+`tests/live.spec.js` is an opt-in integration test that runs the real
+send-to-Kobo chain (web enqueue → device pull → mark opened → delete) against
+the production Supabase project with a throwaway account:
+
+```sh
+GIDEON_LIVE=1 npx playwright test tests/live.spec.js
 ```
 
 ## Auth
