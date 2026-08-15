@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { defineConfig } from "@playwright/test";
 
 // Regression tests for the static dashboard. Everything is mocked at the
@@ -12,7 +13,13 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:3210",
     colorScheme: "light",
     viewport: { width: 420, height: 900 },
-    launchOptions: { executablePath: process.env.PW_CHROMIUM || "/opt/pw-browsers/chromium" },
+    // Cloud/CI images preinstall Chromium at a fixed path and export
+    // PW_CHROMIUM (or rely on the /opt fallback). On a dev machine neither
+    // exists — use Playwright's own managed browser (npx playwright install).
+    launchOptions:
+      process.env.PW_CHROMIUM || existsSync("/opt/pw-browsers/chromium")
+        ? { executablePath: process.env.PW_CHROMIUM || "/opt/pw-browsers/chromium" }
+        : {},
   },
   projects: [{ name: "chromium", use: { browserName: "chromium" } }],
   webServer: {

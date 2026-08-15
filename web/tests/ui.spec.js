@@ -237,6 +237,56 @@ test("sending a title enqueues it and lists it", async ({ page }) => {
   await expect(item.first()).toContainText("Berserk");
 });
 
+test("a send on a stale session refreshes and retries (401 → refresh → 201)", async ({ page }) => {
+  await mockProgress(page, ROWS);
+  let refreshes = 0;
+  await page.route("**/auth/v1/**", (route) => {
+    if (route.request().url().includes("grant_type=refresh_token")) refreshes++;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) });
+  });
+  let posts = 0;
+  let items = [];
+  await page.route("**/rest/v1/send_queue**", (route) => {
+    const req = route.request();
+    if (req.method() === "POST") {
+      posts++;
+      // First attempt hits an expired access token; the retry must succeed.
+      if (posts === 1) return route.fulfill({ status: 401, contentType: "application/json", body: "{}" });
+      const { title } = JSON.parse(req.postData() || "{}");
+      items = [{ id: "id-1", title, created_at: new Date().toISOString() }];
+      return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify(items) });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(items) });
+  });
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  await page.getByTestId("send-input").fill("Berserk");
+  await page.getByTestId("send-btn").click();
+  await expect(page.getByTestId("send-item")).toHaveCount(1);
+  await expect(page.getByTestId("send-item").first()).toContainText("Berserk");
+  expect(refreshes).toBe(1);
+  expect(posts).toBe(2);
+});
+
+test("a failed send surfaces the error and keeps the typed title", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.route("**/rest/v1/send_queue**", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 500, contentType: "application/json", body: "{}" })
+      : route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
+  await page.goto("/");
+  await fillAndSubmit(page);
+
+  await page.getByTestId("send-input").fill("Berserk");
+  await page.getByTestId("send-btn").click();
+  await expect(page.getByTestId("send-note")).toContainText("Couldn't send");
+  await expect(page.getByTestId("send-input")).toHaveValue("Berserk"); // retry is one tap
+  await expect(page.getByTestId("send-btn")).toBeEnabled();
+});
+
 test("a pending send can be removed", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, ROWS);

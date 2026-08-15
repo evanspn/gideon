@@ -1,0 +1,314 @@
+import { test, expect } from "@playwright/test";
+
+// Discover tab: manga recommendations from a public anime list (AniList
+// GraphQL, or MyAnimeList via the Jikan mirror), with one-tap Send to Kobo.
+// Both providers are mocked at the HTTP boundary, like the Supabase mocks in
+// ui.spec.js — fully offline and deterministic even while the real services
+// are having outages.
+
+const SESSION = {
+  access_token: "test-access-token",
+  refresh_token: "test-refresh-token",
+  expires_in: 3600,
+  user: { email: "reader@example.com" },
+};
+
+// The gideon library already contains One Piece — the engine must not
+// recommend what's already on the shelf.
+const ROWS = [
+  {
+    chapter_key: "One Piece/vol3.cbz",
+    current_page: 10,
+    total_pages: 20,
+    updated_at: new Date(Date.now() - 3600e3).toISOString(),
+  },
+];
+
+// --- AniList fixtures -------------------------------------------------------
+
+const ANIME_LIST = {
+  lists: [
+    {
+      entries: [
+        { score: 9, media: { id: 1, title: { romaji: "Sousou no Frieren", english: "Frieren: Beyond Journey's End" } } },
+        { score: 8, media: { id: 2, title: { romaji: "One Piece" } } },
+      ],
+    },
+  ],
+};
+// They already read Vagabond on AniList — excluded from "similar".
+const MANGA_LIST = {
+  lists: [{ entries: [{ score: 7, media: { id: 900, title: { romaji: "Vagabond" } } }] }],
+};
+const RELATIONS = [
+  {
+    id: 1,
+    title: { romaji: "Sousou no Frieren" },
+    relations: {
+      edges: [
+        {
+          relationType: "SOURCE",
+          node: {
+            id: 101,
+            type: "MANGA",
+            format: "MANGA",
+            title: { romaji: "Sousou no Frieren", english: "Frieren: Beyond Journey's End" },
+            coverImage: { large: "https://img.test/frieren.jpg" },
+            averageScore: 86,
+          },
+        },
+      ],
+    },
+  },
+  {
+    id: 2,
+    title: { romaji: "One Piece" },
+    relations: {
+      edges: [
+        {
+          relationType: "SOURCE",
+          node: {
+            id: 102,
+            type: "MANGA",
+            format: "MANGA",
+            title: { romaji: "One Piece" },
+            coverImage: { large: "https://img.test/op.jpg" },
+            averageScore: 90,
+          },
+        },
+      ],
+    },
+  },
+];
+const SIMILAR = [
+  {
+    id: 101,
+    title: { romaji: "Sousou no Frieren" },
+    recommendations: {
+      nodes: [
+        {
+          rating: 140,
+          mediaRecommendation: {
+            id: 201,
+            type: "MANGA",
+            format: "MANGA",
+            title: { romaji: "Yokohama Kaidashi Kikou" },
+            coverImage: { large: "https://img.test/ykk.jpg" },
+            averageScore: 84,
+          },
+        },
+        {
+          // Already on their AniList manga list — must be excluded.
+          rating: 120,
+          mediaRecommendation: {
+            id: 900,
+            type: "MANGA",
+            format: "MANGA",
+            title: { romaji: "Vagabond" },
+            coverImage: { large: "https://img.test/vag.jpg" },
+            averageScore: 92,
+          },
+        },
+        {
+          // A light novel — not manga, must be excluded.
+          rating: 100,
+          mediaRecommendation: {
+            id: 301,
+            type: "MANGA",
+            format: "NOVEL",
+            title: { romaji: "Some Light Novel" },
+            coverImage: { large: "" },
+            averageScore: 70,
+          },
+        },
+      ],
+    },
+  },
+];
+
+function mockAniList(page, { failWith } = {}) {
+  return page.route(/graphql\.anilist\.co/, (route) => {
+    const json = (body) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    if (failWith) return json({ errors: [{ message: failWith, status: 403 }] });
+    const { query, variables } = JSON.parse(route.request().postData() || "{}");
+    if (query.includes("MediaListCollection")) {
+      return json({ data: { MediaListCollection: variables.type === "MANGA" ? MANGA_LIST : ANIME_LIST } });
+    }
+    if (query.includes("recommendations")) return json({ data: { Page: { media: SIMILAR } } });
+    return json({ data: { Page: { media: RELATIONS } } });
+  });
+}
+
+// --- Jikan (MyAnimeList) fixtures -------------------------------------------
+
+function mockJikan(page) {
+  return page.route(/api\.jikan\.moe/, (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const json = (data) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data }) });
+    if (path.includes("/users/")) {
+      return json([{ score: 10, anime: { mal_id: 51, title: "Vinland Saga" } }]);
+    }
+    if (path.includes("/anime/51/full")) {
+      return json({
+        relations: [{ relation: "Adaptation", entry: [{ mal_id: 642, type: "manga", name: "Vinland Saga" }] }],
+      });
+    }
+    if (path.includes("/manga/642/recommendations")) {
+      return json([{ entry: { mal_id: 656, title: "Berserk", images: { jpg: { large_image_url: "https://img.test/berserk.jpg" } } } }]);
+    }
+    if (path.includes("/manga/642")) {
+      return json({ images: { jpg: { large_image_url: "https://img.test/vinland.jpg" } }, score: 8.8 });
+    }
+    return json([]);
+  });
+}
+
+// --- shared setup -------------------------------------------------------------
+
+// An in-memory send_queue that records enqueued bodies, so tests can assert
+// what actually crossed the wire (title + cover_url).
+function mockSends(page, posted) {
+  let items = [];
+  let n = 0;
+  return page.route("**/rest/v1/send_queue**", (route) => {
+    const req = route.request();
+    if (req.method() === "POST") {
+      const body = JSON.parse(req.postData() || "{}");
+      posted?.push(body);
+      const row = { id: `id-${++n}`, ...body, created_at: new Date().toISOString() };
+      items = [row, ...items];
+      return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify([row]) });
+    }
+    if (req.method() === "DELETE") {
+      const m = req.url().match(/id=eq\.([^&]+)/);
+      if (m) items = items.filter((x) => x.id !== decodeURIComponent(m[1]));
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(items) });
+  });
+}
+
+async function signInToDiscover(page) {
+  await page.route("**/auth/v1/**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
+  );
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  await page.goto("/");
+  await page.locator("input[type=email]").fill("reader@example.com");
+  await page.locator("input[type=password]").fill("password123");
+  await page.getByTestId("signin").click();
+  await page.getByTestId("tab-discover").click();
+}
+
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => localStorage.clear());
+  await page.route("**/rest/v1/chapter_pages**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
+});
+
+// --- tests --------------------------------------------------------------------
+
+test("the Discover tab shows the connect form", async ({ page }) => {
+  await mockSends(page);
+  await signInToDiscover(page);
+
+  await expect(page.getByTestId("disc-user")).toBeVisible();
+  await expect(page.getByTestId("disc-go")).toBeVisible();
+  await expect(page.getByTestId("disc-anilist")).toHaveClass(/on/); // default provider
+  await expect(page.getByTestId("disc-mal")).toBeVisible();
+});
+
+test("AniList: recommends the source manga and similar reads, filtered", async ({ page }) => {
+  await mockSends(page);
+  await mockAniList(page);
+  await signInToDiscover(page);
+
+  await page.getByTestId("disc-user").fill("evan");
+  await page.getByTestId("disc-go").click();
+
+  // "Read the source": Frieren (their 9/10) is in; One Piece is dropped
+  // because it's already in the gideon library.
+  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
+  await expect(sources).toHaveCount(1);
+  await expect(sources.first()).toContainText("Frieren");
+  await expect(sources.first()).toContainText("You rated the anime 9/10");
+
+  // "More like what you love": Yokohama is in; Vagabond is dropped (already
+  // on their AniList manga list) and the light novel is dropped (not manga).
+  const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
+  await expect(similar).toHaveCount(1);
+  await expect(similar.first()).toContainText("Yokohama");
+
+  // The list is remembered for next time, and "Change" reopens the form
+  // prefilled.
+  await expect(page.getByTestId("disc-who")).toContainText("evan");
+  await page.getByTestId("disc-change").click();
+  await expect(page.getByTestId("disc-user")).toHaveValue("evan");
+});
+
+test("a card's Send to Kobo enqueues title + cover and shows in pending sends", async ({ page }) => {
+  const posted = [];
+  await mockSends(page, posted);
+  await mockAniList(page);
+  await signInToDiscover(page);
+
+  await page.getByTestId("disc-user").fill("evan");
+  await page.getByTestId("disc-go").click();
+
+  const card = page.getByTestId("rec-sources").getByTestId("rec-card").first();
+  await card.getByTestId("rec-send").click();
+  await expect(card.getByTestId("rec-send")).toHaveText(/Sent to Kobo/);
+  await expect(card.getByTestId("rec-send")).toBeDisabled();
+
+  // The exact row the device will pick up: the title to search for, plus the
+  // cover art for the notification.
+  expect(posted).toEqual([
+    { title: "Frieren: Beyond Journey's End", cover_url: "https://img.test/frieren.jpg" },
+  ]);
+
+  // It shows up in the Stats tab's pending-sends list, thumbnail included.
+  await page.getByTestId("tab-stats").click();
+  const item = page.getByTestId("send-item").first();
+  await expect(item).toContainText("Frieren");
+  await expect(item.locator(".send-cover")).toHaveAttribute("src", "https://img.test/frieren.jpg");
+});
+
+test("a provider outage shows a clear error, not an endless spinner", async ({ page }) => {
+  await mockSends(page);
+  await mockAniList(page, {
+    failWith: "The AniList API has been temporarily disabled due to severe stability issues.",
+  });
+  await signInToDiscover(page);
+
+  await page.getByTestId("disc-user").fill("evan");
+  await page.getByTestId("disc-go").click();
+
+  await expect(page.getByTestId("disc-error")).toContainText("temporarily disabled");
+  await expect(page.getByTestId("disc-go")).toBeVisible(); // form is back for a retry
+});
+
+test("MyAnimeList (via Jikan): the full flow produces sendable cards", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  await signInToDiscover(page);
+
+  await page.getByTestId("disc-mal").click();
+  await page.getByTestId("disc-user").fill("evan_mal");
+  await page.getByTestId("disc-go").click();
+
+  // Jikan is throttled client-side (350ms between calls), so allow a bit more
+  // time than the default for the cards to arrive.
+  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
+  await expect(sources).toHaveCount(1, { timeout: 15000 });
+  await expect(sources.first()).toContainText("Vinland Saga");
+  await expect(sources.first()).toContainText("You rated the anime 10/10");
+
+  const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
+  await expect(similar).toHaveCount(1);
+  await expect(similar.first()).toContainText("Berserk");
+});

@@ -78,7 +78,31 @@ async function refreshSession(session) {
   });
   const next = sessionFrom(data, session.email);
   saveSession(next);
+  // Supabase rotates refresh tokens, so the in-memory session must follow the
+  // stored one — a later call retrying with the stale token would sign out.
+  if (state.session) state.session = next;
   return next;
+}
+
+// Authenticated REST call with one transparent refresh-retry on 401, so a tab
+// that sat open past the ~1h access-token lifetime keeps working (this was why
+// "Send to Kobo" silently did nothing on a stale tab). Throws on any other
+// non-2xx status; callers decide whether that's fatal or decor.
+async function authedFetch(path, opts = {}, retry = true) {
+  const session = state.session;
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...opts,
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401 && retry && session.refresh_token) {
+    const next = await refreshSession(session).catch(() => null);
+    if (next) return authedFetch(path, opts, false);
+  }
+  return res;
 }
 
 async function fetchProgress(session, retry = true, withStartedAt = true) {
@@ -103,11 +127,8 @@ async function fetchProgress(session, retry = true, withStartedAt = true) {
 // Every published chapter-page row at once, for the library's cover art: a
 // series' cover is the first page of its first chapter that the device has
 // published page URLs for. One request; [] on any failure (covers are decor).
-async function fetchAllChapterPages(session) {
-  const url = `${SUPABASE_URL}/rest/v1/chapter_pages?select=chapter_key,page_urls`;
-  const res = await fetch(url, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
-  });
+async function fetchAllChapterPages() {
+  const res = await authedFetch("chapter_pages?select=chapter_key,page_urls");
   if (!res.ok) return [];
   return res.json().catch(() => []);
 }
@@ -115,13 +136,9 @@ async function fetchAllChapterPages(session) {
 // Publish reading progress from the web. Furthest-page-wins server-side, so it
 // can never rewind the Kobo. Best-effort (never blocks the reader).
 function upsertProgress(session, chapterKey, currentPage, totalPages) {
-  return fetch(`${SUPABASE_URL}/rest/v1/rpc/upsert_progress`, {
+  return authedFetch("rpc/upsert_progress", {
     method: "POST",
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${session.access_token}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       p_chapter_key: chapterKey,
       p_current_page: currentPage,
@@ -133,12 +150,9 @@ function upsertProgress(session, chapterKey, currentPage, totalPages) {
 // The page image URLs the device published for a chapter (or [] if it hasn't
 // been resolved for the web yet).
 async function fetchChapterPages(session, chapterKey) {
-  const url = `${SUPABASE_URL}/rest/v1/chapter_pages?chapter_key=eq.${encodeURIComponent(
-    chapterKey
-  )}&select=page_urls`;
-  const res = await fetch(url, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
-  });
+  const res = await authedFetch(
+    `chapter_pages?chapter_key=eq.${encodeURIComponent(chapterKey)}&select=page_urls`
+  );
   if (!res.ok) return [];
   const rows = await res.json();
   return rows[0]?.page_urls ?? [];
@@ -149,20 +163,13 @@ async function fetchChapterPages(session, chapterKey) {
 // needs no backend change. The device is untouched — only the synced copy
 // goes, which is exactly what clearing stale rows from an old library needs.
 async function deleteSeries(session, series) {
-  const headers = {
-    apikey: SUPABASE_ANON_KEY,
-    Authorization: `Bearer ${session.access_token}`,
-  };
   const filters = [
     `chapter_key=eq.${encodeURIComponent(series)}`, // a loose root chapter
     `chapter_key=like.${encodeURIComponent(series + "/*")}`, // series/…
   ];
   for (const table of ["reading_progress", "chapter_pages"]) {
     for (const filter of filters) {
-      await fetch(`${SUPABASE_URL}/rest/v1/${table}?${filter}`, {
-        method: "DELETE",
-        headers,
-      }).catch(() => {});
+      await authedFetch(`${table}?${filter}`, { method: "DELETE" }).catch(() => {});
     }
   }
 }
@@ -174,33 +181,301 @@ async function deleteSeries(session, series) {
 // three calls go straight through PostgREST under row-level security (user_id
 // defaults to auth.uid() on insert).
 
-async function fetchSends(session) {
-  const url = `${SUPABASE_URL}/rest/v1/send_queue?status=eq.pending&select=id,title,created_at&order=created_at.desc`;
-  const res = await fetch(url, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
-  });
+async function fetchSends() {
+  const res = await authedFetch(
+    "send_queue?status=eq.pending&select=id,title,cover_url,created_at&order=created_at.desc"
+  );
   if (!res.ok) return [];
   return res.json();
 }
-async function enqueueSend(session, title) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/send_queue`, {
+async function enqueueSend(title, coverUrl) {
+  const res = await authedFetch("send_queue", {
     method: "POST",
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${session.access_token}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify({ title }),
+    headers: { "Content-Type": "application/json", Prefer: "return=representation" },
+    body: JSON.stringify(coverUrl ? { title, cover_url: coverUrl } : { title }),
   });
-  if (!res.ok) throw new Error(`Couldn't send (${res.status})`);
+  if (!res.ok) {
+    throw new Error(res.status === 401 ? "Session expired — sign in again" : `Couldn't send (${res.status})`);
+  }
   return res.json();
 }
-async function deleteSend(session, id) {
-  return fetch(`${SUPABASE_URL}/rest/v1/send_queue?id=eq.${encodeURIComponent(id)}`, {
-    method: "DELETE",
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+async function deleteSend(id) {
+  return authedFetch(`send_queue?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+// --- Discover: manga recommendations from your anime list ------------------
+//
+// The user points us at their public anime list (AniList username, or a
+// MyAnimeList username via the Jikan mirror — MAL's own API doesn't allow
+// browser calls). From the list we recommend two kinds of manga, each with a
+// one-tap "Send to Kobo" that drops the title into the existing send_queue:
+//
+//   1. "Read the source" — the source manga of the anime they rated highest
+//      (adaptation → manga relation edges).
+//   2. "More like what you love" — community recommendations for those manga.
+//
+// Everything runs client-side against public, CORS-open, no-key APIs, in the
+// same no-SDK plain-fetch style as the Supabase calls. Both providers can be
+// down (they're scraped/community infra), so every step degrades to a clear
+// error state instead of a spinner that never ends.
+
+const REC_PROVIDER_KEY = "gideon.rec.provider"; // "anilist" | "mal"
+const REC_USER_KEY = "gideon.rec.username";
+const ANILIST_URL = "https://graphql.anilist.co";
+const JIKAN_URL = "https://api.jikan.moe/v4";
+
+// How many top-rated anime seed the recommendations, and how many cards we
+// show per section. Small on purpose: Jikan is rate-limited (~3 req/s) and a
+// phone screen only fits so much.
+const REC_SEEDS = 8;
+const REC_MAX_PER_SECTION = 12;
+
+function recPrefs() {
+  return {
+    provider: localStorage.getItem(REC_PROVIDER_KEY) === "mal" ? "mal" : "anilist",
+    username: localStorage.getItem(REC_USER_KEY) || "",
+  };
+}
+function saveRecPrefs(provider, username) {
+  localStorage.setItem(REC_PROVIDER_KEY, provider);
+  localStorage.setItem(REC_USER_KEY, username);
+}
+
+// Titles compare loosely across providers/library dirs ("Frieren: Beyond
+// Journey's End" vs "Frieren_ Beyond Journey's End").
+function normTitle(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// One recommendation card: { title, cover, score (0-100 community score or
+// null), reason }. Both providers reduce to this.
+
+// -- AniList (GraphQL; 3 requests total) --
+
+async function anilistQuery(query, variables) {
+  const res = await fetch(ANILIST_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ query, variables }),
   });
+  const data = await res.json().catch(() => ({}));
+  if (data.errors?.length) throw new Error(data.errors[0].message || "AniList error");
+  if (!res.ok) throw new Error(`AniList error (${res.status})`);
+  return data.data;
+}
+
+const ANILIST_LIST_Q = `query ($name: String, $type: MediaType) {
+  MediaListCollection(userName: $name, type: $type,
+      status_in: [CURRENT, COMPLETED, REPEATING, PAUSED]) {
+    lists { entries { score(format: POINT_10) media { id title { romaji english } } } }
+  }
+}`;
+const ANILIST_REL_Q = `query ($ids: [Int]) {
+  Page(perPage: 50) { media(id_in: $ids, type: ANIME) {
+    id title { romaji english }
+    relations { edges { relationType node {
+      id type format title { romaji english } coverImage { large } averageScore
+    } } }
+  } }
+}`;
+const ANILIST_SIM_Q = `query ($ids: [Int]) {
+  Page(perPage: 50) { media(id_in: $ids, type: MANGA) {
+    id title { romaji english }
+    recommendations(sort: RATING_DESC, perPage: 4) { nodes { rating mediaRecommendation {
+      id type format title { romaji english } coverImage { large } averageScore
+    } } }
+  } }
+}`;
+
+const anilistTitle = (m) => m?.title?.english || m?.title?.romaji || "";
+// Manga we can actually read (not light novels).
+const isMangaNode = (n) => n?.type === "MANGA" && n?.format !== "NOVEL";
+
+async function anilistRecommend(username, onStatus) {
+  onStatus("Reading your AniList…");
+  const animeData = await anilistQuery(ANILIST_LIST_Q, { name: username, type: "ANIME" });
+  const entries = (animeData?.MediaListCollection?.lists || [])
+    .flatMap((l) => l.entries || [])
+    .filter((e) => e?.media?.id);
+  if (!entries.length) throw new Error("That AniList has no anime on it (or it's private).");
+
+  // Their manga list too, so we never recommend something they already read.
+  // Best-effort: a user with no manga list just gets no exclusions.
+  const mangaData = await anilistQuery(ANILIST_LIST_Q, { name: username, type: "MANGA" }).catch(() => null);
+  const alreadyReading = new Set(
+    (mangaData?.MediaListCollection?.lists || [])
+      .flatMap((l) => l.entries || [])
+      .map((e) => normTitle(anilistTitle(e.media)))
+      .filter(Boolean)
+  );
+
+  // Highest-rated first; unscored entries keep list order after the scored.
+  const seeds = entries
+    .slice()
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, REC_SEEDS);
+
+  onStatus("Finding the manga behind your favorites…");
+  const rel = await anilistQuery(ANILIST_REL_Q, { ids: seeds.map((e) => e.media.id) });
+  const scoreByAnime = new Map(seeds.map((e) => [e.media.id, e.score || 0]));
+  const sources = [];
+  for (const anime of rel?.Page?.media || []) {
+    const edges = (anime.relations?.edges || []).filter((e) => isMangaNode(e.node));
+    // Prefer the true SOURCE edge; fall back to any manga relation (some
+    // entries only carry ADAPTATION/PARENT edges).
+    const edge = edges.find((e) => e.relationType === "SOURCE") || edges[0];
+    if (!edge) continue;
+    const yourScore = scoreByAnime.get(anime.id) || 0;
+    sources.push({
+      id: edge.node.id,
+      title: anilistTitle(edge.node),
+      cover: edge.node.coverImage?.large || null,
+      score: edge.node.averageScore ?? null,
+      reason: yourScore
+        ? `You rated the anime ${yourScore}/10 — read the source`
+        : `You watched ${anilistTitle(anime)} — read the source`,
+    });
+  }
+
+  onStatus("Looking for more like what you love…");
+  let similar = [];
+  if (sources.length) {
+    const sim = await anilistQuery(ANILIST_SIM_Q, { ids: sources.map((s) => s.id) }).catch(() => null);
+    for (const manga of sim?.Page?.media || []) {
+      for (const n of manga.recommendations?.nodes || []) {
+        const m = n?.mediaRecommendation;
+        if (!isMangaNode(m)) continue;
+        similar.push({
+          id: m.id,
+          title: anilistTitle(m),
+          cover: m.coverImage?.large || null,
+          score: m.averageScore ?? null,
+          reason: `Loved by readers of ${anilistTitle(manga)}`,
+        });
+      }
+    }
+  }
+  return { sources, similar, alreadyReading };
+}
+
+// -- MyAnimeList via Jikan (REST mirror; sequential + throttled) --
+
+async function jikanGet(path) {
+  const res = await fetch(`${JIKAN_URL}/${path}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || (data.status && data.status >= 400)) {
+    throw new Error(data.message || `MyAnimeList error (${data.status || res.status})`);
+  }
+  return data.data;
+}
+
+async function malRecommend(username, onStatus) {
+  onStatus("Reading your MyAnimeList…");
+  const list = await jikanGet(`users/${encodeURIComponent(username)}/animelist?status=completed`);
+  const entries = (list || []).filter((e) => e?.anime?.mal_id);
+  if (!entries.length) throw new Error("That MyAnimeList has no completed anime (or it's private).");
+
+  const seeds = entries
+    .slice()
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, REC_SEEDS);
+
+  onStatus("Finding the manga behind your favorites…");
+  const sources = [];
+  for (const e of seeds) {
+    await sleep(350); // Jikan is rate-limited (~3 req/s shared) — be polite
+    const full = await jikanGet(`anime/${e.anime.mal_id}/full`).catch(() => null);
+    const adaptation = (full?.relations || [])
+      .filter((r) => r.relation === "Adaptation")
+      .flatMap((r) => r.entry || [])
+      .find((x) => x.type === "manga");
+    if (!adaptation) continue;
+    sources.push({
+      id: adaptation.mal_id,
+      title: adaptation.name,
+      cover: null, // filled below (relations carry no art)
+      score: null,
+      reason: e.score
+        ? `You rated the anime ${e.score}/10 — read the source`
+        : `You watched ${e.anime.title} — read the source`,
+    });
+  }
+
+  onStatus("Fetching covers…");
+  for (const s of sources) {
+    await sleep(350);
+    const manga = await jikanGet(`manga/${s.id}`).catch(() => null);
+    if (manga) {
+      s.cover = manga.images?.jpg?.large_image_url || manga.images?.jpg?.image_url || null;
+      s.score = manga.score ? Math.round(manga.score * 10) : null;
+    }
+  }
+
+  onStatus("Looking for more like what you love…");
+  const similar = [];
+  for (const s of sources.slice(0, 3)) {
+    await sleep(350);
+    const recs = await jikanGet(`manga/${s.id}/recommendations`).catch(() => []);
+    for (const r of (recs || []).slice(0, 4)) {
+      similar.push({
+        id: r.entry?.mal_id,
+        title: r.entry?.title || "",
+        cover: r.entry?.images?.jpg?.large_image_url || r.entry?.images?.jpg?.image_url || null,
+        score: null,
+        reason: `Loved by readers of ${s.title}`,
+      });
+    }
+  }
+  return { sources, similar, alreadyReading: new Set() };
+}
+
+// Dedupe, drop what they already have (gideon library, pending sends, their
+// own manga list), cap each section.
+function buildRecommendations({ sources, similar, alreadyReading }) {
+  const libSeries = new Set(
+    (state.rows || []).map((r) => normTitle(displayTitle(parseKey(r.chapter_key).series)))
+  );
+  const pending = new Set((state.sends || []).map((s) => normTitle(s.title)));
+  const skip = (t) => !t || libSeries.has(t) || pending.has(t) || alreadyReading.has(t);
+
+  const seen = new Set();
+  const take = (list) => {
+    const out = [];
+    for (const rec of list) {
+      const key = normTitle(rec.title);
+      if (skip(key) || seen.has(key)) continue;
+      seen.add(key);
+      out.push(rec);
+      if (out.length >= REC_MAX_PER_SECTION) break;
+    }
+    return out;
+  };
+  return { sources: take(sources), similar: take(similar) };
+}
+
+async function runDiscover(provider, username, email, rows) {
+  state.discover = { phase: "loading", status: "Connecting…", provider, username };
+  renderDashboard(email, rows);
+  const onStatus = (msg) => {
+    state.discover.status = msg;
+    const el = document.getElementById("disc-status");
+    if (el) el.textContent = msg;
+  };
+  try {
+    const raw =
+      provider === "mal" ? await malRecommend(username, onStatus) : await anilistRecommend(username, onStatus);
+    const recs = buildRecommendations(raw);
+    if (!recs.sources.length && !recs.similar.length) {
+      throw new Error("Nothing new to recommend — everything we found is already in your library or queue.");
+    }
+    state.discover = { phase: "done", provider, username, recs, sent: new Set() };
+    saveRecPrefs(provider, username);
+  } catch (e) {
+    state.discover = { phase: "error", provider, username, error: e.message || "Something went wrong." };
+  }
+  renderDashboard(email, rows);
 }
 
 // Session + resume state, so the reader can push progress and return home.
@@ -627,6 +902,7 @@ function sendPanelHtml(sends) {
         .map(
           (s) => `
         <div class="send-row" data-testid="send-item">
+          ${s.cover_url ? `<img class="send-cover" src="${esc(s.cover_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : ""}
           <span class="send-title">${esc(s.title)}</span>
           <span class="ago">${esc(timeAgo(s.created_at))}</span>
           <button class="send-x" data-id="${esc(s.id)}" data-testid="send-remove" aria-label="remove">×</button>
@@ -640,6 +916,7 @@ function sendPanelHtml(sends) {
       <input type="text" id="send-title" data-testid="send-input" placeholder="Manga title…" maxlength="512" autocomplete="off" />
       <button class="primary" type="submit" data-testid="send-btn">Send</button>
     </form>
+    <div class="note send-note" id="send-note" data-testid="send-note"></div>
     ${list}
   </section>`;
 }
@@ -653,6 +930,85 @@ function viewStats(stats, groups, sends) {
     </section>
     ${topSeriesHtml(stats)}
     ${recentHtml(groups)}`;
+}
+
+// --- Discover view ----------------------------------------------------------
+
+function recCardHtml(rec) {
+  const sent = !!state.discover?.sent?.has(normTitle(rec.title));
+  const art = rec.cover
+    ? `<img class="rec-cover" src="${esc(rec.cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+    : `<span class="rec-cover rec-ph">${esc([...rec.title][0] || "?")}</span>`;
+  return `
+    <div class="rec-card" data-testid="rec-card">
+      <div class="rec-art">
+        ${art}
+        ${rec.score ? `<span class="rec-score" title="Community score">★ ${(rec.score / 10).toFixed(1)}</span>` : ""}
+      </div>
+      <div class="rec-title" title="${esc(rec.title)}">${esc(rec.title)}</div>
+      <div class="rec-reason">${esc(rec.reason)}</div>
+      <button class="rec-send ${sent ? "sent" : ""}" data-testid="rec-send"
+        data-title="${esc(rec.title)}" data-cover="${esc(rec.cover || "")}" ${sent ? "disabled" : ""}>
+        ${sent ? "Sent to Kobo ✓" : "Send to Kobo"}
+      </button>
+    </div>`;
+}
+
+function recSectionHtml(label, recs, testid) {
+  if (!recs.length) return "";
+  return `<section class="panel">
+    <div class="section-label">${esc(label)}</div>
+    <div class="rec-grid" data-testid="${testid}">${recs.map(recCardHtml).join("")}</div>
+  </section>`;
+}
+
+// The connect form doubles as the "change list" form; provider is a two-way
+// segmented control (AniList / MyAnimeList).
+function discoverConnectHtml(prefs, intro) {
+  return `<section class="panel">
+    <div class="section-label">Discover</div>
+    ${intro ? `<p class="send-hint">${intro}</p>` : ""}
+    <form id="disc-form" class="disc-form">
+      <div class="seg" role="group" aria-label="List provider">
+        <button type="button" class="seg-btn ${prefs.provider === "anilist" ? "on" : ""}" data-provider="anilist" data-testid="disc-anilist">AniList</button>
+        <button type="button" class="seg-btn ${prefs.provider === "mal" ? "on" : ""}" data-provider="mal" data-testid="disc-mal">MyAnimeList</button>
+      </div>
+      <div class="disc-row">
+        <input type="text" id="disc-user" data-testid="disc-user" placeholder="your username" autocomplete="off"
+          autocapitalize="none" spellcheck="false" value="${esc(prefs.username)}" />
+        <button class="primary" type="submit" data-testid="disc-go">Get recommendations</button>
+      </div>
+    </form>
+    <p class="send-hint">Your list must be public. Keep your list on MyAnimeList? It's read through the community Jikan mirror — a bit slower.</p>
+  </section>`;
+}
+
+function viewDiscover() {
+  const d = state.discover;
+  if (!d || d.phase === "idle") {
+    return discoverConnectHtml(
+      recPrefs(),
+      "Point gideon at your anime list and get manga picks — the source manga of what you loved, and what readers of those loved next. One tap sends a pick to your Kobo."
+    );
+  }
+  if (d.phase === "loading") {
+    return `<section class="panel disc-loading" data-testid="disc-loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
+    </section>`;
+  }
+  if (d.phase === "error") {
+    return `${discoverConnectHtml({ provider: d.provider, username: d.username }, "")}
+      <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>`;
+  }
+  // done
+  const who = `<div class="disc-who" data-testid="disc-who">
+      Picks for <b>${esc(d.username)}</b> · ${d.provider === "mal" ? "MyAnimeList" : "AniList"}
+      <button class="ghost" id="disc-change" data-testid="disc-change">Change</button>
+    </div>`;
+  return `${who}
+    ${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
+    ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
 }
 
 // One library card: cover (published page art, or a lettered placeholder),
@@ -954,6 +1310,7 @@ function signOut() {
   state.resume = {};
   state.rows = null;
   state.sends = [];
+  state.discover = null;
   state.tab = "stats";
   renderSignIn("Signed out.");
 }
@@ -961,9 +1318,11 @@ function signOut() {
 // The signed-in dashboard: a header, a Stats/Library tab switch, and the active
 // view. Rows are fetched once and reused across tab switches.
 function renderDashboard(email, rows) {
-  const tab = state.tab === "library" ? "library" : "stats";
+  const tab = ["library", "discover"].includes(state.tab) ? state.tab : "stats";
   let body;
-  if (!rows.length) {
+  if (tab === "discover") {
+    body = viewDiscover();
+  } else if (!rows.length) {
     body = `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`;
   } else if (tab === "library") {
     body = viewLibrary(
@@ -987,6 +1346,7 @@ function renderDashboard(email, rows) {
     <div class="tabs" role="tablist">
       <button class="tab ${tab === "stats" ? "on" : ""}" data-tab="stats" data-testid="tab-stats">Stats</button>
       <button class="tab ${tab === "library" ? "on" : ""}" data-tab="library" data-testid="tab-library">Library</button>
+      <button class="tab ${tab === "discover" ? "on" : ""}" data-tab="discover" data-testid="tab-discover">Discover</button>
     </div>
     ${body}`;
 
@@ -1057,24 +1417,77 @@ function renderDashboard(email, rows) {
     sendForm.addEventListener("submit", async (e) => {
       e.preventDefault();
       const input = document.getElementById("send-title");
+      const btn = sendForm.querySelector("button");
+      const note = document.getElementById("send-note");
       const title = input.value.trim();
       if (!title) return;
-      input.value = "";
+      btn.disabled = true;
+      note.textContent = "";
       try {
-        const [row] = await enqueueSend(state.session, title);
+        const [row] = await enqueueSend(title);
         if (row) state.sends = [row, ...state.sends];
-      } catch (_) {
-        /* best-effort — the panel just won't show the new row */
+        renderDashboard(email, rows);
+      } catch (err) {
+        // Keep the typed title so a retry is one tap, and say what went wrong
+        // (a silent failure here is how "Send" used to look broken).
+        btn.disabled = false;
+        note.textContent = err.message || "Couldn't send — try again.";
       }
-      renderDashboard(email, rows);
     });
   }
   for (const btn of app.querySelectorAll('[data-testid="send-remove"]')) {
     btn.addEventListener("click", async () => {
       const id = btn.getAttribute("data-id");
-      deleteSend(state.session, id).catch(() => {});
+      deleteSend(id).catch(() => {});
       state.sends = state.sends.filter((s) => s.id !== id);
       renderDashboard(email, rows);
+    });
+  }
+  // Discover: connect form (provider toggle + username), change-list link,
+  // and the per-card Send to Kobo buttons.
+  const discForm = document.getElementById("disc-form");
+  if (discForm) {
+    let provider = discForm.querySelector(".seg-btn.on")?.getAttribute("data-provider") || "anilist";
+    for (const seg of discForm.querySelectorAll(".seg-btn")) {
+      seg.addEventListener("click", () => {
+        provider = seg.getAttribute("data-provider");
+        discForm.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("on", b === seg));
+      });
+    }
+    discForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const username = document.getElementById("disc-user").value.trim();
+      if (!username) return;
+      runDiscover(provider, username, email, rows);
+    });
+  }
+  document.getElementById("disc-change")?.addEventListener("click", () => {
+    state.discover = { phase: "idle" };
+    renderDashboard(email, rows);
+  });
+  for (const btn of app.querySelectorAll('[data-testid="rec-send"]')) {
+    btn.addEventListener("click", async () => {
+      const title = btn.getAttribute("data-title");
+      const cover = btn.getAttribute("data-cover") || null;
+      btn.disabled = true;
+      btn.textContent = "Sending…";
+      try {
+        const [row] = await enqueueSend(title, cover);
+        if (row) state.sends = [row, ...state.sends];
+        state.discover?.sent?.add(normTitle(title));
+        btn.textContent = "Sent to Kobo ✓";
+        btn.classList.add("sent");
+      } catch (err) {
+        // In-place failure: re-arm the button and say why, no re-render (a
+        // re-render would scroll the grid back to the top).
+        btn.disabled = false;
+        btn.textContent = "Send to Kobo";
+        btn.insertAdjacentHTML(
+          "afterend",
+          `<div class="note rec-error" data-testid="rec-error">${esc(err.message || "Couldn't send.")}</div>`
+        );
+        setTimeout(() => btn.parentElement?.querySelector(".rec-error")?.remove(), 4000);
+      }
     });
   }
 }
@@ -1175,9 +1588,9 @@ async function showDashboard(session) {
     // Remember where each chapter was left off, so the reader resumes there.
     for (const r of rows) state.resume[r.chapter_key] = r.current_page;
     state.rows = rows;
-    state.sends = await fetchSends(session).catch(() => []);
+    state.sends = await fetchSends().catch(() => []);
     // Covers for the library shelf (best-effort decor).
-    state.covers = coverBySeries(await fetchAllChapterPages(session).catch(() => []));
+    state.covers = coverBySeries(await fetchAllChapterPages().catch(() => []));
     renderDashboard(email, rows);
   } catch (e) {
     if (String(e.message).includes("401")) {
