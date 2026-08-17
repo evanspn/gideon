@@ -37,6 +37,153 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// How many times a reconcile is attempted before it's abandoned, and the base
+/// wait between attempts (the wait grows with each retry).
+const SYNC_ATTEMPTS: usize = 3;
+const SYNC_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long [`sync_before_sleep`] holds the device awake waiting for a
+/// reconcile to land. Short on purpose: the push is one small request, and a
+/// device asked to sleep must sleep — anything unsent is retried after wake.
+const PRE_SLEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How long [`spawn_sync_when_online`] keeps waiting for the radio to come back
+/// before giving up, and how often it re-checks. Bounded so a device that wakes
+/// out of Wi-Fi range doesn't keep a thread (or the radio's attention) forever.
+const ONLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+const ONLINE_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// True while a wait-for-network sync is already pending, so repeated wakes
+/// don't stack up waiters all racing the same reconcile.
+static WAITING_FOR_ONLINE: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`WAITING_FOR_ONLINE`] on any exit, panic included.
+struct WaitingGuard;
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        WAITING_FOR_ONLINE.store(false, Ordering::Release);
+    }
+}
+
+/// The outcome of the most recent sync attempt this session, for the account
+/// screen. Process-local by design: after a restart there's simply no status
+/// until something syncs, which is honest — better than showing a stale
+/// "synced" from a previous run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncStatus {
+    Ok { at: u64 },
+    Failed(String),
+}
+
+static STATUS: std::sync::Mutex<Option<SyncStatus>> = std::sync::Mutex::new(None);
+
+fn set_status(status: SyncStatus) {
+    if let Ok(mut slot) = STATUS.lock() {
+        *slot = Some(status);
+    }
+}
+
+/// The last sync attempt's outcome, if there's been one this session.
+pub fn status() -> Option<SyncStatus> {
+    STATUS.lock().ok().and_then(|s| s.clone())
+}
+
+/// Reset the session status (tests only — the status is process-global, so a
+/// test that asserts "nothing yet" has to clear what another one set).
+#[cfg(test)]
+fn set_status_for_test(status: Option<SyncStatus>) {
+    if let Ok(mut slot) = STATUS.lock() {
+        *slot = status;
+    }
+}
+
+/// A one-line summary of [`status`] for the account screen — `None` when
+/// nothing has been attempted yet this run.
+pub fn status_line() -> Option<String> {
+    match status()? {
+        SyncStatus::Ok { at } => Some(format!("Last synced {}", ago(now().saturating_sub(at)))),
+        // The message itself is a transport/auth string; keep the row short and
+        // say what it means for the user instead.
+        SyncStatus::Failed(_) => Some("Last sync failed — will retry".to_string()),
+    }
+}
+
+/// "just now" / "4 min ago" / "2 h ago" — coarse on purpose.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86400),
+    }
+}
+
+/// Whether the device is holding reading progress the server hasn't got yet.
+/// Cheap (two small JSON reads) and used to decide whether a sync is worth
+/// delaying sleep for at all.
+pub fn has_unpushed(library_dir: &Path) -> bool {
+    let Some(account) = account(library_dir) else {
+        return false;
+    };
+    account.has_unpushed()
+}
+
+/// Flush reading progress before the device suspends.
+///
+/// This is the moment that matters most: you finish a chapter, put the device
+/// down, and it naps — with nothing else to trigger a sync until you next open
+/// the library. Deliberately conservative:
+///
+/// * does nothing when signed out, when there's nothing unpushed, or when the
+///   device is offline — a nap must never be delayed to talk to a dead radio,
+///   and Wi-Fi is never brought UP for this;
+/// * waits at most [`PRE_SLEEP_BUDGET`] for the reconcile, then suspends
+///   regardless. The half-finished request dies with the suspend and is retried
+///   after wake — the local store is authoritative, so nothing is lost.
+pub fn sync_before_sleep(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Send>>) {
+    if !gideon_device::network::is_online() || !has_unpushed(library_dir) {
+        return;
+    }
+    spawn_sync(library_dir, gateway);
+    let deadline = std::time::Instant::now() + PRE_SLEEP_BUDGET;
+    while SYNC_IN_FLIGHT.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Sync as soon as the network is actually back, for up to [`ONLINE_WAIT`].
+///
+/// The wake path kicks a Wi-Fi reconnect that completes asynchronously, so a
+/// sync fired at that moment reliably fails against a radio that hasn't
+/// associated yet. This waits for `is_online` instead of guessing — polling a
+/// local sysfs read, never the network — and only then reconciles. It never
+/// brings the radio up itself, gives up rather than waiting forever, and is
+/// single-flight, so repeated wakes don't stack waiters.
+pub fn spawn_sync_when_online(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Send>>) {
+    let Some(account) = account(library_dir) else {
+        return;
+    };
+    if !account.is_signed_in() {
+        return;
+    }
+    if WAITING_FOR_ONLINE.swap(true, Ordering::AcqRel) {
+        return; // a waiter is already pending
+    }
+    let library_dir = library_dir.to_path_buf();
+    std::thread::spawn(move || {
+        let _guard = WaitingGuard;
+        gideon_device::power::lower_current_thread_to_idle();
+        let deadline = std::time::Instant::now() + ONLINE_WAIT;
+        while !gideon_device::network::is_online() {
+            if std::time::Instant::now() >= deadline {
+                return; // still no network — the next trigger will try again
+            }
+            std::thread::sleep(ONLINE_POLL);
+        }
+        spawn_sync(&library_dir, gateway);
+    });
+}
+
 /// Default Supabase project the app syncs against. The anon key is public by
 /// design — row-level security (keyed to `auth.uid()`), not this key, is what
 /// protects a user's rows — so shipping it in the binary is expected. Both can
@@ -111,8 +258,30 @@ pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Se
     std::thread::spawn(move || {
         // Releases the in-flight flag on any exit, including a panic unwind.
         let _guard = InFlightGuard;
-        match account.sync(now()) {
-            Ok(outcome) => {
+        // Retry a failed reconcile a couple of times before giving up. The
+        // usual cause is a radio that isn't back yet (a nap, a walk out of
+        // range), which fixes itself in seconds — and a dropped sync used to
+        // mean your place simply never reached the web until you happened to
+        // open the library while online.
+        let mut outcome = None;
+        for attempt in 0..SYNC_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(SYNC_RETRY_WAIT * attempt as u32);
+                if !gideon_device::network::is_online() {
+                    continue; // still no network — don't burn an attempt on it
+                }
+            }
+            match account.sync(now()) {
+                Ok(o) => {
+                    outcome = Some(o);
+                    break;
+                }
+                Err(e) => set_status(SyncStatus::Failed(e.to_string())),
+            }
+        }
+        match outcome {
+            Some(outcome) => {
+                set_status(SyncStatus::Ok { at: now() });
                 if outcome.merged > 0 || outcome.pushed > 0 {
                     eprintln!(
                         "sync: merged {} pulled row(s), pushed {}",
@@ -120,8 +289,8 @@ pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Se
                     );
                 }
             }
-            Err(e) => {
-                eprintln!("sync: skipped ({e})");
+            None => {
+                eprintln!("sync: gave up after {SYNC_ATTEMPTS} attempts");
                 return; // offline: resolving/publishing pages would fail too
             }
         }
@@ -260,6 +429,50 @@ mod tests {
         let c = config().expect("build default config exists");
         assert!(c.url.starts_with("https://") && c.url.ends_with(".supabase.co"));
         assert!(c.anon_key.starts_with("eyJ"), "anon key is a JWT");
+    }
+
+    #[test]
+    fn ago_reads_as_a_glance_not_a_stopwatch() {
+        assert_eq!(ago(0), "just now");
+        assert_eq!(ago(59), "just now");
+        assert_eq!(ago(60), "1 min ago");
+        assert_eq!(ago(4 * 60 + 30), "4 min ago");
+        assert_eq!(ago(3 * 3600), "3 h ago");
+        assert_eq!(ago(50 * 3600), "2 d ago");
+    }
+
+    #[test]
+    fn status_line_says_when_it_worked_and_when_it_didnt() {
+        // Nothing attempted yet this run: no row at all, rather than a stale or
+        // invented "synced".
+        set_status_for_test(None);
+        assert_eq!(status_line(), None);
+
+        set_status(SyncStatus::Ok { at: now() });
+        assert_eq!(status_line().as_deref(), Some("Last synced just now"));
+
+        // A failure is stated plainly — this is the thing that used to be
+        // completely invisible — without leaking the transport error text.
+        set_status(SyncStatus::Failed("401 Unauthorized".into()));
+        let line = status_line().expect("a failure shows a row");
+        assert!(line.starts_with("Last sync failed"), "{line}");
+        assert!(!line.contains("401"), "{line}");
+        set_status_for_test(None);
+    }
+
+    #[test]
+    fn sleep_is_never_delayed_when_there_is_nothing_to_send() {
+        // No account dir / signed out: `sync_before_sleep` must fall straight
+        // through. A device asked to sleep sleeps.
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        sync_before_sleep(dir.path(), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "signed out, the pre-sleep flush returned in {:?}",
+            start.elapsed()
+        );
+        assert!(!has_unpushed(dir.path()));
     }
 
     #[test]

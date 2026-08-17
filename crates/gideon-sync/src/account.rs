@@ -163,6 +163,18 @@ impl Account {
         Ok(outcome)
     }
 
+    /// Whether the local store holds reading progress the server hasn't got
+    /// yet — i.e. whether a sync would actually push anything. Local-only (two
+    /// small file reads, no network), so callers can ask it on the UI thread
+    /// before deciding a sync is worth waiting on.
+    pub fn has_unpushed(&self) -> bool {
+        if !self.is_signed_in() {
+            return false;
+        }
+        let store = ProgressStore::load(&self.progress_path()).unwrap_or_default();
+        !crate::pending_pushes(&store, &self.load_state()).is_empty()
+    }
+
     /// Load the signed-in session, refreshing (and persisting) the access token
     /// if it's near expiry. Errors if signed out or the refresh fails.
     fn ensure_fresh_session(&self, now: u64) -> Result<Session> {
@@ -429,5 +441,37 @@ mod tests {
             reloaded.get("Mine/vol1.cbz").is_some(),
             "re-signing into the same account keeps the reading"
         );
+    }
+    #[test]
+    fn has_unpushed_tracks_what_the_server_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let acct = Account::new(config(), dir.path());
+
+        // Signed out: never anything to push (and nothing to push it with).
+        let mut store = ProgressStore::default();
+        store.update("Series/vol1.cbz", 3, 10);
+        store.save(&acct.progress_path()).unwrap();
+        assert!(!acct.has_unpushed());
+
+        // Signed in, page 3 local and nothing known on the server: unpushed.
+        acct.save_session(&session("reader@example.com")).unwrap();
+        assert!(acct.has_unpushed());
+
+        // Once the server is known to have that page, there's nothing to send —
+        // so a sleep is never delayed for a sync that would push nothing.
+        acct.save_state(&SyncState {
+            server_pages: [("Series/vol1.cbz".to_string(), 3usize)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!acct.has_unpushed());
+
+        // Read one more page and it's pending again.
+        let mut store = ProgressStore::load(&acct.progress_path()).unwrap();
+        store.update("Series/vol1.cbz", 4, 10);
+        store.save(&acct.progress_path()).unwrap();
+        assert!(acct.has_unpushed());
     }
 }
