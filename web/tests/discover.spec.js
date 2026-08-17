@@ -659,6 +659,80 @@ test("an already-connected browser replaying a code stays quiet", async ({ page 
   expect(new URL(page.url()).search).toBe(""); // code still scrubbed
 });
 
+// --- late-arriving recommendations must not disturb the app -----------------
+
+// Holds the manga-list call open so recommendations are still running while
+// the test drives the UI elsewhere; release() lets them finish.
+function mockSlowRecs(page) {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  page.route(/\/api\/mal\?path=/, async (route) => {
+    const [p] = (new URL(route.request().url()).searchParams.get("path") || "").split("?");
+    const json = (b) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
+    if (p.includes("/animelist")) return json({ data: [] });
+    if (p.includes("/mangalist")) {
+      await gate;
+      return json({ data: [{ node: { id: 900, title: "Vagabond" }, list_status: { score: 9, num_chapters_read: 104 } }] });
+    }
+    if (p === "manga/900") return json(MAL.manga900);
+    if (p === "manga/ranking") return json(MAL.ranking);
+    return json({ data: [] });
+  });
+  return () => release();
+}
+
+test("recommendations finishing while you're reading don't kick you out", async ({ page }) => {
+  await mockSends(page);
+  const finishRecs = mockSlowRecs(page);
+  await page.route("**/rest/v1/chapter_pages**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([{ chapter_key: "One Piece/vol3.cbz", page_urls: ["https://cdn.test/p1.png"] }]),
+    })
+  );
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, ROWS); // lands on Discover, recs start
+
+  await expect(page.getByTestId("disc-loading")).toBeVisible();
+  // Go read a chapter while the recommendations are still running.
+  await page.getByTestId("tab-library").click();
+  await page.getByTestId("tile").first().click();
+  await expect(page.getByTestId("reader-img")).toBeVisible();
+
+  finishRecs();
+  await page.waitForTimeout(1200);
+  // Still reading — the reader was never torn down.
+  await expect(page.getByTestId("reader-img")).toBeVisible();
+  await expect(page.getByTestId("disc-loading")).toHaveCount(0);
+});
+
+test("recommendations arriving don't wipe a half-typed search or double-send", async ({ page }) => {
+  const posted = [];
+  await mockSends(page, posted);
+  const finishRecs = mockSlowRecs(page);
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, ROWS);
+
+  await expect(page.getByTestId("disc-loading")).toBeVisible();
+  await page.getByTestId("search-input").fill("berserk");
+  // Send a browse card while recs are still in flight.
+  const card = page.getByTestId("browse-results").getByTestId("rec-card").first();
+  await card.getByTestId("rec-send").click();
+
+  finishRecs();
+  await expect(page.getByTestId("rec-similar")).toBeVisible({ timeout: 15000 });
+
+  // Typed query survived, and the card still reads as sent — one row only.
+  await expect(page.getByTestId("search-input")).toHaveValue("berserk");
+  await expect(
+    page.getByTestId("browse-results").getByTestId("rec-card").first().getByTestId("rec-send")
+  ).toHaveText(/Sent to Kobo/);
+  await page.waitForTimeout(300);
+  expect(posted).toHaveLength(1);
+});
+
 test("library cards and the stats sheet show the community rating", async ({ page }) => {
   await mockSends(page);
   mockMalApi(page); // the limit=1 lookup answers One Piece with mean 9.0
