@@ -5561,13 +5561,9 @@ fn apply_key_edit(buffer: &str, key: Key, shift: bool) -> Option<String> {
     match key {
         Key::Char(c) => {
             let mut b = buffer.to_string();
-            // Shift upper-cases letters (case-sensitive passwords); other
-            // characters are unaffected.
-            if shift {
-                b.extend(c.to_uppercase());
-            } else {
-                b.push(c);
-            }
+            // Shift types the key's upper register: upper-case letters and the
+            // symbols (`!`, `#`, `?` …) — passwords need both.
+            b.push(if shift { layout::shifted_char(c) } else { c });
             Some(b)
         }
         // No leading or doubled spaces — sources won't match them, and
@@ -5628,8 +5624,8 @@ fn compose_keyboard(
     for (key, x, y, w, h) in l.keyboard_keys() {
         rect_outline(&mut canvas, x, y, w, h, 0xAA);
         let label = match key {
-            // Show the case that will actually be typed.
-            Key::Char(c) if shift => c.to_uppercase().to_string(),
+            // Show the character that will actually be typed.
+            Key::Char(c) if shift => layout::shifted_char(c).to_string(),
             Key::Char(c) => c.to_string(),
             Key::Backspace => "<del".to_string(),
             Key::Space => "space".to_string(),

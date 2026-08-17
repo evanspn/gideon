@@ -3516,8 +3516,8 @@ fn keyboard_shift_types_uppercase() {
 
 #[test]
 fn keyboard_shift_and_at_sign_editing() {
-    // Unit-level: Shift upper-cases letters, other characters are unaffected,
-    // and Shift/Search don't edit the buffer.
+    // Unit-level: Shift types each key's upper register — upper-case letters
+    // AND the symbols — and Shift/Search don't edit the buffer.
     assert_eq!(
         apply_key_edit("ab", Key::Char('c'), false).as_deref(),
         Some("abc")
@@ -3526,9 +3526,16 @@ fn keyboard_shift_and_at_sign_editing() {
         apply_key_edit("ab", Key::Char('c'), true).as_deref(),
         Some("abC")
     );
+    // The lockout this fixes: a password with a '!' in it was untypeable,
+    // because Shift left the digit row as digits.
     assert_eq!(
-        apply_key_edit("a", Key::Char('@'), true).as_deref(),
-        Some("a@")
+        apply_key_edit("pw", Key::Char('1'), true).as_deref(),
+        Some("pw!")
+    );
+    assert_eq!(
+        apply_key_edit("a", Key::Char('@'), false).as_deref(),
+        Some("a@"),
+        "unshifted, the email key still types @"
     );
     assert_eq!(apply_key_edit("a", Key::Shift, true), None);
     // The '@' key is actually on the keyboard — email addresses need it.
