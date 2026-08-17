@@ -1707,7 +1707,14 @@ function viewDiscover() {
       <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
     </section>`;
   } else if (d.phase === "error") {
-    recs = `${discoverConnectHtml(d.username, "")}
+    // A connected account shouldn't be dropped back onto the username form —
+    // it has no username to type. Error + retry, nothing else.
+    recs = connectedUser
+      ? `<section class="panel">
+          <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>
+          <button class="primary" id="disc-retry" data-testid="disc-retry">Try again</button>
+        </section>`
+      : `${discoverConnectHtml(d.username, "")}
       <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>`;
   } else {
     const who = `<div class="disc-who" data-testid="disc-who">
@@ -2192,6 +2199,10 @@ function renderDashboard(email, rows) {
   });
   document.getElementById("mal-sync")?.addEventListener("click", () => {
     syncKoboToMal(email, rows);
+  });
+  document.getElementById("disc-retry")?.addEventListener("click", () => {
+    state.discover = null;
+    renderDashboard(email, rows); // connected auto-run kicks back in
   });
   // A connected account runs its recommendations without being asked.
   if (tab === "discover" && !state.search && !state.discover && malConn()?.username) {
