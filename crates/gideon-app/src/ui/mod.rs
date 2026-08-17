@@ -1089,6 +1089,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         lines.push("Press power or open the cover to wake.".to_string());
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         self.show_status_full(&lines)?;
+        // Last chance to get your place off the device: the nap can last all
+        // night, and nothing else would sync until the library is opened again.
+        // Bounded and skipped entirely when offline (see `sync_before_sleep`).
+        crate::sync::sync_before_sleep(&self.library_dir, self.gateway.background_clone());
         let mut result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -1170,6 +1174,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // radio was down gets another go, so the next chapter is on disk before
         // the user reaches it. Queue-only — nothing blocks here.
         self.rekick_lookahead();
+        // Push whatever the pre-sleep flush couldn't — but not now, when the
+        // radio is still coming back: this waits for the network to actually be
+        // up, then syncs.
+        crate::sync::spawn_sync_when_online(&self.library_dir, self.gateway.background_clone());
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -3851,6 +3859,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // down — a dead battery must not lose it.
                         reader.save_progress(&mut store, key);
                         store.merge_save(&progress_file)?;
+                        // …and get it off the device while there's still a
+                        // network to send it over. This is the common case for
+                        // "the web never updated": you finish a chapter, put
+                        // the Kobo down, and it idles into suspend without ever
+                        // leaving the reader. Bounded, and skipped when offline.
+                        crate::sync::sync_before_sleep(
+                            &self.library_dir,
+                            self.gateway.background_clone(),
+                        );
                         let mut result = self.sleeper.as_mut().expect("checked above")();
                         self.last_wake = Some(std::time::Instant::now());
                         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -3939,6 +3956,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             &self.library_dir,
                             &self.index_guard,
                             self.settings_dir.as_deref(),
+                        );
+                        // Anything the pre-sleep flush couldn't send goes out
+                        // once the radio is genuinely back (not now — it isn't).
+                        crate::sync::spawn_sync_when_online(
+                            &self.library_dir,
+                            self.gateway.background_clone(),
                         );
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
@@ -4437,7 +4460,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         (format!("Signed in as {email}"), false),
                         ("Sync now".to_string(), true),
                         ("Sign out".to_string(), true),
-                    ],
+                    ]
+                    .into_iter()
+                    // Last: what sync actually did, so a silently failing
+                    // background sync stops being invisible. Appended (not
+                    // inserted) so the action rows keep their tap indices.
+                    .chain(crate::sync::status_line().map(|line| (line, false)))
+                    .collect(),
                     None => vec![
                         ("Sign in with email".to_string(), true),
                         (
