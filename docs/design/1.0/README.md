@@ -9,7 +9,8 @@ size (1264×1680). These are design source files, not shipping code.
 | `SeriesShelf.dc.html` | Direction A · Shelf — Series detail |
 | `Dossier.dc.html` | Direction B · Dossier — Today |
 | `DossierLibrary.dc.html` | Direction B · Dossier — Library |
-| `Palettes.dc.html` | Kaleido palette reference — four candidate schemes |
+| `Palettes.dc.html` | Kaleido palette reference — swatches, panel approximation, what collapses |
+| `Profiles.dc.html` | All five profiles side by side on real components |
 | `canvas.json` | Canvas layout + the annotations explaining both directions |
 
 ## Geometry is lifted from the source, not invented
@@ -73,10 +74,26 @@ pull from Supabase. That is the cost difference between the two.
 
 ## Choosing a scheme
 
-`Palettes.dc.html` is a reference sheet, not a device screen: four candidate
-schemes (Ink & Rust, Indigo Press, Sumi & Vermilion, Botanical), each swatch
-shown as authored sRGB beside an approximation of the panel rendering, with the
-mono value twin underneath. The mockups currently use Ink & Rust.
+Every screen artboard carries a **Profile** tweak with five options, so any
+screen can be flipped to any scheme:
+
+| Profile | Character |
+| --- | --- |
+| `ink-rust` | warm neutral, one earth accent — the default |
+| `indigo` | cool editorial, blue-led |
+| `sumi` | near-monochrome, a single vermilion |
+| `botanical` | four hues for genre coding |
+| `mono` | the non-Kaleido build |
+
+`Profiles.dc.html` shows all five side by side on the same components.
+`Palettes.dc.html` is the swatch reference: each colour as authored sRGB beside
+an approximation of the panel rendering, with the mono value twin underneath,
+plus a strip of hues the filter cannot carry at all.
+
+`mono` is a **target, not a fallback** — it is what ships if gideon reaches a
+Clara or an older Libra. Nothing in any layout depends on hue alone; where a
+scheme uses colour to separate two states, the mono profile separates them by
+value instead (`#000000` publishing against `#999999` finished).
 
 The panel approximation is a **model, not a measurement** — it pulls each
 channel toward luminance and compresses the range the way a colour filter array

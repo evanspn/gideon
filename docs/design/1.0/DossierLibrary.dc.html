@@ -101,23 +101,40 @@
 </div>
 </x-dc>
 
-<script data-dc-script data-props='{"accent":{"editor":"color","default":"#a85f38","section":"Theme"},"mono":{"editor":"boolean","default":false,"section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
+<script data-dc-script data-props='{"scheme":{"editor":"enum","default":"ink-rust","options":["ink-rust","indigo","sumi","botanical","mono"],"section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
 class Component extends DCLogic {
   renderVals() {
-    const mono = this.props.mono ?? false;
-    const rust = this.props.accent ?? '#a85f38';
-    // One muted family: shared lightness/chroma, hue varied. Kaleido desaturates,
-    // so these are already pulled back from sRGB — and each has a gray twin below,
-    // because color must never be the only carrier of meaning.
-    const c = mono
-      ? { accent: '#000000', star: '#555555', bar: '#222222', label: '#555555',
-          status: '#000000', statusBd: '#aaaaaa', genre: '#999999', genreBd: '#aaaaaa',
-          statusTint: '#f0f0f0', genreTint: '#f6f6f6', ink: '#000000',
-          heat: ['#eeeeee', '#cccccc', '#999999', '#555555', '#000000'] }
-      : { accent: rust, star: '#b08a2e', bar: rust, label: rust,
-          status: '#4c7a55', statusBd: '#4c7a55', genre: '#3f6b8c', genreBd: '#3f6b8c',
-          statusTint: '#dbe7dd', genreTint: '#dae4eb', ink: '#000000',
-          heat: ['#eeeeee', '#dcc9a6', '#c9a86b', '#a85f38', '#6c3f24'] };
+    // Five colour profiles. Kaleido subtracts saturation, so each is already
+    // muted in sRGB rather than relying on the panel's CFA gain to mute it.
+    // 'mono' is the non-Kaleido build — a real target, not a degraded fallback.
+    const SCHEMES = {
+      'ink-rust': {
+        accent: '#a85f38', star: '#b08a2e', bar: '#a85f38', label: '#a85f38',
+        status: '#4c7a55', statusBd: '#4c7a55', genre: '#3f6b8c', genreBd: '#3f6b8c',
+        statusTint: '#dbe7dd', genreTint: '#dae4eb', ink: '#000000',
+        heat: ['#eeeeee', '#dcc9a6', '#c9a86b', '#a85f38', '#6c3f24'] },
+      'indigo': {
+        accent: '#3f5488', star: '#a2603f', bar: '#3f5488', label: '#3f5488',
+        status: '#3a6e72', statusBd: '#3a6e72', genre: '#6b4a73', genreBd: '#6b4a73',
+        statusTint: '#d7e4e4', genreTint: '#e4dcea', ink: '#000000',
+        heat: ['#eeeeee', '#c8cfe2', '#8e9cc4', '#3f5488', '#28345a'] },
+      'sumi': {
+        accent: '#b14a32', star: '#b14a32', bar: '#1a1a1a', label: '#1a1a1a',
+        status: '#1a1a1a', statusBd: '#6e6a63', genre: '#6e6a63', genreBd: '#6e6a63',
+        statusTint: '#eedcd5', genreTint: '#eeece7', ink: '#000000',
+        heat: ['#efece6', '#e0c4ba', '#cd8874', '#b14a32', '#6f2d1e'] },
+      'botanical': {
+        accent: '#a4633e', star: '#9a7a34', bar: '#5f6f3f', label: '#5f6f3f',
+        status: '#5f6f3f', statusBd: '#5f6f3f', genre: '#4e6e86', genreBd: '#4e6e86',
+        statusTint: '#e2e6d6', genreTint: '#dfe6ec', ink: '#000000',
+        heat: ['#eeeeee', '#d5dcc2', '#a8b585', '#5f6f3f', '#3b4527'] },
+      'mono': {
+        accent: '#000000', star: '#555555', bar: '#222222', label: '#555555',
+        status: '#000000', statusBd: '#aaaaaa', genre: '#999999', genreBd: '#aaaaaa',
+        statusTint: '#f0f0f0', genreTint: '#f6f6f6', ink: '#000000',
+        heat: ['#eeeeee', '#cccccc', '#999999', '#555555', '#000000'] },
+    };
+    const c = SCHEMES[this.props.scheme] ?? SCHEMES['ink-rust'];
     const on  = { label: '', border: c.accent, bg: c.accent, fg: '#ffffff', weight: '700' };
     const off = { label: '', border: '#aaaaaa', bg: '#ffffff', fg: '#333333', weight: '400' };
     const seg = (label, active) => ({ ...(active ? on : off), label });
