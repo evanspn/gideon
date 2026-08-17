@@ -44,7 +44,9 @@ their MAL manga list — exact-title matches only, never rewinding MAL-side
 progress, idempotent so re-running resumes. The `/api/mal` proxy forwards the
 user's token on an explicit method+path allowlist; the single write
 (`PATCH manga/{id}/my_list_status`) is field-allowlisted. Security headers
-(CSP included) ship via `vercel.json`.
+(CSP included) ship via the **root** `vercel.json` — the only one Vercel
+reads. A `web/vercel.json` is silently ignored on a root deploy, which is why
+those headers, like the API functions, were never actually live.
 
 Heads-up for iOS users: Safari evicts script-writable storage after ~7 days
 without a visit, so a long absence may mean tapping Connect again — it's one
@@ -60,13 +62,27 @@ there's no CDN dependency at runtime.
 
 ## Deploy (Vercel)
 
+**Deploys run from the repository root, not from this directory.** The layout
+Vercel expects:
+
+* `vercel.json` (`outputDirectory: "web"`) — serves this directory's static
+  files, no build step;
+* `api/` **at the repo root** — the serverless functions (`api/mal.js`,
+  `api/mal-oauth.js`). Vercel only turns a root-level `api/` directory into
+  functions; when these lived in `web/api/` they were never deployed at all,
+  and every MyAnimeList call in the browser got a 404 ("connection isn't
+  configured", "MyAnimeList error (404)"). Keep them at the root.
+
 ```sh
-# from this directory, with a Vercel token in $VERCEL_TOKEN
+# from the REPOSITORY ROOT, with a Vercel token in $VERCEL_TOKEN
 npx vercel deploy --prod --yes --scope <team> --token "$VERCEL_TOKEN"
 ```
 
-`.vercelignore` keeps the test tooling (and `package.json`) out of the deploy,
-so Vercel serves the static files directly with no build.
+The root `.vercelignore` keeps the device app and the test tooling (including
+`web/package.json`, so Vercel doesn't treat this as a Node build) out of the
+upload. Pushing to `main` deploys automatically via
+`.github/workflows/deploy-web.yml`, which verifies afterwards that both the
+static files AND the API functions actually answer on the live site.
 
 ## Tests
 

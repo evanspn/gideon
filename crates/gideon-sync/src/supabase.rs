@@ -27,6 +27,22 @@ use crate::{Error, ProgressTransport, ProgressUpdate, RemoteProgress, Result};
 /// actually expires, so a request never goes out with a just-expired token.
 const EXPIRY_SKEW_SECS: u64 = 60;
 
+/// Network timeouts for every sync request. `ureq`'s defaults let a request sit
+/// on a half-open connection indefinitely, which on a Kobo means a sync thread
+/// wedged for the rest of the session — and, since sync is single-flight, every
+/// later trigger silently dropped. A stalled request must fail so the retry can
+/// happen.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An agent with those timeouts, shared by both clients.
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(CALL_TIMEOUT)
+        .build()
+}
+
 fn transport_err(e: impl std::fmt::Display) -> Error {
     Error::Transport(e.to_string())
 }
@@ -213,7 +229,7 @@ impl AuthClient {
     pub fn new(config: SupabaseConfig) -> Self {
         Self {
             config,
-            agent: ureq::Agent::new(),
+            agent: agent(),
         }
     }
 
@@ -258,7 +274,7 @@ impl SupabaseTransport {
         Self {
             config,
             access_token,
-            agent: ureq::Agent::new(),
+            agent: agent(),
         }
     }
 

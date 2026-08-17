@@ -430,6 +430,12 @@ enum Screen {
     NewProfile {
         name: String,
     },
+    /// On-screen keyboard for naming the *default* profile, converting it into
+    /// an ordinary one: the action key moves the library root's contents into
+    /// `@<name>` and switches to it.
+    ConvertDefault {
+        name: String,
+    },
     /// Device-global settings (NOT per profile): each tap cycles a value
     /// and saves settings.json immediately.
     Settings,
@@ -1089,6 +1095,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         lines.push("Press power or open the cover to wake.".to_string());
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         self.show_status_full(&lines)?;
+        // Last chance to get your place off the device: the nap can last all
+        // night, and nothing else would sync until the library is opened again.
+        // Bounded and skipped entirely when offline (see `sync_before_sleep`).
+        crate::sync::sync_before_sleep(&self.library_dir, self.gateway.background_clone());
         let mut result = self.sleeper.as_mut().expect("checked above")();
         self.last_wake = Some(std::time::Instant::now());
         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -1170,6 +1180,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // radio was down gets another go, so the next chapter is on disk before
         // the user reaches it. Queue-only — nothing blocks here.
         self.rekick_lookahead();
+        // Push whatever the pre-sleep flush couldn't — but not now, when the
+        // radio is still coming back: this waits for the network to actually be
+        // up, then syncs.
+        crate::sync::spawn_sync_when_online(&self.library_dir, self.gateway.background_clone());
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -1969,11 +1983,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     self.push(Screen::NewProfile {
                         name: String::new(),
                     })?;
+                } else if row == profiles.len() + 1
+                    && profiles.iter().any(|p| p == gideon_core::DEFAULT_PROFILE)
+                {
+                    self.keyboard_paints = 0;
+                    self.keyboard_shift = false;
+                    self.push(Screen::ConvertDefault {
+                        name: String::new(),
+                    })?;
                 }
                 Ok(Flow::Continue)
             }
             Screen::NewProfile { name } => {
                 self.tap_new_profile(&name, x, y)?;
+                Ok(Flow::Continue)
+            }
+            Screen::ConvertDefault { name } => {
+                self.tap_convert_default(&name, x, y)?;
                 Ok(Flow::Continue)
             }
             Screen::PowerMenu => match row {
@@ -2292,6 +2318,29 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(())
     }
 
+    /// Handle a tap on the name-the-default-profile keyboard: edit the name in
+    /// place, or (action key) convert the default profile to that name.
+    fn tap_convert_default(&mut self, name: &str, x: u32, y: u32) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let trimmed = name.trim().to_string();
+            if !trimmed.is_empty() {
+                self.convert_default_profile(&trimmed)?;
+            }
+            return Ok(());
+        }
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(n) = key.and_then(|key| apply_key_edit(name, key, self.keyboard_shift)) {
+            if let Some(Screen::ConvertDefault { name }) = self.stack.last_mut() {
+                *name = n;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
+    }
+
     /// Repaint after a keyboard edit. Mostly-partial refreshes keep typing
     /// fast, but ghosting accumulates — flash the panel clean every Nth
     /// repaint.
@@ -2471,6 +2520,47 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         settings.active_profile = name.to_string();
         self.save_settings(&settings);
+        self.stack.truncate(1);
+        self.render_current(RefreshMode::Full)
+    }
+
+    /// Give the default profile a name, turning it into an ordinary profile:
+    /// its library (the root itself, `.gideon` bookkeeping and all) moves into
+    /// `@<name>`, and "default" stops existing. The library root is left as a
+    /// pure container of profile directories.
+    ///
+    /// Nothing else about the profile changes — same books, same progress, same
+    /// sync account — because all of it lives inside the directory that moved.
+    fn convert_default_profile(&mut self, name: &str) -> Result<()> {
+        // The progress cache and the pre-downloader's worker both hold paths
+        // under the old location; retire them before anything moves.
+        self.invalidate_progress_cache();
+        self.predownloader = None;
+        let target = match gideon_core::profile::convert_default(&self.base_library, name) {
+            Ok(target) => target,
+            // A taken or unusable name isn't an error worth an error screen —
+            // say what's wrong and leave the library untouched.
+            Err(e) => {
+                return self.push(Screen::Message {
+                    title: "Profiles".to_string(),
+                    body: format!("{e}"),
+                })
+            }
+        };
+        let mut settings = self.load_settings();
+        settings
+            .profiles
+            .retain(|p| p != gideon_core::DEFAULT_PROFILE && p != name);
+        settings.profiles.insert(0, name.to_string());
+        if settings.active_profile == gideon_core::DEFAULT_PROFILE {
+            settings.active_profile = name.to_string();
+        }
+        self.save_settings(&settings);
+        if self.active_profile == gideon_core::DEFAULT_PROFILE {
+            self.active_profile = name.to_string();
+            self.library_dir = target;
+        }
+        // The library that was on screen just moved — start over from Home.
         self.stack.truncate(1);
         self.render_current(RefreshMode::Full)
     }
@@ -3851,6 +3941,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // down — a dead battery must not lose it.
                         reader.save_progress(&mut store, key);
                         store.merge_save(&progress_file)?;
+                        // …and get it off the device while there's still a
+                        // network to send it over. This is the common case for
+                        // "the web never updated": you finish a chapter, put
+                        // the Kobo down, and it idles into suspend without ever
+                        // leaving the reader. Bounded, and skipped when offline.
+                        crate::sync::sync_before_sleep(
+                            &self.library_dir,
+                            self.gateway.background_clone(),
+                        );
                         let mut result = self.sleeper.as_mut().expect("checked above")();
                         self.last_wake = Some(std::time::Instant::now());
                         if matches!(result, Ok(SleepResult::Skipped)) {
@@ -3939,6 +4038,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             &self.library_dir,
                             &self.index_guard,
                             self.settings_dir.as_deref(),
+                        );
+                        // Anything the pre-sleep flush couldn't send goes out
+                        // once the radio is genuinely back (not now — it isn't).
+                        crate::sync::spawn_sync_when_online(
+                            &self.library_dir,
+                            self.gateway.background_clone(),
                         );
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
@@ -4400,11 +4505,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     })
                     .collect();
                 rows.push(("New profile…".to_string(), true));
+                // The default profile's library IS the library root — give it a
+                // name and it becomes an ordinary "@name" profile like the rest.
+                // Offered only while a default profile still exists.
+                if profiles.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) {
+                    rows.push(("Name the default profile…".to_string(), true));
+                }
                 compose_list(l, "Profiles", &rows, 0, 1)
             }
             Screen::NewProfile { name } => {
                 compose_keyboard(l, "New profile", name, "Create", self.keyboard_shift)
             }
+            Screen::ConvertDefault { name } => compose_keyboard(
+                l,
+                "Name the default profile",
+                name,
+                "Convert",
+                self.keyboard_shift,
+            ),
             Screen::Settings => {
                 let settings = self.load_settings();
                 let mut rows = settings_rows(&settings);
@@ -4437,7 +4555,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         (format!("Signed in as {email}"), false),
                         ("Sync now".to_string(), true),
                         ("Sign out".to_string(), true),
-                    ],
+                    ]
+                    .into_iter()
+                    // Last: what sync actually did, so a silently failing
+                    // background sync stops being invisible. Appended (not
+                    // inserted) so the action rows keep their tap indices.
+                    .chain(crate::sync::status_line().map(|line| (line, false)))
+                    .collect(),
                     None => vec![
                         ("Sign in with email".to_string(), true),
                         (
@@ -6636,11 +6760,7 @@ fn cycle<T: Copy + PartialEq>(steps: &[T], current: T) -> T {
 /// `<root>/@<name>` otherwise. The @ prefix keeps profile dirs from
 /// colliding with series dirs, and the root scan skips them.
 fn profile_library_dir(base: &Path, profile: &str) -> PathBuf {
-    if profile == "default" {
-        base.to_path_buf()
-    } else {
-        base.join(format!("@{profile}"))
-    }
+    gideon_core::profile::library_dir(base, profile)
 }
 
 /// Progress file shared with `gideon library` / `gideon read`.

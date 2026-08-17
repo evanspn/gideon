@@ -3,7 +3,7 @@
 // suite mocks this endpoint away). Run: npm run test:api
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import handler from "./mal.js";
+import handler from "../../api/mal.js";
 
 process.env.MAL_CLIENT_ID = "cid-test";
 
