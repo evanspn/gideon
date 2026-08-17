@@ -633,6 +633,22 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 /* Community-score badge on library cards */
 .item .badge.rating { border-color: var(--accent); color: var(--accent); }
 
+/* MAL sync progress + per-series report */
+.mal-sync-btn { margin-top: 4px; }
+.sync-report {
+  margin-top: 10px; display: flex; flex-direction: column; gap: 6px;
+  max-height: 300px; overflow-y: auto;
+}
+.sync-row { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; min-width: 0; }
+.sync-outcome {
+  flex: 0 0 auto; text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.sync-updated .sync-outcome { border-color: var(--accent); color: var(--accent); }
+.sync-title { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-note { flex: 1 1 auto; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* MAL OAuth redirect: the code, unmissable */
 .oauth-banner {
   background: var(--accent); color: var(--accent-ink);

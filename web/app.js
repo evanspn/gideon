@@ -497,9 +497,22 @@ const malScore = (mean) => (mean ? Math.round(mean * 10) : null);
 
 // --- provider operations (proxy-first, Jikan fallback) ---
 
+// Whether this username is the connected account — if so, personal reads go
+// through the user token (private lists work; no Jikan fallback exists for
+// them, and none is possible).
+const isOwnAccount = (username) => !!username && malConn()?.username === username;
+
 // The user's completed anime, as { id, title, score }.
 function opAnimeList(username) {
   const u = encodeURIComponent(username);
+  if (isOwnAccount(username)) {
+    return malUserGet("users/@me/animelist?status=completed&limit=1000&fields=list_status&nsfw=true").then(
+      (d) =>
+        (d.data || [])
+          .filter((e) => e.node?.id)
+          .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }))
+    );
+  }
   return withMal(
     async () => {
       let d;
@@ -525,6 +538,11 @@ function opAnimeList(username) {
 // Titles on their manga list (normalized), for exclusions. Best-effort.
 function opMangaListTitles(username) {
   const u = encodeURIComponent(username);
+  if (isOwnAccount(username)) {
+    return malUserGet("users/@me/mangalist?limit=1000&nsfw=true").then(
+      (d) => new Set((d.data || []).map((e) => normTitle(e.node?.title)).filter(Boolean))
+    );
+  }
   return withMal(
     async () => {
       const d = await malGet(`users/${u}/mangalist?limit=1000&nsfw=true`);
@@ -832,6 +850,166 @@ async function fetchLibraryRatings(titles) {
 // The community score for a library series, if we've resolved one.
 function seriesRating(series) {
   return state.ratings?.get(normTitle(displayTitle(series))) ?? null;
+}
+
+// --- authenticated MAL calls (through the proxy, user token forwarded) ------
+
+async function malUserGet(path) {
+  const token = await malUserToken();
+  if (!token) {
+    throw Object.assign(new Error("MyAnimeList needs a reconnect."), { reconnect: true });
+  }
+  const res = await fetch(`api/mal?path=${encodeURIComponent(path)}`, {
+    headers: { "X-MAL-USER-TOKEN": token },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw Object.assign(new Error(data.error || `MyAnimeList error (${res.status})`), {
+      status: res.status,
+    });
+  }
+  return data;
+}
+
+async function malUserPatch(path, fields) {
+  const token = await malUserToken();
+  if (!token) {
+    throw Object.assign(new Error("MyAnimeList needs a reconnect."), { reconnect: true });
+  }
+  const res = await fetch(`api/mal?path=${encodeURIComponent(path)}`, {
+    method: "PATCH",
+    headers: { "X-MAL-USER-TOKEN": token, "Content-Type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw Object.assign(new Error(data.error || `MyAnimeList error (${res.status})`), {
+      status: res.status,
+    });
+  }
+  return data;
+}
+
+// --- Sync the Kobo's reading history onto the connected MAL list ------------
+//
+// Safety rules from review: only write entries whose normalized title matches
+// the MAL search result EXACTLY (a fuzzy write could scribble on a stranger
+// series in the user's real list — the one failure recovery can't undo);
+// never move MAL progress backwards (furthest-wins, gideon's cardinal rule,
+// applied to the MAL side too); duplicates of one MAL entry across library
+// folders merge to the furthest chapter. Idempotent, so re-running resumes.
+
+const seriesQuery = (title) =>
+  title.replace(/\s*\([^)]*\)/g, "").replace(/^manga[\s-]+/i, "").trim() || title;
+
+async function syncKoboToMal(email, rows) {
+  if (!malConn() || state.malSync?.phase === "running") return;
+  const groups = groupBySeries(rows);
+  state.malSync = { phase: "running", note: "Reading your MAL list…", report: [] };
+  patchMalSync();
+
+  let existing;
+  try {
+    const d = await malUserGet("users/@me/mangalist?limit=1000&fields=list_status&nsfw=true");
+    existing = new Map((d.data || []).filter((e) => e.node?.id).map((e) => [e.node.id, e.list_status || {}]));
+  } catch (e) {
+    state.malSync = {
+      phase: "error",
+      error: e.reconnect ? "MyAnimeList needs a reconnect first." : "Couldn't read your MAL list — try again.",
+    };
+    patchMalSync();
+    return;
+  }
+
+  // Phase 1: match every series (exact title only), merging duplicate folders.
+  const targets = new Map(); // mal_id -> { titles, finished, num_chapters }
+  const report = [];
+  state.malSync.report = report;
+  let i = 0;
+  for (const g of groups) {
+    i++;
+    state.malSync.note = `Matching ${i}/${groups.length}…`;
+    patchMalSync();
+    const title = displayTitle(g.series);
+    const finished = g.chapters.filter((c) => c.total_pages > 0 && c.current_page + 1 >= c.total_pages).length;
+    const q = seriesQuery(title);
+    let match = null;
+    try {
+      await sleep(250);
+      const d = await malGet(
+        `manga?q=${encodeURIComponent(q.slice(0, 64))}&limit=3&fields=num_chapters,media_type`
+      );
+      match = (d.data || [])
+        .map((x) => x.node)
+        .filter((n) => !["light_novel", "novel"].includes(n.media_type))
+        .find((n) => normTitle(n.title) === normTitle(q));
+    } catch {
+      report.push({ title, outcome: "skipped", note: "search unavailable — run sync again later" });
+      continue;
+    }
+    if (!match) {
+      report.push({ title, outcome: "skipped", note: "no confident match — add it on MAL by hand" });
+      continue;
+    }
+    const t = targets.get(match.id) || {
+      titles: [],
+      malTitle: match.title,
+      finished: 0,
+      num_chapters: match.num_chapters || 0,
+    };
+    t.titles.push(title);
+    t.finished = Math.max(t.finished, finished);
+    targets.set(match.id, t);
+  }
+
+  // Phase 2: furthest-wins writes.
+  let updated = 0;
+  let j = 0;
+  for (const [id, t] of targets) {
+    j++;
+    state.malSync.note = `Updating ${j}/${targets.size}…`;
+    patchMalSync();
+    const ls = existing.get(id);
+    const current = ls?.num_chapters_read || 0;
+    const target = Math.max(t.finished, current);
+    if (ls && target <= current) {
+      report.push({ title: t.malTitle, outcome: "kept", note: `MAL already at ${current} ch` });
+      continue;
+    }
+    const status =
+      (t.num_chapters > 0 && target >= t.num_chapters) || ls?.status === "completed"
+        ? "completed"
+        : "reading";
+    try {
+      await sleep(250);
+      await malUserPatch(`manga/${id}/my_list_status`, { status, num_chapters_read: target });
+      updated++;
+      report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
+    } catch (e) {
+      if (e.status === 429 || e.status >= 500) {
+        // One paused retry; if MAL is really struggling, stop — the run is
+        // idempotent, so "Sync again" resumes exactly where this left off.
+        await sleep(2000);
+        try {
+          await malUserPatch(`manga/${id}/my_list_status`, { status, num_chapters_read: target });
+          updated++;
+          report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
+          continue;
+        } catch {}
+        state.malSync = {
+          phase: "error",
+          error: "MyAnimeList is rate-limiting — tap Sync again in a minute to resume.",
+          report,
+        };
+        patchMalSync();
+        return;
+      }
+      report.push({ title: t.malTitle, outcome: "skipped", note: "MAL rejected the update" });
+    }
+  }
+
+  state.malSync = { phase: "done", updated, report };
+  patchMalSync();
 }
 
 // Dedupe, drop what they already have (gideon library, pending sends, their
@@ -1460,6 +1638,8 @@ function malPanelHtml() {
       <div class="lib-head"><div class="section-label">MyAnimeList</div>
         <button class="ghost" id="mal-disconnect" data-testid="mal-disconnect">Disconnect</button></div>
       <p class="send-hint">Connected${conn.username ? ` as <b>${esc(conn.username)}</b>` : ""} — recommendations use this account automatically.</p>
+      <button class="ghost mal-sync-btn" id="mal-sync" data-testid="mal-sync">Sync Kobo reading to MAL</button>
+      <div id="mal-sync-body">${malSyncBodyHtml()}</div>
       ${toast}${err}
     </section>`;
   }
@@ -1469,6 +1649,39 @@ function malPanelHtml() {
     <button class="primary" id="mal-connect" data-testid="mal-connect">Connect MyAnimeList</button>
     ${toast}${err}
   </section>`;
+}
+
+// The sync progress/report area inside the connected panel — patched in
+// place (like Browse) so running progress never wipes other inputs.
+function malSyncBodyHtml() {
+  const s = state.malSync;
+  if (!s) return "";
+  if (s.phase === "running") {
+    return `<div class="send-hint" data-testid="mal-sync-running">${esc(s.note || "Syncing…")}</div>`;
+  }
+  if (s.phase === "error") {
+    return `<div class="note disc-error" data-testid="mal-sync-error">${esc(s.error)}</div>${malSyncReportHtml(s.report)}`;
+  }
+  return `<div class="send-hint" data-testid="mal-sync-done">Done — ${s.updated} update${s.updated === 1 ? "" : "s"} written to your MAL list.</div>${malSyncReportHtml(s.report)}`;
+}
+
+function malSyncReportHtml(report) {
+  if (!report?.length) return "";
+  const rows = report
+    .map(
+      (r) => `<div class="sync-row sync-${esc(r.outcome)}" data-testid="mal-sync-row">
+        <span class="sync-outcome">${esc(r.outcome)}</span>
+        <span class="sync-title">${esc(r.title)}</span>
+        <span class="sync-note">${esc(r.note || "")}</span>
+      </div>`
+    )
+    .join("");
+  return `<div class="sync-report" data-testid="mal-sync-report">${rows}</div>`;
+}
+
+function patchMalSync() {
+  const el = document.getElementById("mal-sync-body");
+  if (el) el.innerHTML = malSyncBodyHtml();
 }
 
 function viewDiscover() {
@@ -1974,7 +2187,11 @@ function renderDashboard(email, rows) {
   document.getElementById("mal-disconnect")?.addEventListener("click", () => {
     clearMalConn();
     state.discover = null;
+    state.malSync = null;
     renderDashboard(email, rows);
+  });
+  document.getElementById("mal-sync")?.addEventListener("click", () => {
+    syncKoboToMal(email, rows);
   });
   // A connected account runs its recommendations without being asked.
   if (tab === "discover" && !state.search && !state.discover && malConn()?.username) {

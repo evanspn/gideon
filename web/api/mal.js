@@ -20,18 +20,23 @@ const ALLOWED_PATHS = [
   /^users\/[A-Za-z0-9_-]{2,16}\/animelist$/,
   /^users\/[A-Za-z0-9_-]{2,16}\/mangalist$/,
 ];
-// Paths that may be called with a user's own OAuth token (X-MAL-USER-TOKEN,
-// forwarded as the Bearer) instead of the app client id. Personal data only.
-const USER_TOKEN_PATHS = [/^users\/@me$/];
+// Requests that may be made with a user's own OAuth token (X-MAL-USER-TOKEN,
+// forwarded as the Bearer) instead of the app client id. Explicit
+// method+path pairs — personal reads plus the single list-status write.
+const USER_TOKEN_RULES = [
+  { method: "GET", re: /^users\/@me$/ },
+  { method: "GET", re: /^users\/@me\/animelist$/ },
+  { method: "GET", re: /^users\/@me\/mangalist$/ },
+  { method: "PATCH", re: /^manga\/\d+\/my_list_status$/ },
+];
+// The only fields the write may carry — everything else is dropped.
+const WRITE_FIELDS = new Set(["status", "num_chapters_read"]);
 const ALLOWED_PARAMS = new Set([
   "q", "limit", "offset", "fields", "status", "ranking_type", "nsfw", "sort",
 ]);
 
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json");
-  if (req.method !== "GET") {
-    return res.status(405).json({ error: "GET only" });
-  }
   const clientId = process.env.MAL_CLIENT_ID;
   if (!clientId) {
     // The app treats this as "proxy not configured" and falls back to Jikan.
@@ -47,11 +52,15 @@ export default async function handler(req, res) {
     // so no code path can forget it.
     res.setHeader("Cache-Control", "no-store");
   }
-  const userPath = USER_TOKEN_PATHS.some((re) => re.test(pathname));
-  if (!(ALLOWED_PATHS.some((re) => re.test(pathname)) || (userPath && userToken))) {
-    return res.status(400).json({ error: "path not allowed" });
+
+  const userRule = USER_TOKEN_RULES.some(
+    (r) => r.method === req.method && r.re.test(pathname)
+  );
+  const publicOk = req.method === "GET" && ALLOWED_PATHS.some((re) => re.test(pathname));
+  if (!publicOk && !userRule) {
+    return res.status(req.method === "GET" ? 400 : 405).json({ error: "not allowed" });
   }
-  if (userPath && !userToken) {
+  if (userRule && !publicOk && !userToken) {
     return res.status(401).json({ error: "user token required" });
   }
   const params = new URLSearchParams();
@@ -59,17 +68,29 @@ export default async function handler(req, res) {
     if (ALLOWED_PARAMS.has(k)) params.set(k, v);
   }
 
+  // The one write: list-status updates, with a field allowlist so nothing
+  // beyond status/num_chapters_read can ever be smuggled through.
+  const init = {
+    method: req.method,
+    headers: userToken
+      ? { Authorization: `Bearer ${userToken}` }
+      : { "X-MAL-CLIENT-ID": clientId },
+    signal: AbortSignal.timeout(10_000),
+  };
+  if (req.method === "PATCH") {
+    if (!userToken) return res.status(401).json({ error: "user token required" });
+    const body = new URLSearchParams();
+    for (const [k, v] of Object.entries(req.body || {})) {
+      if (WRITE_FIELDS.has(k)) body.set(k, String(v));
+    }
+    if (![...body.keys()].length) return res.status(400).json({ error: "no writable fields" });
+    init.headers["Content-Type"] = "application/x-www-form-urlencoded";
+    init.body = body;
+  }
+
   let upstream;
   try {
-    upstream = await fetch(
-      `https://api.myanimelist.net/v2/${pathname}?${params}`,
-      {
-        headers: userToken
-          ? { Authorization: `Bearer ${userToken}` }
-          : { "X-MAL-CLIENT-ID": clientId },
-        signal: AbortSignal.timeout(10_000),
-      }
-    );
+    upstream = await fetch(`https://api.myanimelist.net/v2/${pathname}?${params}`, init);
   } catch {
     return res.status(502).json({ error: "MyAnimeList didn't answer" });
   }
