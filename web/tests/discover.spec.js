@@ -744,6 +744,25 @@ test("connected recommendations read the private @me list, never the public path
   expect(publicListHits).toEqual([]);
 });
 
+test("a connected account's failed recommendations offer retry, not a username form", async ({ page }) => {
+  await mockSends(page);
+  // @me animelist errors hard (500) → the recommend flow fails for a
+  // connected user; they must get Try again, never the type-a-username card.
+  await page.route(/\/api\/mal\?path=/, (route) => {
+    const [p] = (new URL(route.request().url()).searchParams.get("path") || "").split("?");
+    if (p === "users/@me/animelist") {
+      return route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: '{"data":[]}' });
+  });
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, ROWS);
+
+  await expect(page.getByTestId("disc-error")).toBeVisible({ timeout: 15000 });
+  await expect(page.getByTestId("disc-retry")).toBeVisible();
+  await expect(page.getByTestId("disc-user")).toHaveCount(0);
+});
+
 test("library cards and the stats sheet show the community rating", async ({ page }) => {
   await mockSends(page);
   await mockJikan(page); // the limit=1 lookup answers ★ 9.2 for every series
