@@ -162,9 +162,8 @@ test("the Discover tab shows the MyAnimeList connect form", async ({ page }) => 
   await mockSends(page);
   await signInAnd(page, "tab-discover");
 
-  await expect(page.getByTestId("disc-user")).toBeVisible();
-  await expect(page.getByTestId("disc-user")).toHaveAttribute("placeholder", /MyAnimeList/);
-  await expect(page.getByTestId("disc-go")).toBeVisible();
+  await expect(page.getByTestId("mal-connect")).toBeVisible();
+  await expect(page.getByTestId("disc-user")).toHaveCount(0); // username flow is gone
 });
 
 
@@ -182,10 +181,8 @@ test("the full recommend flow runs on MAL's official API", async ({ page }) => {
   const posted = [];
   await mockSends(page, posted);
   await mockMalProxy(page);
-  await signInAnd(page, "tab-discover");
-
-  await page.getByTestId("disc-user").fill("evan_mal");
-  await page.getByTestId("disc-go").click();
+  await page.addInitScript(CONNECTED);
+  await signInAnd(page, "tab-discover"); // connected → recs auto-run
 
   // Frieren via the related_manga edge (One Piece resolves via the
   // search-by-title fallback and is then excluded — it's in the library).
@@ -213,10 +210,8 @@ test("the full recommend flow runs on MAL's official API", async ({ page }) => {
 test("recommendations work from reading history alone (no anime list)", async ({ page }) => {
   await mockSends(page);
   await mockMalProxy(page, { overrides: { "/animelist": { data: [] } } });
-  await signInAnd(page, "tab-discover");
-
-  await page.getByTestId("disc-user").fill("evan_mal");
-  await page.getByTestId("disc-go").click();
+  await page.addInitScript(CONNECTED);
+  await signInAnd(page, "tab-discover"); // connected → recs auto-run
 
   // No anime → no "read the source" section, but the manga they've READ
   // (Vagabond) seeds community picks.
@@ -270,9 +265,9 @@ test("the browse row arriving does not wipe a half-typed username", async ({ pag
   });
   await signInAnd(page, "tab-discover");
 
-  await page.getByTestId("disc-user").fill("halftyped");
+  await page.getByTestId("search-input").fill("halftyped");
   await expect(page.getByTestId("browse-results")).toBeVisible();
-  await expect(page.getByTestId("disc-user")).toHaveValue("halftyped");
+  await expect(page.getByTestId("search-input")).toHaveValue("halftyped");
 });
 
 test("browse and search run on official rankings/search with ratings", async ({ page }) => {
@@ -294,16 +289,6 @@ test("browse and search run on official rankings/search with ratings", async ({ 
 
 });
 
-test("an unknown MAL user gets a clear error", async ({ page }) => {
-  await mockSends(page);
-  await mockMalProxy(page, { animelistStatus: 404 });
-  await signInAnd(page, "tab-discover");
-
-  await page.getByTestId("disc-user").fill("no_such_user");
-  await page.getByTestId("disc-go").click();
-
-  await expect(page.getByTestId("disc-error")).toContainText("wasn't found");
-});
 
 
 // --- "Connect MyAnimeList" (per-user OAuth) ----------------------------------
@@ -415,8 +400,7 @@ test("a connected account runs its recommendations automatically", async ({ page
 
   // Disconnect restores the manual path.
   await page.getByTestId("mal-disconnect").click();
-  await expect(page.getByTestId("mal-connect")).toBeVisible();
-  await expect(page.getByTestId("disc-user")).toBeVisible();
+  await expect(page.getByTestId("mal-connect")).toBeVisible(); // gateway is back
 });
 
 // --- connected-account data (user token) and Kobo→MAL sync -------------------
@@ -650,7 +634,7 @@ test("a return finishing while signed out lands under the account that started i
   await page.getByTestId("signin").click();
   await page.getByTestId("tab-discover").click();
   await expect(page.getByTestId("mal-connected")).toBeVisible();
-  await expect(page.getByTestId("mal-badge")).toContainText("Connected");
+  await expect(page.getByTestId("mal-badge")).toContainText("MyAnimeList");
 });
 
 test("an already-connected browser replaying a code stays quiet", async ({ page }) => {
