@@ -25,9 +25,32 @@ built against them directly:
 - flat fills and 1px rules only (no gradients, shadows or radii), so partial
   refresh stays clean; every tap target ≥ 88px
 
-The single accent (`#B4633A`, the web app's `--accent`) appears only as the nav
-underline, the score star and the Continue label, so it degrades to a mid-gray
-gracefully on Kaleido.
+## Color, and what it costs on other devices
+
+The Libra Colour has a Kaleido filter, so both directions use color. Two
+physical facts shape how:
+
+1. **The color layer resolves at ~150ppi against 300ppi for black.** Color in
+   thin strokes or body text reads soft and fringed, so color lives in
+   **blocks** — chip fills, progress bars, heatmap cells, the nav indicator —
+   and text stays black. The one exception is type large and bold enough to
+   carry it (the 38px status value on the series screen).
+2. **Kaleido subtracts saturation.** The palette is already pulled back from
+   sRGB rather than relying on the panel to mute it: one family at shared
+   lightness and chroma with hue varied — rust `#A85F38`, gold `#B08A2E`,
+   green `#4C7A55`, blue `#3F6B8C`, plus pale tints `#DBE7DD` / `#DAE4EB`
+   for chip fills.
+
+**Color is never the only carrier.** Every colored element also differs in
+value, position or label, so the same layout survives on a panel without
+Kaleido. Each artboard has a `mono` tweak that renders exactly that: the
+palette collapses to the existing grayscale constants (`#222222` progress on
+`#CCCCCC`, `#555555` labels) and the status swatch separates by value
+(`#000000` publishing, `#999999` finished) instead of hue.
+
+So if gideon ever ships to a non-Kaleido device — Clara, older Libras — the
+mono rendering is the build, not a degraded afterthought. Implementations
+should read these as two token sets behind one layout, not two designs.
 
 ## The data gap these mockups assume
 

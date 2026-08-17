@@ -25,7 +25,7 @@
       "x": 0,
       "y": -520,
       "w": 900,
-      "text": "E-INK GROUND RULES BOTH DIRECTIONS FOLLOW\n\nDrawn at the real panel size: 1264 x 1680 (Libra Colour).\n\nAll geometry is lifted from the current source, not invented:\n  row height 102px, body text 45px, pad 19px\n  title rules #555555, row separators #DDDDDD, card borders #AAAAAA\n  progress fill #222222 on a #CCCCCC track, shelf gap 16 / title 44 / bar 8\n  DejaVu Sans, regular and bold only — there is no weight scale\n\nNo gradients, no shadows, no rounded corners, no anti-aliased hairlines — flat fills and 1px rules only, so partial refresh stays clean and nothing ghosts.\n\nEvery tap target is at least 88px tall.\n\nColor is Kaleido: roughly half the saturation of an LCD, and only worth spending on cover art. The one accent (default #B4633A, the web app's warm manga-ink orange) appears only as the nav underline, the score star, and the Continue label — it degrades to a mid-gray gracefully."
+      "text": "E-INK GROUND RULES BOTH DIRECTIONS FOLLOW\n\nDrawn at the real panel size: 1264 x 1680 (Libra Colour).\n\nAll geometry is lifted from the current source, not invented:\n  row height 102px, body text 45px, pad 19px\n  title rules #555555, row separators #DDDDDD, card borders #AAAAAA\n  progress track #CCCCCC, shelf gap 16 / title 44 / bar 8\n  DejaVu Sans, regular and bold only — there is no weight scale\n\nNo gradients, no shadows, no rounded corners, no anti-aliased hairlines — flat fills and 1px rules only, so partial refresh stays clean and nothing ghosts.\n\nEvery tap target is at least 88px tall."
     },
     {
       "id": "data-gap",
@@ -33,6 +33,13 @@
       "y": -520,
       "w": 900,
       "text": "HONEST NOTE — THE DATA ISN'T ON THE DEVICE YET\n\nBoth mockups show MAL score, rank, status, genres and chapter counts. The device stores none of that today.\n\nSeriesRef (gideon-core/src/series.rs) holds only: source_id, source_name, manga_id, manga_title, cover_url, downloaded map. No genres, no status, no score, no total chapter count.\n\nmal.rs parses ONLY title and cover_url out of the Jikan payload — mean score, status, genres, rank, chapter count all arrive over the wire and get discarded by parse_popular.\n\nProgress is per-chapter only (current_page, total_pages, last_read_at). There is no streak, no pages-read total, no per-day history — computeStats in web/app.js derives all of that from Supabase, on the web side only.\n\nSo Direction B's stat band and heatmap need either a stats store on device or a pull from Supabase; Direction A's chips need only the MAL fields mal.rs is already throwing away. That difference is the real cost gap between the two."
+    },
+    {
+      "id": "color-rules",
+      "x": 2000,
+      "y": -520,
+      "w": 900,
+      "text": "COLOR — LIBRA COLOUR ONLY\n\nThe Libra Colour has a Kaleido filter, so color is available and both directions use it. Two physical facts shape how:\n\n1. The color layer resolves at ~150ppi against 300ppi for black. Color in thin strokes or body text reads soft and fringed. So color lives in BLOCKS — chip fills, progress bars, heatmap cells, the nav indicator — and text stays black. The one exception is type large and bold enough to carry it (the 38px status value on the series screen).\n\n2. Kaleido subtracts saturation. The palette is already pulled back from sRGB rather than relying on the panel to mute it: one family at shared lightness and chroma, hue varied — rust #A85F38, gold #B08A2E, green #4C7A55, blue #3F6B8C, with pale tints #DBE7DD and #DAE4EB for chip fills.\n\nCOLOR IS NEVER THE ONLY CARRIER. Every colored element also differs in value, position or label, so the same layout survives on a mono panel. Flip the artboard's Mono tweak to see it: the Clara and older Libra rendering, where the palette collapses to the existing grayscale constants and the status swatch separates by value (#000000 publishing, #999999 finished) instead of hue.\n\nIf gideon ever ships to a non-Kaleido device, that mono column is the build — not a degraded afterthought."
     }
   ],
   "launch": { "view": "canvas" }

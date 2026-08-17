@@ -37,7 +37,7 @@
       <div style="display: flex; align-items: stretch; border: 1px solid #aaaaaa;">
         <div style="flex-grow: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid #dddddd;">
           <div style="display: flex; align-items: center; gap: 8px;">
-            <svg width="26" height="26" viewBox="0 0 24 24" fill="{{accent}}" stroke="none"><path d="m12 3 2.6 5.6 6 .8-4.4 4.2 1.1 6.1L12 16.8 6.7 19.7l1.1-6.1L3.4 9.4l6-.8Z"></path></svg>
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="{{c.star}}" stroke="none"><path d="m12 3 2.6 5.6 6 .8-4.4 4.2 1.1 6.1L12 16.8 6.7 19.7l1.1-6.1L3.4 9.4l6-.8Z"></path></svg>
             <div style="font-size: 38px; font-weight: 700; font-variant-numeric: tabular-nums;">8.74</div>
           </div>
           <div style="font-size: 22px; letter-spacing: 1.6px; text-transform: uppercase; color: #555555;">Score</div>
@@ -47,17 +47,17 @@
           <div style="font-size: 22px; letter-spacing: 1.6px; text-transform: uppercase; color: #555555;">Ranked</div>
         </div>
         <div style="flex-grow: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px;">
-          <div style="font-size: 38px; font-weight: 700;">Publishing</div>
+          <div style="font-size: 38px; font-weight: 700; color: {{c.status}};">Publishing</div>
           <div style="font-size: 22px; letter-spacing: 1.6px; text-transform: uppercase; color: #555555;">Status</div>
         </div>
       </div>
 
       <div style="height: 16px;"></div>
       <div style="display: flex; flex-wrap: wrap; gap: 10px;">
-        <div style="border: 1px solid #aaaaaa; padding: 5px 14px; font-size: 25px; color: #333333;">Action</div>
-        <div style="border: 1px solid #aaaaaa; padding: 5px 14px; font-size: 25px; color: #333333;">Adventure</div>
-        <div style="border: 1px solid #aaaaaa; padding: 5px 14px; font-size: 25px; color: #333333;">Drama</div>
-        <div style="border: 1px solid #aaaaaa; padding: 5px 14px; font-size: 25px; color: #333333;">Historical</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Action</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Adventure</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Drama</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Historical</div>
       </div>
 
       <div style="flex-grow: 1;"></div>
@@ -68,7 +68,7 @@
       </div>
       <div style="height: 10px;"></div>
       <div style="height: 8px; background: #cccccc;">
-        <div style="height: 8px; background: #222222; width: 25%;"></div>
+        <div style="height: 8px; background: {{c.bar}}; width: 25%;"></div>
       </div>
       <div style="height: 20px;"></div>
       <div style="height: 102px; border: 2px solid #000000; display: flex; align-items: center; justify-content: center; gap: 14px;">
@@ -107,11 +107,25 @@
 </div>
 </x-dc>
 
-<script data-dc-script data-props='{"accent":{"editor":"color","default":"#b4633a","section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
+<script data-dc-script data-props='{"accent":{"editor":"color","default":"#a85f38","section":"Theme"},"mono":{"editor":"boolean","default":false,"section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
 class Component extends DCLogic {
   renderVals() {
+    const mono = this.props.mono ?? false;
+    const rust = this.props.accent ?? '#a85f38';
+    // One muted family: shared lightness/chroma, hue varied. Kaleido desaturates,
+    // so these are already pulled back from sRGB — and each has a gray twin below,
+    // because color must never be the only carrier of meaning.
+    const c = mono
+      ? { accent: '#000000', star: '#555555', bar: '#222222', label: '#555555',
+          status: '#000000', statusBd: '#aaaaaa', genre: '#999999', genreBd: '#aaaaaa',
+          statusTint: '#f0f0f0', genreTint: '#f6f6f6', ink: '#000000',
+          heat: ['#eeeeee', '#cccccc', '#999999', '#555555', '#000000'] }
+      : { accent: rust, star: '#b08a2e', bar: rust, label: rust,
+          status: '#4c7a55', statusBd: '#4c7a55', genre: '#3f6b8c', genreBd: '#3f6b8c',
+          statusTint: '#dbe7dd', genreTint: '#dae4eb', ink: '#000000',
+          heat: ['#eeeeee', '#dcc9a6', '#c9a86b', '#a85f38', '#6c3f24'] };
     return {
-      accent: this.props.accent ?? '#b4633a',
+      c,
       chapters: [
         { title: 'Ch. 54 — The Battle of the Gods', sub: 'page 12 of 44 · 2 days ago', right: '27%', read: false, downloaded: true, weight: '700', bg: '#f4f4f4' },
         { title: 'Ch. 55 — Prologue', sub: '44 pages', right: '', read: false, downloaded: true, weight: '400', bg: '#ffffff' },

@@ -49,10 +49,10 @@
 
           <!-- one metadata line: score · status · genres · downloads -->
           <div style="display: flex; align-items: center; gap: 10px; font-size: 25px; color: #333333;">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="{{accent}}" stroke="none" style="flex-shrink: 0;"><path d="m12 3 2.6 5.6 6 .8-4.4 4.2 1.1 6.1L12 16.8 6.7 19.7l1.1-6.1L3.4 9.4l6-.8Z"></path></svg>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="{{c.star}}" stroke="none" style="flex-shrink: 0;"><path d="m12 3 2.6 5.6 6 .8-4.4 4.2 1.1 6.1L12 16.8 6.7 19.7l1.1-6.1L3.4 9.4l6-.8Z"></path></svg>
             <span style="font-variant-numeric: tabular-nums; font-weight: 700;">{{r.score}}</span>
             <span style="color: #aaaaaa;">|</span>
-            <span>{{r.status}}</span>
+            <span style="display: inline-flex; align-items: center; gap: 8px;"><span style="width: 18px; height: 18px; background: {{r.statusColor}};"></span><span>{{r.status}}</span></span>
             <span style="color: #aaaaaa;">|</span>
             <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{r.genres}}</span>
           </div>
@@ -68,7 +68,7 @@
         <div style="width: 250px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
           <div style="font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums;">{{r.read}}</div>
           <div style="width: 250px; height: 8px; background: #cccccc;">
-            <div style="height: 8px; background: #222222; width: {{r.pct}};"></div>
+            <div style="height: 8px; background: {{c.bar}}; width: {{r.pct}};"></div>
           </div>
           <div style="font-size: 24px; color: #555555;">{{r.next}}</div>
         </div>
@@ -84,7 +84,7 @@
       <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#555555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V9l8-5 8 5v10"></path><path d="M9 19v-6h6v6"></path></svg>
       <div style="font-size: 26px; color: #555555;">Today</div>
     </div>
-    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border-top: 6px solid {{accent}}; box-sizing: border-box;">
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border-top: 6px solid {{c.accent}}; box-sizing: border-box;">
       <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16"></rect><rect x="14" y="4" width="7" height="16"></rect></svg>
       <div style="font-size: 26px; font-weight: 700;">Library</div>
     </div>
@@ -101,23 +101,37 @@
 </div>
 </x-dc>
 
-<script data-dc-script data-props='{"accent":{"editor":"color","default":"#b4633a","section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
+<script data-dc-script data-props='{"accent":{"editor":"color","default":"#a85f38","section":"Theme"},"mono":{"editor":"boolean","default":false,"section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
 class Component extends DCLogic {
   renderVals() {
-    const on  = { label: '', border: '#000000', bg: '#000000', fg: '#ffffff', weight: '700' };
+    const mono = this.props.mono ?? false;
+    const rust = this.props.accent ?? '#a85f38';
+    // One muted family: shared lightness/chroma, hue varied. Kaleido desaturates,
+    // so these are already pulled back from sRGB — and each has a gray twin below,
+    // because color must never be the only carrier of meaning.
+    const c = mono
+      ? { accent: '#000000', star: '#555555', bar: '#222222', label: '#555555',
+          status: '#000000', statusBd: '#aaaaaa', genre: '#999999', genreBd: '#aaaaaa',
+          statusTint: '#f0f0f0', genreTint: '#f6f6f6', ink: '#000000',
+          heat: ['#eeeeee', '#cccccc', '#999999', '#555555', '#000000'] }
+      : { accent: rust, star: '#b08a2e', bar: rust, label: rust,
+          status: '#4c7a55', statusBd: '#4c7a55', genre: '#3f6b8c', genreBd: '#3f6b8c',
+          statusTint: '#dbe7dd', genreTint: '#dae4eb', ink: '#000000',
+          heat: ['#eeeeee', '#dcc9a6', '#c9a86b', '#a85f38', '#6c3f24'] };
+    const on  = { label: '', border: c.accent, bg: c.accent, fg: '#ffffff', weight: '700' };
     const off = { label: '', border: '#aaaaaa', bg: '#ffffff', fg: '#333333', weight: '400' };
     const seg = (label, active) => ({ ...(active ? on : off), label });
     return {
-      accent: this.props.accent ?? '#b4633a',
+      c,
       filters: [seg('All 42', true), seg('Reading 11', false), seg('Unread 6', false), seg('Downloaded 18', false)],
       rows: [
-        { title: 'Vinland Saga',  score: '8.74', status: 'Publishing', genres: 'Action · Drama · Historical', downloads: '18 chapters · 214 MB', when: '2 days ago',  read: '54 / 213', pct: '25%', next: 'next: Ch. 55', tint: '#6f7d86', done: false },
-        { title: 'Chainsaw Man',  score: '8.61', status: 'Publishing', genres: 'Action · Supernatural',       downloads: '9 chapters · 96 MB',   when: '4 days ago',  read: '76 / 97',  pct: '78%', next: 'next: Ch. 77', tint: '#7a5c52', done: false },
-        { title: 'Frieren',       score: '9.02', status: 'Publishing', genres: 'Adventure · Fantasy',         downloads: '12 chapters · 141 MB', when: '6 days ago',  read: '52 / 126', pct: '41%', next: 'next: Ch. 53', tint: '#5f6f78', done: false },
-        { title: 'Blue Period',   score: '8.33', status: 'Publishing', genres: 'Drama · Slice of Life',       downloads: 'not downloaded',       when: '2 weeks ago', read: '9 / 74',   pct: '12%', next: 'next: Ch. 10', tint: '#6b6470', done: false },
-        { title: 'Oyasumi Punpun',score: '9.01', status: 'Finished',   genres: 'Drama · Psychological',       downloads: '3 chapters · 34 MB',   when: '1 month ago', read: '147 / 147',pct: '100%',next: 'finished',     tint: '#5a5a5a', done: true  },
-        { title: 'Dandadan',      score: '8.55', status: 'Publishing', genres: 'Action · Comedy · Sci-Fi',    downloads: '5 chapters · 61 MB',   when: '1 month ago', read: '31 / 188', pct: '16%', next: 'next: Ch. 32', tint: '#6d6255', done: false },
-        { title: 'Witch Hat Atelier', score: '8.79', status: 'Publishing', genres: 'Adventure · Fantasy',     downloads: 'not downloaded',       when: '2 months ago',read: '18 / 82',  pct: '22%', next: 'next: Ch. 19', tint: '#63707a', done: false },
+        { title: 'Vinland Saga',  score: '8.74', status: 'Publishing', statusColor: c.status, genres: 'Action · Drama · Historical', downloads: '18 chapters · 214 MB', when: '2 days ago',  read: '54 / 213', pct: '25%', next: 'next: Ch. 55', tint: '#6f7d86', done: false },
+        { title: 'Chainsaw Man',  score: '8.61', status: 'Publishing', statusColor: c.status, genres: 'Action · Supernatural',       downloads: '9 chapters · 96 MB',   when: '4 days ago',  read: '76 / 97',  pct: '78%', next: 'next: Ch. 77', tint: '#7a5c52', done: false },
+        { title: 'Frieren',       score: '9.02', status: 'Publishing', statusColor: c.status, genres: 'Adventure · Fantasy',         downloads: '12 chapters · 141 MB', when: '6 days ago',  read: '52 / 126', pct: '41%', next: 'next: Ch. 53', tint: '#5f6f78', done: false },
+        { title: 'Blue Period',   score: '8.33', status: 'Publishing', statusColor: c.status, genres: 'Drama · Slice of Life',       downloads: 'not downloaded',       when: '2 weeks ago', read: '9 / 74',   pct: '12%', next: 'next: Ch. 10', tint: '#6b6470', done: false },
+        { title: 'Oyasumi Punpun',score: '9.01', status: 'Finished', statusColor: c.genre,   genres: 'Drama · Psychological',       downloads: '3 chapters · 34 MB',   when: '1 month ago', read: '147 / 147',pct: '100%',next: 'finished',     tint: '#5a5a5a', done: true  },
+        { title: 'Dandadan',      score: '8.55', status: 'Publishing', statusColor: c.status, genres: 'Action · Comedy · Sci-Fi',    downloads: '5 chapters · 61 MB',   when: '1 month ago', read: '31 / 188', pct: '16%', next: 'next: Ch. 32', tint: '#6d6255', done: false },
+        { title: 'Witch Hat Atelier', score: '8.79', status: 'Publishing', statusColor: c.status, genres: 'Adventure · Fantasy',     downloads: 'not downloaded',       when: '2 months ago',read: '18 / 82',  pct: '22%', next: 'next: Ch. 19', tint: '#63707a', done: false },
       ],
     };
   }
