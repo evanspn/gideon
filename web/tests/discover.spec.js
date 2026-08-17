@@ -763,6 +763,136 @@ test("a connected account's failed recommendations offer retry, not a username f
   await expect(page.getByTestId("disc-user")).toHaveCount(0);
 });
 
+test("an OAuth return with no local record explains itself instead of silence", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  // Persisted gideon session, but NO pending PKCE record — the cross-browser
+  // return case. The site must say what happened, not shrug.
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.session",
+      JSON.stringify({ access_token: "t", refresh_token: "r", email: "reader@example.com", expires_at: Math.floor(Date.now() / 1000) + 3600 })
+    );
+  });
+  await page.goto("/?code=STRAY&state=whatever");
+
+  await expect(page.getByTestId("mal-error")).toContainText("different browser");
+  await expect(page.getByTestId("mal-connect")).toBeVisible();
+  expect(new URL(page.url()).search).toBe(""); // code scrubbed from the bar
+});
+
+test("an unrelated ?code link (no state) is left completely alone", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.session",
+      JSON.stringify({ access_token: "t", refresh_token: "r", email: "reader@example.com", expires_at: Math.floor(Date.now() / 1000) + 3600 })
+    );
+  });
+  await page.goto("/?code=NOT_OURS&utm_source=x");
+
+  await expect(page.getByTestId("signout")).toBeVisible();
+  await page.getByTestId("tab-discover").click();
+  await expect(page.getByTestId("mal-error")).toHaveCount(0); // no false claim
+  expect(new URL(page.url()).search).toBe("?code=NOT_OURS&utm_source=x"); // untouched
+});
+
+test("scrubbing an OAuth return preserves the recovery-link hash", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
+  // Stray code+state AND a Supabase recovery hash on one URL: the MAL scrub
+  // must not destroy the hash before the session adopter reads it.
+  await page.goto(
+    "/?code=STRAY&state=whatever#access_token=rec-at&refresh_token=rec-rt&type=recovery&expires_in=3600"
+  );
+
+  await expect(page.getByTestId("recovery-banner")).toBeVisible(); // hash survived
+  const session = await page.evaluate(() => JSON.parse(localStorage.getItem("gideon.session")));
+  expect(session.access_token).toBe("rec-at");
+});
+
+test("a cross-browser OAuth return while signed out surfaces on the sign-in screen", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  await page.goto("/?code=STRAY&state=whatever");
+
+  await expect(page.getByTestId("note")).toContainText("different browser");
+  await expect(page.getByTestId("signin")).toBeVisible();
+});
+
+test("a return finishing while signed out lands under the account that started it", async ({ page }) => {
+  await mockSends(page);
+  await page.route("**/auth/v1/**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
+  );
+  mockOauth(page); // token exchange endpoint
+  await page.route(/\/api\/mal\?path=users%2F%40me/, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: '{"id":1,"name":"evan_mal"}' })
+  );
+  // The dance was started by reader@example.com (recorded in the PKCE
+  // record), but the session is gone when MAL redirects back.
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.mal.pkce",
+      JSON.stringify({ verifier: "v".repeat(60), state: "STATE1", at: Date.now(), email: "reader@example.com" })
+    );
+  });
+  await page.goto("/?code=CODE1&state=STATE1");
+  await expect(page.getByTestId("signin")).toBeVisible(); // still signed out
+
+  // Tokens went straight to that account's key — no shared anonymous slot a
+  // different user could inherit.
+  const stored = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("gideon.mal.reader@example.com") || "null")
+  );
+  expect(stored?.access_token).toBe("mal-at");
+  expect(await page.evaluate(() => localStorage.getItem("gideon.mal.anon"))).toBeNull();
+
+  // Signing in as that user finds the connection waiting.
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  mockMalApi(page);
+  await page.locator("input[type=email]").fill("reader@example.com");
+  await page.locator("input[type=password]").fill("password123");
+  await page.getByTestId("signin").click();
+  await page.getByTestId("tab-discover").click();
+  await expect(page.getByTestId("mal-connected")).toBeVisible();
+  await expect(page.getByTestId("mal-badge")).toContainText("Connected");
+});
+
+test("an already-connected browser replaying a code stays quiet", async ({ page }) => {
+  await mockSends(page);
+  mockMalApi(page);
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  await page.addInitScript(CONNECTED);
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.session",
+      JSON.stringify({ access_token: "t", refresh_token: "r", email: "reader@example.com", expires_at: Math.floor(Date.now() / 1000) + 3600 })
+    );
+  });
+  // Back-button / history replay: a code arrives but we're already connected.
+  await page.goto("/?code=REPLAY&state=whatever");
+
+  await page.getByTestId("tab-discover").click();
+  await expect(page.getByTestId("mal-connected")).toBeVisible();
+  await expect(page.getByTestId("mal-error")).toHaveCount(0); // no bogus advice
+  expect(new URL(page.url()).search).toBe(""); // code still scrubbed
+});
+
 test("library cards and the stats sheet show the community rating", async ({ page }) => {
   await mockSends(page);
   await mockJikan(page); // the limit=1 lookup answers ★ 9.2 for every series
