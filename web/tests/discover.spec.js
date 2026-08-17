@@ -605,7 +605,8 @@ test("an unconfigured deployment says so instead of redirecting", async ({ page 
 
 test("a connected account runs its recommendations automatically", async ({ page }) => {
   await mockSends(page);
-  await mockJikan(page); // serves the evan_mal fixtures
+  await mockJikan(page);
+  mockMalApi(page); // connected reads go through @me on the proxy
   await page.addInitScript(() => {
     localStorage.setItem(
       "gideon.mal.reader@example.com",
@@ -630,6 +631,117 @@ test("a connected account runs its recommendations automatically", async ({ page
   await page.getByTestId("mal-disconnect").click();
   await expect(page.getByTestId("mal-connect")).toBeVisible();
   await expect(page.getByTestId("disc-user")).toBeVisible();
+});
+
+// --- connected-account data (user token) and Kobo→MAL sync -------------------
+
+// One dispatcher for /api/mal covering both client-id catalog calls and
+// user-token personal calls; records PATCH writes and every personal path hit.
+function mockMalApi(page, { patches = [], personal = [] } = {}) {
+  page.route(/\/api\/mal\?path=/, (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    const [p, qs = ""] = (url.searchParams.get("path") || "").split("?");
+    const q = new URLSearchParams(qs);
+    if (req.headers()["x-mal-user-token"]) personal.push(`${req.method()} ${p}`);
+    const json = (b, s = 200) =>
+      route.fulfill({ status: s, contentType: "application/json", body: JSON.stringify(b) });
+    if (req.method() === "PATCH") {
+      patches.push({ path: p, body: JSON.parse(req.postData() || "{}") });
+      return json({ status: "reading" });
+    }
+    if (p === "users/@me") return json({ id: 1, name: "evan_mal" });
+    if (p === "users/@me/animelist")
+      return json({ data: [{ node: { id: 51, title: "Sousou no Frieren" }, list_status: { score: 10 } }] });
+    if (p === "users/@me/mangalist")
+      return json({
+        data: [{ node: { id: 13, title: "One Piece" }, list_status: { status: "reading", num_chapters_read: 5 } }],
+      });
+    if (p === "manga") {
+      const term = (q.get("q") || "").toLowerCase();
+      if (term.includes("berserk"))
+        return json({ data: [{ node: { id: 2, title: "Berserk", media_type: "manga", num_chapters: 0 } }] });
+      if (term.includes("one piece"))
+        return json({ data: [{ node: { id: 13, title: "One Piece", media_type: "manga", num_chapters: 0 } }] });
+      if (term.includes("sousou") || term.includes("frieren"))
+        return json({ data: [{ node: { id: 101, title: "Sousou no Frieren", media_type: "manga", num_chapters: 0, main_picture: { large: "https://img.test/frieren.jpg" } } }] });
+      return json({ data: [{ node: { id: 999, title: "Something Else", media_type: "manga" } }] });
+    }
+    return json({ data: [] });
+  });
+  return { patches, personal };
+}
+
+const CONNECTED = () =>
+  localStorage.setItem(
+    "gideon.mal.reader@example.com",
+    JSON.stringify({
+      access_token: "mal-at",
+      refresh_token: "mal-rt",
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      username: "evan_mal",
+    })
+  );
+
+async function signInWithRows(page, rows) {
+  await page.route("**/auth/v1/**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SESSION) })
+  );
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(rows) })
+  );
+  await page.goto("/");
+  await page.locator("input[type=email]").fill("reader@example.com");
+  await page.locator("input[type=password]").fill("password123");
+  await page.getByTestId("signin").click();
+  await page.getByTestId("tab-discover").click();
+}
+
+test("Sync Kobo→MAL: exact matches written furthest-wins, the rest reported", async ({ page }) => {
+  await mockSends(page);
+  const { patches } = mockMalApi(page);
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, [
+    // Finished 1 chapter of Berserk — not on MAL yet → written.
+    { chapter_key: "Berserk/ch1.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+    // Finished 1 chapter of One Piece — MAL already at 5 → kept, never rewound.
+    { chapter_key: "One Piece/vol1.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+    // No confident MAL match → skipped, never written.
+    { chapter_key: "Weird Unknown Manga/c1.cbz", current_page: 9, total_pages: 10, updated_at: new Date().toISOString() },
+  ]);
+
+  await page.getByTestId("mal-sync").click();
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  await expect(page.getByTestId("mal-sync-done")).toContainText("1 update");
+
+  // Only the safe write happened, with only the allowlisted fields.
+  expect(patches).toEqual([
+    { path: "manga/2/my_list_status", body: { status: "reading", num_chapters_read: 1 } },
+  ]);
+
+  const rows = page.getByTestId("mal-sync-row");
+  await expect(rows.filter({ hasText: "kept" })).toContainText("already at 5");
+  await expect(rows.filter({ hasText: "skipped" })).toContainText("no confident match");
+  await expect(rows.filter({ hasText: "updated" })).toContainText("Berserk");
+});
+
+test("connected recommendations read the private @me list, never the public path", async ({ page }) => {
+  await mockSends(page);
+  const { personal } = mockMalApi(page);
+  const publicListHits = [];
+  await page.route(/\/api\/mal\?path=users%2Fevan_mal/, (route) => {
+    publicListHits.push(route.request().url());
+    return route.fulfill({ status: 200, contentType: "application/json", body: '{"data":[]}' });
+  });
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, ROWS);
+
+  // Auto-run recommendations for the connected account arrive via @me.
+  await expect(page.getByTestId("rec-sources").getByTestId("rec-card").first()).toBeVisible({
+    timeout: 15000,
+  });
+  expect(personal).toContain("GET users/@me/animelist");
+  expect(publicListHits).toEqual([]);
 });
 
 test("library cards and the stats sheet show the community rating", async ({ page }) => {
