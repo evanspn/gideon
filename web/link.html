@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gideon — link a computer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <div class="head"><div class="brand">gideon <span>· link a computer</span></div></div>
+      <div class="card">
+        <h1>Link a computer</h1>
+        <p>
+          Give another machine (like the gideon CLI/MCP on your computer) access to this
+          account <b>without typing your password on it</b>. Paste the pairing code the
+          computer showed you; you'll get back an encrypted link code that only that
+          computer can read.
+        </p>
+        <div id="link-body"></div>
+      </div>
+    </main>
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+      const session = JSON.parse(localStorage.getItem("gideon.session") || "null");
+
+      if (!session?.refresh_token) {
+        $("link-body").innerHTML =
+          `<div class="note">You're not signed in on this device. <a href="./index.html">Sign in first</a>, then come back to this page.</div>`;
+      } else {
+        $("link-body").innerHTML = `
+          <div class="stack">
+            <input type="text" id="pairing" placeholder="Pairing code from the computer" autocomplete="off"
+              autocapitalize="none" spellcheck="false" />
+          </div>
+          <div class="field actions"><button class="primary" id="make">Create link code</button></div>
+          <div class="note" id="out"></div>`;
+        $("make").addEventListener("click", async () => {
+          const out = $("out");
+          try {
+            const spki = unb64($("pairing").value.trim());
+            const theirPub = await crypto.subtle.importKey(
+              "spki", spki, { name: "ECDH", namedCurve: "P-256" }, false, []);
+            const eph = await crypto.subtle.generateKey(
+              { name: "ECDH", namedCurve: "P-256" }, false, ["deriveKey"]);
+            const aes = await crypto.subtle.deriveKey(
+              { name: "ECDH", public: theirPub }, eph.privateKey,
+              { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const payload = new TextEncoder().encode(JSON.stringify({
+              access_token: session.access_token,
+              refresh_token: session.refresh_token,
+              email: session.email || null,
+            }));
+            const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aes, payload);
+            const ephPub = await crypto.subtle.exportKey("spki", eph.publicKey);
+            const blob = btoa(JSON.stringify({ e: b64(ephPub), i: b64(iv), c: b64(ct) }));
+            out.innerHTML = `Link code created — copy it and give it to the computer:<br/>
+              <code style="display:block;word-break:break-all;user-select:all;-webkit-user-select:all;
+                background:var(--track);border-radius:8px;padding:10px;margin:10px 0">${blob}</code>
+              <button class="primary" id="copy">Copy link code</button>`;
+            $("copy").addEventListener("click", async () => {
+              await navigator.clipboard.writeText(blob).catch(() => {});
+              $("copy").textContent = "Copied ✓";
+            });
+          } catch (e) {
+            out.textContent = "That pairing code doesn't look right — paste it exactly as the computer showed it.";
+          }
+        });
+      }
+    </script>
+  </body>
+</html>

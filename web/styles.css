@@ -632,3 +632,16 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 
 /* Community-score badge on library cards */
 .item .badge.rating { border-color: var(--accent); color: var(--accent); }
+
+/* MAL OAuth redirect: the code, unmissable */
+.oauth-banner {
+  background: var(--accent); color: var(--accent-ink);
+  padding: 16px 20px; text-align: center;
+}
+.ob-label { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+.ob-code {
+  display: block; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+  word-break: break-all; user-select: all; -webkit-user-select: all;
+  background: rgba(0, 0, 0, 0.25); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
+}
+.ob-copy { background: var(--panel); color: var(--ink); }
