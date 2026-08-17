@@ -4,9 +4,11 @@
   "description": "gideon reading-progress web dashboard + Playwright regression tests",
   "scripts": {
     "test": "playwright test",
-    "test:update": "playwright test --update-snapshots"
+    "test:update": "playwright test --update-snapshots",
+    "test:api": "node --test api/*.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.1"
-  }
+  },
+  "type": "module"
 }

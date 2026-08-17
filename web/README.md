@@ -22,12 +22,32 @@ just don't render.
 MAL data arrives one of two ways, preferred in this order:
 
 1. **Official MAL API** via the same-origin serverless proxy `api/mal.js` —
-   first-party data, immune to mirror outages. One-time setup: create a
-   Client ID at myanimelist.net → Preferences → API, then
-   `vercel env add MAL_CLIENT_ID production` (the browser never sees it).
+   first-party data, immune to mirror outages. One-time *deployment* setup:
+   create a Client ID at myanimelist.net → Preferences → API, then
+   `vercel env add MAL_CLIENT_ID production` and
+   `vercel env add MAL_CLIENT_SECRET production` (neither reaches the
+   browser). Users never do any of this.
 2. **Jikan** (the community mirror, public/no-key/CORS-open) — the automatic
    fallback whenever the proxy isn't configured or can't reach MAL. Jikan has
    had multi-day outages, which is why the proxy exists.
+
+## Per-user MyAnimeList accounts (multi-user)
+
+Any signed-in user can tap **Connect MyAnimeList** on the Discover tab: a
+standard S256-PKCE OAuth dance against the shared app registration, with the
+code exchanged by `api/mal-oauth.js` (the only holder of the client secret)
+and tokens stored only in that user's browser, keyed to their gideon account.
+Connected users get automatic recommendations (private lists included) and a
+**Sync Kobo reading to MAL** button that writes their reading history to
+their MAL manga list — exact-title matches only, never rewinding MAL-side
+progress, idempotent so re-running resumes. The `/api/mal` proxy forwards the
+user's token on an explicit method+path allowlist; the single write
+(`PATCH manga/{id}/my_list_status`) is field-allowlisted. Security headers
+(CSP included) ship via `vercel.json`.
+
+Heads-up for iOS users: Safari evicts script-writable storage after ~7 days
+without a visit, so a long absence may mean tapping Connect again — it's one
+tap, by design.
 
 Live at **https://gideon-sync.vercel.app**.
 
