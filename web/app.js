@@ -334,9 +334,9 @@ async function withMal(proxyFn, jikanFn) {
 
 const MAL_PKCE_KEY = "gideon.mal.pkce";
 
+const malKeyFor = (email) => `gideon.mal.${email || "anon"}`;
 function malKey() {
-  const email = state.session?.email || loadSession()?.email || "anon";
-  return `gideon.mal.${email}`;
+  return malKeyFor(state.session?.email || loadSession()?.email);
 }
 function malConn() {
   try {
@@ -377,10 +377,18 @@ async function startMalConnect() {
   const pkceState = randToken(16);
   // localStorage, not sessionStorage: phone OAuth round-trips can come back
   // in a new tab or from an in-app browser, which drops sessionStorage. A
-  // 15-minute expiry keeps abandoned attempts from lingering.
+  // 15-minute expiry keeps abandoned attempts from lingering. The record
+  // carries WHO started the dance, so the returning tokens land under that
+  // account even if the gideon session is gone by then — never under a
+  // shared anonymous key another user could inherit.
   localStorage.setItem(
     MAL_PKCE_KEY,
-    JSON.stringify({ verifier, state: pkceState, at: Date.now() })
+    JSON.stringify({
+      verifier,
+      state: pkceState,
+      at: Date.now(),
+      email: state.session?.email || loadSession()?.email || null,
+    })
   );
   const u = new URL("https://myanimelist.net/v1/oauth2/authorize");
   u.search = new URLSearchParams({
@@ -399,28 +407,43 @@ async function startMalConnect() {
 async function finishMalConnect() {
   const q = new URLSearchParams(location.search);
   const code = q.get("code");
-  if (!code) return false;
+  const returnedState = q.get("state");
+  // Our authorize URL always carries state; a bare ?code from some unrelated
+  // link is not ours — leave the URL and everything else alone.
+  if (!code || !returnedState) return false;
   let pending = null;
   try {
     pending = JSON.parse(localStorage.getItem(MAL_PKCE_KEY));
   } catch {}
   localStorage.removeItem(MAL_PKCE_KEY);
+  // Scrub only our own params, and preserve the fragment — a Supabase
+  // recovery link's #access_token rides in the hash and is adopted by the
+  // next boot step; wiping it here would burn the reset link.
+  const scrub = () => {
+    q.delete("code");
+    q.delete("state");
+    const qs = q.toString();
+    history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
+  };
+  scrub();
+  // An already-connected browser seeing a code again is a replay (Back
+  // button, history revisit, second tab) — the connected panel already says
+  // everything; an error telling them to "tap Connect" would be wrong and
+  // impossible (that button doesn't render while connected).
+  if (malConn()) return true;
+  state.tab = "discover";
   if (!pending) {
     // The dance started in a different browser than it finished in (phones
     // hop between in-app browsers and Safari) — the code is useless without
     // the verifier held over there. Never leave this silent: say what
     // happened and what one tap fixes it.
-    history.replaceState(null, "", location.pathname);
     state.malError =
       "Almost connected — that sign-in finished in a different browser than it started in. Tap Connect once more, right here.";
-    state.tab = "discover";
     return true;
   }
-  history.replaceState(null, "", location.pathname);
-  if (q.get("state") !== pending.state || Date.now() - pending.at > 15 * 60_000) {
+  if (returnedState !== pending.state || Date.now() - pending.at > 15 * 60_000) {
     // Bad state or stale attempt: quiet, actionable, no OAuth vocabulary.
     state.malError = "That sign-in didn't finish — tap Connect again.";
-    state.tab = "discover";
     return true;
   }
   try {
@@ -444,9 +467,11 @@ async function finishMalConnect() {
       .then((r) => (r.ok ? r.json() : null))
       .catch(() => null);
     conn.username = me?.name || null;
-    saveMalConn(conn);
+    // Store under the account that STARTED the dance — even if this browser
+    // is signed out right now, the tokens belong to that user and will be
+    // there the moment they sign back in. Never a shared anonymous slot.
+    localStorage.setItem(malKeyFor(pending.email || state.session?.email || loadSession()?.email), JSON.stringify(conn));
     state.malToast = `MyAnimeList connected${conn.username ? ` as ${conn.username}` : ""} ✓`;
-    state.tab = "discover"; // land the reader where the connection shows
   } catch (e) {
     state.malError = `MyAnimeList connection failed — ${e.message || "try again"}.`;
   }
@@ -2049,6 +2074,9 @@ function signOut() {
   state.browse = null;
   state.sentTitles = null;
   state.ratings = null;
+  state.malSync = null;
+  state.malToast = null;
+  state.malError = null;
   state.tab = "stats";
   renderSignIn("Signed out.");
 }
@@ -2336,15 +2364,6 @@ function renderReader(chapterKey, title, pages) {
 async function showDashboard(session) {
   state.session = session;
   const email = session.email ?? "signed in";
-  // Adopt a MAL connection completed before sign-in (the OAuth return can
-  // land while signed out — the tokens were parked under the anon key).
-  const anonConn = localStorage.getItem("gideon.mal.anon");
-  if (anonConn && !malConn()) {
-    localStorage.setItem(malKey(), anonConn);
-    localStorage.removeItem("gideon.mal.anon");
-    state.malToast = "MyAnimeList connected ✓";
-    state.tab = "discover";
-  }
   try {
     const rows = (await fetchProgress(session)) ?? [];
     // Remember where each chapter was left off, so the reader resumes there.
@@ -2434,7 +2453,9 @@ async function boot() {
   if (linkType === "recovery") showRecoveryBanner();
   const session = loadSession();
   if (session?.access_token) showDashboard(session);
-  else renderSignIn("");
+  // Signed out, the MAL panel never renders — surface a pending connection
+  // message on the sign-in screen instead of dropping it.
+  else renderSignIn(state.malError || "");
 }
 
 boot();
