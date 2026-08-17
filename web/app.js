@@ -1907,7 +1907,84 @@ async function showDashboard(session) {
   }
 }
 
+// The site is the registered OAuth redirect URI for the MyAnimeList API app.
+// When MAL bounces back here with ?code=…, surface it loudly — the address
+// bar hides query strings on phones, and the person needs to copy the code.
+function showOauthCodeBanner() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get("code");
+  if (!code) return;
+  document.body.insertAdjacentHTML(
+    "afterbegin",
+    `<div class="oauth-banner" data-testid="oauth-banner">
+      <div class="ob-label">MyAnimeList authorization code — copy it and paste it back to Claude:</div>
+      <code class="ob-code">${esc(code)}</code>
+      <button class="primary ob-copy" id="ob-copy">Copy code</button>
+    </div>`
+  );
+  document.getElementById("ob-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      document.getElementById("ob-copy").textContent = "Copied ✓";
+    } catch {
+      /* selectable text remains as the fallback */
+    }
+  });
+}
+
+// Supabase auth links (password recovery) land here with tokens in the URL
+// fragment. Adopt the session so the link actually signs you in, scrub the
+// tokens from the address bar, and for recovery links offer to set a new
+// password immediately.
+function adoptHashSession() {
+  const h = new URLSearchParams(location.hash.replace(/^#/, ""));
+  if (!h.get("access_token")) return null;
+  saveSession({
+    access_token: h.get("access_token"),
+    refresh_token: h.get("refresh_token") || "",
+    email: null,
+    expires_at: Math.floor(Date.now() / 1000) + Number(h.get("expires_in") || 3600),
+  });
+  const type = h.get("type");
+  history.replaceState(null, "", location.pathname);
+  return type || "signin";
+}
+
+function showRecoveryBanner() {
+  document.body.insertAdjacentHTML(
+    "afterbegin",
+    `<div class="oauth-banner" data-testid="recovery-banner">
+      <div class="ob-label">You're signed in via your reset link — choose a new password:</div>
+      <form id="pw-form" style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+        <input type="password" id="new-pw" placeholder="new password" minlength="6" required
+          autocomplete="new-password" style="padding:10px 12px;border-radius:8px;border:none;font:inherit" />
+        <button class="primary ob-copy" type="submit">Save password</button>
+      </form>
+      <div class="ob-label" id="pw-note" style="margin-top:8px"></div>
+    </div>`
+  );
+  document.getElementById("pw-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const note = document.getElementById("pw-note");
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      method: "PUT",
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${loadSession()?.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ password: document.getElementById("new-pw").value }),
+    }).catch(() => null);
+    note.textContent = res?.ok
+      ? "Password updated ✓ — use it everywhere (Kobo included)."
+      : "Couldn't update the password — try once more.";
+  });
+}
+
 function boot() {
+  showOauthCodeBanner();
+  const linkType = adoptHashSession();
+  if (linkType === "recovery") showRecoveryBanner();
   const session = loadSession();
   if (session?.access_token) showDashboard(session);
   else renderSignIn("");

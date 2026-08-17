@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gideon → MyAnimeList authorization</title>
+    <!-- Forwards to MAL's OAuth consent screen with the parameters intact —
+         phones mangle the long URL when it travels through chat. After
+         "Allow", MAL returns to this site, which displays the code. -->
+    <script>
+      location.replace(
+        "https://myanimelist.net/v1/oauth2/authorize" +
+          "?response_type=code" +
+          "&client_id=fb578441e45e2c53ca0cf9d79790bd76" +
+          "&code_challenge=zfEhkykeoK7239phtEIRXyqVw3P2x18leJwR0iTO0uA9mSNPG-1LEtvYd-Rx0707p67A8HzmNO2v5juwMKLlMw" +
+          "&code_challenge_method=plain" +
+          "&state=fKFDC5rkb6fNrJS4flvjYA" +
+          "&redirect_uri=https%3A%2F%2Fgideon-sync.vercel.app%2F"
+      );
+    </script>
+  </head>
+  <body style="font-family: sans-serif; padding: 2em; background: #17171a; color: #ececed">
+    Redirecting to MyAnimeList…
+  </body>
+</html>
