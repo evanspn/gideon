@@ -19,17 +19,18 @@ titles get a rating chip (resolved via Jikan search, cached in localStorage
 for a week). Outages surface as retryable error states, and missing ratings
 just don't render.
 
-MAL data arrives one of two ways, preferred in this order:
+All MAL data is first-party, through the same-origin serverless proxy
+`api/mal.js` (browsers can't call MAL directly — no CORS). One-time
+*deployment* setup: create a Client ID at myanimelist.net → Preferences →
+API, then `vercel env add MAL_CLIENT_ID production` and
+`vercel env add MAL_CLIENT_SECRET production` (neither reaches the browser).
+Users never do any of this. There is no third-party mirror in the stack —
+the Jikan fallback was removed once the official path proved out (the mirror
+had multi-day outages while MAL itself was up).
 
-1. **Official MAL API** via the same-origin serverless proxy `api/mal.js` —
-   first-party data, immune to mirror outages. One-time *deployment* setup:
-   create a Client ID at myanimelist.net → Preferences → API, then
-   `vercel env add MAL_CLIENT_ID production` and
-   `vercel env add MAL_CLIENT_SECRET production` (neither reaches the
-   browser). Users never do any of this.
-2. **Jikan** (the community mirror, public/no-key/CORS-open) — the automatic
-   fallback whenever the proxy isn't configured or can't reach MAL. Jikan has
-   had multi-day outages, which is why the proxy exists.
+Recommendations are seeded from BOTH the anime list (source manga of
+top-rated shows) and the manga the user has actually read ("Because you read
+X") — so a manga-only reader gets real picks with an empty anime list.
 
 ## Per-user MyAnimeList accounts (multi-user)
 

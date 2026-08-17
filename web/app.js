@@ -205,27 +205,24 @@ async function deleteSend(id) {
 
 // --- Discover: manga recommendations from your MyAnimeList -----------------
 //
-// The user points us at their public MyAnimeList username, read through the
-// community Jikan mirror (MAL's own API doesn't allow browser calls). From
-// the list we recommend two kinds of manga, each with a one-tap "Send to
-// Kobo" that drops the title into the existing send_queue:
+// A connected account (or any public MAL username) yields two kinds of picks,
+// each with a one-tap "Send to Kobo" into the existing send_queue:
 //
-//   1. "Read the source" — the source manga of the anime they rated highest
-//      (the "Adaptation" relation on the anime entry).
-//   2. "More like what you love" — community recommendations for those manga.
+//   1. "Read the source" — the source manga of the anime they rated highest.
+//   2. "More like what you love" — community recommendations seeded from
+//      those source manga AND from the manga they've already read, so a
+//      reader with no anime list still gets real suggestions.
 //
-// Everything runs client-side against Jikan's public, CORS-open, no-key REST
-// API, in the same no-SDK plain-fetch style as the Supabase calls. Jikan is
-// community infra and can be down, so every step degrades to a clear error
-// state instead of a spinner that never ends.
+// All data is first-party MyAnimeList through the same-origin serverless
+// proxy (api/mal.js). MAL can still have a bad day, so every step degrades
+// to a clear, retryable error state instead of a spinner that never ends.
 
 const REC_USER_KEY = "gideon.rec.username";
-const JIKAN_URL = "https://api.jikan.moe/v4";
 
-// How many top-rated anime seed the recommendations, and how many cards we
-// show per section. Small on purpose: Jikan is rate-limited (~3 req/s) and a
-// phone screen only fits so much.
+// How many top-rated anime / read manga seed the recommendations, and how
+// many cards we show per section — a phone screen only fits so much.
 const REC_SEEDS = 8;
+const REC_READ_SEEDS = 6;
 const REC_MAX_PER_SECTION = 12;
 
 function recUsername() {
@@ -246,82 +243,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // One recommendation card everywhere: { title, cover, score (0-100 community
 // score or null), reason }.
 
-// -- MyAnimeList via Jikan (REST mirror; sequential + throttled) --
-
-// One global throttle for every Jikan call in the app. Jikan's per-IP budget
-// is ~3 req/s / 60 req/min; ratings, browse, search and the recommendation
-// flow can all be in flight at once, and if each paces only itself their
-// combined rate blows the budget and everything starts seeing 429s. So: all
-// requests go through one chain, spaced ≥450ms apart, with a single paused
-// retry when a 429 slips through anyway.
-let jikanChain = Promise.resolve();
-let jikanLastAt = 0;
-const JIKAN_GAP_MS = 450;
-
-function jikanGet(path) {
-  const run = jikanChain.then(async () => {
-    const wait = jikanLastAt + JIKAN_GAP_MS - Date.now();
-    if (wait > 0) await sleep(wait);
-    let res = await fetch(`${JIKAN_URL}/${path}`);
-    if (res.status === 429) {
-      await sleep(1600);
-      res = await fetch(`${JIKAN_URL}/${path}`);
-    }
-    jikanLastAt = Date.now();
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || (data.status && data.status >= 400)) {
-      throw new Error(
-        res.status === 429 || data.status === 429
-          ? "Too many requests right now — give it a few seconds and retry."
-          : data.message || `MyAnimeList error (${data.status || res.status})`
-      );
-    }
-    return data.data;
-  });
-  // Keep the chain alive after a failure so later calls still run (spaced).
-  jikanChain = run.catch(() => {});
-  return run;
-}
-
 // -- MAL official API via the same-origin proxy (api/mal.js) --
-//
-// Preferred data path: first-party MyAnimeList through our own serverless
-// proxy — immune to the Jikan mirror's outages. When the proxy reports it
-// isn't configured (no MAL_CLIENT_ID env var yet), isn't deployed (local dev
-// server), or can't reach MAL, each operation falls back to Jikan. A real
-// answer from MAL itself (404 unknown user, 400 bad request) is
-// authoritative and never falls back.
-
-// After a hard proxy failure we skip it for a while — but with a decay, so a
-// transient blip doesn't disable first-party data until a full page reload.
-let malProxyDownAt = 0;
-const MAL_PROXY_RETRY_MS = 60_000;
-const malProxyDown = () => Date.now() - malProxyDownAt < MAL_PROXY_RETRY_MS;
 
 async function malGet(path) {
   const res = await fetch(`api/mal?path=${encodeURIComponent(path)}`);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.message || data.error || `MyAnimeList error (${res.status})`);
-    // 503 = proxy unconfigured, 5xx = proxy/upstream trouble, and a 404
-    // without MAL's JSON error shape = no proxy at all (static dev server).
-    err.fallback =
-      res.status === 503 || res.status >= 500 || (res.status === 404 && !data.error) || res.status === 405;
-    throw err;
+    throw new Error(
+      data.error === "proxy-unconfigured"
+        ? "MyAnimeList isn't configured for this site yet."
+        : data.message || data.error || `MyAnimeList error (${res.status})`
+    );
   }
   return data;
-}
-
-async function withMal(proxyFn, jikanFn) {
-  if (!malProxyDown()) {
-    try {
-      return await proxyFn();
-    } catch (e) {
-      if (!e.fallback) throw e; // MAL's own answer — surface it
-      malProxyDownAt = Date.now();
-    }
-  }
-  return jikanFn();
 }
 
 // --- "Connect MyAnimeList" (per-user OAuth) ---------------------------------
@@ -530,168 +464,149 @@ async function malUserToken() {
 const malCover = (n) => n?.main_picture?.large || n?.main_picture?.medium || null;
 const malScore = (mean) => (mean ? Math.round(mean * 10) : null);
 
-// --- provider operations (proxy-first, Jikan fallback) ---
+// --- provider operations (official MAL API, via the proxy) ---
 
 // Whether this username is the connected account — if so, personal reads go
-// through the user token (private lists work; no Jikan fallback exists for
-// them, and none is possible).
+// through the user token, so private lists work.
 const isOwnAccount = (username) => !!username && malConn()?.username === username;
 
-// The user's completed anime, as { id, title, score }.
-function opAnimeList(username) {
-  const u = encodeURIComponent(username);
+// The user's completed anime, as { id, title, score }. May be empty — a
+// manga-only reader still gets recommendations from what they've read.
+async function opAnimeList(username) {
   if (isOwnAccount(username)) {
-    return malUserGet("users/@me/animelist?status=completed&limit=1000&fields=list_status&nsfw=true").then(
-      (d) =>
-        (d.data || [])
-          .filter((e) => e.node?.id)
-          .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }))
+    const d = await malUserGet(
+      "users/@me/animelist?status=completed&limit=1000&fields=list_status&nsfw=true"
     );
+    return (d.data || [])
+      .filter((e) => e.node?.id)
+      .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }));
   }
-  return withMal(
-    async () => {
-      let d;
-      try {
-        d = await malGet(`users/${u}/animelist?status=completed&limit=1000&fields=list_status&nsfw=true`);
-      } catch (e) {
-        if (e.fallback) throw e;
-        throw new Error("That MyAnimeList user wasn't found (or their list is private).");
-      }
-      return (d.data || [])
-        .filter((e) => e.node?.id)
-        .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }));
-    },
-    async () => {
-      const list = await jikanGet(`users/${u}/animelist?status=completed`);
-      return (list || [])
-        .filter((e) => e?.anime?.mal_id)
-        .map((e) => ({ id: e.anime.mal_id, title: e.anime.title || "", score: e.score || 0 }));
-    }
-  );
+  let d;
+  try {
+    d = await malGet(
+      `users/${encodeURIComponent(username)}/animelist?status=completed&limit=1000&fields=list_status&nsfw=true`
+    );
+  } catch (e) {
+    if (/isn't configured/.test(e.message)) throw e;
+    throw new Error("That MyAnimeList user wasn't found (or their list is private).");
+  }
+  return (d.data || [])
+    .filter((e) => e.node?.id)
+    .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }));
 }
 
-// Titles on their manga list (normalized), for exclusions. Best-effort.
-function opMangaListTitles(username) {
-  const u = encodeURIComponent(username);
-  if (isOwnAccount(username)) {
-    return malUserGet("users/@me/mangalist?limit=1000&nsfw=true").then(
-      (d) => new Set((d.data || []).map((e) => normTitle(e.node?.title)).filter(Boolean))
-    );
-  }
-  return withMal(
-    async () => {
-      const d = await malGet(`users/${u}/mangalist?limit=1000&nsfw=true`);
-      return new Set((d.data || []).map((e) => normTitle(e.node?.title)).filter(Boolean));
-    },
-    async () => {
-      const list = await jikanGet(`users/${u}/mangalist`);
-      return new Set((list || []).map((e) => normTitle(e?.manga?.title)).filter(Boolean));
-    }
-  );
+// Their manga list, as { id, title, score, chapters } — used both to exclude
+// what they've already read and to SEED "because you read X" picks.
+async function opMangaList(username) {
+  const d = isOwnAccount(username)
+    ? await malUserGet("users/@me/mangalist?limit=1000&fields=list_status&nsfw=true")
+    : await malGet(
+        `users/${encodeURIComponent(username)}/mangalist?limit=1000&fields=list_status&nsfw=true`
+      );
+  return (d.data || [])
+    .filter((e) => e.node?.id)
+    .map((e) => ({
+      id: e.node.id,
+      title: e.node.title || "",
+      score: e.list_status?.score || 0,
+      chapters: e.list_status?.num_chapters_read || 0,
+    }));
 }
 
 // The source manga behind an anime: { id, title, cover, score } or null.
-function opSourceManga(anime) {
-  return withMal(
-    async () => {
-      // MAL's related_manga on anime is often empty (a long-standing API
-      // gap), so fall back to searching the manga catalog by the anime's
-      // title — MAL search is good at exact-name matches.
-      const d = await malGet(`anime/${anime.id}?fields=related_manga`).catch(() => null);
-      const rel = (d?.related_manga || []).find((r) => r.node?.id);
-      if (rel) {
-        return { id: rel.node.id, title: rel.node.title || "", cover: malCover(rel.node), score: null };
-      }
-      if (normTitle(anime.title).length < 3) return null;
-      const s = await malGet(
-        `manga?q=${encodeURIComponent(anime.title.slice(0, 64))}&limit=1&fields=mean,main_picture`
-      );
-      const n = s.data?.[0]?.node;
-      return n ? { id: n.id, title: n.title || "", cover: malCover(n), score: malScore(n.mean) } : null;
-    },
-    async () => {
-      const full = await jikanGet(`anime/${anime.id}/full`).catch(() => null);
-      const adaptation = (full?.relations || [])
-        .filter((r) => r.relation === "Adaptation")
-        .flatMap((r) => r.entry || [])
-        .find((x) => x.type === "manga");
-      return adaptation ? { id: adaptation.mal_id, title: adaptation.name, cover: null, score: null } : null;
-    }
+async function opSourceManga(anime) {
+  // MAL's related_manga on anime is often empty (a long-standing API gap),
+  // so fall back to searching the manga catalog by the anime's title.
+  const d = await malGet(`anime/${anime.id}?fields=related_manga`).catch(() => null);
+  const rel = (d?.related_manga || []).find((r) => r.node?.id);
+  if (rel) {
+    return { id: rel.node.id, title: rel.node.title || "", cover: malCover(rel.node), score: null };
+  }
+  if (normTitle(anime.title).length < 3) return null;
+  const s = await malGet(
+    `manga?q=${encodeURIComponent(anime.title.slice(0, 64))}&limit=1&fields=mean,main_picture`
   );
+  const n = s.data?.[0]?.node;
+  return n ? { id: n.id, title: n.title || "", cover: malCover(n), score: malScore(n.mean) } : null;
 }
 
-// A manga's meta + community recommendations in one shape:
+// A manga's meta + community recommendations in one call:
 // { cover, score, recs: [{ id, title, cover }] }.
-function opMangaFull(id) {
-  return withMal(
-    async () => {
-      const d = await malGet(`manga/${id}?fields=mean,main_picture,recommendations`);
-      return {
-        cover: malCover(d),
-        score: malScore(d.mean),
-        recs: (d.recommendations || [])
-          .filter((r) => r.node?.id)
-          .map((r) => ({ id: r.node.id, title: r.node.title || "", cover: malCover(r.node) })),
-      };
-    },
-    async () => {
-      const manga = await jikanGet(`manga/${id}`).catch(() => null);
-      const recs = await jikanGet(`manga/${id}/recommendations`).catch(() => []);
-      return {
-        cover: manga?.images?.jpg?.large_image_url || manga?.images?.jpg?.image_url || null,
-        score: manga?.score ? Math.round(manga.score * 10) : null,
-        recs: (recs || [])
-          .filter((r) => r.entry?.mal_id)
-          .map((r) => ({
-            id: r.entry.mal_id,
-            title: r.entry.title || "",
-            cover: r.entry.images?.jpg?.large_image_url || r.entry.images?.jpg?.image_url || null,
-          })),
-      };
-    }
-  );
+async function opMangaFull(id) {
+  const d = await malGet(`manga/${id}?fields=mean,main_picture,recommendations`);
+  return {
+    cover: malCover(d),
+    score: malScore(d.mean),
+    recs: (d.recommendations || [])
+      .filter((r) => r.node?.id)
+      .map((r) => ({ id: r.node.id, title: r.node.title || "", cover: malCover(r.node) })),
+  };
 }
 
 async function malRecommend(username, onStatus) {
   onStatus("Reading your MyAnimeList…");
-  const entries = await opAnimeList(username);
-  if (!entries.length) throw new Error("That MyAnimeList has no completed anime (or it's private).");
+  const anime = await opAnimeList(username);
+  const mangaList = await opMangaList(username).catch(() => []);
+  if (!anime.length && !mangaList.length) {
+    throw new Error(
+      "This MyAnimeList has nothing on it yet — rate a few anime, or sync your Kobo reading, and picks will appear."
+    );
+  }
+  const alreadyReading = new Set(mangaList.map((e) => normTitle(e.title)).filter(Boolean));
 
-  // Their manga list too, so we never recommend something they already read.
-  // Best-effort: no manga list (or an endpoint hiccup) just means no exclusions.
-  const alreadyReading = await opMangaListTitles(username).catch(() => new Set());
-
-  const seeds = entries
-    .slice()
-    .sort((a, b) => (b.score || 0) - (a.score || 0))
-    .slice(0, REC_SEEDS);
-
-  onStatus("Finding the manga behind your favorites…");
+  // Anime-derived: the source manga of their top-rated shows.
   const sources = [];
-  for (const e of seeds) {
-    const m = await opSourceManga(e).catch(() => null);
-    if (!m) continue;
-    sources.push({
-      id: m.id,
-      title: m.title,
-      cover: m.cover || null,
-      score: m.score ?? null,
-      reason: e.score
-        ? `You rated the anime ${e.score}/10 — read the source`
-        : `You watched ${e.title} — read the source`,
-    });
+  if (anime.length) {
+    onStatus("Finding the manga behind your favorites…");
+    const seeds = anime
+      .slice()
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
+      .slice(0, REC_SEEDS);
+    for (const e of seeds) {
+      const m = await opSourceManga(e).catch(() => null);
+      if (!m) continue;
+      sources.push({
+        id: m.id,
+        title: m.title,
+        cover: m.cover || null,
+        score: m.score ?? null,
+        reason: e.score
+          ? `You rated the anime ${e.score}/10 — read the source`
+          : `You watched ${e.title} — read the source`,
+      });
+    }
   }
 
+  // Similar picks, seeded from those source manga AND from what they've
+  // actually read (their best-loved / furthest-read manga) — so a reader
+  // with no anime list still gets real suggestions.
   onStatus("Looking for more like what you love…");
+  const readSeeds = mangaList
+    .slice()
+    .sort((a, b) => (b.score || 0) - (a.score || 0) || (b.chapters || 0) - (a.chapters || 0))
+    .slice(0, REC_READ_SEEDS);
+  const seeds = [
+    ...sources.map((s, i) => ({ id: s.id, title: s.title, fill: s, collect: i < 3, read: false })),
+    ...readSeeds.map((m) => ({ id: m.id, title: m.title, fill: null, collect: true, read: true })),
+  ];
   const similar = [];
-  for (const [i, s] of sources.entries()) {
-    const full = await opMangaFull(s.id).catch(() => null);
+  const seen = new Set();
+  for (const seed of seeds) {
+    if (seen.has(seed.id)) continue;
+    seen.add(seed.id);
+    const full = await opMangaFull(seed.id).catch(() => null);
     if (!full) continue;
-    s.cover = s.cover || full.cover;
-    s.score = s.score ?? full.score;
-    if (i < 3) {
+    if (seed.fill) {
+      seed.fill.cover = seed.fill.cover || full.cover;
+      seed.fill.score = seed.fill.score ?? full.score;
+    }
+    if (seed.collect) {
       for (const r of full.recs.slice(0, 4)) {
-        similar.push({ ...r, score: null, reason: `Loved by readers of ${s.title}` });
+        similar.push({
+          ...r,
+          score: null,
+          reason: seed.read ? `Because you read ${seed.title}` : `Loved by readers of ${seed.title}`,
+        });
       }
     }
   }
@@ -703,23 +618,6 @@ async function malRecommend(username, onStatus) {
 // One card shape everywhere: { title, cover, score (0-100 or null), reason }.
 // Browse and search don't filter against the library — you're allowed to look
 // at what you own — the card just shows "queued" instead of a Send button.
-
-async function jikanBrowse({ search, mode }) {
-  const path = search
-    ? `manga?q=${encodeURIComponent(search)}&sfw=true&limit=18&order_by=members&sort=desc`
-    : mode === "top"
-      ? "top/manga?limit=18"
-      : "top/manga?filter=publishing&limit=18";
-  const rows = await jikanGet(path);
-  return (rows || [])
-    .filter((m) => (m.type || "").toLowerCase() !== "light novel")
-    .map((m) => ({
-      title: m.title || "",
-      cover: m.images?.jpg?.large_image_url || m.images?.jpg?.image_url || null,
-      score: m.score ? Math.round(m.score * 10) : null,
-      reason: (m.genres || []).slice(0, 3).map((g) => g.name).join(" · "),
-    }));
-}
 
 async function malBrowse({ search, mode }) {
   const fields = "mean,genres,main_picture,media_type,nsfw";
@@ -739,31 +637,13 @@ async function malBrowse({ search, mode }) {
     }));
 }
 
-function opBrowse(opts) {
-  return withMal(() => malBrowse(opts), () => jikanBrowse(opts));
-}
+const opBrowse = (opts) => malBrowse(opts);
 
 // Community score for one library title: { score } (null when unknown).
-// Throws only on infrastructure failure — a "no such manga" answer caches
-// as null so the sweep can move on.
-function opRating(title) {
-  if (normTitle(title).length < 3) return Promise.resolve({ score: null });
-  return withMal(
-    async () => {
-      try {
-        const d = await malGet(`manga?q=${encodeURIComponent(title.slice(0, 64))}&limit=1&fields=mean`);
-        return { score: malScore(d.data?.[0]?.node?.mean) };
-      } catch (e) {
-        if (e.fallback) throw e;
-        return { score: null };
-      }
-    },
-    async () => {
-      const rows = await jikanGet(`manga?q=${encodeURIComponent(title)}&limit=1&sfw=true`);
-      const m = rows?.[0];
-      return { score: m?.score ? Math.round(m.score * 10) : null };
-    }
-  );
+async function opRating(title) {
+  if (normTitle(title).length < 3) return { score: null };
+  const d = await malGet(`manga?q=${encodeURIComponent(title.slice(0, 64))}&limit=1&fields=mean`);
+  return { score: malScore(d.data?.[0]?.node?.mean) };
 }
 
 async function runBrowse(mode, email, rows) {
@@ -850,8 +730,8 @@ async function runSearch(q, email, rows) {
 // -- community ratings for the library (decor; cached) --
 //
 // Library titles come from the device's directory names, so each one is
-// resolved with a Jikan search (throttled — one request per unresolved title
-// per week; the localStorage cache absorbs the rest). Failures (Jikan/MAL
+// resolved with a MAL search (throttled — one request per unresolved title
+// per week; the localStorage cache absorbs the rest). Failures (MAL
 // outages) just mean no stars.
 
 const RATING_CACHE_KEY = "gideon.ratings";
@@ -1598,7 +1478,7 @@ function discoverConnectHtml(username, intro) {
         <button class="primary" type="submit" data-testid="disc-go">Get recommendations</button>
       </div>
     </form>
-    <p class="send-hint">Your MyAnimeList must be public (it's read through the community Jikan mirror — no sign-in, no keys).</p>
+    <p class="send-hint">Works with any public MyAnimeList username. For a private list, use Connect above.</p>
   </section>`;
 }
 

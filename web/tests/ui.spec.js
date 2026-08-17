@@ -88,9 +88,9 @@ function mockSends(page, initial = []) {
 test.beforeEach(async ({ page }) => {
   // (No localStorage.clear(): contexts are per-test isolated, and an
   // init-script clear re-runs on every navigation, breaking OAuth returns.)
-  // The dashboard resolves community ratings via Jikan in the background;
-  // keep that offline and empty for every test.
-  await page.route(/api\.jikan\.moe/, (route) =>
+  // The dashboard resolves community ratings via the MAL proxy in the
+  // background; keep that offline and empty for every test.
+  await page.route(/\/api\/mal\?path=/, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: '{"data":[]}' })
   );
   // Default: no pending sends, so the dashboard's send fetch never hits the net.
