@@ -5,7 +5,7 @@
   "scripts": {
     "test": "playwright test",
     "test:update": "playwright test --update-snapshots",
-    "test:api": "node --test api/*.test.mjs"
+    "test:api": "node --test api-tests/*.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.1"
