@@ -665,15 +665,21 @@ function wireRecSend(btn) {
   btn.addEventListener("click", async () => {
     const title = btn.getAttribute("data-title");
     const cover = btn.getAttribute("data-cover") || null;
+    const key = normTitle(title);
+    // Claim the title BEFORE the request: any re-render while it's in flight
+    // must rebuild the card as already-sent, or a second tap would queue the
+    // same manga twice.
+    if (isQueued(title)) return;
+    (state.sentTitles ||= new Set()).add(key);
     btn.disabled = true;
     btn.textContent = "Sending…";
     try {
       const [row] = await enqueueSend(title, cover);
       if (row) state.sends = [row, ...state.sends];
-      (state.sentTitles ||= new Set()).add(normTitle(title));
       btn.textContent = "Sent to Kobo ✓";
       btn.classList.add("sent");
     } catch (err) {
+      state.sentTitles.delete(key); // failed — allow a retry
       btn.disabled = false;
       btn.textContent = "Send to Kobo";
       btn.insertAdjacentHTML(
@@ -925,9 +931,9 @@ function buildRecommendations({ sources, similar, alreadyReading }) {
 
 async function runDiscover(email, rows) {
   state.discover = { phase: "loading", status: "Reading your MyAnimeList…" };
-  renderDashboard(email, rows);
+  patchDiscoverRecs(email, rows);
   const onStatus = (msg) => {
-    state.discover.status = msg;
+    if (state.discover?.phase === "loading") state.discover.status = msg;
     const el = document.getElementById("disc-status");
     if (el) el.textContent = msg;
   };
@@ -941,7 +947,28 @@ async function runDiscover(email, rows) {
   } catch (e) {
     state.discover = { phase: "error", error: e.message || "Something went wrong." };
   }
-  renderDashboard(email, rows);
+  patchDiscoverRecs(email, rows);
+}
+
+// Recommendations take many seconds (sequential MAL calls) and now start on
+// every Discover visit, so they routinely finish after the reader has moved
+// on. Never re-render the whole dashboard from here: that would yank someone
+// out of the manga reader mid-chapter, and even on Discover it would wipe a
+// half-typed search or reset an in-flight "Sending…" button. Patch just the
+// recommendations region, and only while it's actually on screen.
+function patchDiscoverRecs(email, rows) {
+  if (state.tab !== "discover" || state.search) return; // reader/other tab: leave the DOM alone
+  const host = document.getElementById("disc-recs");
+  if (!host) {
+    renderDashboard(email, rows);
+    return;
+  }
+  host.innerHTML = discoverRecsHtml();
+  document.getElementById("disc-retry")?.addEventListener("click", () => {
+    state.discover = null;
+    renderDashboard(email, rows); // the auto-run kicks back in
+  });
+  for (const btn of host.querySelectorAll('[data-testid="rec-send"]')) wireRecSend(btn);
 }
 
 // Session + resume state, so the reader can push progress and return home.
@@ -1576,24 +1603,31 @@ function viewDiscover() {
   }
 
   // Connected: recommendations simply appear; the account lives in a slim
-  // footer at the bottom until it's needed.
+  // footer at the bottom until it's needed. The recs live in their own host
+  // element so they can be patched in place when they arrive (see
+  // patchDiscoverRecs) instead of rebuilding the tab.
+  return `${search}${notices}<div id="disc-recs">${discoverRecsHtml()}</div>${browseSectionHtml()}${malFooterHtml()}`;
+}
+
+function discoverRecsHtml() {
   const d = state.discover;
-  let recs = "";
   if (d?.phase === "loading") {
-    recs = `<section class="panel disc-loading" data-testid="disc-loading">
+    return `<section class="panel disc-loading" data-testid="disc-loading">
       <div class="spinner" aria-hidden="true"></div>
       <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
     </section>`;
-  } else if (d?.phase === "error") {
-    recs = `<section class="panel">
+  }
+  if (d?.phase === "error") {
+    return `<section class="panel">
         <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>
         <button class="primary" id="disc-retry" data-testid="disc-retry">Try again</button>
       </section>`;
-  } else if (d?.phase === "done") {
-    recs = `${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
+  }
+  if (d?.phase === "done") {
+    return `${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
       ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
   }
-  return `${search}${notices}${recs}${browseSectionHtml()}${malFooterHtml()}`;
+  return "";
 }
 
 // One library card: cover (published page art, or a lettered placeholder),
