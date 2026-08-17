@@ -283,15 +283,6 @@ function randToken(bytes) {
   return btoa(String.fromCharCode(...a)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-// base64url(SHA-256(verifier)) — the S256 code challenge.
-async function s256(verifier) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  return btoa(String.fromCharCode(...new Uint8Array(digest)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
 async function startMalConnect() {
   const res = await fetch("api/mal-oauth?action=config").catch(() => null);
   const cfg = res?.ok ? await res.json().catch(() => null) : null;
@@ -319,8 +310,13 @@ async function startMalConnect() {
   u.search = new URLSearchParams({
     response_type: "code",
     client_id: cfg.client_id,
-    code_challenge: await s256(verifier),
-    code_challenge_method: "S256",
+    // MyAnimeList implements PKCE with the `plain` method ONLY — it has no
+    // S256 support, and sending a hashed challenge makes every exchange fail
+    // with invalid_grant. So the challenge IS the verifier here. Do not
+    // "harden" this to S256 without checking MAL's API first; the per-attempt
+    // random verifier + state check are what protect the flow.
+    code_challenge: verifier,
+    code_challenge_method: "plain",
     state: pkceState,
     redirect_uri: cfg.redirect_uri,
   });
@@ -398,7 +394,10 @@ async function finishMalConnect() {
     localStorage.setItem(malKeyFor(pending.email || state.session?.email || loadSession()?.email), JSON.stringify(conn));
     state.malToast = `MyAnimeList connected${conn.username ? ` as ${conn.username}` : ""} ✓`;
   } catch (e) {
-    state.malError = `MyAnimeList connection failed — ${e.message || "try again"}.`;
+    // OAuth error codes mean nothing to a reader; say what to do instead.
+    state.malError = /invalid_grant|expired/i.test(e.message || "")
+      ? "That sign-in didn't go through — tap Connect MyAnimeList to try again."
+      : `Couldn't connect MyAnimeList — ${e.message || "try again"}.`;
   }
   return true;
 }

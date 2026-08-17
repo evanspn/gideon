@@ -352,6 +352,64 @@ test("Connect MyAnimeList completes the OAuth dance and lands connected", async 
   expect(new URL(page.url()).search).toBe("");
 });
 
+test("the authorize URL uses MAL's only supported PKCE method (plain)", async ({ page }) => {
+  await mockSends(page);
+  let authorizeUrl = null;
+  await page.route("**/api/mal-oauth**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ client_id: "cid", redirect_uri: "http://127.0.0.1:3210/" }),
+    })
+  );
+  // Bounce back to our own origin (without a code, so the pending PKCE
+  // record survives) — otherwise localStorage would be read on MAL's origin.
+  await page.route(/myanimelist\.net\/v1\/oauth2\/authorize/, (route) => {
+    authorizeUrl = new URL(route.request().url());
+    return route.fulfill({ status: 302, headers: { Location: "http://127.0.0.1:3210/" } });
+  });
+  await signInAnd(page, "tab-discover");
+  await page.getByTestId("mal-connect").click();
+  await expect.poll(() => authorizeUrl !== null).toBeTruthy();
+
+  // MAL supports ONLY code_challenge_method=plain; S256 makes every token
+  // exchange fail with invalid_grant. The challenge must equal the verifier.
+  expect(authorizeUrl.searchParams.get("code_challenge_method")).toBe("plain");
+  const challenge = authorizeUrl.searchParams.get("code_challenge");
+  expect(challenge.length).toBeGreaterThanOrEqual(43);
+  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem("gideon.mal.pkce") || "{}"));
+  expect(challenge).toBe(stored.verifier);
+});
+
+test("a failed exchange explains itself without OAuth jargon", async ({ page }) => {
+  await mockSends(page);
+  await page.route("**/api/mal-oauth**", (route) => {
+    const action = new URL(route.request().url()).searchParams.get("action");
+    if (action === "config") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ client_id: "cid", redirect_uri: "http://127.0.0.1:3210/" }),
+      });
+    }
+    return route.fulfill({ status: 400, contentType: "application/json", body: '{"error":"invalid_grant"}' });
+  });
+  await page.route(/myanimelist\.net\/v1\/oauth2\/authorize/, (route) => {
+    const u = new URL(route.request().url());
+    return route.fulfill({
+      status: 302,
+      headers: { Location: `http://127.0.0.1:3210/?code=C&state=${u.searchParams.get("state")}` },
+    });
+  });
+  await signInAnd(page, "tab-discover");
+  await page.getByTestId("mal-connect").click();
+
+  const err = page.getByTestId("mal-error");
+  await expect(err).toContainText("didn't go through");
+  await expect(err).not.toContainText("invalid_grant");
+  await expect(page.getByTestId("mal-connect")).toBeVisible();
+});
+
 test("a corrupted OAuth state is discarded quietly — no token exchange", async ({ page }) => {
   await mockSends(page);
   const exchanges = mockOauth(page, { breakState: true });
