@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: "DejaVu Sans", Verdana, Geneva, sans-serif; }
+    a { color: #8a4a2a; } a:hover { color: #5e3018; }
+  </style>
+</helmet>
+
+<div style="width: 1264px; height: 1680px; background: #ffffff; color: #000000; display: flex; flex-direction: column; overflow: hidden;">
+
+  <!-- title bar -->
+  <div style="height: 102px; flex-shrink: 0; display: flex; align-items: center; gap: 16px; padding: 0 19px; border-bottom: 1px solid #555555; box-sizing: border-box;">
+    <div style="font-size: 42px; font-weight: 700; letter-spacing: -0.5px;">gideon</div>
+    <div style="font-size: 30px; color: #555555;">1.0 &middot; evan</div>
+    <div style="flex-grow: 1;"></div>
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 6.5 17.5 13.5 12 17.5V2.5l5.5 4L6.5 17.5"></path></svg>
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5a9 9 0 0 1 14 0"></path><path d="M8 16a5 5 0 0 1 8 0"></path><circle cx="12" cy="19.5" r="1.2" fill="#000000"></circle></svg>
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <svg width="42" height="24" viewBox="0 0 42 24" fill="none" stroke="#000000" stroke-width="1.8"><rect x="1" y="4" width="34" height="16" rx="3"></rect><rect x="4" y="7" width="24" height="10" fill="#000000" stroke="none"></rect><path d="M38 9v6" stroke-linecap="round"></path></svg>
+      <div style="font-size: 30px; font-variant-numeric: tabular-nums;">84%</div>
+    </div>
+  </div>
+
+  <!-- ── stat band: the numbers the web dashboard already computes ── -->
+  <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid #555555;">
+    <sc-for list="{{tiles}}" as="t" hint-placeholder-count="4">
+      <div style="padding: 20px 19px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid #dddddd; box-sizing: border-box;">
+        <div style="font-size: 52px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums;">{{t.val}}</div>
+        <div style="height: 6px;"></div>
+        <div style="font-size: 24px; letter-spacing: 1.6px; text-transform: uppercase; color: #000000;">{{t.label}}</div>
+        <div style="font-size: 24px; color: #555555;">{{t.sub}}</div>
+      </div>
+    </sc-for>
+  </div>
+
+  <!-- ── activity heatmap, 18 weeks, 5 e-ink grays ─────────────────── -->
+  <div style="padding: 24px 19px 22px 19px; border-bottom: 1px solid #dddddd;">
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <div style="font-size: 26px; letter-spacing: 2.4px; text-transform: uppercase; color: {{c.label}}; font-weight: 700;">Reading activity</div>
+      <div style="flex-grow: 1; height: 1px; background: #dddddd;"></div>
+      <div style="font-size: 25px; color: #555555;">last 18 weeks</div>
+    </div>
+    <div style="height: 16px;"></div>
+    <div style="display: flex; gap: 8px;">
+      <sc-for list="{{weeks}}" as="w" hint-placeholder-count="18">
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <sc-for list="{{w.days}}" as="d" hint-placeholder-count="7">
+            <div style="width: 40px; height: 40px; background: {{d}};"></div>
+          </sc-for>
+        </div>
+      </sc-for>
+      <div style="flex-grow: 1;"></div>
+      <div style="display: flex; flex-direction: column; justify-content: flex-end; align-items: flex-end; gap: 10px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <div style="font-size: 24px; color: #555555;">Less</div>
+          <div style="width: 26px; height: 26px; background: {{heat0}};"></div>
+          <div style="width: 26px; height: 26px; background: {{heat1}};"></div>
+          <div style="width: 26px; height: 26px; background: {{heat2}};"></div>
+          <div style="width: 26px; height: 26px; background: {{heat3}};"></div>
+          <div style="width: 26px; height: 26px; background: {{heat4}};"></div>
+          <div style="font-size: 24px; color: #555555;">More</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── continue ─────────────────────────────────────────────────── -->
+  <div style="padding: 22px 19px; border-bottom: 1px solid #dddddd; display: flex; gap: 20px; align-items: center;">
+    <div style="width: 150px; height: 225px; flex-shrink: 0; background: #6f7d86;"></div>
+    <div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px;">
+      <div style="font-size: 25px; letter-spacing: 2.4px; text-transform: uppercase; color: {{c.accent}}; font-weight: 700;">Continue</div>
+      <div style="font-size: 42px; font-weight: 700; line-height: 1.1;">Vinland Saga</div>
+      <div style="font-size: 30px; color: #333333;">Ch. 54 &mdash; page 12 of 44 &middot; 2 days ago</div>
+      <div style="height: 6px;"></div>
+      <div style="height: 8px; background: #cccccc;">
+        <div style="height: 8px; background: {{c.bar}}; width: 27%;"></div>
+      </div>
+    </div>
+    <div style="width: 150px; height: 150px; flex-shrink: 0; border: 2px solid #000000; display: flex; align-items: center; justify-content: center;">
+      <svg width="52" height="52" viewBox="0 0 24 24" fill="#000000" stroke="none"><path d="M8 4.5 19 12 8 19.5Z"></path></svg>
+    </div>
+  </div>
+
+  <!-- ── from MyAnimeList: recommendations we can already fetch ────── -->
+  <div style="padding: 22px 19px; flex-grow: 1; min-height: 0; display: flex; flex-direction: column;">
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <div style="font-size: 26px; letter-spacing: 2.4px; text-transform: uppercase; color: {{c.label}}; font-weight: 700;">Because you read Vinland Saga</div>
+      <div style="flex-grow: 1; height: 1px; background: #dddddd;"></div>
+    </div>
+    <div style="height: 16px;"></div>
+    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px;">
+      <sc-for list="{{recs}}" as="r" hint-placeholder-count="4">
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="height: 280px; background: {{r.tint}}; border: 1px solid #aaaaaa; box-sizing: border-box; position: relative; display: flex; align-items: flex-start; justify-content: flex-end; padding: 8px;">
+            <div style="background: #ffffff; border: 2px solid {{c.star}}; padding: 3px 9px; font-size: 23px; font-weight: 700; font-variant-numeric: tabular-nums;">{{r.score}}</div>
+          </div>
+          <div style="font-size: 26px; font-weight: 700; line-height: 1.15; text-wrap: pretty;">{{r.title}}</div>
+          <div style="font-size: 23px; color: #555555; line-height: 1.2;">{{r.reason}}</div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+
+  <!-- ── nav ──────────────────────────────────────────────────────── -->
+  <div style="height: 132px; flex-shrink: 0; background: #ffffff; border-top: 1px solid #555555; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); box-sizing: border-box;">
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border-top: 6px solid {{c.accent}}; box-sizing: border-box;">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V9l8-5 8 5v10"></path><path d="M9 19v-6h6v6"></path></svg>
+      <div style="font-size: 26px; font-weight: 700;">Today</div>
+    </div>
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#555555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16"></rect><rect x="14" y="4" width="7" height="16"></rect></svg>
+      <div style="font-size: 26px; color: #555555;">Library</div>
+    </div>
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#555555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 5 5"></path></svg>
+      <div style="font-size: 26px; color: #555555;">Discover</div>
+    </div>
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#555555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"></path></svg>
+      <div style="font-size: 26px; color: #555555;">Settings</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{"scheme":{"editor":"enum","default":"ink-rust","options":["ink-rust","indigo","sumi","botanical","mono"],"section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
+class Component extends DCLogic {
+  renderVals() {
+    // Five colour profiles. Kaleido subtracts saturation, so each is already
+    // muted in sRGB rather than relying on the panel's CFA gain to mute it.
+    // 'mono' is the non-Kaleido build — a real target, not a degraded fallback.
+    const SCHEMES = {
+      'ink-rust': {
+        accent: '#a85f38', star: '#b08a2e', bar: '#a85f38', label: '#a85f38',
+        status: '#4c7a55', statusBd: '#4c7a55', genre: '#3f6b8c', genreBd: '#3f6b8c',
+        statusTint: '#dbe7dd', genreTint: '#dae4eb', ink: '#000000',
+        heat: ['#eeeeee', '#dcc9a6', '#c9a86b', '#a85f38', '#6c3f24'] },
+      'indigo': {
+        accent: '#3f5488', star: '#a2603f', bar: '#3f5488', label: '#3f5488',
+        status: '#3a6e72', statusBd: '#3a6e72', genre: '#6b4a73', genreBd: '#6b4a73',
+        statusTint: '#d7e4e4', genreTint: '#e4dcea', ink: '#000000',
+        heat: ['#eeeeee', '#c8cfe2', '#8e9cc4', '#3f5488', '#28345a'] },
+      'sumi': {
+        accent: '#b14a32', star: '#b14a32', bar: '#1a1a1a', label: '#1a1a1a',
+        status: '#1a1a1a', statusBd: '#6e6a63', genre: '#6e6a63', genreBd: '#6e6a63',
+        statusTint: '#eedcd5', genreTint: '#eeece7', ink: '#000000',
+        heat: ['#efece6', '#e0c4ba', '#cd8874', '#b14a32', '#6f2d1e'] },
+      'botanical': {
+        accent: '#a4633e', star: '#9a7a34', bar: '#5f6f3f', label: '#5f6f3f',
+        status: '#5f6f3f', statusBd: '#5f6f3f', genre: '#4e6e86', genreBd: '#4e6e86',
+        statusTint: '#e2e6d6', genreTint: '#dfe6ec', ink: '#000000',
+        heat: ['#eeeeee', '#d5dcc2', '#a8b585', '#5f6f3f', '#3b4527'] },
+      'mono': {
+        accent: '#000000', star: '#555555', bar: '#222222', label: '#555555',
+        status: '#000000', statusBd: '#aaaaaa', genre: '#999999', genreBd: '#aaaaaa',
+        statusTint: '#f0f0f0', genreTint: '#f6f6f6', ink: '#000000',
+        heat: ['#eeeeee', '#cccccc', '#999999', '#555555', '#000000'] },
+    };
+    const c = SCHEMES[this.props.scheme] ?? SCHEMES['ink-rust'];
+    const ramp = c.heat;
+    // Fixed sample pattern — no randomness, so the artboard is stable across renders.
+    const seed = [0,1,0,2,3,1,0, 2,0,1,3,4,2,1, 0,0,2,1,1,0,3, 4,2,1,0,0,1,2,
+                  1,3,4,2,0,0,1, 0,1,1,2,3,3,2, 2,0,0,1,4,3,1, 1,2,3,4,4,2,0,
+                  0,0,1,2,2,1,0, 3,4,2,1,1,0,0, 1,1,2,3,2,2,1, 0,2,4,3,1,0,1,
+                  2,3,3,1,0,1,2, 4,4,3,2,1,1,0, 0,1,2,2,3,4,3, 1,0,0,1,2,3,4,
+                  2,1,1,0,2,3,4, 3,2,2,4,4,3,2];
+    const weeks = [];
+    for (let w = 0; w < 18; w++) {
+      weeks.push({ days: seed.slice(w * 7, w * 7 + 7).map((n) => ramp[n]) });
+    }
+    return {
+      c,
+      heat0: c.heat[0], heat1: c.heat[1], heat2: c.heat[2], heat3: c.heat[3], heat4: c.heat[4],
+      weeks,
+      tiles: [
+        { val: '31', label: 'Day streak', sub: 'best 47' },
+        { val: '412', label: 'Chapters', sub: 'across 42 series' },
+        { val: '9,180', label: 'Pages read', sub: 'since Mar 2025' },
+        { val: '1.8 GB', label: 'Downloaded', sub: 'of 2 GB limit' },
+      ],
+      recs: [
+        { title: 'Berserk', score: '9.47', reason: 'Loved by readers of Vinland Saga', tint: '#5c5450' },
+        { title: 'Kingdom', score: '9.10', reason: 'Historical · Action', tint: '#6a6058' },
+        { title: 'Vagabond', score: '9.24', reason: 'Loved by readers of Vinland Saga', tint: '#59636b' },
+        { title: 'Golden Kamuy', score: '8.91', reason: 'You watched the anime', tint: '#6b6470' },
+      ],
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,164 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: "DejaVu Sans", Verdana, Geneva, sans-serif; }
+    a { color: #8a4a2a; } a:hover { color: #5e3018; }
+  </style>
+</helmet>
+
+<div style="width: 1264px; height: 1680px; background: #ffffff; color: #000000; display: flex; flex-direction: column; overflow: hidden;">
+
+  <!-- title bar -->
+  <div style="height: 102px; flex-shrink: 0; display: flex; align-items: center; gap: 16px; padding: 0 19px; border-bottom: 1px solid #555555; box-sizing: border-box;">
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 5-7 7 7 7"></path></svg>
+    <div style="font-size: 38px; font-weight: 700;">Vinland Saga</div>
+    <div style="flex-grow: 1;"></div>
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="5" r="1.4" fill="#000000"></circle><circle cx="12" cy="12" r="1.4" fill="#000000"></circle><circle cx="12" cy="19" r="1.4" fill="#000000"></circle></svg>
+  </div>
+
+  <!-- hero: cover + facts -->
+  <div style="padding: 24px 19px; display: flex; gap: 24px; flex-shrink: 0;">
+    <div style="width: 300px; height: 450px; flex-shrink: 0; background: #6f7d86; display: flex; align-items: flex-end; padding: 16px; box-sizing: border-box;">
+      <div style="color: #ffffff; font-size: 30px; font-weight: 700; line-height: 1.15; text-wrap: pretty;">Vinland Saga</div>
+    </div>
+
+    <div style="flex-grow: 1; display: flex; flex-direction: column;">
+      <div style="font-size: 30px; color: #333333;">Makoto Yukimura &middot; 2005</div>
+      <div style="height: 14px;"></div>
+
+      <!-- the MAL block: score, rank, status, genres — all thrown away by mal.rs today -->
+      <div style="display: flex; align-items: stretch; border: 1px solid #aaaaaa;">
+        <div style="flex-grow: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid #dddddd;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="{{c.star}}" stroke="none"><path d="m12 3 2.6 5.6 6 .8-4.4 4.2 1.1 6.1L12 16.8 6.7 19.7l1.1-6.1L3.4 9.4l6-.8Z"></path></svg>
+            <div style="font-size: 38px; font-weight: 700; font-variant-numeric: tabular-nums;">8.74</div>
+          </div>
+          <div style="font-size: 22px; letter-spacing: 1.6px; text-transform: uppercase; color: #555555;">Score</div>
+        </div>
+        <div style="flex-grow: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid #dddddd;">
+          <div style="font-size: 38px; font-weight: 700; font-variant-numeric: tabular-nums;">#12</div>
+          <div style="font-size: 22px; letter-spacing: 1.6px; text-transform: uppercase; color: #555555;">Ranked</div>
+        </div>
+        <div style="flex-grow: 1; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px;">
+          <div style="font-size: 38px; font-weight: 700; color: {{c.status}};">Publishing</div>
+          <div style="font-size: 22px; letter-spacing: 1.6px; text-transform: uppercase; color: #555555;">Status</div>
+        </div>
+      </div>
+
+      <div style="height: 16px;"></div>
+      <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Action</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Adventure</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Drama</div>
+        <div style="background: {{c.genreTint}}; padding: 6px 16px; font-size: 25px; color: {{c.ink}};">Historical</div>
+      </div>
+
+      <div style="flex-grow: 1;"></div>
+
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <div style="font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums;">54 / 213</div>
+        <div style="font-size: 28px; color: #555555;">read &middot; 18 downloaded</div>
+      </div>
+      <div style="height: 10px;"></div>
+      <div style="height: 8px; background: #cccccc;">
+        <div style="height: 8px; background: {{c.bar}}; width: 25%;"></div>
+      </div>
+      <div style="height: 20px;"></div>
+      <div style="height: 102px; border: 2px solid #000000; display: flex; align-items: center; justify-content: center; gap: 14px;">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h5a3 3 0 0 1 3 3v10a2.5 2.5 0 0 0-2.5-2.5H4Z"></path><path d="M20 5.5h-5a3 3 0 0 0-3 3v10a2.5 2.5 0 0 1 2.5-2.5H20Z"></path></svg>
+        <div style="font-size: 36px; font-weight: 700;">Resume chapter 54</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="height: 1px; background: #555555;"></div>
+
+  <!-- chapter list, 102px rows with the existing icon gutter -->
+  <div style="flex-grow: 1; display: flex; flex-direction: column; min-height: 0;">
+    <sc-for list="{{chapters}}" as="ch" hint-placeholder-count="6">
+      <div style="height: 102px; flex-shrink: 0; display: flex; align-items: center; gap: 18px; padding: 0 19px; border-bottom: 1px solid #dddddd; box-sizing: border-box; background: {{ch.bg}};">
+        <div style="width: 40px; flex-shrink: 0; display: flex; justify-content: center;">
+          <sc-if value="{{ch.read}}" hint-placeholder-val="{{true}}">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 12.5 5 5 11-11"></path></svg>
+          </sc-if>
+        </div>
+        <div style="width: 40px; flex-shrink: 0; display: flex; justify-content: center;">
+          <sc-if value="{{ch.downloaded}}" hint-placeholder-val="{{true}}">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#555555" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"></path><path d="m7.5 10 4.5 4.5 4.5-4.5"></path><path d="M4 20h16"></path></svg>
+          </sc-if>
+        </div>
+        <div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+          <div style="font-size: 34px; font-weight: {{ch.weight}}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ch.title}}</div>
+          <div style="font-size: 24px; color: #555555;">{{ch.sub}}</div>
+        </div>
+        <div style="font-size: 26px; color: #555555; font-variant-numeric: tabular-nums; flex-shrink: 0;">{{ch.right}}</div>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#555555" stroke-width="2" stroke-linecap="round" style="flex-shrink: 0;"><circle cx="12" cy="5" r="1.4" fill="#555555"></circle><circle cx="12" cy="12" r="1.4" fill="#555555"></circle><circle cx="12" cy="19" r="1.4" fill="#555555"></circle></svg>
+      </div>
+    </sc-for>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{"scheme":{"editor":"enum","default":"ink-rust","options":["ink-rust","indigo","sumi","botanical","mono"],"section":"Theme"},"$preview":{"width":1264,"height":1680}}'>
+class Component extends DCLogic {
+  renderVals() {
+    // Five colour profiles. Kaleido subtracts saturation, so each is already
+    // muted in sRGB rather than relying on the panel's CFA gain to mute it.
+    // 'mono' is the non-Kaleido build — a real target, not a degraded fallback.
+    const SCHEMES = {
+      'ink-rust': {
+        accent: '#a85f38', star: '#b08a2e', bar: '#a85f38', label: '#a85f38',
+        status: '#4c7a55', statusBd: '#4c7a55', genre: '#3f6b8c', genreBd: '#3f6b8c',
+        statusTint: '#dbe7dd', genreTint: '#dae4eb', ink: '#000000',
+        heat: ['#eeeeee', '#dcc9a6', '#c9a86b', '#a85f38', '#6c3f24'] },
+      'indigo': {
+        accent: '#3f5488', star: '#a2603f', bar: '#3f5488', label: '#3f5488',
+        status: '#3a6e72', statusBd: '#3a6e72', genre: '#6b4a73', genreBd: '#6b4a73',
+        statusTint: '#d7e4e4', genreTint: '#e4dcea', ink: '#000000',
+        heat: ['#eeeeee', '#c8cfe2', '#8e9cc4', '#3f5488', '#28345a'] },
+      'sumi': {
+        accent: '#b14a32', star: '#b14a32', bar: '#1a1a1a', label: '#1a1a1a',
+        status: '#1a1a1a', statusBd: '#6e6a63', genre: '#6e6a63', genreBd: '#6e6a63',
+        statusTint: '#eedcd5', genreTint: '#eeece7', ink: '#000000',
+        heat: ['#efece6', '#e0c4ba', '#cd8874', '#b14a32', '#6f2d1e'] },
+      'botanical': {
+        accent: '#a4633e', star: '#9a7a34', bar: '#5f6f3f', label: '#5f6f3f',
+        status: '#5f6f3f', statusBd: '#5f6f3f', genre: '#4e6e86', genreBd: '#4e6e86',
+        statusTint: '#e2e6d6', genreTint: '#dfe6ec', ink: '#000000',
+        heat: ['#eeeeee', '#d5dcc2', '#a8b585', '#5f6f3f', '#3b4527'] },
+      'mono': {
+        accent: '#000000', star: '#555555', bar: '#222222', label: '#555555',
+        status: '#000000', statusBd: '#aaaaaa', genre: '#999999', genreBd: '#aaaaaa',
+        statusTint: '#f0f0f0', genreTint: '#f6f6f6', ink: '#000000',
+        heat: ['#eeeeee', '#cccccc', '#999999', '#555555', '#000000'] },
+    };
+    const c = SCHEMES[this.props.scheme] ?? SCHEMES['ink-rust'];
+    return {
+      c,
+      chapters: [
+        { title: 'Ch. 54 — The Battle of the Gods', sub: 'page 12 of 44 · 2 days ago', right: '27%', read: false, downloaded: true, weight: '700', bg: '#f4f4f4' },
+        { title: 'Ch. 55 — Prologue', sub: '44 pages', right: '', read: false, downloaded: true, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 56 — Ketil’s Farm', sub: '41 pages', right: '', read: false, downloaded: true, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 53 — Servant', sub: 'finished · 5 days ago', right: '', read: true, downloaded: true, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 52 — Snake', sub: 'finished · 6 days ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 51 — The Man With No Past', sub: 'finished · 6 days ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 50 — Reunion', sub: 'finished · 1 week ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 49 — Slave Ship', sub: 'finished · 1 week ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 48 — Passage of Arms', sub: 'finished · 1 week ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 47 — Homecoming', sub: 'finished · 2 weeks ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+        { title: 'Ch. 46 — The End of the Prologue', sub: 'finished · 2 weeks ago', right: '', read: true, downloaded: false, weight: '400', bg: '#ffffff' },
+      ],
+    };
+  }
+}
+</script>
+</body>
+</html>

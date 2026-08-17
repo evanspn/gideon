@@ -1,0 +1,114 @@
+{
+  "artboards": [
+    {
+      "file": "Main.dc.html",
+      "title": "A \u00b7 Shelf \u2014 Library",
+      "x": 0,
+      "y": 0,
+      "w": 1264,
+      "h": 1680,
+      "page": "page-1"
+    },
+    {
+      "file": "SeriesShelf.dc.html",
+      "title": "A \u00b7 Shelf \u2014 Series",
+      "x": 1400,
+      "y": 0,
+      "w": 1264,
+      "h": 1680,
+      "page": "page-1"
+    },
+    {
+      "file": "Dossier.dc.html",
+      "title": "B \u00b7 Dossier \u2014 Today",
+      "x": 0,
+      "y": 1960,
+      "w": 1264,
+      "h": 1680,
+      "page": "page-1"
+    },
+    {
+      "file": "DossierLibrary.dc.html",
+      "title": "B \u00b7 Dossier \u2014 Library",
+      "x": 1400,
+      "y": 1960,
+      "w": 1264,
+      "h": 1680,
+      "page": "page-1"
+    },
+    {
+      "file": "Palettes.dc.html",
+      "title": "Kaleido palette reference",
+      "x": 0,
+      "y": 3920,
+      "w": 1500,
+      "h": 3100,
+      "page": "page-2"
+    },
+    {
+      "file": "Profiles.dc.html",
+      "title": "Five colour profiles",
+      "x": 1700,
+      "y": 3920,
+      "w": 1500,
+      "h": 1000,
+      "page": "page-2"
+    }
+  ],
+  "annotations": [
+    {
+      "id": "dir-a",
+      "x": 2760,
+      "y": 0,
+      "w": 520,
+      "text": "DIRECTION A \u2014 SHELF\n\nCovers lead. The flat 102px text menu on Home is gone: the library IS the home screen, with a persistent 4-item bottom nav.\n\nData is present but quiet \u2014 one score chip, one status chip, one \"54 / 213 chapters\" line. Nothing competes with the cover art.\n\nTradeoff: least new data plumbing, least new information. Closest to what ships today, so the cheapest to build.",
+      "page": "page-1"
+    },
+    {
+      "id": "dir-b",
+      "x": 2760,
+      "y": 1960,
+      "w": 520,
+      "text": "DIRECTION B \u2014 DOSSIER\n\nData leads. Home becomes a Today screen: the four stat tiles and the 18-week activity heatmap the web dashboard already computes, then Continue, then MAL recommendations.\n\nLibrary is a dense 194px list row \u2014 score, status, genres, download size, chapters read, next chapter \u2014 all on one line each.\n\nTradeoff: needs the most new data on-device, and more full refreshes. Highest payoff for the tracking work.",
+      "page": "page-1"
+    },
+    {
+      "id": "eink-rules",
+      "x": 0,
+      "y": -520,
+      "w": 900,
+      "text": "E-INK GROUND RULES BOTH DIRECTIONS FOLLOW\n\nDrawn at the real panel size: 1264 x 1680 (Libra Colour).\n\nAll geometry is lifted from the current source, not invented:\n  row height 102px, body text 45px, pad 19px\n  title rules #555555, row separators #DDDDDD, card borders #AAAAAA\n  progress track #CCCCCC, shelf gap 16 / title 44 / bar 8\n  DejaVu Sans, regular and bold only \u2014 there is no weight scale\n\nNo gradients, no shadows, no rounded corners, no anti-aliased hairlines \u2014 flat fills and 1px rules only, so partial refresh stays clean and nothing ghosts.\n\nEvery tap target is at least 88px tall.",
+      "page": "page-1"
+    },
+    {
+      "id": "data-gap",
+      "x": 1000,
+      "y": -520,
+      "w": 900,
+      "text": "HONEST NOTE \u2014 THE DATA ISN'T ON THE DEVICE YET\n\nBoth mockups show MAL score, rank, status, genres and chapter counts. The device stores none of that today.\n\nSeriesRef (gideon-core/src/series.rs) holds only: source_id, source_name, manga_id, manga_title, cover_url, downloaded map. No genres, no status, no score, no total chapter count.\n\nmal.rs parses ONLY title and cover_url out of the Jikan payload \u2014 mean score, status, genres, rank, chapter count all arrive over the wire and get discarded by parse_popular.\n\nProgress is per-chapter only (current_page, total_pages, last_read_at). There is no streak, no pages-read total, no per-day history \u2014 computeStats in web/app.js derives all of that from Supabase, on the web side only.\n\nSo Direction B's stat band and heatmap need either a stats store on device or a pull from Supabase; Direction A's chips need only the MAL fields mal.rs is already throwing away. That difference is the real cost gap between the two.",
+      "page": "page-1"
+    },
+    {
+      "id": "color-rules",
+      "x": 2000,
+      "y": -520,
+      "w": 900,
+      "text": "COLOUR \u2014 FIVE PROFILES\n\nThe Libra Colour has a Kaleido filter, so colour is available and every screen uses it. Two physical facts shape how:\n\n1. The colour layer resolves at ~150ppi against 300ppi for black. Colour in thin strokes or body text reads soft and fringed. So colour lives in BLOCKS \u2014 chip fills, progress bars, heatmap cells, the nav indicator \u2014 and text stays black. The one exception is type large and bold enough to carry it (the 38px status value on the series screen).\n\n2. Kaleido subtracts saturation. Every profile is already pulled back from sRGB rather than relying on the panel's CFA gain to mute it.\n\nEach screen artboard carries a PROFILE tweak with five options: Ink & Rust (the default), Indigo Press, Sumi & Vermilion, Botanical, and Mono. Flip any screen to any of them. The Colour page has the full swatch reference and a side-by-side of all five on real components.\n\nCOLOUR IS NEVER THE ONLY CARRIER. Every coloured element also differs in value, position or label, so the same layout survives without a colour filter. Mono is that build \u2014 the Clara and older-Libra target, where the palette collapses to the existing grayscale constants and the status swatch separates by value instead of hue. It is a target, not a degraded afterthought.",
+      "page": "page-1"
+    }
+  ],
+  "launch": {
+    "view": "canvas",
+    "page": "page-2"
+  },
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "Screens"
+    },
+    {
+      "id": "page-2",
+      "name": "Colour"
+    }
+  ]
+}
