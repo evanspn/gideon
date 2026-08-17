@@ -29,6 +29,9 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("can't convert the default profile: {0}")]
+    ConvertProfile(String),
+
     #[error("failed to parse progress store: {0}")]
     ProgressStore(#[from] serde_json::Error),
 }

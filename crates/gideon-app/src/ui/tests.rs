@@ -3486,6 +3486,105 @@ fn new_profile_keyboard_creates_and_switches() {
 }
 
 #[test]
+fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
+    // The default profile's library used to BE the library root — a shape no
+    // other profile has. Naming it moves the root's contents (books and the
+    // .gideon bookkeeping alike) into "@name", so afterwards every profile is
+    // just a directory and "default" is gone.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    std::fs::create_dir_all(lib.join(".gideon")).unwrap();
+    std::fs::write(lib.join(".gideon/progress.json"), "{}").unwrap();
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+
+    let events = vec![
+        tap_title_left(), // [default, alex, New profile…, Name the default…]
+        tap_row(3),       // Name the default profile…
+        tap_key(Key::Char('m')),
+        tap_key(Key::Char('e')),
+        tap_key(Key::Search), // convert
+        tap_row(0),           // Library (now @me's)
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    // The books and the bookkeeping moved; other profiles stayed put.
+    assert!(lib.join("@me/Shared/vol1.cbz").is_file());
+    assert!(lib.join("@me/.gideon/progress.json").is_file());
+    assert!(!lib.join("Shared").exists());
+    assert!(lib.join("@alex/Alexs Series/vol1.cbz").is_file());
+
+    // "default" is no longer a profile, and the app is running as the new one.
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.profiles,
+        vec!["me".to_string(), "alex".to_string()]
+    );
+    assert_eq!(settings.active_profile, "me");
+    let Screen::Library { items, .. } = app.screen() else {
+        panic!("expected the converted profile's library");
+    };
+    let titles: Vec<String> = items.iter().map(|c| c.title()).collect();
+    assert_eq!(titles, vec!["Shared".to_string()]);
+}
+
+#[test]
+fn naming_the_default_profile_a_taken_name_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+
+    let events = vec![
+        tap_title_left(),
+        tap_row(3), // Name the default profile…
+        tap_key(Key::Char('a')),
+        tap_key(Key::Char('l')),
+        tap_key(Key::Char('e')),
+        tap_key(Key::Char('x')),
+        tap_key(Key::Search), // alex already owns @alex
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    assert!(matches!(app.screen(), Screen::Message { .. }));
+    assert!(lib.join("Shared/vol1.cbz").is_file(), "nothing moved");
+    assert!(lib.join("@alex/Alexs Series/vol1.cbz").is_file());
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert_eq!(
+        settings.profiles,
+        vec!["default".to_string(), "alex".to_string()]
+    );
+    assert_eq!(settings.active_profile, "default");
+}
+
+#[test]
+fn the_profile_menu_stops_offering_conversion_once_default_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        profiles: vec!["me".to_string(), "alex".to_string()],
+        active_profile: "me".to_string(),
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    // Row 3 would be "Name the default profile…" if it were offered; with no
+    // default profile the row doesn't exist, so the tap does nothing.
+    let events = vec![tap_title_left(), tap_row(3)];
+    let mut app = app(&lib, FakeGateway::default(), events)
+        .with_settings_dir(settings_dir)
+        .with_profile("me");
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::ProfileMenu { .. }));
+}
+
+#[test]
 fn keyboard_shift_types_uppercase() {
     // The Shift key makes letters upper-case — needed for case-sensitive input
     // (passwords). Drive it through the new-profile keyboard: Shift, b -> "B".
