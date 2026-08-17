@@ -1,10 +1,15 @@
 name: Deploy web dashboard
 
-# Auto-publishes the reading-stats dashboard (web/) to Vercel production on
-# every push to main that touches it, so merging a web change ships it — no
-# manual `vercel deploy`. The project (gideon-sync) is static: no build step,
-# Vercel just serves the files. Auth is a single repo secret, VERCEL_TOKEN;
-# the org/project IDs below are not sensitive (they're public identifiers).
+# Auto-publishes the reading-stats dashboard to Vercel production on every
+# push to main that touches it, so merging a web change ships it — no manual
+# `vercel deploy`. Auth is a single repo secret, VERCEL_TOKEN; the org/project
+# IDs below are not sensitive (they're public identifiers).
+#
+# Deploys from the REPO ROOT, exactly like the Vercel Git integration does, so
+# both paths ship the same thing: `vercel.json` serves the static dashboard out
+# of web/, and the serverless functions come from the root api/ directory.
+# Deploying from web/ instead (as this used to) leaves api/ behind, which is
+# how production ended up answering 404 for every MyAnimeList call.
 #
 # One-time setup: add a repo secret named VERCEL_TOKEN
 #   Settings → Secrets and variables → Actions → New repository secret
@@ -16,6 +21,8 @@ on:
     branches: [main]
     paths:
       - "web/**"
+      - "api/**"
+      - "vercel.json"
       - ".github/workflows/deploy-web.yml"
   workflow_dispatch:
 
@@ -43,7 +50,6 @@ jobs:
 
       - name: Deploy (production)
         if: steps.guard.outputs.has_token == 'true'
-        working-directory: web
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
@@ -70,4 +76,17 @@ jobs:
               echo "::error::$f on the live site did not match web/$f (last HTTP $code)"; exit 1
             fi
             echo "$f ✓ (matches, HTTP 200)"
+          done
+
+          # The API functions must EXIST. This check only ever looked at the
+          # static files, so a deploy that shipped no functions passed happily
+          # while every MyAnimeList feature answered 404 in the browser.
+          # 404 is the failure; anything else (200, or 503 "proxy-unconfigured"
+          # when the MAL env vars are absent) means the function is live.
+          for ep in "api/mal-oauth?action=config" "api/mal?path=manga%2Franking"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://gideon-sync.vercel.app/$ep")
+            if [ "$code" = "404" ]; then
+              echo "::error::/$ep is not deployed (HTTP 404) — the serverless functions in api/ did not ship"; exit 1
+            fi
+            echo "/$ep ✓ (function is live, HTTP $code)"
           done

@@ -2,7 +2,7 @@
 // minimization, and the per-instance rate limit. Run: npm run test:api
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import handler from "./mal-oauth.js";
+import handler from "../../api/mal-oauth.js";
 
 process.env.MAL_CLIENT_ID = "cid-test";
 process.env.MAL_CLIENT_SECRET = "secret-test";
