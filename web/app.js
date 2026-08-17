@@ -217,20 +217,11 @@ async function deleteSend(id) {
 // proxy (api/mal.js). MAL can still have a bad day, so every step degrades
 // to a clear, retryable error state instead of a spinner that never ends.
 
-const REC_USER_KEY = "gideon.rec.username";
-
 // How many top-rated anime / read manga seed the recommendations, and how
 // many cards we show per section — a phone screen only fits so much.
 const REC_SEEDS = 8;
 const REC_READ_SEEDS = 6;
 const REC_MAX_PER_SECTION = 12;
-
-function recUsername() {
-  return localStorage.getItem(REC_USER_KEY) || "";
-}
-function saveRecUsername(username) {
-  localStorage.setItem(REC_USER_KEY, username);
-}
 
 // Titles compare loosely across MAL/library dirs ("Frieren: Beyond
 // Journey's End" vs "Frieren_ Beyond Journey's End").
@@ -465,31 +456,16 @@ const malCover = (n) => n?.main_picture?.large || n?.main_picture?.medium || nul
 const malScore = (mean) => (mean ? Math.round(mean * 10) : null);
 
 // --- provider operations (official MAL API, via the proxy) ---
-
-// Whether this username is the connected account — if so, personal reads go
-// through the user token, so private lists work.
-const isOwnAccount = (username) => !!username && malConn()?.username === username;
+//
+// Personal reads always use the connected account's token — the connection
+// is the only doorway to recommendations, so private lists just work.
 
 // The user's completed anime, as { id, title, score }. May be empty — a
 // manga-only reader still gets recommendations from what they've read.
-async function opAnimeList(username) {
-  if (isOwnAccount(username)) {
-    const d = await malUserGet(
-      "users/@me/animelist?status=completed&limit=1000&fields=list_status&nsfw=true"
-    );
-    return (d.data || [])
-      .filter((e) => e.node?.id)
-      .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }));
-  }
-  let d;
-  try {
-    d = await malGet(
-      `users/${encodeURIComponent(username)}/animelist?status=completed&limit=1000&fields=list_status&nsfw=true`
-    );
-  } catch (e) {
-    if (/isn't configured/.test(e.message)) throw e;
-    throw new Error("That MyAnimeList user wasn't found (or their list is private).");
-  }
+async function opAnimeList() {
+  const d = await malUserGet(
+    "users/@me/animelist?status=completed&limit=1000&fields=list_status&nsfw=true"
+  );
   return (d.data || [])
     .filter((e) => e.node?.id)
     .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }));
@@ -497,12 +473,8 @@ async function opAnimeList(username) {
 
 // Their manga list, as { id, title, score, chapters } — used both to exclude
 // what they've already read and to SEED "because you read X" picks.
-async function opMangaList(username) {
-  const d = isOwnAccount(username)
-    ? await malUserGet("users/@me/mangalist?limit=1000&fields=list_status&nsfw=true")
-    : await malGet(
-        `users/${encodeURIComponent(username)}/mangalist?limit=1000&fields=list_status&nsfw=true`
-      );
+async function opMangaList() {
+  const d = await malUserGet("users/@me/mangalist?limit=1000&fields=list_status&nsfw=true");
   return (d.data || [])
     .filter((e) => e.node?.id)
     .map((e) => ({
@@ -543,10 +515,10 @@ async function opMangaFull(id) {
   };
 }
 
-async function malRecommend(username, onStatus) {
+async function malRecommend(onStatus) {
   onStatus("Reading your MyAnimeList…");
-  const anime = await opAnimeList(username);
-  const mangaList = await opMangaList(username).catch(() => []);
+  const anime = await opAnimeList();
+  const mangaList = await opMangaList().catch(() => []);
   if (!anime.length && !mangaList.length) {
     throw new Error(
       "This MyAnimeList has nothing on it yet — rate a few anime, or sync your Kobo reading, and picks will appear."
@@ -951,8 +923,8 @@ function buildRecommendations({ sources, similar, alreadyReading }) {
   return { sources: take(sources), similar: take(similar) };
 }
 
-async function runDiscover(username, email, rows) {
-  state.discover = { phase: "loading", status: "Connecting…", username };
+async function runDiscover(email, rows) {
+  state.discover = { phase: "loading", status: "Reading your MyAnimeList…" };
   renderDashboard(email, rows);
   const onStatus = (msg) => {
     state.discover.status = msg;
@@ -960,15 +932,14 @@ async function runDiscover(username, email, rows) {
     if (el) el.textContent = msg;
   };
   try {
-    const raw = await malRecommend(username, onStatus);
+    const raw = await malRecommend(onStatus);
     const recs = buildRecommendations(raw);
     if (!recs.sources.length && !recs.similar.length) {
       throw new Error("Nothing new to recommend — everything we found is already in your library or queue.");
     }
-    state.discover = { phase: "done", username, recs };
-    saveRecUsername(username);
+    state.discover = { phase: "done", recs };
   } catch (e) {
-    state.discover = { phase: "error", username, error: e.message || "Something went wrong." };
+    state.discover = { phase: "error", error: e.message || "Something went wrong." };
   }
   renderDashboard(email, rows);
 }
@@ -1466,22 +1437,6 @@ function recSectionHtml(label, recs, testid) {
   </section>`;
 }
 
-// The connect form doubles as the "change list" form.
-function discoverConnectHtml(username, intro) {
-  return `<section class="panel">
-    <div class="section-label">Discover</div>
-    ${intro ? `<p class="send-hint">${intro}</p>` : ""}
-    <form id="disc-form" class="disc-form">
-      <div class="disc-row">
-        <input type="text" id="disc-user" data-testid="disc-user" placeholder="MyAnimeList username" autocomplete="off"
-          autocapitalize="none" spellcheck="false" value="${esc(username)}" />
-        <button class="primary" type="submit" data-testid="disc-go">Get recommendations</button>
-      </div>
-    </form>
-    <p class="send-hint">Works with any public MyAnimeList username. For a private list, use Connect above.</p>
-  </section>`;
-}
-
 // The search bar sits above everything on the Discover tab; results replace
 // the recommendation/browse sections until cleared.
 function searchPanelHtml() {
@@ -1537,33 +1492,42 @@ function browseSectionHtml() {
   return `<section class="panel"><div id="browse-body">${browseBodyHtml()}</div></section>`;
 }
 
-// The MyAnimeList account panel: one-tap Connect when not linked, the
-// connected identity (with Disconnect) when linked. Toast/error surface here
-// and clear once shown.
-function malPanelHtml() {
-  const conn = malConn();
+// One-shot MAL notices (connect success/failure), rendered at the top of
+// the Discover tab wherever it is in its lifecycle.
+function malNoticesHtml() {
   const toast = state.malToast
-    ? `<div class="note ok" data-testid="mal-toast">${esc(state.malToast)}</div>`
+    ? `<div class="note ok mal-notice" data-testid="mal-toast">${esc(state.malToast)}</div>`
     : "";
   const err = state.malError
-    ? `<div class="note disc-error" data-testid="mal-error">${esc(state.malError)}</div>`
+    ? `<div class="note disc-error mal-notice" data-testid="mal-error">${esc(state.malError)}</div>`
     : "";
-  if (conn) {
-    return `<section class="panel" data-testid="mal-connected">
-      <div class="lib-head">
-        <div class="section-label">MyAnimeList <span class="mal-badge" data-testid="mal-badge">✓ Connected</span></div>
-        <button class="ghost" id="mal-disconnect" data-testid="mal-disconnect">Disconnect</button></div>
-      <p class="send-hint">Connected${conn.username ? ` as <b>${esc(conn.username)}</b>` : ""} — recommendations use this account automatically.</p>
-      <button class="ghost mal-sync-btn" id="mal-sync" data-testid="mal-sync">Sync Kobo reading to MAL</button>
-      <div id="mal-sync-body">${malSyncBodyHtml()}</div>
-      ${toast}${err}
-    </section>`;
-  }
+  return toast + err;
+}
+
+// The one-time gateway: shown until the account is connected, and again only
+// when the connection dies and needs a re-auth.
+function connectCardHtml() {
   return `<section class="panel" data-testid="mal-connect-card">
     <div class="section-label">MyAnimeList</div>
-    <p class="send-hint">Connect your MyAnimeList and get personal manga picks with one tap — no username typing, private lists included.</p>
+    <p class="send-hint">Connect your MyAnimeList and this tab fills with personal manga picks — from what you've read and what you've watched. One tap, private lists included.</p>
     <button class="primary" id="mal-connect" data-testid="mal-connect">Connect MyAnimeList</button>
-    ${toast}${err}
+  </section>`;
+}
+
+// Once connected the account hides away: a slim footer at the bottom of the
+// tab, holding the sync action and Disconnect.
+function malFooterHtml() {
+  const conn = malConn();
+  return `<section class="panel mal-footer" data-testid="mal-connected">
+    <div class="mal-row">
+      <span class="mal-badge" data-testid="mal-badge">✓ MyAnimeList</span>
+      ${conn.username ? `<span class="mal-user">${esc(conn.username)}</span>` : ""}
+      <span class="mal-actions">
+        <button class="ghost" id="mal-sync" data-testid="mal-sync">Sync Kobo reading</button>
+        <button class="ghost" id="mal-disconnect" data-testid="mal-disconnect">Disconnect</button>
+      </span>
+    </div>
+    <div id="mal-sync-body">${malSyncBodyHtml()}</div>
   </section>`;
 }
 
@@ -1603,45 +1567,33 @@ function patchMalSync() {
 function viewDiscover() {
   const search = searchPanelHtml();
   if (state.search) return `${search}${searchResultsHtml()}`;
+  const notices = malNoticesHtml();
 
-  const mal = malPanelHtml();
-  const connectedUser = malConn()?.username;
+  // Not connected: the Connect card is the whole story (browse/search below
+  // need no account). It reappears by itself when a connection dies.
+  if (!malConn()) {
+    return `${search}${notices}${connectCardHtml()}${browseSectionHtml()}`;
+  }
+
+  // Connected: recommendations simply appear; the account lives in a slim
+  // footer at the bottom until it's needed.
   const d = state.discover;
-  let recs;
-  if (!d || d.phase === "idle") {
-    // With a connected account the username form is redundant — the
-    // recommendations run on the linked account automatically.
-    recs = connectedUser
-      ? ""
-      : discoverConnectHtml(
-          recUsername(),
-          "Or point gideon at any public MyAnimeList username — the source manga of what you loved, and what readers of those loved next."
-        );
-  } else if (d.phase === "loading") {
+  let recs = "";
+  if (d?.phase === "loading") {
     recs = `<section class="panel disc-loading" data-testid="disc-loading">
       <div class="spinner" aria-hidden="true"></div>
       <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
     </section>`;
-  } else if (d.phase === "error") {
-    // A connected account shouldn't be dropped back onto the username form —
-    // it has no username to type. Error + retry, nothing else.
-    recs = connectedUser
-      ? `<section class="panel">
-          <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>
-          <button class="primary" id="disc-retry" data-testid="disc-retry">Try again</button>
-        </section>`
-      : `${discoverConnectHtml(d.username, "")}
-      <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>`;
-  } else {
-    const who = `<div class="disc-who" data-testid="disc-who">
-        Picks for <b>${esc(d.username)}</b> · MyAnimeList
-        <button class="ghost" id="disc-change" data-testid="disc-change">Change</button>
-      </div>`;
-    recs = `${who}
-      ${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
+  } else if (d?.phase === "error") {
+    recs = `<section class="panel">
+        <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>
+        <button class="primary" id="disc-retry" data-testid="disc-retry">Try again</button>
+      </section>`;
+  } else if (d?.phase === "done") {
+    recs = `${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
       ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
   }
-  return `${search}${mal}${recs}${browseSectionHtml()}`;
+  return `${search}${notices}${recs}${browseSectionHtml()}${malFooterHtml()}`;
 }
 
 // One library card: cover (published page art, or a lettered placeholder),
@@ -2094,15 +2046,6 @@ function renderDashboard(email, rows) {
   }
   // Discover: connect form (username), change-list link,
   // and the per-card Send to Kobo buttons.
-  const discForm = document.getElementById("disc-form");
-  if (discForm) {
-    discForm.addEventListener("submit", (e) => {
-      e.preventDefault();
-      const username = document.getElementById("disc-user").value.trim();
-      if (!username) return;
-      runDiscover(username, email, rows);
-    });
-  }
   // MyAnimeList account: connect (OAuth redirect) and disconnect.
   document.getElementById("mal-connect")?.addEventListener("click", () => {
     startMalConnect().catch((e) => {
@@ -2121,16 +2064,12 @@ function renderDashboard(email, rows) {
   });
   document.getElementById("disc-retry")?.addEventListener("click", () => {
     state.discover = null;
-    renderDashboard(email, rows); // connected auto-run kicks back in
+    renderDashboard(email, rows); // the auto-run below kicks back in
   });
   // A connected account runs its recommendations without being asked.
-  if (tab === "discover" && !state.search && !state.discover && malConn()?.username) {
-    runDiscover(malConn().username, email, rows);
+  if (tab === "discover" && !state.search && !state.discover && malConn()) {
+    runDiscover(email, rows);
   }
-  document.getElementById("disc-change")?.addEventListener("click", () => {
-    state.discover = { phase: "idle" };
-    renderDashboard(email, rows);
-  });
   // Search: submit runs it, Clear returns to recommendations + browse.
   const searchForm = document.getElementById("search-form");
   if (searchForm) {
