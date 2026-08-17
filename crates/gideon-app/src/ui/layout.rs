@@ -50,7 +50,38 @@ pub enum Key {
 /// (backspace / space / search) is built separately in [`keyboard_keys`].
 /// Manga titles lean on punctuation ("Re:Zero", "Dr. Stone", "Frieren -"),
 /// so the letter rows carry the common marks.
-pub const KEYBOARD_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-:."];
+pub const KEYBOARD_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl',", "zxcvbnm-:./"];
+
+/// The character a key types with Shift held, US-layout style: letters
+/// upper-case, and every other key its printed symbol — `1` → `!`, `/` → `?`,
+/// and so on. Without this, Shift only changed letters and the symbol half of
+/// the keyboard was simply untypeable, which locks you out of any password
+/// with a `!` in it.
+pub fn shifted_char(c: char) -> char {
+    match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '\'' => '"',
+        ',' => '<',
+        '-' => '_',
+        ':' => ';',
+        '.' => '>',
+        '/' => '?',
+        // The bottom-row email key doubles as `+` (address tags, and one more
+        // password symbol) — nothing on a keyboard shifts to `@` here, since
+        // the `2` key already covers it.
+        '@' => '+',
+        c => c.to_ascii_uppercase(),
+    }
+}
 
 /// A key and its screen rectangle: `(key, x, y, w, h)`.
 pub type KeyRect = (Key, u32, u32, u32, u32);
@@ -510,6 +541,29 @@ mod tests {
             expected.len() + 4,
             "shift, backspace, space, search (@ is a Char)"
         );
+    }
+
+    #[test]
+    fn shift_reaches_the_common_password_symbols() {
+        // Every key's shifted twin, plus the '@' key: what a password can
+        // actually contain on the device. A gap here locks someone out of
+        // their own account (this started with a '!').
+        let typeable: Vec<char> = KEYBOARD_ROWS
+            .iter()
+            .flat_map(|r| r.chars())
+            .chain(['@'])
+            .map(shifted_char)
+            .collect();
+        for c in "!@#$%^&*()_+\"<>?;:".chars() {
+            assert!(
+                typeable.contains(&c) || KEYBOARD_ROWS.iter().any(|r| r.contains(c)),
+                "{c} can't be typed"
+            );
+        }
+        // Letters still shift to upper case, and the digits are still there
+        // unshifted.
+        assert_eq!(shifted_char('q'), 'Q');
+        assert!(KEYBOARD_ROWS[0].contains('1'));
     }
 
     #[test]
