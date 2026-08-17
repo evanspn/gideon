@@ -6396,3 +6396,187 @@ fn update_prompt_back_declines() {
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
 }
+
+/// A source-linked series with only its first chapter on disk — the state the
+/// reader ends up in when the look-ahead didn't manage to stock the next one.
+fn one_chapter_fixture(lib: &Path) {
+    make_cbz(&lib.join("Series/vol1.cbz"), 2);
+    let mut index = gideon_core::SeriesIndex::load(lib);
+    index.record(
+        "Series",
+        gideon_core::SeriesRef {
+            source_id: "src".into(),
+            source_name: "Src".into(),
+            manga_id: "m1".into(),
+            manga_title: "Series".into(),
+            ..Default::default()
+        },
+    );
+    index.record_download("Series", "c1", "vol1.cbz");
+    index.save(lib).unwrap();
+}
+
+#[test]
+fn library_reading_downloads_the_next_chapter_when_it_runs_out() {
+    // The bug: reading a series from the library shelf only ever chained
+    // through chapters already on disk. Turning past the last page of the last
+    // downloaded chapter did nothing, and the only way on was backing out to
+    // the chapter list and tapping the next chapter by hand. Now the turn
+    // itself fetches it from the source and keeps reading.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    one_chapter_fixture(&lib);
+
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        chapters: vec![
+            ChapterEntry {
+                id: "c1".into(),
+                num: Some(1.0),
+                title: None,
+                lang: None,
+            },
+            ChapterEntry {
+                id: "c2".into(),
+                num: Some(2.0),
+                title: None,
+                lang: None,
+            },
+        ],
+        download: Some(Box::new(|library, progress| {
+            let path = library.join("Series/vol2.cbz");
+            make_cbz(&path, 2);
+            progress(2, 2);
+            Ok(path)
+        })),
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_row(0),        // Home -> Library
+        tap_shelf_cell0(), // the card -> vol1 (the only download)
+        reader_tap_next(), // vol1 page 2 (last)
+        reader_tap_next(), // past the end -> fetch and open c2
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    assert!(
+        lib.join("Series/vol2.cbz").exists(),
+        "the next chapter was downloaded from the source"
+    );
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert!(
+        store.get("Series/vol2.cbz").is_some(),
+        "reading continued into the freshly downloaded chapter"
+    );
+}
+
+#[test]
+fn library_reading_says_so_when_the_series_is_finished() {
+    // Same path, nothing left to fetch: the turn must explain itself rather
+    // than silently doing nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    one_chapter_fixture(&lib);
+
+    let gateway = FakeGateway {
+        installed: RefCell::new(vec![SourceEntry {
+            id: "src".into(),
+            name: "Src".into(),
+        }]),
+        chapters: vec![ChapterEntry {
+            id: "c1".into(),
+            num: Some(1.0),
+            title: None,
+            lang: None,
+        }],
+        ..FakeGateway::default()
+    };
+
+    let events = vec![
+        tap_row(0),
+        tap_shelf_cell0(),
+        reader_tap_next(),
+        reader_tap_next(), // past the end -> nothing newer at the source
+    ];
+    let mut app = app(&lib, gateway, events);
+    app.run().unwrap();
+
+    let Screen::Message { title, body } = app.screen() else {
+        panic!("expected a message about the next chapter");
+    };
+    assert_eq!(title, "Next chapter");
+    assert!(body.contains("up to date"), "body was {body:?}");
+}
+
+#[test]
+fn a_failed_lookahead_is_retried_by_the_next_kick() {
+    // The wake case: the look-ahead fired while the radio was still down after
+    // a suspend and failed, so the next chapter never landed — and, because the
+    // worker had already recorded it as "queued", nothing could ever ask for it
+    // again in that session. Waking re-fires the look-ahead
+    // (`rekick_lookahead`), and this proves the re-fire actually reaches the
+    // worker instead of being swallowed by the dedup set.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let gateway = FailFirstGateway::new("Manga One");
+    let started = std::sync::Arc::clone(&gateway.started);
+    let mut app = UiApp::new(
+        MemoryDisplay::new(W, H),
+        FakeInput::new(vec![]),
+        gateway,
+        lib.clone(),
+    );
+
+    let source = SourceEntry {
+        id: "src".into(),
+        name: "Src".into(),
+    };
+    let manga = MangaEntry {
+        id: "m1".into(),
+        title: "Manga One".into(),
+        cover_url: None,
+    };
+    let chapters: Vec<ChapterEntry> = (1..=2)
+        .map(|i| ChapterEntry {
+            id: format!("c{i}"),
+            num: Some(i as f32),
+            title: None,
+            lang: Some("en".into()),
+        })
+        .collect();
+
+    // Read c1: the look-ahead queues c2, whose first attempt fails.
+    app.predownload_ahead(&source, &manga, &chapters, "c1");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while started.load(std::sync::atomic::Ordering::SeqCst) < 1
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c2").is_none(),
+        "the first attempt failed, so nothing is on disk yet"
+    );
+
+    // Waking re-fires the same look-ahead — and this time it lands.
+    app.rekick_lookahead();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if app.downloaded_chapter_path(&source, &manga, "c2").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
+        "the re-kick after wake retried the chapter that failed while offline"
+    );
+}

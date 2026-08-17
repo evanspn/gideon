@@ -747,9 +747,25 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// `None` for gateways without background support (tests), which fall
     /// back to a foreground pre-download.
     predownloader: Option<Predownloader>,
+    /// What the look-ahead was last asked to stock up, so it can be re-fired
+    /// after waking from sleep. A suspend usually takes the network with it, and
+    /// look-ahead jobs that ran into the dead radio quietly failed; without a
+    /// re-kick the next chapter is still missing when the user turns past the
+    /// last page. Cleared when the user leaves the manga.
+    lookahead: Option<LookaheadPlan>,
     /// The most recent global searches (newest first, capped at
     /// [`RECENT_SEARCHES`]) for instant reopen from the search screen.
     recent_searches: Vec<RecentSearch>,
+}
+
+/// The last look-ahead request: which chapters of which manga to keep stocked
+/// ahead of the one being read. Re-fired on wake (see [`UiApp::lookahead`]).
+#[derive(Clone)]
+struct LookaheadPlan {
+    source: SourceEntry,
+    manga: MangaEntry,
+    chapters: Vec<ChapterEntry>,
+    after_id: String,
 }
 
 /// Cover-cache key: (source path, file mtime, target cell size).
@@ -797,6 +813,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             progress_cache: std::cell::RefCell::new(None),
             index_guard: Arc::new(Mutex::new(())),
             predownloader: None,
+            lookahead: None,
             recent_searches: Vec::new(),
         }
     }
@@ -1149,6 +1166,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Restore Bluetooth and re-connect the page-turn remote (detached,
         // no-op unless the suspend powered it down).
         gideon_device::bluetooth::reconnect_after_wake();
+        // Re-stock the chapters ahead: anything the look-ahead missed while the
+        // radio was down gets another go, so the next chapter is on disk before
+        // the user reaches it. Queue-only — nothing blocks here.
+        self.rekick_lookahead();
         // Suspend powers the frontlight down; bring it back to its levels.
         if let Some(lights) = self.lights.as_mut() {
             lights.reapply();
@@ -1182,6 +1203,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             if let Some(worker) = self.predownloader.as_mut() {
                 worker.cancel_pending();
             }
+            // …and don't let a wake re-fire the abandoned look-ahead.
+            self.lookahead = None;
         }
         self.stack.pop();
         // Returning to the library: rebuild it from disk so chapters downloaded
@@ -2981,16 +3004,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    /// The chapters to pre-fetch: a **fixed window** of the next `count`
-    /// chapters (by position) after `after_id`, minus any already on disk.
-    ///
-    /// The window is bounded to `count` *positions* — NOT "the next `count`
-    /// missing chapters". That distinction is the whole point: if it walked
-    /// past downloaded chapters hunting for `count` missing ones, then every
-    /// time the look-ahead re-fired from the same chapter it would march one
-    /// window further into the series (c2,c3 → c4,c5 → c6,c7 …) and eventually
-    /// download everything. Anchored positionally, re-firing from the same
-    /// chapter yields the same window — all already stored — so it does nothing.
+    /// The look-ahead window for a source/manga/chapter list, as
+    /// [`lookahead_targets`] computes it. Test-facing wrapper.
+    #[cfg(test)]
     fn predownload_targets(
         &self,
         source: &SourceEntry,
@@ -3002,21 +3018,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if count == 0 || chapters.is_empty() {
             return Vec::new();
         }
-        let mut id = after_id.to_string();
-        let mut out = Vec::new();
-        for _ in 0..count {
-            let Some(next) = next_chapter(chapters, &id) else {
-                break; // reached the end of the chapter list
-            };
-            id = next.id.clone();
-            if self
-                .downloaded_chapter_path(source, manga, &next.id)
-                .is_none()
-            {
-                out.push(next.clone()); // in-window and not yet stored
-            }
-        }
-        out
+        let plan = LookaheadPlan {
+            source: source.clone(),
+            manga: manga.clone(),
+            chapters: chapters.to_vec(),
+            after_id: after_id.to_string(),
+        };
+        lookahead_targets(&plan, &self.library_dir, count)
     }
 
     /// Build the background pre-downloader on first use, if the gateway
@@ -3050,17 +3058,79 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         chapters: &[ChapterEntry],
         after_id: &str,
     ) {
-        if !self.ensure_predownloader() {
-            return; // no background worker → no foreground stalling, ever
+        // Remember the request even if there's no worker to run it: waking up
+        // re-fires it (see [`Self::rekick_lookahead`]).
+        self.lookahead = Some(LookaheadPlan {
+            source: source.clone(),
+            manga: manga.clone(),
+            chapters: chapters.to_vec(),
+            after_id: after_id.to_string(),
+        });
+        self.rekick_lookahead();
+    }
+
+    /// Fire (or re-fire) the stored look-ahead request.
+    ///
+    /// Called on wake as well as on every chapter open: a suspend takes the
+    /// network down with it, so look-ahead jobs that ran while the radio was
+    /// gone failed and left the next chapter un-stocked. Turning past the last
+    /// page then had nothing to flow into, which is what forced the trip back
+    /// out to the chapter list. Re-queueing is cheap — chapters already on disk
+    /// are no-ops on the worker, and ones still queued are deduped.
+    ///
+    /// Takes the fields it needs one by one rather than going through `&self`
+    /// helpers: the reader holds a mutable borrow of the display for its whole
+    /// session, and the wake path inside it has to be able to call this.
+    fn rekick_lookahead(&mut self) {
+        Self::fire_lookahead(
+            &self.lookahead,
+            &mut self.predownloader,
+            &self.gateway,
+            &self.library_dir,
+            &self.index_guard,
+            self.settings_dir.as_deref(),
+        );
+    }
+
+    /// The body of [`Self::rekick_lookahead`], over individual fields so the
+    /// reader's wake path (which holds `self.display`) can call it too.
+    fn fire_lookahead(
+        lookahead: &Option<LookaheadPlan>,
+        predownloader: &mut Option<Predownloader>,
+        gateway: &G,
+        library_dir: &Path,
+        index_guard: &Arc<Mutex<()>>,
+        settings_dir: Option<&Path>,
+    ) {
+        let Some(plan) = lookahead else {
+            return; // nothing being read from a source
+        };
+        let settings = settings_in(settings_dir);
+        let count = settings.predownload_unread_chapters as usize;
+        if count == 0 || plan.chapters.is_empty() {
+            return;
         }
-        let targets = self.predownload_targets(source, manga, chapters, after_id);
-        let worker = self.predownloader.as_mut().expect("just ensured");
+        // Build the worker on first use; without one (some tests) the look-ahead
+        // is simply skipped — never a foreground stall.
+        if predownloader.is_none() {
+            if let Some(gateway) = gateway.background_clone() {
+                *predownloader = Some(Predownloader::spawn(
+                    gateway,
+                    library_dir.to_path_buf(),
+                    Arc::clone(index_guard),
+                    settings.storage_size_limit.bytes(),
+                ));
+            }
+        }
+        let Some(worker) = predownloader.as_mut() else {
+            return;
+        };
         let epoch = worker.epoch();
-        for chapter in &targets {
+        for chapter in lookahead_targets(plan, library_dir, count) {
             worker.queue(PreloadJob {
-                source: source.clone(),
-                manga: manga.clone(),
-                chapter_id: chapter.id.clone(),
+                source: plan.source.clone(),
+                manga: plan.manga.clone(),
+                chapter_id: chapter.id,
                 epoch,
                 persistent: false,
             });
@@ -3259,12 +3329,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // Continuation within the series: the card's next chapter
             // (chapters keep the scan's natural order).
             let next = card.next_after(&entry).cloned();
-            match self.run_reader(&entry.path, &entry.relative_path, next.is_some())? {
+            // Past the last downloaded chapter, a series that came from a
+            // source keeps going online — so the page turn is still live.
+            let can_continue_online =
+                next.is_none() && self.series_origin(&entry.relative_path).is_some();
+            let next_available = next.is_some() || can_continue_online;
+            match self.run_reader(&entry.path, &entry.relative_path, next_available)? {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
                 ReaderOutcome::Back => return Ok(Flow::Continue),
-                ReaderOutcome::NextChapter => {
-                    entry = next.expect("NextChapter only with a next");
-                }
+                ReaderOutcome::NextChapter => match next {
+                    Some(next) => entry = next,
+                    // Ran out of downloads: fetch the chapter list and carry on
+                    // from the source instead of dead-ending here.
+                    None => return self.continue_from_source(&entry),
+                },
             }
         }
     }
@@ -3276,13 +3354,96 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut i = start;
         loop {
             let entry = &entries[i];
-            let next_available = i + 1 < entries.len();
-            match self.run_reader(&entry.path, &entry.relative_path, next_available)? {
+            let more_on_disk = i + 1 < entries.len();
+            // As on the shelf: the end of the downloads isn't the end of the
+            // series when it came from a source.
+            let can_continue_online =
+                !more_on_disk && self.series_origin(&entry.relative_path).is_some();
+            match self.run_reader(
+                &entry.path,
+                &entry.relative_path,
+                more_on_disk || can_continue_online,
+            )? {
                 ReaderOutcome::Quit => return Ok(Flow::Quit(Exit::Close)),
                 ReaderOutcome::Back => return Ok(Flow::Continue),
-                ReaderOutcome::NextChapter => i += 1,
+                ReaderOutcome::NextChapter if more_on_disk => i += 1,
+                ReaderOutcome::NextChapter => {
+                    let entry = entries[i].clone();
+                    return self.continue_from_source(&entry);
+                }
             }
         }
+    }
+
+    /// Where a downloaded chapter came from: its source, its manga, and the
+    /// chapter id the file was downloaded under. `None` for sideloaded files and
+    /// for series whose origin was never recorded.
+    fn series_origin(&self, relative_path: &str) -> Option<(SourceEntry, MangaEntry, String)> {
+        let series_dir = series_key_of(relative_path);
+        let file = relative_path.rsplit('/').next()?;
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let origin = index.get(series_dir)?;
+        let chapter_id = origin
+            .downloaded
+            .iter()
+            .find(|(_, name)| name.as_str() == file)
+            .map(|(id, _)| id.clone())?;
+        Some((
+            SourceEntry {
+                id: origin.source_id.clone(),
+                name: origin.source_name.clone(),
+            },
+            MangaEntry {
+                id: origin.manga_id.clone(),
+                title: origin.manga_title.clone(),
+                cover_url: origin.cover_url.clone(),
+            },
+            chapter_id,
+        ))
+    }
+
+    /// Turned past the last page of the last **downloaded** chapter: go get the
+    /// next one from the source and keep reading.
+    ///
+    /// This is the case the library shelf used to dead-end on. Reading a series
+    /// from the shelf only ever chained through files already on disk, so when
+    /// the look-ahead hadn't managed to stock the next chapter — typically after
+    /// a sleep, with the radio down — the page turn did nothing and the only way
+    /// forward was backing out to the chapter list and tapping the next chapter
+    /// by hand. Now the turn itself fetches, and hands over to
+    /// [`Self::download_and_read`], which resumes the normal look-ahead from
+    /// there on.
+    fn continue_from_source(&mut self, entry: &LibraryEntry) -> Result<Flow> {
+        let Some((source, manga, chapter_id)) = self.series_origin(&entry.relative_path) else {
+            return Ok(Flow::Continue); // sideloaded: nothing to continue from
+        };
+        self.show_status(&["Looking for the next chapter…"])?;
+        // Bring the radio up if the nap took it down; a failure here still falls
+        // through to the fetch, which surfaces the offline message.
+        self.ensure_online()?;
+        let chapters = match self.gateway.chapters(&source.id, &manga.id) {
+            Ok(chapters) if !chapters.is_empty() => chapters,
+            Ok(_) | Err(_) => {
+                return self
+                    .push(Screen::Message {
+                        title: "Next chapter".to_string(),
+                        body: "Couldn't reach the source to fetch the next chapter.\n\
+                               Check Wi-Fi and try again — everything downloaded\n\
+                               is still readable from the library."
+                            .to_string(),
+                    })
+                    .map(|_| Flow::Continue);
+            }
+        };
+        let Some(next) = next_chapter(&chapters, &chapter_id) else {
+            return self
+                .push(Screen::Message {
+                    title: "Next chapter".to_string(),
+                    body: format!("You're up to date with {}.", manga.title),
+                })
+                .map(|_| Flow::Continue);
+        };
+        self.download_and_read(&source, &manga, &next, &chapters)
     }
 
     // --- reader session ---
@@ -3765,6 +3926,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // Restore Bluetooth and re-connect the page-turn
                         // remote (detached, no-op unless suspend took it down).
                         gideon_device::bluetooth::reconnect_after_wake();
+                        // Re-stock the chapters ahead. Waking up mid-chapter is
+                        // exactly when the next one is likeliest to be missing
+                        // (queued while the radio was down), and it's needed a
+                        // few page turns from now — so ask again here rather
+                        // than discovering the gap at the last page. (Field-wise,
+                        // not through `&mut self`: the reader holds the display.)
+                        Self::fire_lookahead(
+                            &self.lookahead,
+                            &mut self.predownloader,
+                            &self.gateway,
+                            &self.library_dir,
+                            &self.index_guard,
+                            self.settings_dir.as_deref(),
+                        );
                         if let Some(lights) = self.lights.as_mut() {
                             lights.reapply();
                         }
@@ -5921,11 +6096,25 @@ struct Predownloader {
     tx: mpsc::Sender<PreloadJob>,
     /// Chapter keys already handed to the worker, so repeated kicks (every
     /// reader open / page advance) don't enqueue the same chapter twice.
-    queued: HashSet<String>,
+    ///
+    /// Shared with the worker, which **removes** a key whose download failed
+    /// (offline, source hiccup). A failed look-ahead must not be remembered as
+    /// "done": otherwise the chapter you were about to read stays un-stocked for
+    /// the rest of the session and no later kick — the next page turn, or the
+    /// re-kick after waking from sleep — can ever retry it.
+    queued: Arc<Mutex<HashSet<String>>>,
     /// The current cancellation epoch, shared with the worker. Queueing stamps
     /// jobs with it; [`Self::cancel_pending`] bumps it.
     epoch: Arc<AtomicU64>,
 }
+
+/// How many times the worker attempts a chapter before giving up on it, and how
+/// long it waits between attempts. Sized for the common failure: waking up with
+/// the radio still coming back, where the first attempt fires before Wi-Fi has
+/// associated. Idle-priority and bounded, so a dead network costs a background
+/// thread half a minute per chapter and nothing else.
+const PRELOAD_ATTEMPTS: usize = 3;
+const PRELOAD_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Predownloader {
     fn spawn(
@@ -5937,14 +6126,54 @@ impl Predownloader {
         let (tx, rx) = mpsc::channel::<PreloadJob>();
         let epoch = Arc::new(AtomicU64::new(0));
         let worker_epoch = Arc::clone(&epoch);
+        let queued: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let worker_queued = Arc::clone(&queued);
         let _ = std::thread::Builder::new()
             .name("gideon-predownload".into())
             .spawn(move || {
                 // Run at idle CPU/IO priority: the reader must never stutter
                 // because chapters are pre-fetching behind it.
                 gideon_device::power::lower_current_thread_to_idle();
-                // Ends when the sender (and thus the app) is dropped.
-                for job in rx {
+                // Chapters whose fetch failed, waiting out their backoff. Kept
+                // OUT of the channel so a retry never delays a freshly queued
+                // chapter — the one the reader is about to need always goes
+                // first. Each entry is (job, attempts so far, when to retry).
+                let mut retries: Vec<(PreloadJob, usize, std::time::Instant)> = Vec::new();
+                loop {
+                    // Take the next queued chapter, waiting at most until the
+                    // soonest retry is due. Ends when the sender (and thus the
+                    // app) is dropped.
+                    let job = match retries.iter().map(|(_, _, due)| *due).min() {
+                        Some(due) => {
+                            let wait = due.saturating_duration_since(std::time::Instant::now());
+                            match rx.recv_timeout(wait) {
+                                Ok(job) => Some(job),
+                                // Nothing new queued: the retry is due now.
+                                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        None => match rx.recv() {
+                            Ok(job) => Some(job),
+                            Err(_) => break,
+                        },
+                    };
+                    let (job, attempts) = match job {
+                        Some(job) => (job, 0),
+                        None => {
+                            // Pop the due retry (earliest first).
+                            let Some(i) = retries
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, (_, _, due))| *due)
+                                .map(|(i, _)| i)
+                            else {
+                                continue;
+                            };
+                            let (job, attempts, _) = retries.swap_remove(i);
+                            (job, attempts)
+                        }
+                    };
                     // The user left this manga after the job was queued — drop it
                     // instead of downloading chapters they've navigated away from.
                     // Persistent (explicitly requested) downloads ignore the epoch
@@ -5981,17 +6210,38 @@ impl Predownloader {
                             // Stay within the storage budget as the batch lands.
                             evict_to_storage_limit(&library_dir, &index_guard, storage_limit);
                         }
-                        // Offline / source error: skip quietly and take the next
-                        // job — the chapter just stays un-stocked.
-                        Err(_) => continue,
+                        // Offline / source error. The usual cause is a radio that
+                        // hasn't finished coming back after a suspend, which fixes
+                        // itself in seconds — so schedule another attempt rather
+                        // than leaving the chapter un-stocked.
+                        Err(_) => {
+                            // Drop the dedup entry: a kick that comes in before
+                            // the backoff expires — the next page turn, or the
+                            // re-kick after waking with the radio back — must be
+                            // able to try again straight away rather than wait
+                            // out a schedule it can't see. A duplicate attempt
+                            // is a cheap no-op once the chapter is on disk.
+                            if let Ok(mut queued) = worker_queued.lock() {
+                                queued.remove(&preload_key(
+                                    &job.source.id,
+                                    &job.manga.id,
+                                    &job.chapter_id,
+                                ));
+                            }
+                            let attempts = attempts + 1;
+                            if attempts < PRELOAD_ATTEMPTS {
+                                retries.push((
+                                    job,
+                                    attempts,
+                                    std::time::Instant::now()
+                                        + PRELOAD_RETRY_WAIT * attempts as u32,
+                                ));
+                            }
+                        }
                     }
                 }
             });
-        Self {
-            tx,
-            queued: HashSet::new(),
-            epoch,
-        }
+        Self { tx, queued, epoch }
     }
 
     /// Enqueue a chapter.
@@ -6006,13 +6256,13 @@ impl Predownloader {
     /// re-requested in the same session — "it says it's downloading but never
     /// does".
     fn queue(&mut self, job: PreloadJob) {
-        let key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            job.source.id, job.manga.id, job.chapter_id
-        );
+        let key = preload_key(&job.source.id, &job.manga.id, &job.chapter_id);
         // Record the key regardless (so a later look-ahead won't re-add it), but
         // only *gate* on it for non-persistent look-ahead jobs.
-        let fresh = self.queued.insert(key);
+        let fresh = match self.queued.lock() {
+            Ok(mut queued) => queued.insert(key),
+            Err(_) => true, // poisoned: never silently swallow the request
+        };
         if job.persistent || fresh {
             // If the worker is gone the send just fails; nothing else to do.
             let _ = self.tx.send(job);
@@ -6031,8 +6281,57 @@ impl Predownloader {
     /// background once they've moved on.
     fn cancel_pending(&mut self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
-        self.queued.clear();
+        if let Ok(mut queued) = self.queued.lock() {
+            queued.clear();
+        }
     }
+}
+
+/// Settings read straight from their directory, for paths that can't take a
+/// `&self` borrow (the reader holds the display for its whole session).
+fn settings_in(dir: Option<&Path>) -> gideon_core::Settings {
+    dir.map(|dir| gideon_core::Settings::load(dir).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// The chapters to pre-fetch: a **fixed window** of the next `count` chapters
+/// (by position) after the plan's anchor, minus any already on disk.
+///
+/// The window is bounded to `count` *positions* — NOT "the next `count` missing
+/// chapters". That distinction is the whole point: if it walked past downloaded
+/// chapters hunting for `count` missing ones, then every time the look-ahead
+/// re-fired from the same chapter it would march one window further into the
+/// series (c2,c3 → c4,c5 → c6,c7 …) and eventually download everything.
+/// Anchored positionally, re-firing from the same chapter yields the same
+/// window — all already stored — so it does nothing. That's what makes the
+/// re-kick on wake safe to fire as often as we like.
+fn lookahead_targets(plan: &LookaheadPlan, library_dir: &Path, count: usize) -> Vec<ChapterEntry> {
+    let index = gideon_core::SeriesIndex::load(library_dir);
+    let stored = index.find_manga(&plan.source.id, &plan.manga.id);
+    let mut id = plan.after_id.clone();
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let Some(next) = next_chapter(&plan.chapters, &id) else {
+            break; // reached the end of the chapter list
+        };
+        id = next.id.clone();
+        let on_disk = stored.is_some_and(|(dir, series)| {
+            series
+                .downloaded
+                .get(&next.id)
+                .is_some_and(|file| library_dir.join(dir).join(file).exists())
+        });
+        if !on_disk {
+            out.push(next); // in-window and not yet stored
+        }
+    }
+    out
+}
+
+/// Dedup key for a queued chapter, shared by the queueing side and the worker
+/// (which drops the key again when the download failed).
+fn preload_key(source_id: &str, manga_id: &str, chapter_id: &str) -> String {
+    format!("{source_id}\u{1f}{manga_id}\u{1f}{chapter_id}")
 }
 
 /// Downloaded-content usage for the storage screen.
