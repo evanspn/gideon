@@ -405,7 +405,17 @@ async function finishMalConnect() {
     pending = JSON.parse(localStorage.getItem(MAL_PKCE_KEY));
   } catch {}
   localStorage.removeItem(MAL_PKCE_KEY);
-  if (!pending) return false; // a ?code we never asked for — ignore it
+  if (!pending) {
+    // The dance started in a different browser than it finished in (phones
+    // hop between in-app browsers and Safari) — the code is useless without
+    // the verifier held over there. Never leave this silent: say what
+    // happened and what one tap fixes it.
+    history.replaceState(null, "", location.pathname);
+    state.malError =
+      "Almost connected — that sign-in finished in a different browser than it started in. Tap Connect once more, right here.";
+    state.tab = "discover";
+    return true;
+  }
   history.replaceState(null, "", location.pathname);
   if (q.get("state") !== pending.state || Date.now() - pending.at > 15 * 60_000) {
     // Bad state or stale attempt: quiet, actionable, no OAuth vocabulary.
@@ -1635,7 +1645,8 @@ function malPanelHtml() {
     : "";
   if (conn) {
     return `<section class="panel" data-testid="mal-connected">
-      <div class="lib-head"><div class="section-label">MyAnimeList</div>
+      <div class="lib-head">
+        <div class="section-label">MyAnimeList <span class="mal-badge" data-testid="mal-badge">✓ Connected</span></div>
         <button class="ghost" id="mal-disconnect" data-testid="mal-disconnect">Disconnect</button></div>
       <p class="send-hint">Connected${conn.username ? ` as <b>${esc(conn.username)}</b>` : ""} — recommendations use this account automatically.</p>
       <button class="ghost mal-sync-btn" id="mal-sync" data-testid="mal-sync">Sync Kobo reading to MAL</button>
@@ -2325,6 +2336,15 @@ function renderReader(chapterKey, title, pages) {
 async function showDashboard(session) {
   state.session = session;
   const email = session.email ?? "signed in";
+  // Adopt a MAL connection completed before sign-in (the OAuth return can
+  // land while signed out — the tokens were parked under the anon key).
+  const anonConn = localStorage.getItem("gideon.mal.anon");
+  if (anonConn && !malConn()) {
+    localStorage.setItem(malKey(), anonConn);
+    localStorage.removeItem("gideon.mal.anon");
+    state.malToast = "MyAnimeList connected ✓";
+    state.tab = "discover";
+  }
   try {
     const rows = (await fetchProgress(session)) ?? [];
     // Remember where each chapter was left off, so the reader resumes there.

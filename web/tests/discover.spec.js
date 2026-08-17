@@ -763,6 +763,44 @@ test("a connected account's failed recommendations offer retry, not a username f
   await expect(page.getByTestId("disc-user")).toHaveCount(0);
 });
 
+test("an OAuth return with no local record explains itself instead of silence", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ROWS) })
+  );
+  // Persisted gideon session, but NO pending PKCE record — the cross-browser
+  // return case. The site must say what happened, not shrug.
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.session",
+      JSON.stringify({ access_token: "t", refresh_token: "r", email: "reader@example.com", expires_at: Math.floor(Date.now() / 1000) + 3600 })
+    );
+  });
+  await page.goto("/?code=STRAY&state=whatever");
+
+  await expect(page.getByTestId("mal-error")).toContainText("different browser");
+  await expect(page.getByTestId("mal-connect")).toBeVisible();
+  expect(new URL(page.url()).search).toBe(""); // code scrubbed from the bar
+});
+
+test("a connection made while signed out is adopted at sign-in", async ({ page }) => {
+  await mockSends(page);
+  mockMalApi(page);
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.mal.anon",
+      JSON.stringify({ access_token: "mal-at", refresh_token: "mal-rt", expires_at: Math.floor(Date.now() / 1000) + 3600, username: "evan_mal" })
+    );
+  });
+  await signInWithRows(page, ROWS);
+
+  await expect(page.getByTestId("mal-connected")).toBeVisible();
+  await expect(page.getByTestId("mal-badge")).toContainText("Connected");
+  await expect(page.getByTestId("mal-connected")).toContainText("evan_mal");
+  expect(await page.evaluate(() => localStorage.getItem("gideon.mal.anon"))).toBeNull();
+});
+
 test("library cards and the stats sheet show the community rating", async ({ page }) => {
   await mockSends(page);
   await mockJikan(page); // the limit=1 lookup answers ★ 9.2 for every series
