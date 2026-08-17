@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// Migrate the Kobo's synced reading history onto the user's MyAnimeList
-// manga list. Reads reading_progress via the gideon sync account
-// (~/.config/gideon/mcp-auth.json), matches each series against MAL, and
-// writes my_list_status with the user's OAuth token
-// (~/.config/gideon/mal-api.json, from the one-tap authorize flow).
+// CLI migration of the Kobo's synced reading history onto a MyAnimeList
+// manga list. NOTE: the website now has this built in — the "Sync Kobo
+// reading to MAL" button on the Discover tab (connected accounts) is the
+// supported path, with exact-match-only writes and furthest-wins. This
+// script remains for headless use. It reads reading_progress via the gideon
+// sync account (~/.config/gideon/mcp-auth.json) and writes my_list_status
+// with the OAuth token in ~/.config/gideon/mal-api.json.
 //
 //   node migrate-mal.mjs           # dry run: print the plan, write nothing
 //   node migrate-mal.mjs --apply   # write to MAL

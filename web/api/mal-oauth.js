@@ -13,6 +13,22 @@
 const TOKEN_URL = "https://myanimelist.net/v1/oauth2/token";
 const REDIRECT_URI = "https://gideon-sync.vercel.app/";
 
+// Best-effort per-instance rate limit on the exchange actions, so this
+// endpoint can't be farmed as a free token-exchange oracle for our client
+// credentials. Fluid Compute reuses instances, so this catches sustained
+// abuse from one source even without shared state.
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX = 10;
+const hitsByIp = new Map();
+function rateLimited(ip) {
+  const now = Date.now();
+  const hits = (hitsByIp.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  hits.push(now);
+  hitsByIp.set(ip, hits);
+  if (hitsByIp.size > 10_000) hitsByIp.clear(); // memory backstop
+  return hits.length > RATE_MAX;
+}
+
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Cache-Control", "no-store");
@@ -28,6 +44,10 @@ export default async function handler(req, res) {
   }
   if (req.method !== "POST") {
     return res.status(405).json({ error: "POST only" });
+  }
+  const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || "unknown";
+  if (rateLimited(ip)) {
+    return res.status(429).json({ error: "slow down — try again in a minute" });
   }
 
   const body = req.body || {};
