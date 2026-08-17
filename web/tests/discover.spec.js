@@ -92,6 +92,84 @@ function mockJikan(page, { overrides = {} } = {}) {
   });
 }
 
+// --- MAL official-API proxy fixtures (api/mal.js shapes) --------------------
+
+const MAL = {
+  animelist: {
+    data: [
+      { node: { id: 51, title: "Sousou no Frieren" }, list_status: { score: 10 } },
+      { node: { id: 52, title: "One Piece" }, list_status: { score: 8 } },
+    ],
+  },
+  mangalist: { data: [{ node: { id: 900, title: "Vagabond" } }] },
+  // Frieren's anime carries the manga relation; One Piece's is empty (MAL's
+  // related_manga is often empty), forcing the search-by-title fallback.
+  anime51: {
+    related_manga: [
+      { node: { id: 101, title: "Frieren: Beyond Journey's End", main_picture: { large: "https://img.test/frieren.jpg" } }, relation_type: "adaptation" },
+    ],
+  },
+  anime52: { related_manga: [] },
+  searchOnePiece: { data: [{ node: { id: 102, title: "One Piece", main_picture: { large: "https://img.test/op.jpg" }, mean: 9.0 } }] },
+  manga101: {
+    mean: 8.6,
+    main_picture: { large: "https://img.test/frieren.jpg" },
+    recommendations: [
+      { node: { id: 201, title: "Yokohama Kaidashi Kikou", main_picture: { large: "https://img.test/ykk.jpg" } } },
+      { node: { id: 900, title: "Vagabond", main_picture: { large: "https://img.test/vag.jpg" } } },
+    ],
+  },
+  manga102: { mean: 9.0, main_picture: { large: "https://img.test/op.jpg" }, recommendations: [] },
+  ranking: {
+    data: [
+      { node: { id: 501, title: "Chainsaw Man", media_type: "manga", mean: 8.6, main_picture: { large: "https://img.test/csm.jpg" }, genres: [{ name: "Action" }, { name: "Horror" }] } },
+      { node: { id: 502, title: "A Light Novel", media_type: "light_novel", mean: 7.0 } },
+      { node: { id: 503, title: "Vagabond", media_type: "manga", mean: 9.2, main_picture: { large: "https://img.test/vag2.jpg" }, genres: [{ name: "Drama" }] } },
+    ],
+  },
+  searchBerserk: { data: [{ node: { id: 601, title: "Berserk", media_type: "manga", mean: 9.3, main_picture: { large: "https://img.test/berserk.jpg" }, genres: [{ name: "Dark Fantasy" }] } }] },
+};
+
+function mockMalProxy(page, { animelistStatus } = {}) {
+  return page.route("**/api/mal**", (route) => {
+    const url = new URL(route.request().url());
+    const [p, qs = ""] = (url.searchParams.get("path") || "").split("?");
+    const q = new URLSearchParams(qs);
+    const json = (b, status = 200) =>
+      route.fulfill({ status, contentType: "application/json", body: JSON.stringify(b) });
+    if (p.endsWith("/animelist")) {
+      if (animelistStatus) return json({ message: "", error: "not_found" }, animelistStatus);
+      return json(MAL.animelist);
+    }
+    if (p.endsWith("/mangalist")) return json(MAL.mangalist);
+    if (p === "anime/51") return json(MAL.anime51);
+    if (p === "anime/52") return json(MAL.anime52);
+    if (p === "manga/101") return json(MAL.manga101);
+    if (p === "manga/102") return json(MAL.manga102);
+    if (p === "manga/ranking") return json(MAL.ranking);
+    if (p === "manga") {
+      if (q.get("limit") === "1") {
+        // Source-manga fallback + library-ratings lookups.
+        const term = (q.get("q") || "").toLowerCase();
+        return json(term.includes("one piece") ? MAL.searchOnePiece : { data: [] });
+      }
+      return json(MAL.searchBerserk);
+    }
+    return json({ data: [] });
+  });
+}
+
+// Counts Jikan traffic; register before mockMalProxy so proxy-path tests can
+// assert the mirror was never touched.
+function trackJikan(page) {
+  const calls = [];
+  page.route(/api\.jikan\.moe/, (route) => {
+    calls.push(route.request().url());
+    return route.fulfill({ status: 200, contentType: "application/json", body: '{"data":[]}' });
+  });
+  return calls;
+}
+
 // --- shared setup -------------------------------------------------------------
 
 // An in-memory send_queue that records enqueued bodies, so tests can assert
@@ -359,6 +437,81 @@ test("the browse row arriving does not wipe a half-typed username", async ({ pag
   await page.getByTestId("disc-user").fill("halftyped");
   await expect(page.getByTestId("browse-results")).toBeVisible();
   await expect(page.getByTestId("disc-user")).toHaveValue("halftyped");
+});
+
+// --- official-API proxy path -------------------------------------------------
+
+test("proxy: the full recommend flow runs on MAL's official API, Jikan untouched", async ({ page }) => {
+  await mockSends(page);
+  const jikanCalls = trackJikan(page);
+  await mockMalProxy(page);
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("disc-user").fill("evan_mal");
+  await page.getByTestId("disc-go").click();
+
+  // Frieren via the related_manga edge (One Piece resolves via the
+  // search-by-title fallback and is then excluded — it's in the library).
+  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
+  await expect(sources).toHaveCount(1, { timeout: 15000 });
+  await expect(sources.first()).toContainText("Frieren");
+  await expect(sources.first()).toContainText("You rated the anime 10/10");
+  await expect(sources.first()).toContainText("★ 8.6");
+
+  // Similar: Yokohama in, Vagabond dropped (their MAL manga list).
+  const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
+  await expect(similar).toHaveCount(1);
+  await expect(similar.first()).toContainText("Yokohama");
+
+  expect(jikanCalls).toEqual([]);
+});
+
+test("proxy: browse and search run on official rankings/search with ratings", async ({ page }) => {
+  await mockSends(page);
+  const jikanCalls = trackJikan(page);
+  await mockMalProxy(page);
+  await signInAnd(page, "tab-discover");
+
+  // Ranking-backed browse: light novel filtered by media_type, ★ from mean.
+  const cards = page.getByTestId("browse-results").getByTestId("rec-card");
+  await expect(cards).toHaveCount(2);
+  await expect(cards.nth(0)).toContainText("Chainsaw Man");
+  await expect(cards.nth(0)).toContainText("★ 8.6");
+
+  await page.getByTestId("search-input").fill("berserk");
+  await page.getByTestId("search-btn").click();
+  const results = page.getByTestId("search-results").getByTestId("rec-card");
+  await expect(results).toHaveCount(1);
+  await expect(results.first()).toContainText("★ 9.3");
+
+  expect(jikanCalls).toEqual([]);
+});
+
+test("proxy: an unknown MAL user is authoritative — clear error, no Jikan fallback", async ({ page }) => {
+  await mockSends(page);
+  const jikanCalls = trackJikan(page);
+  await mockMalProxy(page, { animelistStatus: 404 });
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("disc-user").fill("no_such_user");
+  await page.getByTestId("disc-go").click();
+
+  await expect(page.getByTestId("disc-error")).toContainText("wasn't found");
+  expect(jikanCalls.filter((u) => u.includes("animelist"))).toEqual([]);
+});
+
+test("proxy unconfigured (503) falls back to Jikan transparently", async ({ page }) => {
+  await mockSends(page);
+  await page.route("**/api/mal**", (route) =>
+    route.fulfill({ status: 503, contentType: "application/json", body: '{"error":"proxy-unconfigured"}' })
+  );
+  await mockJikan(page);
+  await signInAnd(page, "tab-discover");
+
+  // Browse arrives via Jikan as before.
+  const cards = page.getByTestId("browse-results").getByTestId("rec-card");
+  await expect(cards).toHaveCount(2);
+  await expect(cards.nth(0)).toContainText("Chainsaw Man");
 });
 
 test("library cards and the stats sheet show the community rating", async ({ page }) => {

@@ -10,3 +10,5 @@ playwright-report
 blob-report
 .gitignore
 README.md
+.env*
+.vercel
