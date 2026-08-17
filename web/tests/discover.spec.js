@@ -210,7 +210,9 @@ async function signInAnd(page, tab) {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => localStorage.clear());
+  // No localStorage.clear() here: each test already gets an isolated browser
+  // context, and an init-script clear re-runs on every navigation — which
+  // wipes the session mid-OAuth-redirect.
   await page.route("**/rest/v1/chapter_pages**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
@@ -512,6 +514,122 @@ test("proxy unconfigured (503) falls back to Jikan transparently", async ({ page
   const cards = page.getByTestId("browse-results").getByTestId("rec-card");
   await expect(cards).toHaveCount(2);
   await expect(cards.nth(0)).toContainText("Chainsaw Man");
+});
+
+// --- "Connect MyAnimeList" (per-user OAuth) ----------------------------------
+
+function mockOauth(page, { configStatus = 200, breakState = false } = {}) {
+  const exchanges = [];
+  page.route("**/api/mal-oauth**", (route) => {
+    const url = new URL(route.request().url());
+    const action = url.searchParams.get("action");
+    const json = (b, status = 200) =>
+      route.fulfill({ status, contentType: "application/json", body: JSON.stringify(b) });
+    if (action === "config") {
+      if (configStatus !== 200) return json({ error: "proxy-unconfigured" }, configStatus);
+      // redirect_uri points back at the test server so the dance completes.
+      return json({ client_id: "test-cid", redirect_uri: "http://127.0.0.1:3210/" });
+    }
+    if (action === "token") {
+      exchanges.push(JSON.parse(route.request().postData() || "{}"));
+      return json({ access_token: "mal-at", refresh_token: "mal-rt", expires_in: 3600 });
+    }
+    return json({ error: "unknown" }, 400);
+  });
+  // MAL's authorize page: immediately bounce back with a code, echoing (or
+  // corrupting) the state — the shape of a user tapping Allow.
+  page.route(/myanimelist\.net\/v1\/oauth2\/authorize/, (route) => {
+    const u = new URL(route.request().url());
+    const st = breakState ? "WRONG" : u.searchParams.get("state");
+    return route.fulfill({
+      status: 302,
+      headers: { Location: `http://127.0.0.1:3210/?code=CODE123&state=${st}` },
+    });
+  });
+  return exchanges;
+}
+
+test("Connect MyAnimeList completes the OAuth dance and lands connected", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  const exchanges = mockOauth(page);
+  await page.route("**/api/mal?path=users%2F%40me**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: '{"id":1,"name":"TestUser"}' })
+  );
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("mal-connect").click();
+  // Back from MAL: the app auto-completes and lands on Discover, connected.
+  await expect(page.getByTestId("mal-connected")).toBeVisible({ timeout: 10000 });
+  await expect(page.getByTestId("mal-connected")).toContainText("TestUser");
+  await expect(page.getByTestId("mal-toast")).toContainText("connected");
+
+  // The exchange carried a real S256-grade verifier, and tokens are scoped
+  // to the signed-in gideon account.
+  expect(exchanges).toHaveLength(1);
+  expect(exchanges[0].code).toBe("CODE123");
+  expect(exchanges[0].verifier.length).toBeGreaterThanOrEqual(43);
+  const stored = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("gideon.mal.reader@example.com") || "null")
+  );
+  expect(stored.access_token).toBe("mal-at");
+  expect(stored.username).toBe("TestUser");
+  // No OAuth residue in the address bar.
+  expect(new URL(page.url()).search).toBe("");
+});
+
+test("a corrupted OAuth state is discarded quietly — no token exchange", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  const exchanges = mockOauth(page, { breakState: true });
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("mal-connect").click();
+  await expect(page.getByTestId("mal-error")).toContainText("didn't finish");
+  await expect(page.getByTestId("mal-connect")).toBeVisible(); // Connect card is back
+  expect(exchanges).toHaveLength(0);
+  expect(
+    await page.evaluate(() => localStorage.getItem("gideon.mal.reader@example.com"))
+  ).toBeNull();
+});
+
+test("an unconfigured deployment says so instead of redirecting", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page);
+  mockOauth(page, { configStatus: 503 });
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("mal-connect").click();
+  await expect(page.getByTestId("mal-error")).toContainText("isn't configured");
+});
+
+test("a connected account runs its recommendations automatically", async ({ page }) => {
+  await mockSends(page);
+  await mockJikan(page); // serves the evan_mal fixtures
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "gideon.mal.reader@example.com",
+      JSON.stringify({
+        access_token: "mal-at",
+        refresh_token: "mal-rt",
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        username: "evan_mal",
+      })
+    );
+  });
+  await signInAnd(page, "tab-discover");
+
+  // No typing, no button: the linked account's picks just arrive.
+  await expect(page.getByTestId("mal-connected")).toContainText("evan_mal");
+  await expect(page.getByTestId("disc-user")).toHaveCount(0); // manual form hidden
+  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
+  await expect(sources).toHaveCount(1, { timeout: 15000 });
+  await expect(sources.first()).toContainText("Frieren");
+
+  // Disconnect restores the manual path.
+  await page.getByTestId("mal-disconnect").click();
+  await expect(page.getByTestId("mal-connect")).toBeVisible();
+  await expect(page.getByTestId("disc-user")).toBeVisible();
 });
 
 test("library cards and the stats sheet show the community rating", async ({ page }) => {

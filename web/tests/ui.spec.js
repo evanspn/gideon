@@ -86,7 +86,8 @@ function mockSends(page, initial = []) {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => localStorage.clear());
+  // (No localStorage.clear(): contexts are per-test isolated, and an
+  // init-script clear re-runs on every navigation, breaking OAuth returns.)
   // The dashboard resolves community ratings via Jikan in the background;
   // keep that offline and empty for every test.
   await page.route(/api\.jikan\.moe/, (route) =>
