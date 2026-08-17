@@ -9,6 +9,7 @@ size (1264×1680). These are design source files, not shipping code.
 | `SeriesShelf.dc.html` | Direction A · Shelf — Series detail |
 | `Dossier.dc.html` | Direction B · Dossier — Today |
 | `DossierLibrary.dc.html` | Direction B · Dossier — Library |
+| `Palettes.dc.html` | Kaleido palette reference — four candidate schemes |
 | `canvas.json` | Canvas layout + the annotations explaining both directions |
 
 ## Geometry is lifted from the source, not invented
@@ -69,6 +70,28 @@ Both directions show data the device does not store today:
 So Direction A's metadata chips need only the fields `mal.rs` already throws
 away; Direction B's stat band and heatmap need a stats store on-device or a
 pull from Supabase. That is the cost difference between the two.
+
+## Choosing a scheme
+
+`Palettes.dc.html` is a reference sheet, not a device screen: four candidate
+schemes (Ink & Rust, Indigo Press, Sumi & Vermilion, Botanical), each swatch
+shown as authored sRGB beside an approximation of the panel rendering, with the
+mono value twin underneath. The mockups currently use Ink & Rust.
+
+The panel approximation is a **model, not a measurement** — it pulls each
+channel toward luminance and compresses the range the way a colour filter array
+does. It is good enough to rank schemes and to catch two roles collapsing to the
+same value; it is not a substitute for looking at the hardware. The `desat`
+tweak on that artboard adjusts how hard the model pushes.
+
+Two facts from this repo shape all four:
+
+- The saturation "boost" is a hardware CFA gain flag
+  (`HWTCON_FLAG_CFA_EINK_G2`, `crates/gideon-device/src/kobo.rs:62`), not a
+  software transform — gideon applies no colour correction of its own.
+- `vivid` is documented as banding on gradients
+  (`crates/gideon-core/src/settings.rs:70-73`), which is an independent reason
+  to stay on flat fills.
 
 ## Regenerating the canvas
 

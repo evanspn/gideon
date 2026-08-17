@@ -3,7 +3,8 @@
     { "file": "Main.dc.html",           "title": "A · Shelf — Library",       "x": 0,    "y": 0,    "w": 1264, "h": 1680 },
     { "file": "SeriesShelf.dc.html",    "title": "A · Shelf — Series",        "x": 1400, "y": 0,    "w": 1264, "h": 1680 },
     { "file": "Dossier.dc.html",        "title": "B · Dossier — Today",       "x": 0,    "y": 1960, "w": 1264, "h": 1680 },
-    { "file": "DossierLibrary.dc.html", "title": "B · Dossier — Library",     "x": 1400, "y": 1960, "w": 1264, "h": 1680 }
+    { "file": "DossierLibrary.dc.html", "title": "B · Dossier — Library",     "x": 1400, "y": 1960, "w": 1264, "h": 1680 },
+    { "file": "Palettes.dc.html",       "title": "Kaleido palette reference", "x": 0,    "y": 3920, "w": 1500, "h": 3100 }
   ],
   "annotations": [
     {
