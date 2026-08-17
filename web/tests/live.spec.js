@@ -81,6 +81,30 @@ test.describe("live MyAnimeList (Jikan) integration", () => {
   });
 });
 
+// LIVE check of the deployed MAL official-API proxy (web/api/mal.js) on
+// production. Passes in either supported state: configured (MAL_CLIENT_ID
+// env var set on the Vercel project → real ranking data with the shape the
+// app consumes) or not yet configured (clean 503 "proxy-unconfigured", which
+// the app answers by falling back to Jikan).
+test.describe("live MAL proxy on production", () => {
+  test.skip(!LIVE, "opt-in: set GIDEON_LIVE=1 to run against production");
+
+  test("api/mal responds configured-or-unconfigured, never broken", async () => {
+    test.setTimeout(30_000);
+    const path = encodeURIComponent("manga/ranking?ranking_type=all&limit=3&fields=mean");
+    const res = await fetch(`https://gideon-sync.vercel.app/api/mal?path=${path}`);
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 503) {
+      expect(body.error).toBe("proxy-unconfigured"); // add MAL_CLIENT_ID to go live
+      return;
+    }
+    expect(res.status, JSON.stringify(body).slice(0, 200)).toBe(200);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data[0].node.title).toBeTruthy();
+    expect(typeof body.data[0].node.mean).toBe("number");
+  });
+});
+
 test.describe("live send-to-Kobo chain", () => {
   test.skip(!LIVE, "opt-in: set GIDEON_LIVE=1 to run against the real backend");
 

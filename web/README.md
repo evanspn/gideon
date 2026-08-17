@@ -11,15 +11,23 @@ design — RLS, keyed to `auth.uid()`, is what scopes every row to its owner).
 
 Two write paths exist, both through `send_queue`: the **Send to Kobo** box on
 Stats, and the **Discover** tab — point it at a public **MyAnimeList**
-username (read via the community Jikan mirror; MAL's own API doesn't allow
-browser calls) and it recommends manga from your anime list (the source manga
+username and it recommends manga from your anime list (the source manga
 of your top-rated anime, plus community picks seeded from those), each with a
 one-tap Send to Kobo. The tab also carries a manga search box and Trending /
 Top-rated browse rows — every card shows its community ★ score — and library
 titles get a rating chip (resolved via Jikan search, cached in localStorage
-for a week). Everything runs client-side against Jikan's public, no-key,
-CORS-open API; outages surface as retryable error states, and missing ratings
+for a week). Outages surface as retryable error states, and missing ratings
 just don't render.
+
+MAL data arrives one of two ways, preferred in this order:
+
+1. **Official MAL API** via the same-origin serverless proxy `api/mal.js` —
+   first-party data, immune to mirror outages. One-time setup: create a
+   Client ID at myanimelist.net → Preferences → API, then
+   `vercel env add MAL_CLIENT_ID production` (the browser never sees it).
+2. **Jikan** (the community mirror, public/no-key/CORS-open) — the automatic
+   fallback whenever the proxy isn't configured or can't reach MAL. Jikan has
+   had multi-day outages, which is why the proxy exists.
 
 Live at **https://gideon-sync.vercel.app**.
 

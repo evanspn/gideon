@@ -283,18 +283,158 @@ function jikanGet(path) {
   return run;
 }
 
+// -- MAL official API via the same-origin proxy (api/mal.js) --
+//
+// Preferred data path: first-party MyAnimeList through our own serverless
+// proxy — immune to the Jikan mirror's outages. When the proxy reports it
+// isn't configured (no MAL_CLIENT_ID env var yet), isn't deployed (local dev
+// server), or can't reach MAL, each operation falls back to Jikan. A real
+// answer from MAL itself (404 unknown user, 400 bad request) is
+// authoritative and never falls back.
+
+let malProxyDown = false; // remembered per page load after a hard failure
+
+async function malGet(path) {
+  const res = await fetch(`api/mal?path=${encodeURIComponent(path)}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.message || data.error || `MyAnimeList error (${res.status})`);
+    // 503 = proxy unconfigured, 5xx = proxy/upstream trouble, and a 404
+    // without MAL's JSON error shape = no proxy at all (static dev server).
+    err.fallback =
+      res.status === 503 || res.status >= 500 || (res.status === 404 && !data.error) || res.status === 405;
+    throw err;
+  }
+  return data;
+}
+
+async function withMal(proxyFn, jikanFn) {
+  if (!malProxyDown) {
+    try {
+      return await proxyFn();
+    } catch (e) {
+      if (!e.fallback) throw e; // MAL's own answer — surface it
+      malProxyDown = true;
+    }
+  }
+  return jikanFn();
+}
+
+const malCover = (n) => n?.main_picture?.large || n?.main_picture?.medium || null;
+const malScore = (mean) => (mean ? Math.round(mean * 10) : null);
+
+// --- provider operations (proxy-first, Jikan fallback) ---
+
+// The user's completed anime, as { id, title, score }.
+function opAnimeList(username) {
+  const u = encodeURIComponent(username);
+  return withMal(
+    async () => {
+      let d;
+      try {
+        d = await malGet(`users/${u}/animelist?status=completed&limit=1000&fields=list_status&nsfw=true`);
+      } catch (e) {
+        if (e.fallback) throw e;
+        throw new Error("That MyAnimeList user wasn't found (or their list is private).");
+      }
+      return (d.data || [])
+        .filter((e) => e.node?.id)
+        .map((e) => ({ id: e.node.id, title: e.node.title || "", score: e.list_status?.score || 0 }));
+    },
+    async () => {
+      const list = await jikanGet(`users/${u}/animelist?status=completed`);
+      return (list || [])
+        .filter((e) => e?.anime?.mal_id)
+        .map((e) => ({ id: e.anime.mal_id, title: e.anime.title || "", score: e.score || 0 }));
+    }
+  );
+}
+
+// Titles on their manga list (normalized), for exclusions. Best-effort.
+function opMangaListTitles(username) {
+  const u = encodeURIComponent(username);
+  return withMal(
+    async () => {
+      const d = await malGet(`users/${u}/mangalist?limit=1000&nsfw=true`);
+      return new Set((d.data || []).map((e) => normTitle(e.node?.title)).filter(Boolean));
+    },
+    async () => {
+      const list = await jikanGet(`users/${u}/mangalist`);
+      return new Set((list || []).map((e) => normTitle(e?.manga?.title)).filter(Boolean));
+    }
+  );
+}
+
+// The source manga behind an anime: { id, title, cover, score } or null.
+function opSourceManga(anime) {
+  return withMal(
+    async () => {
+      // MAL's related_manga on anime is often empty (a long-standing API
+      // gap), so fall back to searching the manga catalog by the anime's
+      // title — MAL search is good at exact-name matches.
+      const d = await malGet(`anime/${anime.id}?fields=related_manga`).catch(() => null);
+      const rel = (d?.related_manga || []).find((r) => r.node?.id);
+      if (rel) {
+        return { id: rel.node.id, title: rel.node.title || "", cover: malCover(rel.node), score: null };
+      }
+      if (normTitle(anime.title).length < 3) return null;
+      const s = await malGet(
+        `manga?q=${encodeURIComponent(anime.title.slice(0, 64))}&limit=1&fields=mean,main_picture`
+      );
+      const n = s.data?.[0]?.node;
+      return n ? { id: n.id, title: n.title || "", cover: malCover(n), score: malScore(n.mean) } : null;
+    },
+    async () => {
+      const full = await jikanGet(`anime/${anime.id}/full`).catch(() => null);
+      const adaptation = (full?.relations || [])
+        .filter((r) => r.relation === "Adaptation")
+        .flatMap((r) => r.entry || [])
+        .find((x) => x.type === "manga");
+      return adaptation ? { id: adaptation.mal_id, title: adaptation.name, cover: null, score: null } : null;
+    }
+  );
+}
+
+// A manga's meta + community recommendations in one shape:
+// { cover, score, recs: [{ id, title, cover }] }.
+function opMangaFull(id) {
+  return withMal(
+    async () => {
+      const d = await malGet(`manga/${id}?fields=mean,main_picture,recommendations`);
+      return {
+        cover: malCover(d),
+        score: malScore(d.mean),
+        recs: (d.recommendations || [])
+          .filter((r) => r.node?.id)
+          .map((r) => ({ id: r.node.id, title: r.node.title || "", cover: malCover(r.node) })),
+      };
+    },
+    async () => {
+      const manga = await jikanGet(`manga/${id}`).catch(() => null);
+      const recs = await jikanGet(`manga/${id}/recommendations`).catch(() => []);
+      return {
+        cover: manga?.images?.jpg?.large_image_url || manga?.images?.jpg?.image_url || null,
+        score: manga?.score ? Math.round(manga.score * 10) : null,
+        recs: (recs || [])
+          .filter((r) => r.entry?.mal_id)
+          .map((r) => ({
+            id: r.entry.mal_id,
+            title: r.entry.title || "",
+            cover: r.entry.images?.jpg?.large_image_url || r.entry.images?.jpg?.image_url || null,
+          })),
+      };
+    }
+  );
+}
+
 async function malRecommend(username, onStatus) {
   onStatus("Reading your MyAnimeList…");
-  const list = await jikanGet(`users/${encodeURIComponent(username)}/animelist?status=completed`);
-  const entries = (list || []).filter((e) => e?.anime?.mal_id);
+  const entries = await opAnimeList(username);
   if (!entries.length) throw new Error("That MyAnimeList has no completed anime (or it's private).");
 
   // Their manga list too, so we never recommend something they already read.
   // Best-effort: no manga list (or an endpoint hiccup) just means no exclusions.
-  const mangalist = await jikanGet(`users/${encodeURIComponent(username)}/mangalist`).catch(() => []);
-  const alreadyReading = new Set(
-    (mangalist || []).map((e) => normTitle(e?.manga?.title)).filter(Boolean)
-  );
+  const alreadyReading = await opMangaListTitles(username).catch(() => new Set());
 
   const seeds = entries
     .slice()
@@ -304,44 +444,30 @@ async function malRecommend(username, onStatus) {
   onStatus("Finding the manga behind your favorites…");
   const sources = [];
   for (const e of seeds) {
-    const full = await jikanGet(`anime/${e.anime.mal_id}/full`).catch(() => null);
-    const adaptation = (full?.relations || [])
-      .filter((r) => r.relation === "Adaptation")
-      .flatMap((r) => r.entry || [])
-      .find((x) => x.type === "manga");
-    if (!adaptation) continue;
+    const m = await opSourceManga(e).catch(() => null);
+    if (!m) continue;
     sources.push({
-      id: adaptation.mal_id,
-      title: adaptation.name,
-      cover: null, // filled below (relations carry no art)
-      score: null,
+      id: m.id,
+      title: m.title,
+      cover: m.cover || null,
+      score: m.score ?? null,
       reason: e.score
         ? `You rated the anime ${e.score}/10 — read the source`
-        : `You watched ${e.anime.title} — read the source`,
+        : `You watched ${e.title} — read the source`,
     });
-  }
-
-  onStatus("Fetching covers…");
-  for (const s of sources) {
-    const manga = await jikanGet(`manga/${s.id}`).catch(() => null);
-    if (manga) {
-      s.cover = manga.images?.jpg?.large_image_url || manga.images?.jpg?.image_url || null;
-      s.score = manga.score ? Math.round(manga.score * 10) : null;
-    }
   }
 
   onStatus("Looking for more like what you love…");
   const similar = [];
-  for (const s of sources.slice(0, 3)) {
-    const recs = await jikanGet(`manga/${s.id}/recommendations`).catch(() => []);
-    for (const r of (recs || []).slice(0, 4)) {
-      similar.push({
-        id: r.entry?.mal_id,
-        title: r.entry?.title || "",
-        cover: r.entry?.images?.jpg?.large_image_url || r.entry?.images?.jpg?.image_url || null,
-        score: null,
-        reason: `Loved by readers of ${s.title}`,
-      });
+  for (const [i, s] of sources.entries()) {
+    const full = await opMangaFull(s.id).catch(() => null);
+    if (!full) continue;
+    s.cover = s.cover || full.cover;
+    s.score = s.score ?? full.score;
+    if (i < 3) {
+      for (const r of full.recs.slice(0, 4)) {
+        similar.push({ ...r, score: null, reason: `Loved by readers of ${s.title}` });
+      }
     }
   }
   return { sources, similar, alreadyReading };
@@ -370,11 +496,56 @@ async function jikanBrowse({ search, mode }) {
     }));
 }
 
+async function malBrowse({ search, mode }) {
+  const fields = "mean,genres,main_picture,media_type,nsfw";
+  const path = search
+    ? `manga?q=${encodeURIComponent(search)}&limit=18&fields=${fields}`
+    : `manga/ranking?ranking_type=${mode === "top" ? "all" : "bypopularity"}&limit=18&fields=${fields}`;
+  const d = await malGet(path);
+  return (d.data || [])
+    .map((r) => r.node)
+    .filter(Boolean)
+    .filter((n) => !["light_novel", "novel"].includes(n.media_type) && (n.nsfw ?? "white") === "white")
+    .map((n) => ({
+      title: n.title || "",
+      cover: malCover(n),
+      score: malScore(n.mean),
+      reason: (n.genres || []).slice(0, 3).map((g) => g.name).join(" · "),
+    }));
+}
+
+function opBrowse(opts) {
+  return withMal(() => malBrowse(opts), () => jikanBrowse(opts));
+}
+
+// Community score for one library title: { score } (null when unknown).
+// Throws only on infrastructure failure — a "no such manga" answer caches
+// as null so the sweep can move on.
+function opRating(title) {
+  if (normTitle(title).length < 3) return Promise.resolve({ score: null });
+  return withMal(
+    async () => {
+      try {
+        const d = await malGet(`manga?q=${encodeURIComponent(title.slice(0, 64))}&limit=1&fields=mean`);
+        return { score: malScore(d.data?.[0]?.node?.mean) };
+      } catch (e) {
+        if (e.fallback) throw e;
+        return { score: null };
+      }
+    },
+    async () => {
+      const rows = await jikanGet(`manga?q=${encodeURIComponent(title)}&limit=1&sfw=true`);
+      const m = rows?.[0];
+      return { score: m?.score ? Math.round(m.score * 10) : null };
+    }
+  );
+}
+
 async function runBrowse(mode, email, rows) {
   state.browse = { phase: "loading", mode };
   patchBrowse(email, rows);
   try {
-    const cards = await jikanBrowse({ mode });
+    const cards = await opBrowse({ mode });
     state.browse = { phase: "done", mode, cards };
   } catch (e) {
     state.browse = { phase: "error", mode, error: e.message || "Couldn't load." };
@@ -441,7 +612,7 @@ async function runSearch(q, email, rows) {
   state.search = { phase: "loading", q };
   renderDashboard(email, rows);
   try {
-    const cards = await jikanBrowse({ search: q });
+    const cards = await opBrowse({ search: q });
     state.search = cards.length
       ? { phase: "done", q, cards }
       : { phase: "error", q, error: `Nothing found for “${q}”.` };
@@ -475,13 +646,12 @@ async function fetchLibraryRatings(titles) {
   const fresh = (t) => cache[normTitle(t)] && nowMs - cache[normTitle(t)].at < RATING_TTL_MS;
   const missing = [...new Set(titles.filter((t) => !fresh(t)))];
   for (const t of missing) {
-    const rows = await jikanGet(`manga?q=${encodeURIComponent(t)}&limit=1&sfw=true`).catch(() => null);
+    const r = await opRating(t).catch(() => null);
     // Outage or rate limit: stop the whole sweep — hammering a down API only
-    // makes the 429s worse. Unresolved titles stay uncached, so a later visit
+    // makes things worse. Unresolved titles stay uncached, so a later visit
     // picks up where this one stopped.
-    if (rows === null) break;
-    const m = rows?.[0];
-    cache[normTitle(t)] = { s: m?.score ? Math.round(m.score * 10) : null, at: nowMs };
+    if (r === null) break;
+    cache[normTitle(t)] = { s: r.score, at: nowMs };
   }
   localStorage.setItem(RATING_CACHE_KEY, JSON.stringify(cache));
   return new Map(titles.map((t) => [normTitle(t), cache[normTitle(t)]?.s ?? null]));
