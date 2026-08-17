@@ -292,7 +292,11 @@ function jikanGet(path) {
 // answer from MAL itself (404 unknown user, 400 bad request) is
 // authoritative and never falls back.
 
-let malProxyDown = false; // remembered per page load after a hard failure
+// After a hard proxy failure we skip it for a while — but with a decay, so a
+// transient blip doesn't disable first-party data until a full page reload.
+let malProxyDownAt = 0;
+const MAL_PROXY_RETRY_MS = 60_000;
+const malProxyDown = () => Date.now() - malProxyDownAt < MAL_PROXY_RETRY_MS;
 
 async function malGet(path) {
   const res = await fetch(`api/mal?path=${encodeURIComponent(path)}`);
@@ -309,15 +313,183 @@ async function malGet(path) {
 }
 
 async function withMal(proxyFn, jikanFn) {
-  if (!malProxyDown) {
+  if (!malProxyDown()) {
     try {
       return await proxyFn();
     } catch (e) {
       if (!e.fallback) throw e; // MAL's own answer — surface it
-      malProxyDown = true;
+      malProxyDownAt = Date.now();
     }
   }
   return jikanFn();
+}
+
+// --- "Connect MyAnimeList" (per-user OAuth) ---------------------------------
+//
+// One tap connects the reader's own MAL account: the browser runs the PKCE
+// dance against MAL's authorize page, and /api/mal-oauth (which holds the
+// client secret) exchanges the code. Tokens live only in this browser,
+// scoped to the signed-in gideon account so a shared browser never leaks a
+// connection between users.
+
+const MAL_PKCE_KEY = "gideon.mal.pkce";
+
+function malKey() {
+  const email = state.session?.email || loadSession()?.email || "anon";
+  return `gideon.mal.${email}`;
+}
+function malConn() {
+  try {
+    return JSON.parse(localStorage.getItem(malKey()));
+  } catch {
+    return null;
+  }
+}
+function saveMalConn(c) {
+  localStorage.setItem(malKey(), JSON.stringify(c));
+}
+function clearMalConn() {
+  localStorage.removeItem(malKey());
+}
+
+function randToken(bytes) {
+  const a = new Uint8Array(bytes);
+  crypto.getRandomValues(a);
+  return btoa(String.fromCharCode(...a)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// base64url(SHA-256(verifier)) — the S256 code challenge.
+async function s256(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function startMalConnect() {
+  const res = await fetch("api/mal-oauth?action=config").catch(() => null);
+  const cfg = res?.ok ? await res.json().catch(() => null) : null;
+  if (!cfg?.client_id) {
+    throw new Error("MyAnimeList connection isn't configured on this deployment.");
+  }
+  const verifier = randToken(64); // 86 chars — valid PKCE (43–128)
+  const pkceState = randToken(16);
+  // localStorage, not sessionStorage: phone OAuth round-trips can come back
+  // in a new tab or from an in-app browser, which drops sessionStorage. A
+  // 15-minute expiry keeps abandoned attempts from lingering.
+  localStorage.setItem(
+    MAL_PKCE_KEY,
+    JSON.stringify({ verifier, state: pkceState, at: Date.now() })
+  );
+  const u = new URL("https://myanimelist.net/v1/oauth2/authorize");
+  u.search = new URLSearchParams({
+    response_type: "code",
+    client_id: cfg.client_id,
+    code_challenge: await s256(verifier),
+    code_challenge_method: "S256",
+    state: pkceState,
+    redirect_uri: cfg.redirect_uri,
+  });
+  location.href = u;
+}
+
+// Completes the dance when MAL redirects back with ?code and our state.
+// Returns true if this load was an OAuth return (ours), false otherwise.
+async function finishMalConnect() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get("code");
+  if (!code) return false;
+  let pending = null;
+  try {
+    pending = JSON.parse(localStorage.getItem(MAL_PKCE_KEY));
+  } catch {}
+  localStorage.removeItem(MAL_PKCE_KEY);
+  if (!pending) return false; // a ?code we never asked for — ignore it
+  history.replaceState(null, "", location.pathname);
+  if (q.get("state") !== pending.state || Date.now() - pending.at > 15 * 60_000) {
+    // Bad state or stale attempt: quiet, actionable, no OAuth vocabulary.
+    state.malError = "That sign-in didn't finish — tap Connect again.";
+    state.tab = "discover";
+    return true;
+  }
+  try {
+    const res = await fetch("api/mal-oauth?action=token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, verifier: pending.verifier }),
+    });
+    const tok = await res.json().catch(() => ({}));
+    if (!res.ok || !tok.access_token) throw new Error(tok.error || "token exchange failed");
+    const conn = {
+      access_token: tok.access_token,
+      refresh_token: tok.refresh_token,
+      expires_at: Math.floor(Date.now() / 1000) + (tok.expires_in || 3600),
+      username: null,
+    };
+    // Learn who this is, for the UI and for recommendations (best-effort).
+    const me = await fetch(`api/mal?path=${encodeURIComponent("users/@me")}`, {
+      headers: { "X-MAL-USER-TOKEN": conn.access_token },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    conn.username = me?.name || null;
+    saveMalConn(conn);
+    state.malToast = `MyAnimeList connected${conn.username ? ` as ${conn.username}` : ""} ✓`;
+    state.tab = "discover"; // land the reader where the connection shows
+  } catch (e) {
+    state.malError = `MyAnimeList connection failed — ${e.message || "try again"}.`;
+  }
+  return true;
+}
+
+// A valid user access token, refreshing near expiry. Null = disconnected
+// (dead refresh token); the UI falls back to the Connect button.
+//
+// Hardened per review: single-flight (two tabs refreshing concurrently would
+// burn the rotated pair), persist-before-anything-else, and only a definitive
+// invalid_grant disconnects — a MAL 5xx keeps the old token and tries again
+// later rather than forcing everyone back through OAuth on a blip.
+let malRefreshInFlight = null;
+async function malUserToken() {
+  const conn = malConn();
+  if (!conn?.access_token) return null;
+  if (conn.expires_at - 300 > Math.floor(Date.now() / 1000)) return conn.access_token;
+  if (!malRefreshInFlight) {
+    malRefreshInFlight = (async () => {
+      try {
+        const res = await fetch("api/mal-oauth?action=refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: conn.refresh_token }),
+        });
+        const tok = await res.json().catch(() => ({}));
+        if (res.ok && tok.access_token) {
+          saveMalConn({
+            ...conn,
+            access_token: tok.access_token,
+            refresh_token: tok.refresh_token,
+            expires_at: Math.floor(Date.now() / 1000) + (tok.expires_in || 3600),
+          });
+          return tok.access_token;
+        }
+        if (res.status === 400 || res.status === 401) {
+          // Definitive rejection. Another tab may have rotated the pair
+          // under us — re-read before declaring the connection dead.
+          const latest = malConn();
+          if (latest && latest.refresh_token !== conn.refresh_token) return latest.access_token;
+          clearMalConn();
+          return null;
+        }
+        return conn.access_token; // transient upstream trouble: keep going
+      } catch {
+        return conn.access_token; // network blip: keep going
+      } finally {
+        malRefreshInFlight = null;
+      }
+    })();
+  }
+  return malRefreshInFlight;
 }
 
 const malCover = (n) => n?.main_picture?.large || n?.main_picture?.medium || null;
@@ -1272,17 +1444,50 @@ function browseSectionHtml() {
   return `<section class="panel"><div id="browse-body">${browseBodyHtml()}</div></section>`;
 }
 
+// The MyAnimeList account panel: one-tap Connect when not linked, the
+// connected identity (with Disconnect) when linked. Toast/error surface here
+// and clear once shown.
+function malPanelHtml() {
+  const conn = malConn();
+  const toast = state.malToast
+    ? `<div class="note ok" data-testid="mal-toast">${esc(state.malToast)}</div>`
+    : "";
+  const err = state.malError
+    ? `<div class="note disc-error" data-testid="mal-error">${esc(state.malError)}</div>`
+    : "";
+  if (conn) {
+    return `<section class="panel" data-testid="mal-connected">
+      <div class="lib-head"><div class="section-label">MyAnimeList</div>
+        <button class="ghost" id="mal-disconnect" data-testid="mal-disconnect">Disconnect</button></div>
+      <p class="send-hint">Connected${conn.username ? ` as <b>${esc(conn.username)}</b>` : ""} — recommendations use this account automatically.</p>
+      ${toast}${err}
+    </section>`;
+  }
+  return `<section class="panel" data-testid="mal-connect-card">
+    <div class="section-label">MyAnimeList</div>
+    <p class="send-hint">Connect your MyAnimeList and get personal manga picks with one tap — no username typing, private lists included.</p>
+    <button class="primary" id="mal-connect" data-testid="mal-connect">Connect MyAnimeList</button>
+    ${toast}${err}
+  </section>`;
+}
+
 function viewDiscover() {
   const search = searchPanelHtml();
   if (state.search) return `${search}${searchResultsHtml()}`;
 
+  const mal = malPanelHtml();
+  const connectedUser = malConn()?.username;
   const d = state.discover;
   let recs;
   if (!d || d.phase === "idle") {
-    recs = discoverConnectHtml(
-      recUsername(),
-      "Point gideon at your MyAnimeList and get manga picks — the source manga of what you loved, and what readers of those loved next. One tap sends a pick to your Kobo."
-    );
+    // With a connected account the username form is redundant — the
+    // recommendations run on the linked account automatically.
+    recs = connectedUser
+      ? ""
+      : discoverConnectHtml(
+          recUsername(),
+          "Or point gideon at any public MyAnimeList username — the source manga of what you loved, and what readers of those loved next."
+        );
   } else if (d.phase === "loading") {
     recs = `<section class="panel disc-loading" data-testid="disc-loading">
       <div class="spinner" aria-hidden="true"></div>
@@ -1300,7 +1505,7 @@ function viewDiscover() {
       ${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
       ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
   }
-  return `${search}${recs}${browseSectionHtml()}`;
+  return `${search}${mal}${recs}${browseSectionHtml()}`;
 }
 
 // One library card: cover (published page art, or a lettered placeholder),
@@ -1657,6 +1862,9 @@ function renderDashboard(email, rows) {
   for (const b of app.querySelectorAll(".tab")) {
     b.addEventListener("click", () => {
       state.tab = b.getAttribute("data-tab");
+      // Leaving the tab dismisses one-shot MAL notices.
+      state.malToast = null;
+      state.malError = null;
       renderDashboard(email, rows);
     });
   }
@@ -1755,6 +1963,22 @@ function renderDashboard(email, rows) {
       if (!username) return;
       runDiscover(username, email, rows);
     });
+  }
+  // MyAnimeList account: connect (OAuth redirect) and disconnect.
+  document.getElementById("mal-connect")?.addEventListener("click", () => {
+    startMalConnect().catch((e) => {
+      state.malError = e.message || "Couldn't start the MyAnimeList connection.";
+      renderDashboard(email, rows);
+    });
+  });
+  document.getElementById("mal-disconnect")?.addEventListener("click", () => {
+    clearMalConn();
+    state.discover = null;
+    renderDashboard(email, rows);
+  });
+  // A connected account runs its recommendations without being asked.
+  if (tab === "discover" && !state.search && !state.discover && malConn()?.username) {
+    runDiscover(malConn().username, email, rows);
   }
   document.getElementById("disc-change")?.addEventListener("click", () => {
     state.discover = { phase: "idle" };
@@ -1907,31 +2131,6 @@ async function showDashboard(session) {
   }
 }
 
-// The site is the registered OAuth redirect URI for the MyAnimeList API app.
-// When MAL bounces back here with ?code=…, surface it loudly — the address
-// bar hides query strings on phones, and the person needs to copy the code.
-function showOauthCodeBanner() {
-  const params = new URLSearchParams(location.search);
-  const code = params.get("code");
-  if (!code) return;
-  document.body.insertAdjacentHTML(
-    "afterbegin",
-    `<div class="oauth-banner" data-testid="oauth-banner">
-      <div class="ob-label">MyAnimeList authorization code — copy it and paste it back to Claude:</div>
-      <code class="ob-code">${esc(code)}</code>
-      <button class="primary ob-copy" id="ob-copy">Copy code</button>
-    </div>`
-  );
-  document.getElementById("ob-copy").addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(code);
-      document.getElementById("ob-copy").textContent = "Copied ✓";
-    } catch {
-      /* selectable text remains as the fallback */
-    }
-  });
-}
-
 // Supabase auth links (password recovery) land here with tokens in the URL
 // fragment. Adopt the session so the link actually signs you in, scrub the
 // tokens from the address bar, and for recovery links offer to set a new
@@ -1981,8 +2180,8 @@ function showRecoveryBanner() {
   });
 }
 
-function boot() {
-  showOauthCodeBanner();
+async function boot() {
+  await finishMalConnect(); // OAuth return from "Connect MyAnimeList"
   const linkType = adoptHashSession();
   if (linkType === "recovery") showRecoveryBanner();
   const session = loadSession();

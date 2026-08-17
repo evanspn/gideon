@@ -20,6 +20,9 @@ const ALLOWED_PATHS = [
   /^users\/[A-Za-z0-9_-]{2,16}\/animelist$/,
   /^users\/[A-Za-z0-9_-]{2,16}\/mangalist$/,
 ];
+// Paths that may be called with a user's own OAuth token (X-MAL-USER-TOKEN,
+// forwarded as the Bearer) instead of the app client id. Personal data only.
+const USER_TOKEN_PATHS = [/^users\/@me$/];
 const ALLOWED_PARAMS = new Set([
   "q", "limit", "offset", "fields", "status", "ranking_type", "nsfw", "sort",
 ]);
@@ -37,8 +40,19 @@ export default async function handler(req, res) {
 
   const raw = String(req.query.path || "");
   const [pathname, query = ""] = raw.split("?");
-  if (!ALLOWED_PATHS.some((re) => re.test(pathname))) {
+  const userToken = req.headers["x-mal-user-token"];
+  if (userToken) {
+    // Personal responses must never enter the shared edge cache (the cache
+    // key is the URL — headers don't partition it). Set before any branching
+    // so no code path can forget it.
+    res.setHeader("Cache-Control", "no-store");
+  }
+  const userPath = USER_TOKEN_PATHS.some((re) => re.test(pathname));
+  if (!(ALLOWED_PATHS.some((re) => re.test(pathname)) || (userPath && userToken))) {
     return res.status(400).json({ error: "path not allowed" });
+  }
+  if (userPath && !userToken) {
+    return res.status(401).json({ error: "user token required" });
   }
   const params = new URLSearchParams();
   for (const [k, v] of new URLSearchParams(query)) {
@@ -49,7 +63,12 @@ export default async function handler(req, res) {
   try {
     upstream = await fetch(
       `https://api.myanimelist.net/v2/${pathname}?${params}`,
-      { headers: { "X-MAL-CLIENT-ID": clientId }, signal: AbortSignal.timeout(10_000) }
+      {
+        headers: userToken
+          ? { Authorization: `Bearer ${userToken}` }
+          : { "X-MAL-CLIENT-ID": clientId },
+        signal: AbortSignal.timeout(10_000),
+      }
     );
   } catch {
     return res.status(502).json({ error: "MyAnimeList didn't answer" });
@@ -57,12 +76,15 @@ export default async function handler(req, res) {
 
   const body = await upstream.text();
   // Public catalog data (search/ranking/details) is safe to cache at the
-  // edge; user lists change and shouldn't be.
-  const cacheable = pathname === "manga" || pathname === "manga/ranking" || /^\w+\/\d+$/.test(pathname);
-  res.setHeader(
-    "Cache-Control",
-    cacheable ? "s-maxage=3600, stale-while-revalidate=86400" : "no-store"
-  );
+  // edge; anything fetched with a user token was already pinned no-store
+  // above and must stay that way.
+  if (!userToken) {
+    const cacheable = pathname === "manga" || pathname === "manga/ranking" || /^\w+\/\d+$/.test(pathname);
+    res.setHeader(
+      "Cache-Control",
+      cacheable ? "s-maxage=3600, stale-while-revalidate=86400" : "no-store"
+    );
+  }
   // Pass MAL's status through (404 unknown user, 400 bad request, …) so the
   // app can tell an authoritative answer from an infrastructure failure.
   return res.status(upstream.status).send(body || "{}");
