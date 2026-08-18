@@ -31,7 +31,9 @@ use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage};
+use gideon_render::{
+    calendar, heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage,
+};
 
 use crate::reader::Reader;
 
@@ -175,6 +177,7 @@ enum SettingAction {
     RotateSpreads,
     ColorProfile,
     LibraryView,
+    StatsView,
     Predownload,
     CleanupHours,
     StorageLimit,
@@ -1880,6 +1883,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // of these values you are even looking at.
             ("Profile", self.active_profile.clone()),
             ("Library view", s.library_view.clone()),
+            ("Today's chart", s.stats_view.clone()),
             (
                 "Reader fit",
                 match FitMode::from_setting(&s.reader_fit) {
@@ -2412,6 +2416,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     "shelf".into()
                 } else {
                     "list".into()
+                };
+            }
+            "Today's chart" => {
+                settings.stats_view = if settings.stats_view == "heatmap" {
+                    "calendar".into()
+                } else {
+                    "heatmap".into()
                 };
             }
             "Reader fit" => {
@@ -3321,6 +3332,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     "shelf".into()
                 } else {
                     "list".into()
+                };
+            }
+            SettingAction::StatsView => {
+                settings.stats_view = if settings.stats_view == "heatmap" {
+                    "calendar".into()
+                } else {
+                    "heatmap".into()
                 };
             }
             SettingAction::Predownload => {
@@ -5535,34 +5553,66 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         );
         y += tile_h + l.pad;
 
-        // The grid needs saying what it is. Unlabelled, a block of coloured
-        // squares is decoration; with a header and a Less→More key it is a
-        // chart, and the same header style the settings groups use ties it to
-        // the rest of the interface.
-        let weeks = STATS_HEATMAP_WEEKS;
+        // The chart needs saying what it is. Unlabelled, a block of coloured
+        // squares is decoration; with a header and a key it is a chart, and
+        // the same header style the settings groups use ties it to the rest
+        // of the interface.
         let head_h = l.row_h * 2 / 3;
+        let calendar = settings.stats_view == "calendar";
+        let heading = if calendar {
+            let (year, month, _) = gideon_core::stats::civil_from_days(stats.today);
+            format!("{} {year}", month_name(month))
+        } else {
+            format!("Reading activity — last {STATS_HEATMAP_WEEKS} weeks")
+        };
         widgets::draw_section_header(
             &mut canvas,
             l.pad,
             y,
             inner,
             head_h,
-            &format!("Reading activity — last {weeks} weeks"),
+            &heading,
             l.text_px,
             &theme,
         );
         y += head_h + l.pad / 2;
-        let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
-        heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
-        y += grid.height() + l.pad;
-        self.draw_heatmap_key(&mut canvas, y, &palette);
+        if calendar {
+            let month = month_of(stats.today);
+            let cal = calendar::CalendarLayout::fit(l.pad, y, inner, self.calendar_height(), month);
+            let spans = stats.spans(
+                month.first_cell,
+                month.first_cell + i64::from(month.weeks()) * 7,
+            );
+            let spans: Vec<calendar::Span> = spans
+                .iter()
+                .map(|s| calendar::Span {
+                    series: &s.series,
+                    start_day: s.start_day,
+                    end_day: s.end_day,
+                })
+                .collect();
+            calendar::draw_calendar(
+                &mut canvas,
+                &cal,
+                month,
+                &spans,
+                stats.today,
+                l.text_px,
+                &theme,
+            );
+        } else {
+            let weeks = STATS_HEATMAP_WEEKS;
+            let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
+            heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
+            self.draw_heatmap_key(&mut canvas, y + grid.height() + l.pad, &palette);
+        }
         y = self.continue_card_top();
 
         // Continue: the chapter a tap resumes. Omitted on a fresh device
         // rather than drawn as an empty card.
         let nav_top = l.height.saturating_sub(l.nav_h);
         if let Some((title, chapter, pct)) = self.continue_card() {
-            if nav_top.saturating_sub(y) >= l.row_h * 2 {
+            if nav_top.saturating_sub(y) >= self.continue_card_height() {
                 let mut gray = GrayPage::new_white(l.width, l.height);
                 draw_text(
                     &mut gray,
@@ -5603,7 +5653,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // a third of the panel blank, which on a screen whose whole job is
         // "what should I read next" was the one question it declined to
         // answer.
-        let waiting = self.waiting_rows();
+        // The calendar fills the space the waiting list would use, and it
+        // already says which series have been in your hands lately.
+        let waiting = if calendar {
+            Vec::new()
+        } else {
+            self.waiting_rows()
+        };
         if !waiting.is_empty() {
             let mut wy = self.waiting_top();
             widgets::draw_section_header(
@@ -5715,6 +5771,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Top of the Continue card on Today, and the bottom of the area it can
     /// use. Shared with `compose_stats` so what is drawn is what is tapped —
     /// the card was drawn for a week before anything would open it.
+    /// How tall the month calendar is drawn: everything between the chart
+    /// heading and the Continue card.
+    ///
+    /// It is taller than the heatmap on purpose — a month of bars carrying
+    /// titles needs the room, and it is why the calendar view drops the
+    /// "waiting for you" list and keeps only the Continue card.
+    fn calendar_height(&self) -> u32 {
+        let l = &self.layout;
+        let head_h = l.row_h * 2 / 3;
+        let top = l.content_top() + l.pad + l.row_h * 2 + l.pad + head_h + l.pad / 2;
+        let bottom = l
+            .nav_top()
+            .saturating_sub(self.continue_card_height() + l.pad * 2);
+        bottom.saturating_sub(top)
+    }
+
+    /// Whether Today is showing the month calendar rather than the heatmap.
+    fn stats_is_calendar(&self) -> bool {
+        self.load_settings().stats_view == "calendar"
+    }
+
     fn continue_card_top(&self) -> u32 {
         let l = &self.layout;
         let grid = heatmap::HeatmapLayout::fit(
@@ -5724,19 +5801,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             l.width.saturating_sub(l.pad * 2),
             6,
         );
-        // tiles, then the activity header, the grid, and its key.
+        // tiles, then the chart heading, the chart, and (for the heatmap)
+        // its key.
         let head_h = l.row_h * 2 / 3;
+        let top = l.content_top() + l.pad + l.row_h * 2 + l.pad + head_h + l.pad / 2;
+        if self.stats_is_calendar() {
+            // The calendar runs right down to the Continue card.
+            return top + self.calendar_height() + l.pad;
+        }
         let key_h = (l.text_px * 0.5) as u32;
-        l.content_top()
-            + l.pad
-            + l.row_h * 2
-            + l.pad
-            + head_h
-            + l.pad / 2
-            + grid.height()
-            + l.pad
-            + key_h
-            + l.pad * 2
+        top + grid.height() + l.pad + key_h + l.pad * 2
     }
 
     /// How tall the Continue card is: eyebrow, title, chapter line, bar.
@@ -5748,7 +5822,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn continue_card_hit(&self, y: u32) -> bool {
         let top = self.continue_card_top();
         let bottom = (top + self.continue_card_height()).min(self.layout.nav_top());
-        self.layout.nav_top().saturating_sub(top) >= self.layout.row_h * 2 && y >= top && y < bottom
+        // Measured against the card's own height, not an unrelated two rows:
+        // the calendar view leaves it exactly the room it needs and no more.
+        self.layout.nav_top().saturating_sub(top) >= self.continue_card_height()
+            && y >= top
+            && y < bottom
     }
 
     /// Top of the "waiting for you" list: below the Continue card when there
@@ -6824,6 +6902,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Run `f` with the (cached) ProgressStore: the disk read + JSON parse
     /// happen at most once between [`Self::invalidate_progress_cache`]
     /// calls, not once per repaint.
+    /// This profile's reading statistics, from its own progress store.
+    #[cfg(test)]
+    fn reading_stats(&self) -> gideon_core::ReadingStats {
+        self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store))
+    }
+
     fn with_progress<R>(&self, f: impl FnOnce(&Self, &ProgressStore) -> R) -> R {
         let store = self.progress_cache.borrow_mut().take().unwrap_or_else(|| {
             ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default()
@@ -8894,6 +8978,12 @@ fn settings_groups(s: &gideon_core::Settings) -> Vec<SettingsGroup> {
                     SettingAction::LibraryView,
                 ),
                 row(
+                    "Today's chart",
+                    s.stats_view.clone(),
+                    "months at a glance, or this month by series",
+                    SettingAction::StatsView,
+                ),
+                row(
                     "Pre-download ahead",
                     s.predownload_unread_chapters.to_string(),
                     "chapters fetched past the one you are on",
@@ -8981,6 +9071,44 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{} KB", (b / KB).round() as u64)
     }
+}
+
+/// The month a local day index falls in, as the calendar widget needs it.
+fn month_of(day: i64) -> calendar::Month {
+    use gideon_core::stats::{civil_from_days, days_from_civil, weekday};
+    let (year, month, _) = civil_from_days(day);
+    let first_day = days_from_civil(year, month, 1);
+    let next = if month == 12 {
+        days_from_civil(year + 1, 1, 1)
+    } else {
+        days_from_civil(year, month + 1, 1)
+    };
+    // Monday-first: `weekday` is Sunday-first, so Monday is 1.
+    let column = (weekday(first_day) + 6) % 7;
+    calendar::Month {
+        first_cell: first_day - i64::from(column),
+        first_day,
+        days: (next - first_day) as u32,
+    }
+}
+
+/// English month name, for the calendar heading.
+fn month_name(month: u32) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    NAMES[(month.clamp(1, 12) - 1) as usize]
 }
 
 /// Next value in a cycle: the entry after `current`, wrapping around; the

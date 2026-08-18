@@ -394,6 +394,24 @@ fn pages_of(p: &ReadingProgress) -> usize {
 }
 
 /// Everything the stats screen needs, computed in one pass over the store.
+/// An unbroken run of days one series was read on: the calendar's bar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadingSpan {
+    pub series: String,
+    /// First local day of the run, inclusive.
+    pub start_day: i64,
+    /// Last local day of the run, inclusive. Equal to `start_day` for a
+    /// single day.
+    pub end_day: i64,
+}
+
+impl ReadingSpan {
+    /// How many days the run covers, at least 1.
+    pub fn days(&self) -> i64 {
+        (self.end_day - self.start_day + 1).max(1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadingStats {
     /// Chapters with a progress row (started or finished).
@@ -423,6 +441,9 @@ pub struct ReadingStats {
     /// Local day index → pages read that day. Sorted, so the first key is
     /// [`Self::first_day`] and iteration draws left-to-right.
     pub by_day: BTreeMap<i64, usize>,
+    /// Series name → the local days it was read on. What the calendar view
+    /// draws: a title, and which squares it belongs in.
+    pub series_days: BTreeMap<String, BTreeSet<i64>>,
     /// The local day the statistics were computed on. Anchors both the current
     /// streak and the right-hand edge of [`Self::heatmap`], and keeps the whole
     /// struct a pure function of its inputs (which is what makes it testable).
@@ -454,6 +475,7 @@ impl ReadingStats {
         let mut pages_read = 0usize;
         let mut series = BTreeSet::new();
         let mut by_day: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut series_days: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
 
         for (key, progress) in entries {
             chapters_tracked += 1;
@@ -465,6 +487,14 @@ impl ReadingStats {
             }
             let day = tz.day_index(progress.last_read_at as i64);
             *by_day.entry(day).or_insert(0) += pages;
+            // Which series was read on which day, for the calendar. A day
+            // with no pages still counts as a day you opened the book: the
+            // calendar is about "did I read this, and for how many days in a
+            // row", not about volume.
+            series_days
+                .entry(series_key_of(key).to_owned())
+                .or_default()
+                .insert(day);
         }
 
         let today = tz.day_index(now_unix);
@@ -481,6 +511,7 @@ impl ReadingStats {
             current_streak,
             longest_streak,
             by_day,
+            series_days,
             today,
         }
     }
@@ -550,6 +581,47 @@ impl ReadingStats {
             col_start += 7;
         }
         grid
+    }
+
+    /// Unbroken runs of days a series was read, clipped to `first_day ..=
+    /// last_day`, ordered by start day and then by title.
+    ///
+    /// This is the calendar's whole point: three evenings in a row with the
+    /// same book is ONE bar three days wide, not three separate marks. A gap
+    /// of even one day ends the run and starts another, because that is what
+    /// the reader did.
+    pub fn spans(&self, first_day: i64, last_day: i64) -> Vec<ReadingSpan> {
+        let mut spans = Vec::new();
+        for (series, days) in &self.series_days {
+            let mut run: Option<(i64, i64)> = None;
+            for &day in days.range(first_day..=last_day) {
+                run = match run {
+                    Some((start, end)) if day == end + 1 => Some((start, day)),
+                    Some((start, end)) => {
+                        spans.push(ReadingSpan {
+                            series: series.clone(),
+                            start_day: start,
+                            end_day: end,
+                        });
+                        Some((day, day))
+                    }
+                    None => Some((day, day)),
+                };
+            }
+            if let Some((start, end)) = run {
+                spans.push(ReadingSpan {
+                    series: series.clone(),
+                    start_day: start,
+                    end_day: end,
+                });
+            }
+        }
+        spans.sort_by(|a, b| {
+            a.start_day
+                .cmp(&b.start_day)
+                .then_with(|| a.series.cmp(&b.series))
+        });
+        spans
     }
 
     /// The local day index of the first cell (a Sunday) of a `weeks`-wide
@@ -930,6 +1002,60 @@ mod tests {
             3,
             "every day the same: one mid tone, not the palest"
         );
+    }
+
+    #[test]
+    fn consecutive_days_of_one_series_are_a_single_span() {
+        // The calendar's whole point: three evenings in a row with the same
+        // book is ONE bar three days wide. A gap of even one day ends the
+        // run, because that is what the reader did.
+        let tz = LocalTimeZone::fixed(0);
+        let today = days_from_civil(2026, 8, 20);
+        let now = (today * SECS_PER_DAY + 12 * 3600) as u64;
+        let at = |back: i64| ((today - back) * SECS_PER_DAY + 10 * 3600) as u64;
+
+        let rows = [
+            // Berserk: 5, 4, 3 days ago (a run), then today (a second run).
+            ("Berserk/v1.cbz".to_string(), progress(9, 10, at(5))),
+            ("Berserk/v2.cbz".to_string(), progress(9, 10, at(4))),
+            ("Berserk/v3.cbz".to_string(), progress(9, 10, at(3))),
+            ("Berserk/v4.cbz".to_string(), progress(9, 10, at(0))),
+            // Pluto: one evening, inside Berserk's first run.
+            ("Pluto/v1.cbz".to_string(), progress(9, 10, at(4))),
+        ];
+        let rows: Vec<(&str, ReadingProgress)> =
+            rows.iter().map(|(k, p)| (k.as_str(), *p)).collect();
+        let s = stats(&rows, &tz, now);
+
+        let spans = s.spans(today - 30, today);
+        assert_eq!(
+            spans,
+            vec![
+                ReadingSpan {
+                    series: "Berserk".into(),
+                    start_day: today - 5,
+                    end_day: today - 3,
+                },
+                ReadingSpan {
+                    series: "Pluto".into(),
+                    start_day: today - 4,
+                    end_day: today - 4,
+                },
+                ReadingSpan {
+                    series: "Berserk".into(),
+                    start_day: today,
+                    end_day: today,
+                },
+            ],
+            "runs merge, gaps split, and the list is ordered by start day"
+        );
+        assert_eq!(spans[0].days(), 3);
+        assert_eq!(spans[1].days(), 1);
+
+        // Clipping to a window keeps only what falls inside it.
+        let clipped = s.spans(today - 4, today - 4);
+        assert_eq!(clipped.len(), 2, "one day of Berserk, one of Pluto");
+        assert!(clipped.iter().all(|sp| sp.days() == 1));
     }
 
     #[test]

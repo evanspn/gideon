@@ -144,6 +144,18 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_library_view")]
     pub library_view: String,
 
+    /// What Today draws above the Continue card: "heatmap" (the activity
+    /// grid, months at a glance) or "calendar" (this month, with a bar per
+    /// series continuing across the days it was read).
+    ///
+    /// Two views of the same reading history, answering different questions
+    /// — "how much, lately" against "what was I on, and for how many days
+    /// running" — so it is a taste, and taste is per profile. Parsed
+    /// leniently: an unknown value means the default.
+    #[serde(default = "default_stats_view")]
+    #[serde(deserialize_with = "lenient_stats_view")]
+    pub stats_view: String,
+
     /// Page turns between full (flashing) e-ink refreshes. Higher flashes
     /// less often (smoother reading) but lets ghosting build up longer.
     /// Parsed leniently — out-of-range or wrong-typed values fall back to the
@@ -210,6 +222,7 @@ impl Default for Settings {
             color_post_process: "vivid".to_string(),
             color_profile: default_color_profile(),
             library_view: default_library_view(),
+            stats_view: default_stats_view(),
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
@@ -369,6 +382,26 @@ fn default_library_view() -> String {
     "list".to_string()
 }
 
+fn default_stats_view() -> String {
+    "heatmap".to_string()
+}
+
+/// Lenient `stats_view` parsing: "heatmap" and "calendar" pass through,
+/// anything else falls back to the default. Both are named explicitly so
+/// neither depends on which one the default happens to be — the bug the
+/// library view shipped with.
+fn lenient_stats_view<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "heatmap" || s == "calendar" => s,
+            _ => default_stats_view(),
+        },
+    )
+}
+
 /// Lenient `library_view` parsing: "list" and "shelf" pass through, anything
 /// else falls back to the default.
 ///
@@ -485,6 +518,9 @@ impl Settings {
         if let Some(v) = p.library_view.clone() {
             self.library_view = v;
         }
+        if let Some(v) = p.stats_view.clone() {
+            self.stats_view = v;
+        }
         if let Some(v) = p.predownload_unread_chapters {
             self.predownload_unread_chapters = v;
         }
@@ -580,6 +616,11 @@ pub struct ProfileSettings {
     #[serde(deserialize_with = "opt_library_view")]
     pub library_view: Option<String>,
 
+    /// See [`Settings::stats_view`]. `None` = use the device value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_stats_view")]
+    pub stats_view: Option<String>,
+
     /// See [`Settings::predownload_unread_chapters`]. `None` = use the device
     /// value.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -645,6 +686,7 @@ impl ProfileSettings {
             reader_full_refresh_interval: Some(s.reader_full_refresh_interval),
             color_profile: Some(s.color_profile.clone()),
             library_view: Some(s.library_view.clone()),
+            stats_view: Some(s.stats_view.clone()),
             predownload_unread_chapters: Some(s.predownload_unread_chapters),
             finished_cleanup_hours: Some(s.finished_cleanup_hours),
         }
@@ -736,6 +778,20 @@ fn opt_library_view<'de, D: serde::Deserializer<'de>>(
     Ok(
         match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
             Some(s) if s == "shelf" || s == "list" => Some(s),
+            _ => None,
+        },
+    )
+}
+
+/// Lenient optional `stats_view`: "heatmap" or "calendar" count as stated,
+/// anything else as "not stated" so the device value shows through.
+fn opt_stats_view<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "heatmap" || s == "calendar" => Some(s),
             _ => None,
         },
     )
@@ -964,6 +1020,7 @@ mod tests {
             reader_fit: "fit-width".into(),
             color_profile: "indigo".into(),
             library_view: "list".into(),
+            stats_view: "calendar".into(),
             reader_rotation: 90,
             reader_rotation_locked: false,
             color_post_process: "standard".into(),
@@ -1130,6 +1187,7 @@ mod tests {
             color_post_process: "standard".into(),
             color_profile: "sumi".into(),
             library_view: "list".into(),
+            stats_view: "calendar".into(),
             reader_full_refresh_interval: 20,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,

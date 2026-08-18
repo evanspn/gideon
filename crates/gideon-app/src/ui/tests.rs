@@ -293,7 +293,7 @@ fn quick_sheet() -> (u32, gideon_render::widgets::GridLayout, u32) {
 
 /// How many value tiles the quick sheet shows, and how many action rows sit
 /// under them ("All settings", "Close").
-const QUICK_TILES: usize = 5;
+const QUICK_TILES: usize = 6;
 const QUICK_ACTIONS: usize = 2;
 
 /// Tap tile `i` of the quick-settings grid.
@@ -7846,6 +7846,24 @@ fn dump_demo() {
             index.record_download(title, &format!("c{i}"), &format!("ch{i}.cbz"));
         }
     }
+    // Consecutive-day runs, which is what the calendar exists to show: four
+    // evenings of one series, three of another overlapping it, and a couple
+    // of single days.
+    for (title, start, run) in [
+        ("Frieren", 2u64, 4u64),
+        ("Chainsaw Man", 4, 3),
+        ("Pluto", 9, 2),
+    ] {
+        for d in 0..run {
+            progress.push((
+                format!("{title}/cal{d}.cbz"),
+                19,
+                20,
+                now - (start + d) * 86_400,
+            ));
+        }
+    }
+
     // A partly-read chapter so Continue has somewhere to point.
     progress.push((
         "Vinland Saga/ch16.cbz".to_string(),
@@ -7914,6 +7932,13 @@ fn dump_demo() {
         // there the way a person does.
         "library" | "shelf" => app.open_library().unwrap(),
         "today" => app.goto_root(Screen::Stats).unwrap(),
+        // Today with the month calendar instead of the heatmap.
+        "calendar" => {
+            let mut settings = app.load_settings();
+            settings.stats_view = "calendar".into();
+            app.save_settings(&settings);
+            app.goto_root(Screen::Stats).unwrap();
+        }
         "discover" => app.goto_root(Screen::Home).unwrap(),
         "settings" => app.goto_root(Screen::Settings).unwrap(),
         "storage" => app.push(Screen::Storage).unwrap(),
@@ -8116,6 +8141,7 @@ fn every_settings_row_changes_the_setting_its_label_names() {
                 }
                 SettingAction::ColorProfile => before.color_profile != after.color_profile,
                 SettingAction::LibraryView => before.library_view != after.library_view,
+                SettingAction::StatsView => before.stats_view != after.stats_view,
                 SettingAction::Predownload => {
                     before.predownload_unread_chapters != after.predownload_unread_chapters
                 }
@@ -8747,4 +8773,106 @@ fn the_title_bar_pages_and_does_not_swallow_the_view_toggle() {
     // The chevrons are finger-sized, not glyph-sized.
     assert!(next.1 - next.0 >= l.title_h.min(88), "next zone too small");
     assert!(prev.1 - prev.0 >= l.title_h.min(88), "prev zone too small");
+}
+
+#[test]
+fn the_calendar_is_a_per_profile_choice_that_replaces_the_heatmap() {
+    // Two views of the same history answering different questions — "how
+    // much, lately" against "what was I on, and for how many days running".
+    // Which one you want is taste, so it lives with the profile.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Manga");
+    let alex = root.join("@alex");
+    make_cbz(&root.join("Berserk/vol1.cbz"), 4);
+    make_cbz(&alex.join("Pluto/vol1.cbz"), 4);
+    let now = now_unix();
+    write_progress(&root, &[("Berserk/vol1.cbz", 1, 4, now - 3600)]);
+    write_progress(&alex, &[("Pluto/vol1.cbz", 1, 4, now - 3600)]);
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+
+    // The default profile takes the calendar; alex is untouched.
+    gideon_core::ProfileSettings {
+        stats_view: Some("calendar".into()),
+        ..Default::default()
+    }
+    .save(&root)
+    .unwrap();
+
+    let mut chosen =
+        app(&root, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    chosen.run().unwrap();
+    assert!(
+        chosen.stats_is_calendar(),
+        "the profile that chose it gets it"
+    );
+    assert_eq!(
+        effective_settings(&settings_dir, &alex).stats_view,
+        "heatmap",
+        "and the other profile keeps the default"
+    );
+
+    // The calendar takes the room the waiting list would use, so Today shows
+    // the chart and the Continue card and nothing else.
+    assert!(
+        chosen.waiting_rows().is_empty() || chosen.stats_is_calendar(),
+        "the calendar view drops the waiting list"
+    );
+
+    // Both views still leave the Continue card somewhere it can be tapped.
+    for view in ["calendar", "heatmap"] {
+        gideon_core::ProfileSettings {
+            stats_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let mut view_app =
+            app(&root, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+        view_app.run().unwrap();
+        let top = view_app.continue_card_top();
+        assert!(
+            view_app.continue_card_hit(top + 1),
+            "{view}: the Continue card must still be reachable"
+        );
+        assert!(
+            top + view_app.continue_card_height() <= layout().nav_top(),
+            "{view}: the Continue card runs under the nav bar"
+        );
+    }
+}
+
+#[test]
+fn the_calendar_draws_a_run_of_days_as_one_bar() {
+    // The point of the view, end to end: four evenings of one series is one
+    // bar four days wide on the screen, not four marks.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
+    gideon_core::ProfileSettings {
+        stats_view: Some("calendar".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
+
+    let now = now_unix();
+    let entries: Vec<(String, usize, usize, u64)> = (0..4)
+        .map(|d| (format!("Berserk/ch{d}.cbz"), 3, 4, now - (d + 1) * 86_400))
+        .collect();
+    let refs: Vec<(&str, usize, usize, u64)> = entries
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let mut app =
+        app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("data"));
+    app.run().unwrap();
+
+    let stats = app.reading_stats();
+    let spans = stats.spans(stats.today - 40, stats.today);
+    let berserk: Vec<&gideon_core::ReadingSpan> =
+        spans.iter().filter(|s| s.series == "Berserk").collect();
+    assert_eq!(berserk.len(), 1, "four consecutive evenings are ONE run");
+    assert_eq!(berserk[0].days(), 4);
 }

@@ -6,6 +6,7 @@
 //! (what most Kobo e-ink panels can actually show) → centered composite
 //! onto a white canvas matching the screen size.
 
+pub mod calendar;
 pub mod heatmap;
 pub mod panels;
 pub mod shelf;
