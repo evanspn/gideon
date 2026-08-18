@@ -63,6 +63,10 @@ const STATS_HEATMAP_WEEKS: u32 = 18;
 /// The settings screen is a grid, not a list: two columns of tiles. Fifteen
 /// settings stacked as rows is two panels of paging; the same fifteen as
 /// tiles is one screen you can take in at a glance.
+/// How many series one background metadata pass looks up. A library of two
+/// hundred sideloads must not become two hundred requests the moment it is
+/// opened; the rest are picked up the next time the library is opened.
+const METADATA_BACKFILL_BATCH: usize = 8;
 const SETTINGS_COLS: u32 = 2;
 /// Gap between settings tiles, and between one group's grid and the next
 /// group's heading.
@@ -1353,6 +1357,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.sheet.is_none() && self.screen_has_nav() && y >= self.layout.nav_top() {
             return self.tap_main_nav(x);
         }
+        // The pager row sits directly on the nav bar, on screens whose paging
+        // buttons cannot live in the strip itself.
+        if self.sheet.is_none() && self.tap_pager_strip(x, y)? {
+            return Ok(Flow::Continue);
+        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -1972,7 +1981,58 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Top edge of the settings pager strip: the last row of content height,
     /// sitting directly on the nav bar.
     fn settings_pager_top(&self) -> u32 {
+        self.pager_strip_top()
+    }
+
+    /// Top edge of the pager strip: the last row of content, sitting on the
+    /// nav bar.
+    ///
+    /// Screens that carry the four-tab nav bar cannot page with the usual
+    /// First/Prev/Next/Last buttons — those live in the same bottom strip,
+    /// and drawing both put the paging labels *underneath* the tabs. On
+    /// hardware that read as "Library First TodayPrev DisCoveNr Sesttings".
+    /// So paging gets its own row above the bar.
+    fn pager_strip_top(&self) -> u32 {
         self.layout.nav_top().saturating_sub(self.layout.row_h)
+    }
+
+    /// Draw the pager strip for a screen that has `pages` pages and is
+    /// showing `page`. No-op for a single page.
+    fn draw_pager_strip(&self, canvas: &mut RgbPage, page: usize, pages: usize) {
+        if pages <= 1 {
+            return;
+        }
+        let l = &self.layout;
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        widgets::draw_setting_row(
+            canvas,
+            l.pad,
+            self.pager_strip_top(),
+            l.width.saturating_sub(l.pad * 2),
+            l.row_h,
+            &widgets::SettingRow {
+                label: "‹  Previous",
+                value: "Next  ›",
+                detail: &format!("page {} of {}", page + 1, pages),
+                selected: false,
+            },
+            l.text_px,
+            &theme,
+        );
+    }
+
+    /// Act on a tap in the pager strip: left half back, right half forward,
+    /// both wrapping. `true` when the tap was the pager's.
+    fn tap_pager_strip(&mut self, x: u32, y: u32) -> Result<bool> {
+        if !self.screen_has_nav() || self.current_page_count() <= 1 {
+            return Ok(false);
+        }
+        if y < self.pager_strip_top() || y >= self.layout.nav_top() {
+            return Ok(false);
+        }
+        let back = x < self.layout.width / 2;
+        self.move_page(PageMove::Delta(if back { -1 } else { 1 }))?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -2280,6 +2340,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.shelf_layout().capacity()
         }
         .max(1)
+    }
+
+    /// Height the library's content may use: the whole content area, less the
+    /// pager row when the library runs to more than one page.
+    ///
+    /// Chicken-and-egg by nature — how many pages there are depends on how
+    /// much room each page has — so it is measured against the full height
+    /// first and re-measured once we know paging is needed.
+    fn library_content_height(&self, items: usize) -> u32 {
+        let l = &self.layout;
+        let full = l.content_height();
+        if !self.screen_has_nav() {
+            return full;
+        }
+        let fits = |h: u32| -> usize {
+            if self.load_settings().library_view == "list" {
+                (h / self.list_row_height()).max(1) as usize
+            } else {
+                ShelfLayout::new(l.width, h, SHELF_COLUMNS)
+                    .capacity()
+                    .max(1)
+            }
+        };
+        if items <= fits(full) {
+            full
+        } else {
+            full.saturating_sub(l.row_h)
+        }
     }
 
     /// Whether the current screen is a top-level destination, and so draws
@@ -2727,7 +2815,43 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Fully background — the shelf renders immediately regardless.
         self.trigger_sync();
         let items = self.scan_library_items()?;
+        self.trigger_metadata_backfill(&items);
         self.push(Screen::Library { items, page: 0 })
+    }
+
+    /// Look up MyAnimeList metadata, in the background, for series in the
+    /// library that have none.
+    ///
+    /// The rows are built around a score, a status and a genre list, and
+    /// until now those only ever arrived on the tail of a download — so a
+    /// library of sideloads, or one downloaded before that code existed,
+    /// showed a title and nothing else no matter how long you owned it.
+    ///
+    /// Fully background and bounded: it never blocks the repaint, never
+    /// fails outward, does nothing at all offline, and takes a handful of
+    /// series per pass so opening a large library is not a burst of
+    /// requests. What it fills in shows up on the next repaint of the
+    /// screen.
+    fn trigger_metadata_backfill(&self, items: &[SeriesCard]) {
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let missing: Vec<(String, String)> = items
+            .iter()
+            .filter_map(|card| {
+                let dir = card.series.clone()?;
+                let has_meta = index
+                    .get(&dir)
+                    .is_some_and(|s| s.meta.as_ref().is_some_and(|m| !m.is_empty()));
+                (!has_meta).then(|| (dir, card.title()))
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let library_dir = self.library_dir.clone();
+        std::thread::spawn(move || {
+            gideon_device::power::lower_current_thread_to_idle();
+            crate::manga::backfill_series_metadata(&library_dir, &missing, METADATA_BACKFILL_BATCH);
+        });
     }
 
     fn build_source_rows(&self) -> Result<Vec<SourceRow>> {
@@ -4154,9 +4278,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn shelf_layout(&self) -> ShelfLayout {
         ShelfLayout::new(
             self.layout.width,
-            self.layout.content_height(),
+            self.library_content_height(self.library_item_count()),
             SHELF_COLUMNS,
         )
+    }
+
+    /// How many series the library screen is currently showing.
+    fn library_item_count(&self) -> usize {
+        match self.stack.last() {
+            Some(Screen::Library { items, .. }) => items.len(),
+            _ => 0,
+        }
     }
 
     /// The series card whose shelf cell contains the tap, if any.
@@ -5201,11 +5333,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(None);
         }
         let page_count = items.len().div_ceil(capacity).max(1);
-        let chrome = compose_chrome_opts(l, "Library", *page, page_count, !nav);
+        // A screen with the nav bar must not also put paging buttons in the
+        // bottom strip — they land underneath the tabs. It gets a pager row
+        // above the bar instead (see `pager_strip_top`).
+        let chrome = compose_chrome_paged(l, "Library", *page, page_count, !nav, 0, !nav);
         let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, &shelf), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
         if nav {
+            self.draw_pager_strip(&mut canvas, *page, page_count);
             let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
             widgets::draw_nav_bar(
                 &mut canvas,
@@ -5626,7 +5762,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn list_rows_per_page(&self) -> usize {
-        ((self.layout.content_height() / self.list_row_height()).max(1)) as usize
+        ((self.library_content_height(self.library_item_count()) / self.list_row_height()).max(1))
+            as usize
     }
 
     /// The Library as a dense list: one row per series carrying everything
@@ -5645,12 +5782,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
         // A top-level destination draws the nav bar in that strip, so the
         // chrome must not also put a Back button there.
-        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(
-            l,
-            "Library",
-            page,
-            page_count,
-            !self.screen_has_nav(),
+        let nav = self.screen_has_nav();
+        let mut canvas = RgbPage::from_gray(&compose_chrome_paged(
+            l, "Library", page, page_count, !nav, 0, !nav,
         ));
         let row_h = self.list_row_height();
 
@@ -5764,7 +5898,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
             }
         });
-        if self.screen_has_nav() {
+        if nav {
+            self.draw_pager_strip(&mut canvas, page, page_count);
             let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
             widgets::draw_nav_bar(
                 &mut canvas,
@@ -6558,8 +6693,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let capacity = shelf.capacity().max(1);
         let page_count = items.len().div_ceil(capacity).max(1);
 
-        let mut canvas =
-            compose_chrome_opts(l, "Library", page, page_count, !self.screen_has_nav());
+        let nav = self.screen_has_nav();
+        let mut canvas = compose_chrome_paged(l, "Library", page, page_count, !nav, 0, !nav);
         if items.is_empty() {
             draw_text(
                 &mut canvas,

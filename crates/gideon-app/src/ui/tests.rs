@@ -7802,6 +7802,11 @@ fn dump_demo() {
         .collect();
     write_progress(&lib, &refs);
 
+    // Extra series so a dump of the library shows what a real one does:
+    // more than one page, and therefore the pager strip.
+    for i in 0..6 {
+        make_cbz(&lib.join(format!("Filler {i:02}/ch0.cbz")), 8);
+    }
     let screen = std::env::var("GIDEON_SCREEN").unwrap_or_else(|_| "today".into());
     let settings_dir = dir.path().join("data");
     gideon_core::Settings {
@@ -8462,4 +8467,60 @@ fn discovers_installed_sources_open_their_listings() {
         matches!(app.screen(), Screen::Listings { source } if source.id == sources[0].id),
         "the tap opened the source's listings"
     );
+}
+
+#[test]
+fn a_paginated_library_does_not_draw_paging_buttons_under_the_nav_bar() {
+    // Shipped in 1.0 and caught on hardware: with more than one page of
+    // series, the Library drew First/Prev/Next/Last into the bottom strip
+    // AND the four nav tabs on top of them, so the bar read
+    // "Library First TodayPrev DisCoveNr Sesttings".
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for view in ["list", "shelf"] {
+        let profile_lib = lib.join(view);
+        for i in 0..12 {
+            make_cbz(&profile_lib.join(format!("Series {i:02}/vol1.cbz")), 1);
+        }
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&profile_lib)
+        .unwrap();
+
+        let mut paged = app(&profile_lib, FakeGateway::default(), vec![]);
+        paged.run().unwrap();
+        assert!(paged.current_page_count() > 1, "{view}: needs to paginate");
+
+        let page = paged.compose_final().unwrap();
+        let l = layout();
+        let strip = l.nav_top() + l.nav_h / 2;
+        // The nav bar draws four labels; the paging buttons would add ink in
+        // the gaps between them. Compare against the same screen on a
+        // single page, where only the tabs are drawn.
+        let one = dir.path().join(format!("{view}-one"));
+        make_cbz(&one.join("Only/vol1.cbz"), 1);
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&one)
+        .unwrap();
+        let mut single = app(&one, FakeGateway::default(), vec![]);
+        single.run().unwrap();
+        assert_eq!(single.current_page_count(), 1);
+        let plain = single.compose_final().unwrap();
+
+        let ink = |p: &gideon_render::RgbPage| -> usize {
+            (0..l.width)
+                .filter(|&x| p.pixel(x, strip) != [0xFF; 3])
+                .count()
+        };
+        assert_eq!(
+            ink(&page),
+            ink(&plain),
+            "{view}: the paged nav strip must hold the tabs and nothing else"
+        );
+    }
 }
