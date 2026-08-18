@@ -3486,6 +3486,90 @@ fn new_profile_keyboard_creates_and_switches() {
 }
 
 #[test]
+fn a_profile_with_a_library_is_listed_even_when_settings_forgot_it() {
+    // settings.json can go missing or come back unparseable (a yanked cable
+    // mid-write, a hand-edit) — and then it parses as the bare default. A
+    // profile must not disappear from the picker just because of that: its
+    // library directory on disk is enough to keep it listed.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("@bo/Bos Series/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
+
+    let events = vec![tap_title_left()];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir);
+    app.run().unwrap();
+
+    let Screen::ProfileMenu { profiles } = app.screen() else {
+        panic!("expected the profile menu");
+    };
+    assert!(
+        profiles.contains(&"alex".to_string()) && profiles.contains(&"bo".to_string()),
+        "both on-disk profiles must be listed, got {profiles:?}"
+    );
+}
+
+#[test]
+fn switching_profiles_cannot_persist_a_list_that_read_back_short() {
+    // The rescued profiles must survive the next settings write too, otherwise
+    // the omission becomes permanent the moment the user switches.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    make_cbz(&lib.join("@bo/Bos Series/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
+
+    let events = vec![
+        tap_title_left(),
+        tap_row(1), // switch to the first rescued profile
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert!(
+        settings.profiles.contains(&"alex".to_string())
+            && settings.profiles.contains(&"bo".to_string()),
+        "the rewritten list must keep both on-disk profiles, got {:?}",
+        settings.profiles
+    );
+}
+
+#[test]
+fn converting_the_default_profile_keeps_profiles_settings_forgot() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Shared/vol1.cbz"), 2);
+    make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
+
+    let events = vec![
+        tap_title_left(),
+        tap_row(3), // [default, alex, New profile…, Name the default…]
+        tap_key(Key::Char('m')),
+        tap_key(Key::Char('e')),
+        tap_key(Key::Search),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    assert!(
+        settings.profiles.contains(&"alex".to_string()),
+        "alex has a library on disk and must stay listed, got {:?}",
+        settings.profiles
+    );
+    assert!(lib.join("@alex/Alexs Series/vol1.cbz").is_file());
+}
+
+#[test]
 fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
     // The default profile's library used to BE the library root — a shape no
     // other profile has. Naming it moves the root's contents (books and the

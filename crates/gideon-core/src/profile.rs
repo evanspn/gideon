@@ -45,6 +45,36 @@ pub fn is_valid_name(name: &str) -> bool {
         && !name.contains(['/', '\\'])
 }
 
+/// Every profile that actually has a library under `root`, by name: one per
+/// `@<name>` directory, sorted.
+///
+/// The library on disk — not `settings.json` — is the truth about which
+/// profiles exist. A settings file that goes missing, gets truncated by a yanked
+/// USB cable, or parses leniently into nothing would otherwise take a profile
+/// out of the picker even though every one of its books is still sitting right
+/// there. Union this into the listed profiles and such a profile comes back by
+/// itself.
+///
+/// An unreadable root yields nothing: this only ever *adds* profiles to a list,
+/// so failing to read it can't take one away.
+pub fn discover(root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_prefix('@')
+                .filter(|rest| !rest.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Convert the default profile — the library root — into an ordinary profile
 /// named `name`, by moving everything the root holds into `<root>/@<name>`.
 ///
@@ -162,6 +192,27 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec!["@alex".to_string(), "@me".to_string()]);
+    }
+
+    #[test]
+    fn discovery_finds_every_profile_that_has_a_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("@alex/Series/ch1.cbz"), "book");
+        fs::create_dir_all(root.join("@bo")).unwrap();
+        // Not profiles: a series directory, a loose book, the bookkeeping
+        // directory, and a stray file that merely starts with @.
+        write(&root.join("Series/ch1.cbz"), "book");
+        write(&root.join("loose.cbz"), "book");
+        write(&root.join(".gideon/progress.json"), "{}");
+        write(&root.join("@notadir"), "file");
+
+        assert_eq!(discover(root), vec!["alex".to_string(), "bo".to_string()]);
+    }
+
+    #[test]
+    fn discovery_of_an_unreadable_root_takes_nothing_away() {
+        assert!(discover(Path::new("/definitely/not/a/library")).is_empty());
     }
 
     #[test]
