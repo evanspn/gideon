@@ -605,19 +605,25 @@ pub fn draw_library_row(
             cx += used + gap / 2;
         }
     }
+    // Genres are plain text, not a second chip. Two tinted pills a single
+    // luma level apart read as one smear at 150ppi, and on a panel without a
+    // colour filter they were literally the same grey — so the two roles
+    // separate by FORM: the status is a filled chip because it is one of a
+    // few fixed states, the genres are a line of words because they are a
+    // list.
     if !row.genres.is_empty() {
-        draw_chip(
-            canvas,
-            &mut layer,
-            &clip,
-            cx,
-            chip_y,
-            chips_right.saturating_sub(cx),
-            chip_h,
-            row.genres,
-            small,
-            t.genre_tint,
-        );
+        let room = chips_right.saturating_sub(cx);
+        if room > 0 {
+            draw_text(
+                &mut layer,
+                cx.saturating_sub(clip.x0),
+                center_y(b1, band, small).saturating_sub(clip.y0),
+                small,
+                row.genres,
+                room,
+                false,
+            );
+        }
     }
 
     // --- band 2: progress bar, then how much is read and what is next.
