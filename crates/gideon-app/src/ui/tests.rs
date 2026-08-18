@@ -184,6 +184,16 @@ impl SourceGateway for FakeGateway {
 const W: u32 = 600;
 const H: u32 = 800;
 
+/// The settings a profile actually sees: the device-global file overlaid with
+/// that profile's own. Personal fields (reader fit, colour profile, library
+/// view, cleanup delay…) live beside the profile's library, not in the device
+/// file, so a test asserting on one has to read the merge — same as the app.
+fn effective_settings(settings_dir: &Path, library_dir: &Path) -> gideon_core::Settings {
+    gideon_core::Settings::load(settings_dir)
+        .unwrap_or_default()
+        .with_profile(&gideon_core::ProfileSettings::load(library_dir))
+}
+
 fn app(
     library: &Path,
     gateway: FakeGateway,
@@ -3804,7 +3814,7 @@ fn settings_rows_cycle_and_persist_to_disk() {
     app.run().unwrap();
 
     assert!(matches!(app.screen(), Screen::Home));
-    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    let settings = effective_settings(&settings_dir, dir.path());
     assert_eq!(settings.predownload_unread_chapters, 5);
     assert_eq!(
         settings.storage_size_limit.bytes(),
@@ -3921,7 +3931,7 @@ fn reader_fit_toggle_applies_to_the_next_book_immediately() {
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
-    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    let settings = effective_settings(&settings_dir, &lib);
     assert_eq!(settings.reader_fit, "fit-width");
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
     assert_eq!(
@@ -6858,9 +6868,7 @@ fn the_library_title_bar_toggles_between_shelf_and_list() {
     app.run().unwrap();
 
     assert_eq!(
-        gideon_core::Settings::load(&settings_dir)
-            .unwrap()
-            .library_view,
+        effective_settings(&settings_dir, &lib).library_view,
         "list",
         "tapping the Library title bar should switch to the dense list"
     );
@@ -7080,4 +7088,51 @@ fn dump_library_list_png() {
     let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| "library.png".into());
     img.save(&out).unwrap();
     eprintln!("wrote {out}");
+}
+
+#[test]
+fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
+    // The point of the split: personal taste follows the reader, hardware
+    // follows the device. One Kobo, two people, one frontlight.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Manga");
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+    make_cbz(&root.join("Shared/vol1.cbz"), 2);
+    make_cbz(&root.join("@alex/Alexs/vol1.cbz"), 2);
+
+    // Default flips to the dense list; alex is untouched.
+    let l = layout();
+    let title_tap = UiEvent::Tap {
+        x: l.width / 2,
+        y: l.title_h / 2,
+    };
+    let mut a = app(&root, FakeGateway::default(), vec![tap_row(0), title_tap])
+        .with_settings_dir(settings_dir.clone());
+    a.run().unwrap();
+
+    let alex_lib = root.join("@alex");
+    assert_eq!(
+        effective_settings(&settings_dir, &root).library_view,
+        "list",
+        "the profile that toggled should be on the list"
+    );
+    assert_eq!(
+        effective_settings(&settings_dir, &alex_lib).library_view,
+        "shelf",
+        "the other profile must not inherit it"
+    );
+
+    // Device-global settings stay shared: a storage-limit change made by one
+    // profile is the same limit the other sees, because there is one disk.
+    let before = effective_settings(&settings_dir, &alex_lib).storage_size_limit;
+    let mut b = app(&root, FakeGateway::default(), vec![tap_row(3), tap_row(1)])
+        .with_settings_dir(settings_dir.clone());
+    b.run().unwrap();
+    let after_self = effective_settings(&settings_dir, &root).storage_size_limit;
+    let after_other = effective_settings(&settings_dir, &alex_lib).storage_size_limit;
+    assert_ne!(before, after_self, "the storage limit should have cycled");
+    assert_eq!(
+        after_self, after_other,
+        "one disk, one limit: both profiles must see the same value"
+    );
 }

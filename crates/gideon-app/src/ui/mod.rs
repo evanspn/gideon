@@ -74,10 +74,10 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
 /// Index of the trailing "Storage" row on the Settings screen — appended after
 /// the ten cycling rows ([`settings_rows`]), it opens the storage detail
 /// screen instead of cycling a value.
-const SETTINGS_STORAGE_ROW: usize = 10;
+const SETTINGS_STORAGE_ROW: usize = 12;
 /// Index of the trailing "Account" row on the Settings screen — appended after
 /// the storage row, it opens the sync account menu (sign in / sync / sign out).
-const SETTINGS_ACCOUNT_ROW: usize = 11;
+const SETTINGS_ACCOUNT_ROW: usize = 13;
 /// Row of the "Free up space now" action on the Storage screen (after three
 /// read-only info rows). Shared by the renderer and the tap handler.
 const STORAGE_FREE_ROW: usize = 3;
@@ -2406,6 +2406,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         let mut settings = self.load_settings();
         match row {
+            10 => {
+                let current = settings.color_profile.as_str();
+                let next = COLOR_PROFILE_STEPS
+                    .iter()
+                    .position(|p| *p == current)
+                    .map_or(0, |i| (i + 1) % COLOR_PROFILE_STEPS.len());
+                settings.color_profile = COLOR_PROFILE_STEPS[next].to_string();
+            }
+            11 => {
+                settings.finished_cleanup_hours = cycle(
+                    &gideon_core::FINISHED_CLEANUP_STEPS,
+                    settings.finished_cleanup_hours,
+                );
+            }
             0 => {
                 settings.predownload_unread_chapters =
                     cycle(&PREDOWNLOAD_STEPS, settings.predownload_unread_chapters);
@@ -2482,18 +2496,51 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Current settings; defaults when no settings dir is configured
     /// (tests, headless) or the file is unreadable.
+    /// The settings in force for the active profile: the device-global file,
+    /// overlaid with whatever this profile has stated for itself.
+    ///
+    /// Two readers sharing a Kobo share the frontlight, the radio and the
+    /// disk, but not a reading fit or a colour theme. A profile that has
+    /// stated nothing inherits the device value, so an upgrading device
+    /// behaves exactly as it did before any per-profile file existed.
     fn load_settings(&self) -> gideon_core::Settings {
-        self.settings_dir
+        let device = self
+            .settings_dir
             .as_deref()
             .map(|dir| gideon_core::Settings::load(dir).unwrap_or_default())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        device.with_profile(&gideon_core::ProfileSettings::load(&self.library_dir))
     }
 
     /// Persist settings (no-op without a settings dir); a failed save is
     /// logged, never fatal.
+    /// Persist a settings change to whichever file owns each field.
+    ///
+    /// The personal fields go to this profile's own file. The device-global
+    /// ones are written back onto the device file as it is on disk, rather
+    /// than saving the merged struct wholesale — saving the merge would bake
+    /// this profile's taste into the device defaults, which is precisely what
+    /// every other profile falls back to.
     fn save_settings(&self, settings: &gideon_core::Settings) {
+        if let Err(e) =
+            gideon_core::ProfileSettings::from_settings(settings).save(&self.library_dir)
+        {
+            eprintln!("gideon: couldn't save profile settings: {e}");
+        }
         if let Some(dir) = &self.settings_dir {
-            if let Err(e) = settings.save(dir) {
+            let mut device = gideon_core::Settings::load(dir).unwrap_or_default();
+            device.profiles = settings.profiles.clone();
+            device.active_profile = settings.active_profile.clone();
+            device.source_lists = settings.source_lists.clone();
+            device.languages = settings.languages.clone();
+            device.storage_size_limit = settings.storage_size_limit;
+            device.auto_check_updates = settings.auto_check_updates;
+            device.color_post_process = settings.color_post_process.clone();
+            device.wifi_auto_connect = settings.wifi_auto_connect;
+            device.idle_suspend_minutes = settings.idle_suspend_minutes;
+            device.frontlight_brightness = settings.frontlight_brightness;
+            device.frontlight_warmth = settings.frontlight_warmth;
+            if let Err(e) = device.save(dir) {
                 eprintln!("gideon: couldn't save settings: {e}");
             }
         }
@@ -3375,8 +3422,53 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// unused) size-budget engine — wired into the download paths so the
     /// "Storage limit" setting actually takes effect.
     fn enforce_storage_limit(&self) -> u64 {
-        let limit = self.load_settings().storage_size_limit.bytes();
-        evict_to_storage_limit(&self.library_dir, &self.index_guard, limit)
+        let settings = self.load_settings();
+        // Finished-and-stale chapters go first. This is not the same thing as
+        // the size budget below: eviction runs because the disk is full and
+        // takes the least-recently-read chapter whether or not you finished
+        // it, while this takes only chapters you are done with. Running it
+        // first means a full disk reclaims what you no longer want before it
+        // starts taking what you might.
+        let reclaimed = self.reclaim_finished(settings.finished_cleanup_hours);
+        reclaimed
+            + evict_to_storage_limit(
+                &self.library_dir,
+                &self.index_guard,
+                settings.storage_size_limit.bytes(),
+            )
+    }
+
+    /// Delete chapters finished longer ago than `hours`, returning the bytes
+    /// freed. `0` disables it.
+    ///
+    /// Best-effort by design: this is housekeeping, and a failure here must
+    /// never surface as an error in front of someone who was reading. The
+    /// engine's own refusals (never an unfinished chapter, never the one you
+    /// have open, never a series' last chapter) are what make that safe.
+    fn reclaim_finished(&self, hours: u32) -> u64 {
+        if hours == 0 {
+            return 0;
+        }
+        let _g = self.index_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let store =
+            gideon_core::ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
+        match gideon_sources::run_finished_cleanup(&self.library_dir, &store, &mut index, hours) {
+            Ok(summary) => {
+                if !summary.is_empty() {
+                    eprintln!(
+                        "gideon: cleaned up {} finished chapter(s), {} bytes",
+                        summary.files(),
+                        summary.bytes()
+                    );
+                }
+                summary.bytes()
+            }
+            Err(e) => {
+                eprintln!("gideon: finished-chapter cleanup failed: {e}");
+                0
+            }
+        }
     }
 
     /// Open the storage-usage screen from Settings.
@@ -7179,8 +7271,32 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
             ),
             true,
         ),
+        (format!("Colour profile: {}", s.color_profile), true),
+        (
+            format!(
+                "Delete finished chapters: {}",
+                cleanup_label(s.finished_cleanup_hours)
+            ),
+            true,
+        ),
     ]
 }
+
+/// How the finished-chapter cleanup delay reads on the settings row.
+/// "never" rather than "0 hours", because zero is a decision, not a duration.
+fn cleanup_label(hours: u32) -> String {
+    match hours {
+        0 => "never".to_string(),
+        24 => "after 1 day".to_string(),
+        168 => "after 1 week".to_string(),
+        h if h % 24 == 0 => format!("after {} days", h / 24),
+        h => format!("after {h} hours"),
+    }
+}
+
+/// The colour profiles the settings row cycles through, in the order the
+/// palette reference presents them.
+const COLOR_PROFILE_STEPS: [&str; 5] = ["ink-rust", "indigo", "sumi", "botanical", "mono"];
 
 /// Next value in a cycle: the entry after `current`, wrapping around; the
 /// first entry when `current` isn't in the list (hand-edited settings).

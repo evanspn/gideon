@@ -4,6 +4,16 @@
 //! languages, storage size limit) and follows the lessons learned there:
 //! parsing is lenient — unknown fields are ignored, missing fields get
 //! defaults, and a malformed file produces a clear error instead of a crash.
+//!
+//! # Two scopes
+//!
+//! [`Settings`] is the *device* file (`$HOME/.config/gideon/settings.json`).
+//! [`ProfileSettings`] is the *reader* file, one per profile, living in that
+//! profile's own library directory. A Kobo shared by two people has one
+//! frontlight, one radio and one disk, but two sets of eyes: the split follows
+//! that line exactly, and [`Settings::with_profile`] merges them back into the
+//! single `Settings` value the rest of gideon already consumes, so no call site
+//! has to know the difference.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +37,32 @@ pub const DEFAULT_FINISHED_CLEANUP_HOURS: u32 = 48;
 /// "3 hours" invites a mis-set that eats a chapter someone was still using.
 pub const FINISHED_CLEANUP_STEPS: [u32; 5] = [0, 24, 48, 72, 168];
 
+/// The whole settings surface, as every existing call site sees it.
+///
+/// Physically this struct is the union of two files. The fields listed below
+/// are the *device-global* half — they stay in `settings.json` under
+/// `$HOME/.config/gideon` and are shared by everyone using the Kobo, because
+/// each one describes a piece of hardware or of the install rather than a
+/// person's taste:
+///
+/// - `profiles`, `active_profile` — the roster itself, and which reader is at
+///   the device right now. It cannot live inside a profile: it is what picks
+///   the profile.
+/// - `source_lists` — sources are *installed software*, fetched and stored
+///   once for the device; two readers browsing the same catalogue is not a
+///   conflict.
+/// - `languages` — a filter over that same shared catalogue, kept with it.
+/// - `storage_size_limit` — one disk, one budget. Per-profile budgets over a
+///   single filesystem would let one reader's quota evict another's chapters.
+/// - `auto_check_updates` — updates replace the binary for everyone.
+/// - `color_post_process` — a panel-calibration knob for the Kaleido filter
+///   (unlike `color_profile`, which is a palette *preference*).
+/// - `wifi_auto_connect` — one radio, and a policy about touching it.
+/// - `idle_suspend_minutes` — one power manager for the whole device.
+/// - `frontlight_brightness`, `frontlight_warmth` — one lamp, and it is
+///   whatever the last hand to touch the slider left it at.
+///
+/// The other nine fields are per-reader; see [`ProfileSettings`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -405,6 +441,290 @@ impl Settings {
     pub fn path(dir: &Path) -> PathBuf {
         dir.join("settings.json")
     }
+
+    /// Overlay a profile's personal settings onto the device-global ones.
+    ///
+    /// Only the fields the profile actually states are replaced; everything
+    /// else — the radio, the lamp, the disk, the profile roster — passes
+    /// through untouched. This is the single point where the two files become
+    /// the one `Settings` value the rest of gideon consumes.
+    #[must_use]
+    pub fn with_profile(mut self, p: &ProfileSettings) -> Settings {
+        if let Some(v) = p.reader_fit.clone() {
+            self.reader_fit = v;
+        }
+        if let Some(v) = p.reader_rotation {
+            self.reader_rotation = v;
+        }
+        if let Some(v) = p.reader_rotation_locked {
+            self.reader_rotation_locked = v;
+        }
+        if let Some(v) = p.auto_rotate_spreads {
+            self.auto_rotate_spreads = v;
+        }
+        if let Some(v) = p.reader_full_refresh_interval {
+            self.reader_full_refresh_interval = v;
+        }
+        if let Some(v) = p.color_profile.clone() {
+            self.color_profile = v;
+        }
+        if let Some(v) = p.library_view.clone() {
+            self.library_view = v;
+        }
+        if let Some(v) = p.predownload_unread_chapters {
+            self.predownload_unread_chapters = v;
+        }
+        if let Some(v) = p.finished_cleanup_hours {
+            self.finished_cleanup_hours = v;
+        }
+        self
+    }
+}
+
+/// The per-profile subset of [`Settings`], stored in the profile's own library
+/// directory at `<profile_library_dir>/.gideon/settings.json` — the same
+/// hidden directory that already holds `progress.json` and `series.json`, so a
+/// reader's preferences travel with their books (including through
+/// [`crate::profile::convert_default`], which moves that whole directory).
+///
+/// Every field here is personal taste or a reading habit, not a property of
+/// the device:
+///
+/// - `reader_fit` — whether a page is shown whole or filled to the width. A
+///   matter of eyesight and of how close you hold the thing.
+/// - `reader_rotation`, `reader_rotation_locked` — one reader reads in
+///   landscape on the sofa, the other portrait in bed; neither wants the
+///   other's orientation restored under them.
+/// - `auto_rotate_spreads` — the same argument for double-page spreads.
+/// - `reader_full_refresh_interval` — a personal trade between ghosting and
+///   flashing; some readers are far more bothered by one than the other.
+/// - `color_profile` — a palette preference, purely aesthetic. (Contrast
+///   `color_post_process`, which calibrates the panel and stays global.)
+/// - `library_view` — shelf or list is a browsing habit, and it is *your*
+///   library being drawn.
+/// - `predownload_unread_chapters` — how far ahead to fetch follows how you
+///   read (binge vs. a chapter a night), and the pre-fetch is done against
+///   your own series.
+/// - `finished_cleanup_hours` — how long *your* finished chapters are kept
+///   before deletion. Letting one reader's tidiness delete another's
+///   just-finished chapter would be the worst kind of shared-device surprise.
+///
+/// # Every field is optional, and that is the migration
+///
+/// Each field is an `Option`: `None` means "this profile has said nothing,
+/// use the device value". That choice is what makes the upgrade path safe.
+/// Every device already in the field has all nine values in the device-global
+/// file and no per-profile file at all; [`ProfileSettings::load`] on such a
+/// device yields `ProfileSettings::default()` — all `None` — and
+/// [`Settings::with_profile`] then changes nothing whatsoever, so the merged
+/// result is byte-identical to what the user had before the upgrade. Their
+/// reader fit and rotation cannot be lost, because nothing ever overwrites
+/// them until the profile explicitly saves a value.
+///
+/// The alternative — seeding the per-profile file from the device file on
+/// first save — was rejected: it needs a write to happen at exactly the right
+/// moment, it makes "not set" and "set to the default" indistinguishable, and
+/// any device that failed or skipped that one write would silently fall back
+/// to defaults instead of the user's real values. A `None` overlay has no such
+/// moment to get wrong: it degrades to today's behaviour by construction.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileSettings {
+    /// See [`Settings::reader_fit`]. `None` = use the device value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_reader_fit")]
+    pub reader_fit: Option<String>,
+
+    /// See [`Settings::reader_rotation`]. `None` = use the device value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_reader_rotation")]
+    pub reader_rotation: Option<u32>,
+
+    /// See [`Settings::reader_rotation_locked`]. `None` = use the device value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_bool")]
+    pub reader_rotation_locked: Option<bool>,
+
+    /// See [`Settings::auto_rotate_spreads`]. `None` = use the device value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_bool")]
+    pub auto_rotate_spreads: Option<bool>,
+
+    /// See [`Settings::reader_full_refresh_interval`]. `None` = use the device
+    /// value; out-of-range (not 4–24) also means `None` rather than a clamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_full_refresh_interval")]
+    pub reader_full_refresh_interval: Option<u32>,
+
+    /// See [`Settings::color_profile`]. `None` = use the device value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_color_profile")]
+    pub color_profile: Option<String>,
+
+    /// See [`Settings::library_view`]. `None` = use the device value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_library_view")]
+    pub library_view: Option<String>,
+
+    /// See [`Settings::predownload_unread_chapters`]. `None` = use the device
+    /// value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_u32")]
+    pub predownload_unread_chapters: Option<u32>,
+
+    /// See [`Settings::finished_cleanup_hours`]. `None` = use the device
+    /// value.
+    ///
+    /// Parsed as defensively here as it is there: this is the one setting that
+    /// deletes user files, so a mangled value falls back to "say nothing" —
+    /// which means the device value, which means the delay the user chose —
+    /// and never to something shorter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "opt_u32")]
+    pub finished_cleanup_hours: Option<u32>,
+}
+
+impl ProfileSettings {
+    /// Load a profile's settings from
+    /// `<profile_library_dir>/.gideon/settings.json`.
+    ///
+    /// Never an error. A missing file — the case on every device upgrading
+    /// into this layout — gives all-`None` defaults, and so does an
+    /// unparseable one; a file that parses but holds junk in some fields gives
+    /// `None` for exactly those fields. In all three cases the affected
+    /// settings fall back to the device-global value, which is the behaviour
+    /// gideon had before profiles were split out at all.
+    pub fn load(profile_library_dir: &Path) -> Self {
+        match fs::read_to_string(Self::path(profile_library_dir)) {
+            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Persist atomically (temp file + rename), creating the `.gideon`
+    /// directory if the profile doesn't have one yet.
+    pub fn save(&self, profile_library_dir: &Path) -> Result<()> {
+        let path = Self::path(profile_library_dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Extract the per-profile half of a merged [`Settings`], stating every
+    /// field explicitly.
+    ///
+    /// This is what the UI calls when a reader changes one of their own
+    /// settings: the merged value it was editing becomes a fully-populated
+    /// `ProfileSettings` to save. Note that it deliberately produces all
+    /// `Some` — once a profile has saved, it owns these nine values outright
+    /// and no longer drifts with the device file.
+    pub fn from_settings(s: &Settings) -> Self {
+        Self {
+            reader_fit: Some(s.reader_fit.clone()),
+            reader_rotation: Some(s.reader_rotation),
+            reader_rotation_locked: Some(s.reader_rotation_locked),
+            auto_rotate_spreads: Some(s.auto_rotate_spreads),
+            reader_full_refresh_interval: Some(s.reader_full_refresh_interval),
+            color_profile: Some(s.color_profile.clone()),
+            library_view: Some(s.library_view.clone()),
+            predownload_unread_chapters: Some(s.predownload_unread_chapters),
+            finished_cleanup_hours: Some(s.finished_cleanup_hours),
+        }
+    }
+
+    pub fn path(profile_library_dir: &Path) -> PathBuf {
+        profile_library_dir.join(".gideon").join("settings.json")
+    }
+}
+
+/// Lenient optional `reader_fit`: a string passes through normalized (unknown
+/// values included — the reader treats them as "contain", exactly as with the
+/// device field), anything else means "unset".
+fn opt_reader_fit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(|s| s.trim().to_ascii_lowercase()))
+}
+
+/// Lenient optional `reader_rotation`: only 0/90/180/270 count as stated.
+fn opt_reader_rotation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_u64() {
+        Some(degrees @ (0 | 90 | 180 | 270)) => Some(degrees as u32),
+        _ => None,
+    })
+}
+
+/// Lenient optional bool: only a JSON bool counts as stated.
+fn opt_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool())
+}
+
+/// Lenient optional non-negative integer: only a whole number that fits in
+/// `u32` counts as stated. Never clamps — a hostile value means "unset", so
+/// the device value stands.
+fn opt_u32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_u64().and_then(|v| u32::try_from(v).ok()))
+}
+
+/// Lenient optional `reader_full_refresh_interval`: 4–24 counts as stated,
+/// anything else means "unset".
+fn opt_full_refresh_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_u64() {
+        Some(n) if (4..=24).contains(&n) => Some(n as u32),
+        _ => None,
+    })
+}
+
+/// Lenient optional `color_profile`: a known palette counts as stated;
+/// anything else (including a palette from a newer build) means "unset".
+fn opt_color_profile<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s)
+                if s == "ink-rust"
+                    || s == "indigo"
+                    || s == "sumi"
+                    || s == "botanical"
+                    || s == "mono" =>
+            {
+                Some(s)
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Lenient optional `library_view`: "shelf" or "list" count as stated.
+fn opt_library_view<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "shelf" || s == "list" => Some(s),
+            _ => None,
+        },
+    )
 }
 
 /// A storage size that round-trips through human-friendly strings
@@ -777,6 +1097,259 @@ mod tests {
                 "{displayed}"
             );
         }
+    }
+
+    /// A `Settings` with every field moved off its default, standing in for
+    /// "what a real device has in settings.json before the upgrade".
+    fn populated_settings() -> Settings {
+        Settings {
+            source_lists: vec!["https://example.com/index.json".into()],
+            languages: vec!["en".into()],
+            profiles: vec!["default".into(), "alex".into()],
+            active_profile: "alex".into(),
+            storage_size_limit: StorageSize(500 * 1024 * 1024),
+            predownload_unread_chapters: 5,
+            auto_check_updates: false,
+            reader_fit: "fit-width".into(),
+            reader_rotation: 270,
+            reader_rotation_locked: false,
+            color_post_process: "standard".into(),
+            color_profile: "sumi".into(),
+            library_view: "list".into(),
+            reader_full_refresh_interval: 20,
+            auto_rotate_spreads: true,
+            wifi_auto_connect: false,
+            idle_suspend_minutes: 5,
+            frontlight_brightness: 65,
+            frontlight_warmth: 40,
+            finished_cleanup_hours: 168,
+        }
+    }
+
+    #[test]
+    fn profile_settings_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = ProfileSettings::from_settings(&populated_settings());
+        p.save(dir.path()).unwrap();
+        // It lands next to progress.json / series.json, so it travels with
+        // the profile through convert_default.
+        assert!(dir.path().join(".gideon/settings.json").is_file());
+        assert_eq!(ProfileSettings::load(dir.path()), p);
+    }
+
+    #[test]
+    fn upgrading_a_device_with_no_per_profile_file_changes_nothing() {
+        // The migration guarantee. A device in the field has every value in
+        // the device-global file and no per-profile file at all; the merged
+        // result must be indistinguishable from today's behaviour.
+        let library = tempfile::tempdir().unwrap();
+        assert!(!ProfileSettings::path(library.path()).exists());
+
+        let device = populated_settings();
+        let merged = device
+            .clone()
+            .with_profile(&ProfileSettings::load(library.path()));
+        assert_eq!(merged, device, "an upgrade must not lose a single setting");
+
+        // Spelled out for the two the user would notice first.
+        assert_eq!(merged.reader_fit, "fit-width");
+        assert_eq!(merged.reader_rotation, 270);
+
+        // And the same holds for a fresh install.
+        let fresh = Settings::default();
+        assert_eq!(
+            fresh
+                .clone()
+                .with_profile(&ProfileSettings::load(library.path())),
+            fresh
+        );
+    }
+
+    #[test]
+    fn a_corrupt_per_profile_file_falls_back_instead_of_erroring() {
+        let device = populated_settings();
+
+        // Unparseable JSON: nothing is stated, so the device values stand.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gideon")).unwrap();
+        std::fs::write(ProfileSettings::path(dir.path()), "{not json").unwrap();
+        assert_eq!(
+            ProfileSettings::load(dir.path()),
+            ProfileSettings::default()
+        );
+        assert_eq!(
+            device
+                .clone()
+                .with_profile(&ProfileSettings::load(dir.path())),
+            device
+        );
+
+        // Parseable but junk per field: those fields fall back one by one,
+        // the good ones still apply.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gideon")).unwrap();
+        std::fs::write(
+            ProfileSettings::path(dir.path()),
+            r#"{
+                "reader_fit": 42,
+                "reader_rotation": 45,
+                "reader_rotation_locked": "no",
+                "auto_rotate_spreads": null,
+                "reader_full_refresh_interval": 99,
+                "color_profile": "chartreuse",
+                "library_view": "gallery",
+                "predownload_unread_chapters": -1,
+                "finished_cleanup_hours": 99999999999999,
+                "future_field": {"nested": true}
+            }"#,
+        )
+        .unwrap();
+        let p = ProfileSettings::load(dir.path());
+        assert_eq!(
+            p,
+            ProfileSettings::default(),
+            "every junk field means unset"
+        );
+        assert_eq!(device.clone().with_profile(&p), device);
+
+        // A mangled cleanup delay must never shorten: it stays the device's.
+        assert_eq!(device.with_profile(&p).finished_cleanup_hours, 168);
+    }
+
+    #[test]
+    fn two_profiles_hold_different_values_independently() {
+        let alex = tempfile::tempdir().unwrap();
+        let bo = tempfile::tempdir().unwrap();
+        let device = Settings::default();
+
+        ProfileSettings {
+            reader_fit: Some("fit-width".into()),
+            reader_rotation: Some(90),
+            color_profile: Some("indigo".into()),
+            library_view: Some("list".into()),
+            ..Default::default()
+        }
+        .save(alex.path())
+        .unwrap();
+
+        ProfileSettings {
+            reader_fit: Some("contain".into()),
+            reader_rotation: Some(180),
+            color_profile: Some("mono".into()),
+            ..Default::default()
+        }
+        .save(bo.path())
+        .unwrap();
+
+        let a = device
+            .clone()
+            .with_profile(&ProfileSettings::load(alex.path()));
+        let b = device
+            .clone()
+            .with_profile(&ProfileSettings::load(bo.path()));
+
+        assert_eq!(a.reader_fit, "fit-width");
+        assert_eq!(b.reader_fit, "contain");
+        assert_eq!(a.reader_rotation, 90);
+        assert_eq!(b.reader_rotation, 180);
+        assert_eq!(a.color_profile, "indigo");
+        assert_eq!(b.color_profile, "mono");
+        // Bo said nothing about the library view, so the device value stands.
+        assert_eq!(a.library_view, "list");
+        assert_eq!(b.library_view, device.library_view);
+    }
+
+    #[test]
+    fn the_overlay_never_touches_device_global_fields() {
+        let device = populated_settings();
+        // A profile that states everything it possibly can.
+        let p = ProfileSettings::from_settings(&Settings::default());
+        let merged = device.clone().with_profile(&p);
+
+        assert_eq!(merged.source_lists, device.source_lists);
+        assert_eq!(merged.languages, device.languages);
+        assert_eq!(merged.profiles, device.profiles);
+        assert_eq!(merged.active_profile, device.active_profile);
+        assert_eq!(merged.storage_size_limit, device.storage_size_limit);
+        assert_eq!(merged.auto_check_updates, device.auto_check_updates);
+        assert_eq!(merged.color_post_process, device.color_post_process);
+        assert_eq!(merged.wifi_auto_connect, device.wifi_auto_connect);
+        assert_eq!(merged.idle_suspend_minutes, device.idle_suspend_minutes);
+        assert_eq!(merged.frontlight_brightness, device.frontlight_brightness);
+        assert_eq!(merged.frontlight_warmth, device.frontlight_warmth);
+        // ...while the personal half did change.
+        assert_ne!(merged.reader_fit, device.reader_fit);
+    }
+
+    #[test]
+    fn from_settings_then_with_profile_round_trips() {
+        let personal = populated_settings();
+        let p = ProfileSettings::from_settings(&personal);
+        // Applied over a completely different device file, the nine personal
+        // values come back exactly.
+        let merged = Settings::default().with_profile(&p);
+        assert_eq!(merged.reader_fit, personal.reader_fit);
+        assert_eq!(merged.reader_rotation, personal.reader_rotation);
+        assert_eq!(
+            merged.reader_rotation_locked,
+            personal.reader_rotation_locked
+        );
+        assert_eq!(merged.auto_rotate_spreads, personal.auto_rotate_spreads);
+        assert_eq!(
+            merged.reader_full_refresh_interval,
+            personal.reader_full_refresh_interval
+        );
+        assert_eq!(merged.color_profile, personal.color_profile);
+        assert_eq!(merged.library_view, personal.library_view);
+        assert_eq!(
+            merged.predownload_unread_chapters,
+            personal.predownload_unread_chapters
+        );
+        assert_eq!(
+            merged.finished_cleanup_hours,
+            personal.finished_cleanup_hours
+        );
+        // And it survives a save/load in between.
+        let dir = tempfile::tempdir().unwrap();
+        p.save(dir.path()).unwrap();
+        assert_eq!(
+            Settings::default().with_profile(&ProfileSettings::load(dir.path())),
+            merged
+        );
+    }
+
+    #[test]
+    fn a_profile_may_state_the_default_value_and_it_sticks() {
+        // "Unset" and "set to the default" must be distinguishable: alex
+        // explicitly wants rotation 0 even though the device is on 270.
+        let dir = tempfile::tempdir().unwrap();
+        ProfileSettings {
+            reader_rotation: Some(0),
+            reader_rotation_locked: Some(true),
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let merged = populated_settings().with_profile(&ProfileSettings::load(dir.path()));
+        assert_eq!(merged.reader_rotation, 0);
+        assert!(merged.reader_rotation_locked);
+    }
+
+    #[test]
+    fn unset_fields_are_omitted_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        ProfileSettings {
+            reader_fit: Some("fit-width".into()),
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let raw = std::fs::read_to_string(ProfileSettings::path(dir.path())).unwrap();
+        assert!(raw.contains("reader_fit"));
+        assert!(
+            !raw.contains("color_profile"),
+            "unset fields must not be written: {raw}"
+        );
     }
 
     #[test]
