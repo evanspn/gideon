@@ -314,6 +314,9 @@ pub fn parse_metadata_match(body: &[u8], query: &str) -> Result<Option<SeriesMet
             // MyAnimeList reports 0 chapters for a series that hasn't
             // finished; that's "unknown", not "zero chapters".
             total_chapters: entry.chapters.filter(|c| *c > 0),
+            // Stamped by whoever stores it, not by the parse: this function
+            // says what MyAnimeList knows, not when we asked.
+            fetched_at: None,
         };
         // An entry that matched but knows nothing is still no metadata.
         return Ok((!meta.is_empty()).then_some(meta));

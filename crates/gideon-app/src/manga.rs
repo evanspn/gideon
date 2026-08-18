@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use gideon_aidoku::source::Source;
-use gideon_core::{SeriesIndex, SeriesRef, Settings};
+use gideon_core::{SeriesIndex, SeriesMeta, SeriesRef, Settings};
 use gideon_sources::storage::sanitize;
 use gideon_sources::{pages_to_cbz, Fetcher, SourceLists, UreqFetcher};
 
@@ -386,6 +386,24 @@ pub fn cmd_manga_download(
     Ok(())
 }
 
+/// How long cached MyAnimeList metadata is trusted before it is worth
+/// re-checking.
+///
+/// Metadata is not news. A score and a genre list are effectively fixed; the
+/// two fields that move are the chapter count, when new chapters are
+/// released, and the score, when a series ends badly enough to drag it. A
+/// fortnight catches both long before anyone would notice, and keeps a
+/// library open from being a burst of requests every single time.
+const METADATA_MAX_AGE: u64 = 14 * 24 * 60 * 60;
+
+/// Seconds since the unix epoch, or 0 if the clock is before it.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Series titles whose MyAnimeList lookup has already been attempted in this
 /// run of gideon, matched or not.
 ///
@@ -432,8 +450,12 @@ fn cache_series_metadata_with(library: &Path, series_dir: &str, fetcher: &dyn Fe
     let Some(series) = index.get(series_dir) else {
         return; // sideloaded, or not recorded (yet) — nothing to attach to
     };
-    if series.meta.as_ref().is_some_and(|meta| !meta.is_empty()) {
-        return; // already cached: never pay for it twice
+    if series
+        .meta
+        .as_ref()
+        .is_some_and(|meta| !meta.is_empty() && !meta.is_stale(now_unix(), METADATA_MAX_AGE))
+    {
+        return; // cached and still fresh: never pay for it twice
     }
     let origin = series.clone();
     if !claim_metadata_lookup(&origin.manga_title) {
@@ -458,13 +480,101 @@ fn cache_series_metadata_with(library: &Path, series_dir: &str, fetcher: &dyn Fe
     index.record(
         series_dir,
         SeriesRef {
-            meta: Some(meta),
+            meta: Some(SeriesMeta {
+                fetched_at: Some(now_unix()),
+                ..meta
+            }),
             ..origin
         },
     );
     if let Err(e) = index.save(library) {
         eprintln!("gideon: couldn't save the series index: {e}");
     }
+}
+
+/// Fill in cached MyAnimeList metadata for series the library already holds.
+///
+/// [`cache_series_metadata`] only ever runs on the tail of a *download*, and
+/// only for a series the index already knows, so two whole categories of book
+/// never got metadata at all: anything downloaded before that code existed,
+/// and anything sideloaded over USB — which between them is most of a real
+/// library. The rows were designed around a score, a status and a genre list
+/// that, on those series, were never going to arrive.
+///
+/// `series` is `(directory, display title)` pairs. A directory with no index
+/// entry gets a minimal one so the metadata has somewhere to live; the source
+/// fields stay empty, which is exactly what a sideloaded book is.
+///
+/// Bounded to `limit` lookups per call and, via [`claim_metadata_lookup`], one
+/// attempt per title per run — a library of 200 sideloads must not turn into
+/// 200 requests the moment it is opened. Returns how many series gained
+/// metadata, so a caller can decide whether the screen is worth repainting.
+pub fn backfill_series_metadata(
+    library: &Path,
+    series: &[(String, String)],
+    limit: usize,
+) -> usize {
+    if !gideon_device::network::is_online() {
+        return 0;
+    }
+    backfill_series_metadata_with(library, series, limit, &UreqFetcher::new())
+}
+
+fn backfill_series_metadata_with(
+    library: &Path,
+    series: &[(String, String)],
+    limit: usize,
+    fetcher: &dyn Fetcher,
+) -> usize {
+    let mut filled = 0;
+    for (dir, title) in series {
+        if filled >= limit {
+            break;
+        }
+        let mut index = SeriesIndex::load(library);
+        let existing = index.get(dir).cloned();
+        if existing.as_ref().is_some_and(|s| {
+            s.meta
+                .as_ref()
+                .is_some_and(|m| !m.is_empty() && !m.is_stale(now_unix(), METADATA_MAX_AGE))
+        }) {
+            continue; // cached and still fresh: never pay for it twice
+        }
+        let base = existing.unwrap_or_else(|| SeriesRef {
+            manga_title: title.clone(),
+            ..SeriesRef::default()
+        });
+        let lookup_title = if base.manga_title.is_empty() {
+            title.clone()
+        } else {
+            base.manga_title.clone()
+        };
+        if !claim_metadata_lookup(&lookup_title) {
+            continue;
+        }
+        let meta = match crate::mal::metadata_for_title(fetcher, &lookup_title) {
+            Ok(Some(meta)) => meta,
+            // No confident match is the expected answer for plenty of series;
+            // a hard failure is MyAnimeList or the link, and either way the
+            // library is left exactly as it was.
+            Ok(None) | Err(_) => continue,
+        };
+        index.record(
+            dir,
+            SeriesRef {
+                meta: Some(SeriesMeta {
+                    fetched_at: Some(now_unix()),
+                    ..meta
+                }),
+                manga_title: lookup_title,
+                ..base
+            },
+        );
+        if index.save(library).is_ok() {
+            filled += 1;
+        }
+    }
+    filled
 }
 
 /// Record a CLI-downloaded chapter's series in the index the way the device
@@ -1133,7 +1243,13 @@ mod series_metadata_tests {
     }
 
     fn jikan(title: &str) -> String {
-        format!("https://api.jikan.moe/v4/manga?q={title}&limit=5")
+        // `search_manga` builds the query with `query_pairs_mut`, which encodes
+        // a space as `+` — a title of more than one word does not reach the
+        // fetcher as it was typed.
+        format!(
+            "https://api.jikan.moe/v4/manga?q={}&limit=5",
+            title.replace(' ', "+")
+        )
     }
 
     /// Titles are unique per test: the "already tried" set is process-wide
@@ -1182,6 +1298,97 @@ mod series_metadata_tests {
     }
 
     #[test]
+    fn the_backfill_reaches_sideloads_and_old_downloads() {
+        // The library rows were built around a score, a status and a genre
+        // list that only ever arrived on the tail of a download — so a
+        // sideloaded book (no index entry at all) and a series downloaded
+        // before that code existed both showed a bare title forever.
+        let dir = tempfile::tempdir().unwrap();
+        // One old download with an index entry but no metadata…
+        library_with(dir.path(), "Pluto", None);
+        // …and one sideload, which the index has never heard of.
+        let fetcher = CountingFetcher::new(
+            FakeFetcher::new()
+                .with(
+                    &jikan("Pluto"),
+                    r#"{"data":[{"title":"Pluto","type":"manga","score":8.9,
+                                "status":"Finished","genres":[{"name":"Mystery"}]}]}"#,
+                )
+                .with(
+                    &jikan("Solo Leveling"),
+                    r#"{"data":[{"title":"Solo Leveling","type":"manga","score":8.2,
+                                "status":"Finished","genres":[{"name":"Action"}]}]}"#,
+                ),
+        );
+
+        let series = [
+            ("Pluto".to_string(), "Pluto".to_string()),
+            ("Solo Leveling".to_string(), "Solo Leveling".to_string()),
+        ];
+        let filled = backfill_series_metadata_with(dir.path(), &series, 8, &fetcher);
+        assert_eq!(filled, 2);
+
+        let index = SeriesIndex::load(dir.path());
+        let old = index.get("Pluto").unwrap();
+        assert_eq!(old.meta.as_ref().unwrap().score, Some(8.9));
+        assert_eq!(
+            old.source_name, "MangaDex",
+            "backfilling metadata must not disturb where the series came from"
+        );
+        assert_eq!(
+            old.downloaded.get("c1"),
+            Some(&"Chapter 1.cbz".into()),
+            "nor its download history"
+        );
+
+        let sideload = index.get("Solo Leveling").expect("sideloads get an entry");
+        assert_eq!(sideload.meta.as_ref().unwrap().score, Some(8.2));
+        assert_eq!(sideload.manga_title, "Solo Leveling");
+        assert!(
+            sideload.source_id.is_empty(),
+            "a sideload has no source, and inventing one would make it look downloaded"
+        );
+
+        // Second pass: everything is cached, so it costs nothing.
+        let before = fetcher.calls.get();
+        assert_eq!(
+            backfill_series_metadata_with(dir.path(), &series, 8, &fetcher),
+            0
+        );
+        assert_eq!(
+            fetcher.calls.get(),
+            before,
+            "cached metadata is never re-fetched"
+        );
+    }
+
+    #[test]
+    fn the_backfill_is_bounded_so_a_big_library_is_not_a_burst() {
+        // Opening a library of two hundred sideloads must not become two
+        // hundred requests.
+        let dir = tempfile::tempdir().unwrap();
+        let series: Vec<(String, String)> = (0..20)
+            .map(|i| (format!("Bounded {i:02}"), format!("Bounded {i:02}")))
+            .collect();
+        let mut fetcher = FakeFetcher::new();
+        for (dir_name, _) in &series {
+            fetcher = fetcher.with(
+                &jikan(dir_name),
+                format!(r#"{{"data":[{{"title":"{dir_name}","type":"manga","score":7.0}}]}}"#),
+            );
+        }
+        let fetcher = CountingFetcher::new(fetcher);
+
+        let filled = backfill_series_metadata_with(dir.path(), &series, 3, &fetcher);
+        assert_eq!(filled, 3, "only the batch limit is looked up");
+        assert_eq!(
+            fetcher.calls.get(),
+            3,
+            "and only that many requests are made"
+        );
+    }
+
+    #[test]
     fn an_ambiguous_match_leaves_the_series_without_metadata() {
         let dir = tempfile::tempdir().unwrap();
         library_with(dir.path(), "Kagerou", None);
@@ -1218,10 +1425,14 @@ mod series_metadata_tests {
     }
 
     #[test]
-    fn a_series_that_has_metadata_is_never_looked_up_again() {
+    fn fresh_metadata_is_never_looked_up_again_but_stale_metadata_refreshes() {
+        // Metadata is stored beside the manga and trusted for a fortnight:
+        // a score and a genre list do not move, and re-fetching them every
+        // time the library opens is a burst of requests for nothing.
         let dir = tempfile::tempdir().unwrap();
         let cached = gideon_core::SeriesMeta {
             score: Some(8.5),
+            fetched_at: Some(now_unix()),
             ..gideon_core::SeriesMeta::default()
         };
         library_with(dir.path(), "Vagabond", Some(cached.clone()));
@@ -1232,10 +1443,38 @@ mod series_metadata_tests {
 
         cache_series_metadata_with(dir.path(), "Vagabond", &fetcher);
 
-        assert_eq!(fetcher.calls.get(), 0, "cached metadata must not hit MAL");
+        assert_eq!(fetcher.calls.get(), 0, "fresh metadata must not hit MAL");
         assert_eq!(
             SeriesIndex::load(dir.path()).get("Vagabond").unwrap().meta,
             Some(cached)
+        );
+
+        // Past the cadence, it is re-checked once — which is how a new
+        // chapter count or a score that slid after a bad ending arrives.
+        let stale = gideon_core::SeriesMeta {
+            score: Some(8.5),
+            fetched_at: Some(now_unix().saturating_sub(METADATA_MAX_AGE + 1)),
+            ..gideon_core::SeriesMeta::default()
+        };
+        library_with(dir.path(), "Vagabond Stale", Some(stale));
+        let fetcher = CountingFetcher::new(FakeFetcher::new().with(
+            &jikan("Vagabond Stale"),
+            r#"{"data":[{"title":"Vagabond Stale","type":"manga","score":9.2}]}"#,
+        ));
+
+        cache_series_metadata_with(dir.path(), "Vagabond Stale", &fetcher);
+
+        assert_eq!(fetcher.calls.get(), 1, "stale metadata is re-checked");
+        let refreshed = SeriesIndex::load(dir.path())
+            .get("Vagabond Stale")
+            .unwrap()
+            .meta
+            .clone()
+            .unwrap();
+        assert_eq!(refreshed.score, Some(9.2), "the newer score is kept");
+        assert!(
+            !refreshed.is_stale(now_unix(), METADATA_MAX_AGE),
+            "and the refresh restamps it, so the next open costs nothing"
         );
     }
 

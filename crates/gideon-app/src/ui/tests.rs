@@ -255,6 +255,14 @@ fn tap_book_row(i: usize) -> UiEvent {
     tap_modal_row(5, i)
 }
 
+/// Tap row `i` of the profiles sheet. `names` is how many profiles it lists;
+/// the rows after them are "New profile…", "Name the default profile…" when
+/// a default still exists, and "Close".
+fn tap_profile_row(i: usize, names: usize, has_default: bool) -> UiEvent {
+    let rows = names + 2 + usize::from(has_default);
+    tap_modal_row(rows as u32, i)
+}
+
 /// Tap row `i` of the delete confirmation sheet: 0 confirms, 1 cancels.
 fn tap_confirm_row(i: usize) -> UiEvent {
     tap_modal_row(2, i)
@@ -473,6 +481,18 @@ fn tap_nav_last() -> UiEvent {
     nav_tap(TapTarget::Last)
 }
 
+/// Tap the title bar's pager: "‹ n/m ›" at its right end. `pages` sizes the
+/// label, which is what the zones are measured from.
+fn tap_page(forward: bool, pages: usize) -> UiEvent {
+    let l = layout();
+    let (prev, next, _) = super::title_pager_zones(&l, 0, pages, 0);
+    let zone = if forward { next } else { prev };
+    UiEvent::Tap {
+        x: (zone.0 + zone.1) / 2,
+        y: l.title_h / 2,
+    }
+}
+
 /// Tap the sort button parked at the right edge of a chapter list's title bar.
 fn tap_sort() -> UiEvent {
     let l = layout();
@@ -548,6 +568,14 @@ fn tap_card_rot(i: usize, rot: u32) -> UiEvent {
     UiEvent::Tap { x, y }
 }
 
+/// [`tap_nav`] at rotation `rot`: the nav zone in reading orientation,
+/// mapped back into panel coordinates.
+fn tap_nav_rot(zone: u32, rot: u32) -> UiEvent {
+    let l = menu_layout(rot);
+    let (x, y) = panel_point_for(l.width * (2 * zone + 1) / 8, l.nav_top() + l.nav_h / 2, rot);
+    UiEvent::Tap { x, y }
+}
+
 fn tap_row_rot(i: usize, rot: u32) -> UiEvent {
     let l = menu_layout(rot);
     let (x, y) = panel_point_for(l.width / 2, l.row_top(i) + l.row_h / 2, rot);
@@ -594,11 +622,14 @@ fn make_tall_cbz(path: &Path, pages: usize) {
 // --- tests ---
 
 #[test]
-fn the_landing_screen_is_the_library_and_is_not_blank() {
+fn the_landing_screen_is_today_and_is_not_blank() {
+    // Today is what the device opens on: the chapter you were in the middle
+    // of and what is waiting unread. The Library is one nav tap away, and it
+    // is the whole library rather than the couple of rows a launcher shows.
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
     // Exactly one paint, and a full one: e-ink flashes on every full
     // refresh, so a launch that painted the landing twice would flash twice
     // before the reader saw anything.
@@ -787,6 +818,7 @@ fn rotated_reader_taps_follow_reading_orientation() {
     let tap_panel_top = UiEvent::Tap { x: W / 2, y: 0 };
     let tap_panel_middle = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
+        tap_nav_rot(0, 90),
         tap_row_rot(0, 90),
         tap_shelf_cell0_rot(90),
         tap_panel_bottom, // next -> page 1
@@ -1263,6 +1295,7 @@ fn physical_buttons_swap_when_upside_down() {
     store.save(&progress_path(&lib)).unwrap();
 
     let events = vec![
+        tap_nav_rot(0, 180),
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
         UiEvent::PageBack, // 180°: the back button goes forward -> page 3
@@ -1295,6 +1328,7 @@ fn bluetooth_remote_direction_is_absolute_upside_down() {
     store.save(&progress_path(&lib)).unwrap();
 
     let events = vec![
+        tap_nav_rot(0, 180),
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
         UiEvent::RemoteNext, // 180°: still advances -> page 3 (no swap)
@@ -1450,7 +1484,12 @@ fn library_paginates_with_prev_next() {
         make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
     }
 
-    let events = vec![tap_nav(0), tap_nav_next(), tap_nav_next(), tap_nav_prev()];
+    let events = vec![
+        tap_nav(0),
+        tap_page(true, 2),
+        tap_page(true, 2), // clamped at the last page
+        tap_page(false, 2),
+    ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1852,7 +1891,7 @@ fn color_library_page_flips_stay_partial() {
     .save(&lib)
     .unwrap();
 
-    let events = vec![tap_nav(0), tap_nav_next()];
+    let events = vec![tap_nav(0), tap_page(true, 2)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -2217,19 +2256,39 @@ fn check_updates_shows_message_screen() {
 }
 
 #[test]
-fn back_on_home_does_nothing() {
+fn a_root_screen_has_no_back_and_cannot_be_popped_out_of() {
+    // The bottom strip of a top-level destination is the nav bar, so the
+    // place Back used to be is now the Library tab. Nothing can pop the root
+    // out from under the app — quitting goes through the power menu — and
+    // the taps after it still work.
     let dir = tempfile::tempdir().unwrap();
-    // Back taps on Home are ignored — quitting goes through the power
-    // menu. The tap after them still works.
-    let mut app = app(
+    let mut rooted = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_back(), tap_back(), tap_card(0)],
+        vec![nav_discover(), tap_back(), tap_back()],
     );
-    app.run().unwrap();
+    rooted.run().unwrap();
     assert!(
-        matches!(app.screen(), Screen::Message { title, .. } if title == "Search"),
-        "the row tap after two ignored Back taps still works"
+        matches!(rooted.screen(), Screen::Library { .. }),
+        "the bottom-left of a root screen is the Library tab"
+    );
+
+    // And the tap after them still works: Discover, then its first card.
+    let mut again = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![
+            nav_discover(),
+            tap_back(),
+            tap_back(),
+            nav_discover(),
+            tap_card(0),
+        ],
+    );
+    again.run().unwrap();
+    assert!(
+        matches!(again.screen(), Screen::Message { title, .. } if title == "Search"),
+        "the tap after them still works"
     );
 }
 
@@ -3634,7 +3693,7 @@ fn title_left_tap_opens_the_profile_menu() {
     let mut app = app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
-    let Screen::ProfileMenu { profiles } = app.screen() else {
+    let Some(Sheet::Profiles { names: profiles }) = app.sheet() else {
         panic!("expected the profile menu");
     };
     assert_eq!(profiles, &vec!["default".to_string(), "alex".to_string()]);
@@ -3650,9 +3709,9 @@ fn switching_profile_shows_only_that_profiles_books() {
 
     let events = vec![
         nav_discover(),
-        tap_title_left(), // profile menu
-        tap_row(1),       // switch to alex -> back on Discover
-        tap_nav(0),       // Library
+        tap_title_left(),            // profile menu
+        tap_profile_row(1, 2, true), // switch to alex
+        tap_nav(0),                  // Library
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3718,13 +3777,13 @@ fn downloads_land_in_the_active_profiles_directory() {
 
     let events = vec![
         nav_discover(),
-        tap_title_left(), // profile menu
-        tap_row(1),       // switch to alex
-        tap_card(1),      // Sources
-        tap_row(0),       // Listings
-        tap_row(0),       // Popular
-        tap_row(0),       // Manga One
-        tap_row(0),       // download + Reader
+        tap_title_left(),            // profile menu
+        tap_profile_row(1, 2, true), // switch to alex
+        tap_card(1),                 // Sources
+        tap_row(0),                  // Listings
+        tap_row(0),                  // Popular
+        tap_row(0),                  // Manga One
+        tap_row(0),                  // download + Reader
         reader_tap_back(),
     ];
     let mut app = app(&lib, gateway, events).with_settings_dir(settings_dir);
@@ -3748,8 +3807,8 @@ fn new_profile_keyboard_creates_and_switches() {
 
     let events = vec![
         nav_discover(),
-        tap_title_left(), // profile menu: [default, New profile…]
-        tap_row(1),       // New profile…
+        tap_title_left(),            // profile menu: [default, New profile…]
+        tap_profile_row(1, 1, true), // New profile…
         tap_key(Key::Char('b')),
         tap_key(Key::Char('o')),
         tap_key(Key::Char('b')),
@@ -3791,7 +3850,7 @@ fn a_profile_with_a_library_is_listed_even_when_settings_forgot_it() {
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
-    let Screen::ProfileMenu { profiles } = app.screen() else {
+    let Some(Sheet::Profiles { names: profiles }) = app.sheet() else {
         panic!("expected the profile menu");
     };
     assert!(
@@ -3815,7 +3874,7 @@ fn switching_profiles_cannot_persist_a_list_that_read_back_short() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(1), // switch to the first rescued profile
+        tap_profile_row(1, 2, true), // switch to the first rescued profile
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3842,7 +3901,7 @@ fn converting_the_default_profile_keeps_profiles_settings_forgot() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(3), // [default, alex, New profile…, Name the default…]
+        tap_profile_row(3, 2, true), // [default, alex, New profile…, Name the default…]
         tap_key(Key::Char('m')),
         tap_key(Key::Char('e')),
         tap_key(Key::Search),
@@ -3876,7 +3935,7 @@ fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
     let events = vec![
         nav_discover(),
         tap_title_left(), // [default, alex, New profile…, Name the default…]
-        tap_row(3),       // Name the default profile…
+        tap_profile_row(3, 2, true), // Name the default profile…
         tap_key(Key::Char('m')),
         tap_key(Key::Char('e')),
         tap_key(Key::Search), // convert
@@ -3916,7 +3975,7 @@ fn naming_the_default_profile_a_taken_name_changes_nothing() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(3), // Name the default profile…
+        tap_profile_row(3, 2, true), // Name the default profile…
         tap_key(Key::Char('a')),
         tap_key(Key::Char('l')),
         tap_key(Key::Char('e')),
@@ -3950,14 +4009,19 @@ fn the_profile_menu_stops_offering_conversion_once_default_is_gone() {
     .save(&settings_dir)
     .unwrap();
 
-    // Row 3 would be "Name the default profile…" if it were offered; with no
-    // default profile the row doesn't exist, so the tap does nothing.
-    let events = vec![nav_discover(), tap_title_left(), tap_row(3)];
+    let events = vec![nav_discover(), tap_title_left()];
     let mut app = app(&lib, FakeGateway::default(), events)
         .with_settings_dir(settings_dir)
         .with_profile("me");
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::ProfileMenu { .. }));
+
+    // "Name the default profile…" is only worth offering while a default
+    // profile still exists; with none, the sheet is the profiles, a way to
+    // make another, and a way out.
+    let (title, rows) = app.sheet_rows();
+    assert_eq!(title, "Profiles");
+    let labels: Vec<&str> = rows.iter().map(|(l, ..)| l.as_str()).collect();
+    assert_eq!(labels, vec!["me", "alex", "New profile…", "Close"]);
 }
 
 #[test]
@@ -3971,10 +4035,10 @@ fn keyboard_shift_types_uppercase() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(1),              // New profile…
-        tap_key(Key::Shift),     // caps on
-        tap_key(Key::Char('b')), // -> 'B'
-        tap_key(Key::Shift),     // caps off
+        tap_profile_row(1, 1, true), // New profile…
+        tap_key(Key::Shift),         // caps on
+        tap_key(Key::Char('b')),     // -> 'B'
+        tap_key(Key::Shift),         // caps off
         tap_key(Key::Char('o')),
         tap_key(Key::Char('b')),
         tap_key(Key::Search), // create "Bob"
@@ -4393,6 +4457,7 @@ fn edge_slides_follow_reading_orientation_when_rotated() {
         y1: 500,
     };
     let events = vec![
+        tap_nav_rot(0, 180),
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
         slide,
@@ -6406,7 +6471,12 @@ fn page_buttons_turn_reader_pages() {
 fn page_buttons_are_ignored_on_unpaged_screens() {
     // Home has no pages; a button press must not crash or navigate.
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![UiEvent::PageForward, UiEvent::PageBack, tap_row(0)];
+    let events = vec![
+        tap_nav(0),
+        UiEvent::PageForward,
+        UiEvent::PageBack,
+        tap_row(0),
+    ];
     let lib = dir.path().join("Manga");
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -6442,7 +6512,7 @@ fn sleep_event_suspends_and_repaints_in_full() {
         app.display().flushes,
         vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
     );
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
     assert_eq!(
         app.input().refreshes,
         1,
@@ -6477,7 +6547,7 @@ fn skipped_suspend_explains_itself_and_stays_awake() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1);
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
     // Initial paint, "Sleeping…", the "staying awake" notice, the restore.
     assert_eq!(app.display().flushes.len(), 4);
     assert!(app
@@ -6513,7 +6583,7 @@ fn charging_sleep_finishes_once_unplugged() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 2, "the refused suspend must be retried");
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 #[test]
@@ -6535,7 +6605,7 @@ fn charging_wait_aborts_when_the_user_is_using_the_device() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "a tap must abort the wait, not re-suspend");
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 #[test]
@@ -6661,7 +6731,7 @@ fn waking_reapplies_the_frontlight() {
 #[test]
 fn sleep_without_a_hook_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![UiEvent::Sleep, tap_row(0)];
+    let events = vec![tap_nav(0), UiEvent::Sleep, tap_row(0)];
     let lib = dir.path().join("Manga");
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -7326,15 +7396,17 @@ fn the_library_title_bar_toggles_between_shelf_and_list() {
 }
 
 #[test]
-fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
-    // The list carries score chips and a progress bar in the theme colour,
-    // so it must take the RGB path; a coverless shelf has no colour to show.
+fn both_library_views_take_the_colour_path_as_a_destination() {
+    // The list carries score chips and a progress bar in the theme colour;
+    // the shelf carries covers. Either way, as a top-level destination the
+    // Library draws the nav bar, which is RGB — a screen that fell back to
+    // the grayscale path would lose every route off itself.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
     let settings_dir = dir.path().join("data");
 
-    for (view, want_colour) in [("shelf", false), ("list", true)] {
+    for view in ["shelf", "list"] {
         // The view is a per-profile setting, so it has to be written to the
         // profile's own file — a device-file value would be overlaid away.
         gideon_core::ProfileSettings {
@@ -7346,10 +7418,9 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
         let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)])
             .with_settings_dir(settings_dir.clone());
         app.run().unwrap();
-        assert_eq!(
+        assert!(
             app.compose_color_current().unwrap().is_some(),
-            want_colour,
-            "{view} view colour path"
+            "{view} view must compose in colour so it can draw the nav bar"
         );
     }
 }
@@ -7499,6 +7570,7 @@ fn dump_library_list_png() {
                     genres: genres.iter().map(|g| (*g).to_string()).collect(),
                     rank: None,
                     total_chapters: Some(*total),
+                    fetched_at: None,
                 }),
                 ..Default::default()
             },
@@ -7760,6 +7832,7 @@ fn dump_demo() {
                     genres: genres.iter().map(|g| (*g).to_string()).collect(),
                     rank: None,
                     total_chapters: Some(*total),
+                    fetched_at: None,
                 }),
                 ..Default::default()
             },
@@ -7802,6 +7875,11 @@ fn dump_demo() {
         .collect();
     write_progress(&lib, &refs);
 
+    // Extra series so a dump of the library shows what a real one does:
+    // more than one page, and therefore the pager strip.
+    for i in 0..6 {
+        make_cbz(&lib.join(format!("Filler {i:02}/ch0.cbz")), 8);
+    }
     let screen = std::env::var("GIDEON_SCREEN").unwrap_or_else(|_| "today".into());
     let settings_dir = dir.path().join("data");
     gideon_core::Settings {
@@ -7822,14 +7900,19 @@ fn dump_demo() {
         FakeGateway::default(),
         lib.clone(),
     )
-    .with_settings_dir(settings_dir);
+    .with_settings_dir(settings_dir)
+    .with_lights(Box::new(FakeLights {
+        levels: std::rc::Rc::new(std::cell::RefCell::new((42, 15))),
+    }));
 
     // Top-level destinations REPLACE the root screen the way the nav bar
     // does; pushing them would make them look like pushed screens (Back
     // instead of the nav bar) and misrepresent the design.
     app.run().unwrap();
     match screen.as_str() {
-        "library" | "shelf" => {}
+        // Today is the landing screen now, so a library dump has to walk
+        // there the way a person does.
+        "library" | "shelf" => app.open_library().unwrap(),
         "today" => app.goto_root(Screen::Stats).unwrap(),
         "discover" => app.goto_root(Screen::Home).unwrap(),
         "settings" => app.goto_root(Screen::Settings).unwrap(),
@@ -7838,6 +7921,10 @@ fn dump_demo() {
         // nav tap produces it.
         "quick" => {
             app.open_quick_settings().unwrap();
+        }
+        // The profiles sheet, over Today.
+        "profiles" => {
+            app.open_profile_menu().unwrap();
         }
         // The long-press book sheet, over the library it was raised from.
         "book" => {
@@ -7956,6 +8043,8 @@ fn every_series_is_reachable_by_paging_in_either_library_view() {
         let mut app =
             app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
         app.run().unwrap();
+        // Today is the landing screen; this test is about the library.
+        app.open_library().unwrap();
 
         let per_page = app.library_page_capacity();
         let Screen::Library { items, .. } = app.screen() else {
@@ -8211,6 +8300,8 @@ fn a_long_press_opens_a_modal_over_the_book_without_flashing() {
 
     let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
     app.run().unwrap();
+    // Today is the landing screen; this test is about the library.
+    app.open_library().unwrap();
     let before = app.display().flushes.len();
 
     let cell = tap_shelf_cell0();
@@ -8462,4 +8553,198 @@ fn discovers_installed_sources_open_their_listings() {
         matches!(app.screen(), Screen::Listings { source } if source.id == sources[0].id),
         "the tap opened the source's listings"
     );
+}
+
+#[test]
+fn every_top_level_destination_owns_its_nav_strip() {
+    // The invariant three separate bugs violated, each found on hardware or
+    // in a screenshot rather than here:
+    //
+    //   * a paginated Library drew First/Prev/Next/Last INTO the nav strip,
+    //     under the tabs, so the bar read "Library First TodayPrev
+    //     DisCoveNr Sesttings";
+    //   * the Library tab pushed instead of replacing the root, so it came
+    //     up with a Back button and no nav bar at all;
+    //   * Discover composed in grayscale, so its nav bar was not drawn.
+    //
+    // All three are the same statement: on a top-level destination, the
+    // bottom strip belongs to the nav bar and to nothing else. Checked by
+    // rendering the bar on its own and requiring the screen's strip to match
+    // it pixel for pixel — which no amount of "looks fine" can fake.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    // Enough series to paginate in either view, so the paging chrome is in
+    // play on every pass.
+    for i in 0..12 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 2);
+        make_red_cover(&lib.join(format!("Series {i:02}")));
+    }
+    write_progress(&lib, &[("Series 00/vol1.cbz", 0, 2, now_unix())]);
+    let settings_dir = dir.path().join("data");
+
+    for view in ["list", "shelf"] {
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&lib)
+        .unwrap();
+
+        for zone in 0..4u32 {
+            let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(zone)])
+                .with_settings_dir(settings_dir.clone());
+            app.run().unwrap();
+            // The Settings tab raises the quick sheet; this is about the
+            // screen under it, so dismiss it the way a tap outside would.
+            if app.sheet().is_some() {
+                app.tap_sheet(1, 1).unwrap();
+            }
+            let what = format!("{view} view, tab {zone}, {:?}", app.screen());
+
+            // A destination replaces the root rather than stacking on it.
+            assert_eq!(app.stack_depth(), 1, "{what}: not a root screen");
+
+            let page = app.compose_final().unwrap();
+            let l = layout();
+
+            // The strip, rendered from nothing but the nav bar.
+            let mut reference = gideon_render::RgbPage::new_white(l.width, l.height);
+            gideon_render::widgets::draw_nav_bar(
+                &mut reference,
+                0,
+                l.nav_top(),
+                l.width,
+                l.nav_h,
+                &app.nav_items(),
+                l.text_px,
+                &gideon_render::widgets::Theme::from_setting(
+                    &effective_settings(&settings_dir, &lib).color_profile,
+                ),
+            );
+
+            let mut drawn = 0usize;
+            for y in l.nav_top()..l.height {
+                for x in 0..l.width {
+                    assert_eq!(
+                        page.pixel(x, y),
+                        reference.pixel(x, y),
+                        "{what}: the nav strip has something else in it at {x},{y}"
+                    );
+                    if reference.pixel(x, y) != [0xFF; 3] {
+                        drawn += 1;
+                    }
+                }
+            }
+            assert!(drawn > 0, "{what}: the nav bar was never drawn");
+        }
+    }
+}
+
+#[test]
+fn quick_settings_sliders_set_the_lamp_where_you_tap() {
+    // Reaching for the light is the most common reason to open this sheet
+    // mid-chapter. A tap on the track sets the level to where you tapped —
+    // stepping across it a level at a time would be worse than the edge
+    // slide that already exists.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let (levels, lights) = lights();
+    let mut app = app(&lib, FakeGateway::default(), vec![])
+        .with_lights(lights)
+        .with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+
+    let sliders = app.quick_sliders();
+    assert_eq!(
+        sliders.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec!["Brightness", "Night warmth"],
+        "a device with a lamp offers both"
+    );
+
+    let l = layout();
+    let sheet_top = app.sheet_bounds().expect("a sheet is open").0;
+    let title_h = (l.text_px * 1.6) as u32;
+    let slider_row = |i: u32| {
+        sheet_top
+            + title_h
+            + super::SETTINGS_GAP
+            + i * (l.row_h + super::SETTINGS_GAP)
+            + l.row_h / 2
+    };
+
+    // Three quarters along the brightness track.
+    let before = app.display().flushes.len();
+    app.tap_sheet(l.pad + (l.width - l.pad * 2) * 3 / 4, slider_row(0))
+        .unwrap();
+    assert_eq!(levels.borrow().0, 75, "brightness follows the tap");
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "one slider's fill changed; it must not flash"
+    );
+
+    // And the warmth row is its own control, not the same one twice.
+    app.tap_sheet(l.pad + (l.width - l.pad * 2) / 4, slider_row(1))
+        .unwrap();
+    assert_eq!(levels.borrow().1, 25, "warmth follows its own tap");
+    assert_eq!(levels.borrow().0, 75, "and leaves brightness alone");
+}
+
+#[test]
+fn a_device_without_a_lamp_gets_no_sliders() {
+    // Drawing a control that cannot do anything is worse than not offering
+    // it: the desktop build and the test harness have no frontlight.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+    assert!(app.quick_sliders().is_empty());
+}
+
+#[test]
+fn the_title_bar_pages_and_does_not_swallow_the_view_toggle() {
+    // The page indicator is the pager: "‹ 2/3 ›" at the right end of the
+    // title bar. A separate Previous/Next row above the nav bar said the
+    // same thing twice and cost a row of content to say it.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..12 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
+    }
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.run().unwrap();
+    app.open_library().unwrap();
+    let pages = app.current_page_count();
+    assert!(pages > 1, "needs to paginate");
+
+    let l = layout();
+    let (prev, next, _) = super::title_pager_zones(&l, 0, pages, 0);
+    let title_y = l.title_h / 2;
+    let page_of = |app: &UiApp<MemoryDisplay, FakeInput, FakeGateway>| match app.screen() {
+        Screen::Library { page, .. } => *page,
+        other => panic!("expected the library, got {other:?}"),
+    };
+
+    // Forward, then back, from the title bar.
+    app.handle_tap((next.0 + next.1) / 2, title_y).unwrap();
+    assert_eq!(page_of(&app), 1, "the › chevron pages forward");
+    app.handle_tap((prev.0 + prev.1) / 2, title_y).unwrap();
+    assert_eq!(page_of(&app), 0, "the ‹ chevron pages back");
+
+    // The rest of the title bar still toggles the library view — the two
+    // must not fight over the same strip.
+    let before = effective_settings(&dir.path().join("data"), &lib).library_view;
+    app.handle_tap(l.pad, title_y).unwrap();
+    let after = effective_settings(&dir.path().join("data"), &lib).library_view;
+    assert_ne!(before, after, "a tap on the title still toggles the view");
+    assert_eq!(page_of(&app), 0, "and does not page");
+
+    // The chevrons are finger-sized, not glyph-sized.
+    assert!(next.1 - next.0 >= l.title_h.min(88), "next zone too small");
+    assert!(prev.1 - prev.0 >= l.title_h.min(88), "prev zone too small");
 }

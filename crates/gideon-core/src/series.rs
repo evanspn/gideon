@@ -94,17 +94,46 @@ pub struct SeriesMeta {
     #[serde(default, deserialize_with = "lenient_count")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_chapters: Option<u32>,
+
+    /// When this metadata was last fetched, as a unix timestamp.
+    ///
+    /// Stored beside the manga so a re-read costs nothing and a refresh is a
+    /// decision rather than a habit: a score and a genre list do not move,
+    /// and the only fields that go stale in practice are the chapter count
+    /// (new chapters) and the score (a series ending badly). So the device
+    /// re-checks on the order of a fortnight, not on every library open.
+    /// `None` means metadata cached before this field existed — treated as
+    /// due, so it refreshes once and then falls into the normal cadence.
+    #[serde(default, deserialize_with = "lenient_timestamp")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<u64>,
 }
 
 impl SeriesMeta {
     /// Whether nothing at all is known. Callers use this to avoid attaching
     /// an all-empty `meta` to a series just because a lookup was attempted.
     pub fn is_empty(&self) -> bool {
+        // `fetched_at` deliberately does not count: a timestamp with nothing
+        // attached to it is not knowledge about the series, and treating it
+        // as such would attach an empty `meta` to everything ever looked up.
         self.score.is_none()
             && self.status.is_none()
             && self.genres.is_empty()
             && self.rank.is_none()
             && self.total_chapters.is_none()
+    }
+
+    /// Whether this metadata is old enough to be worth re-checking, `now`
+    /// and the age both in seconds. Metadata with no stamp is due.
+    pub fn is_stale(&self, now: u64, max_age: u64) -> bool {
+        match self.fetched_at {
+            // A stamp in the future (a clock that was wrong when it was
+            // written) reads as "just fetched" rather than as an age of
+            // billions of seconds, so a bad clock cannot cause a refresh
+            // storm.
+            Some(at) => now.saturating_sub(at) >= max_age,
+            None => true,
+        }
     }
 }
 
@@ -118,6 +147,15 @@ fn lenient_meta<'de, D: serde::Deserializer<'de>>(
     Ok(serde_json::from_value::<SeriesMeta>(value)
         .ok()
         .filter(|meta| !meta.is_empty()))
+}
+
+/// Lenient `fetched_at` parsing: a whole non-negative number passes through,
+/// anything else means "no stamp", which reads as due for a refresh.
+fn lenient_timestamp<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_u64())
 }
 
 /// Lenient `score` parsing: a finite number (or a numeric string, which is
@@ -333,7 +371,45 @@ mod tests {
             genres: vec!["Action".into(), "Drama".into()],
             rank: Some(42),
             total_chapters: Some(120),
+            fetched_at: Some(1_700_000_000),
         }
+    }
+
+    #[test]
+    fn metadata_goes_stale_on_a_schedule_not_on_every_read() {
+        // A score and a genre list do not move; the chapter count does when
+        // new chapters land, and a score can slide after a bad ending. So
+        // metadata is re-checked on the order of a fortnight rather than
+        // every time the library is opened.
+        let fresh = SeriesMeta {
+            fetched_at: Some(1_000_000),
+            ..meta()
+        };
+        const FORTNIGHT: u64 = 14 * 24 * 3600;
+        assert!(!fresh.is_stale(1_000_000 + FORTNIGHT - 1, FORTNIGHT));
+        assert!(fresh.is_stale(1_000_000 + FORTNIGHT, FORTNIGHT));
+
+        // Cached before the stamp existed: due once, then on the cadence.
+        let unstamped = SeriesMeta {
+            fetched_at: None,
+            ..meta()
+        };
+        assert!(unstamped.is_stale(0, FORTNIGHT));
+
+        // A stamp from a clock that was wrong reads as just-fetched rather
+        // than as an age of billions of seconds.
+        let future = SeriesMeta {
+            fetched_at: Some(9_000_000),
+            ..meta()
+        };
+        assert!(!future.is_stale(1_000_000, FORTNIGHT));
+
+        // A stamp alone is not knowledge about the series.
+        assert!(SeriesMeta {
+            fetched_at: Some(1_000_000),
+            ..SeriesMeta::default()
+        }
+        .is_empty());
     }
 
     #[test]

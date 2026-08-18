@@ -70,6 +70,20 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// A pale wash of the accent, for a band behind a heading.
+    ///
+    /// Derived from `accent` rather than stored per profile: a fifth
+    /// constant is a fifth thing a new profile can forget, and the point of
+    /// a wash is that it IS the accent, only quieter. Mixed toward white by
+    /// 85%, which keeps black text on it well clear of the contrast floor
+    /// and survives the colour filter as a visible-but-calm block.
+    pub fn accent_wash(&self) -> [u8; 3] {
+        self.accent.map(|c| {
+            let mixed = 0xFF - ((0xFF - c as u32) * 15 / 100);
+            mixed as u8
+        })
+    }
+
     /// Ink & Rust — the default profile. Warm earth.
     pub const INK_RUST: Theme = Theme {
         accent: [0xA8, 0x5F, 0x38],
@@ -917,9 +931,17 @@ pub fn draw_section_header(
 
     let pad = scaled(text_px, 0.3, 2);
     let gap = scaled(text_px, 0.35, 3);
-    let mark_w = scaled(text_px, 0.22, 2);
+    // Chunky on purpose. The colour layer resolves at half the black
+    // resolution, so a 2px mark of accent is a grey smudge on the panel
+    // however clean it looks on a monitor — colour has to arrive in blocks
+    // big enough to survive the filter.
+    let mark_w = scaled(text_px, 0.3, 4);
     // The band the label lives in: everything above the closing rule.
     let band = h.saturating_sub(1).max(1);
+    // A wash of the accent behind the whole band, so a heading reads as a
+    // band of the profile's colour rather than a line of text with a tick
+    // beside it.
+    fill_rect(canvas, &clip, x, y, w, band, t.accent_wash());
 
     // The accent block, inset from the top and bottom of the band so it reads
     // as a marker beside the label rather than a full-height slab.
@@ -1303,6 +1325,16 @@ mod tests {
 
     fn ink_pixels(c: &RgbPage) -> usize {
         c.pixels.chunks_exact(3).filter(|p| *p != WHITE).count()
+    }
+
+    /// Pixels dark enough to be text rather than a tint or a rule. Counting
+    /// "not white" stopped distinguishing a drawn label from an empty one
+    /// once headings gained a washed band behind them.
+    fn text_pixels(c: &RgbPage) -> usize {
+        c.pixels
+            .chunks_exact(3)
+            .filter(|p| p.iter().all(|&v| v < 0x60))
+            .count()
     }
 
     // --- themes ---
@@ -1865,14 +1897,24 @@ mod tests {
             "the header has no accent block"
         );
         assert_eq!(c.pixel(w / 2, h - 1), RULE, "the header does not close");
-        // The block is a marker, not a slab: the far side of the band is not
-        // painted with it.
-        assert_eq!(c.pixel(w - 1, h / 2), WHITE);
+        // The band behind the label is a wash of the accent, not the accent:
+        // black text sits on it, so it has to stay near white…
+        let wash = c.pixel(w - 1, h / 2);
+        assert_eq!(wash, t.accent_wash());
+        assert!(
+            wash.iter().all(|&c| c > 0xD0),
+            "the wash must stay light enough to hold black text: {wash:?}"
+        );
+        // …and the marker still has to stand out against it.
+        assert_ne!(wash, t.accent, "the marker is a block, not the whole band");
         // An empty label still draws the band's furniture, nothing more.
         let mut bare = RgbPage::new_white(w, h);
         draw_section_header(&mut bare, 0, 0, w, h, "", 20.0, &t);
         assert!(ink_pixels(&bare) > 0);
-        assert!(ink_pixels(&c) > ink_pixels(&bare), "the label drew no ink");
+        assert!(
+            text_pixels(&c) > text_pixels(&bare),
+            "the label drew no ink"
+        );
     }
 
     #[test]
@@ -2357,7 +2399,9 @@ pub fn draw_tile(
     fill_rect(canvas, &clip, x, y + h.saturating_sub(1), w, 1, RULE);
     fill_rect(canvas, &clip, x, y, 1, h, RULE);
     fill_rect(canvas, &clip, x + w.saturating_sub(1), y, 1, h, RULE);
-    let mark_w = scaled(text_px, 0.14, 2);
+    // Wide enough to read as a block of colour at 150ppi rather than a
+    // coloured hairline, which is what the filter turns a thin one into.
+    let mark_w = scaled(text_px, 0.22, 4);
     fill_rect(canvas, &clip, x, y, mark_w, h, t.accent);
 
     let tx = x + mark_w + pad;
@@ -2420,6 +2464,82 @@ pub fn draw_tile(
             *bold,
         );
         ty += (px * 1.3) as u32;
+    }
+    overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
+}
+
+/// A labelled slider: a track with a filled portion, the value at the right,
+/// and tick marks at the quarters.
+///
+/// Drawn rather than dragged — the caller decides what a tap at a given x
+/// means. The point on this panel is that a value with a *position* can be
+/// judged at a glance, where "brightness: 40" has to be read and compared to
+/// a number you no longer remember.
+///
+/// The fill is a block of the accent, the track a flat grey, and the ticks
+/// black: nothing here is a hairline, and nothing depends on hue — on a mono
+/// panel the fill is still visibly a different length.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_slider(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    label: &str,
+    percent: u8,
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let mut layer = clip.text_layer();
+    let pad = scaled(text_px, 0.3, 3);
+    let label_px = text_px * 0.72;
+    let percent = percent.min(100);
+
+    let value = format!("{percent}%");
+    let value_w = measure_text(label_px, &value, true);
+    draw_text(
+        &mut layer,
+        x.saturating_sub(clip.x0),
+        y.saturating_sub(clip.y0),
+        label_px,
+        label,
+        w.saturating_sub(value_w + pad),
+        false,
+    );
+    draw_text(
+        &mut layer,
+        (x + w).saturating_sub(value_w + clip.x0),
+        y.saturating_sub(clip.y0),
+        label_px,
+        &value,
+        value_w,
+        true,
+    );
+
+    // The track: thick enough to read as a control at 150ppi, not a rule.
+    let track_h = scaled(text_px, 0.34, 6);
+    let track_y = y + h.saturating_sub(track_h);
+    fill_rect(canvas, &clip, x, track_y, w, track_h, [0xD8, 0xD8, 0xD8]);
+    let filled = (w as u64 * percent as u64 / 100) as u32;
+    fill_rect(canvas, &clip, x, track_y, filled, track_h, t.accent);
+
+    // Quarter ticks, so a tap has something to aim at.
+    for q in 1..4u32 {
+        let tx = x + w * q / 4;
+        fill_rect(
+            canvas,
+            &clip,
+            tx,
+            track_y.saturating_sub(track_h / 2),
+            2,
+            track_h / 2,
+            RULE,
+        );
     }
     overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
 }

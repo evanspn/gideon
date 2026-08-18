@@ -63,6 +63,10 @@ const STATS_HEATMAP_WEEKS: u32 = 18;
 /// The settings screen is a grid, not a list: two columns of tiles. Fifteen
 /// settings stacked as rows is two panels of paging; the same fifteen as
 /// tiles is one screen you can take in at a glance.
+/// How many series one background metadata pass looks up. A library of two
+/// hundred sideloads must not become two hundred requests the moment it is
+/// opened; the rest are picked up the next time the library is opened.
+const METADATA_BACKFILL_BATCH: usize = 8;
 const SETTINGS_COLS: u32 = 2;
 /// Gap between settings tiles, and between one group's grid and the next
 /// group's heading.
@@ -108,6 +112,20 @@ impl SourceRow {
     }
 }
 
+/// Where the quick-settings sheet's parts sit. A struct rather than a tuple
+/// because it is read by the compositor and the hit test alike, and a
+/// four-tuple of `u32`s is exactly the shape that gets destructured in the
+/// wrong order once.
+struct QuickSheet {
+    top: u32,
+    height: u32,
+    sliders_top: u32,
+    /// Height of one slider row; 0 when the device has no lamp.
+    slider_h: u32,
+    grid: widgets::GridLayout,
+    actions_top: u32,
+}
+
 /// An open modal sheet: what it is titled, and what it offers.
 ///
 /// Kinds rather than free-form callbacks so the tap routing stays a match on
@@ -128,6 +146,15 @@ enum Sheet {
         /// `None` when nothing in the card has been read.
         read_key: Option<String>,
     },
+    /// Who is reading. A sheet rather than a screen: switching profile is a
+    /// thing you do to what is already on screen, and it is reached from the
+    /// quick sheet, which would otherwise hand you off to a full-screen list
+    /// styled like nothing else in the app.
+    ///
+    /// Carries only the names — everything the switch actually does (the
+    /// library dir, the progress cache, the pre-downloader, the settings
+    /// file) is unchanged and still lives in `switch_profile`.
+    Profiles { names: Vec<String> },
     /// Confirmation before an irreversible delete. Nothing leaves the disk
     /// until the confirm row is tapped; dismissing cancels harmlessly.
     ConfirmDelete {
@@ -464,10 +491,6 @@ enum Screen {
     /// chapters and reading progress stay in the library.
     ConfirmRemoveSource {
         source: SourceEntry,
-    },
-    /// Profile picker, opened from the left half of Home's title bar.
-    ProfileMenu {
-        profiles: Vec<String>,
     },
     /// On-screen keyboard for naming a new profile; the action key creates
     /// it and switches to it.
@@ -1025,6 +1048,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.stack.last().expect("screen stack is never empty")
     }
 
+    /// How deep the screen stack is. A top-level destination is depth 1; a
+    /// pushed screen is deeper and carries Back instead of the nav bar.
+    #[cfg(test)]
+    fn stack_depth(&self) -> usize {
+        self.stack.len()
+    }
+
     /// The open modal sheet, if any. Long-press menus and confirmations are
     /// sheets over the screen you were on, not screens of their own, so tests
     /// assert on this rather than on the stack.
@@ -1042,18 +1072,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Main loop: render, then process events until the user quits through
     /// the power menu (or the input source ends). Returns how to exit.
     pub fn run(&mut self) -> Result<Exit> {
-        // The library IS the landing screen. Opening onto a menu, or onto a
-        // dashboard about reading, puts a screen between the reader and the
-        // thing they picked the device up for. Today, Discover and Settings
-        // are one nav tap away.
+        // Today is the landing screen: it opens on the chapter you were in
+        // the middle of and what is waiting unread, which is the answer to
+        // why the device was picked up. The Library is one nav tap away —
+        // and the whole library, rather than the two rows a launcher shows.
+        //
+        // The metadata backfill is kicked here rather than from the Library,
+        // so it has already run by the time you get there.
         if matches!(self.stack.last(), Some(Screen::Library { items, .. }) if items.is_empty()) {
-            self.stack.pop();
-            // `open_library` scans and paints; painting again here would
-            // cost the user a second full-screen flash on every launch.
-            self.open_library()?;
-        } else {
-            self.render_current(RefreshMode::Full)?;
+            if let Ok(items) = self.scan_library_items() {
+                self.trigger_metadata_backfill(&items);
+            }
+            self.stack[0] = Screen::Stats;
         }
+        self.render_current(RefreshMode::Full)?;
         loop {
             // With a suspend hook installed, wait in ticks instead of
             // blocking forever, and auto-suspend after 15 idle minutes —
@@ -1376,6 +1408,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
+                // The pager lives in the title bar: "‹ 2/3 ›" at the right
+                // end, ahead of anything else the bar does, so a tap on a
+                // chevron never toggles the library view by accident.
+                let pages = self.current_page_count();
+                if pages > 1 {
+                    let reserved = if self.screen_has_sort() {
+                        sort_button_width(&self.layout) + self.layout.pad
+                    } else {
+                        0
+                    };
+                    let page = self.current_page();
+                    let (prev, next, _) = title_pager_zones(&self.layout, page, pages, reserved);
+                    if x >= next.0 && x < next.1 {
+                        self.move_page(PageMove::Delta(1))?;
+                        return Ok(Flow::Continue);
+                    }
+                    if x >= prev.0 && x < prev.1 {
+                        self.move_page(PageMove::Delta(-1))?;
+                        return Ok(Flow::Continue);
+                    }
+                }
                 // A chapter list's title bar carries the sort button on its
                 // right edge; tapping it cycles the order.
                 if self.screen_has_sort() && x >= sort_button_x(&self.layout) {
@@ -1694,6 +1747,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Move within the current paginated screen (partial refresh). `Delta`
     /// steps relative to the current page (clamped); `First`/`Last` jump to an
     /// end — so a long chapter list is one tap from the start instead of many.
+    /// The page the current screen is showing, or 0 for a screen that does
+    /// not paginate. Only used to size the title bar's page label, which is
+    /// wider at "10/12" than at "1/2".
+    fn current_page(&self) -> usize {
+        match self.stack.last() {
+            Some(
+                Screen::Library { page, .. }
+                | Screen::Sources { page, .. }
+                | Screen::SearchResults { page, .. }
+                | Screen::Popular { page, .. }
+                | Screen::MangaList { page, .. }
+                | Screen::ChapterList { page, .. }
+                | Screen::DownloadedChapters { page, .. },
+            ) => *page,
+            Some(Screen::Settings) => self.settings_page,
+            _ => 0,
+        }
+    }
+
     fn move_page(&mut self, mv: PageMove) -> Result<()> {
         let per_page = self.layout.rows_per_page();
         let shelf_capacity = self.library_page_capacity();
@@ -1712,6 +1784,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
             Screen::DownloadedChapters { entries, page, .. } => {
                 (page, entries.len().div_ceil(per_page))
+            }
+            // Settings paginates too, but its page lives on the app rather
+            // than in the screen (the screen carries no state at all), so it
+            // is stepped here and returns early.
+            Screen::Settings => {
+                let count = self.settings_page_count().max(1);
+                let new = match mv {
+                    PageMove::Delta(delta) => {
+                        (self.settings_page as i64 + delta).clamp(0, count as i64 - 1) as usize
+                    }
+                    PageMove::First => 0,
+                    PageMove::Last => count - 1,
+                };
+                if new != self.settings_page {
+                    self.settings_page = new;
+                    // A page flip replaces the whole content area, so it
+                    // flashes — the one settings interaction that does.
+                    self.render_current(RefreshMode::Full)?;
+                }
+                return Ok(());
             }
             _ => return Ok(()),
         };
@@ -1765,6 +1857,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// stacking onto it — what the nav bar does, exposed so tests and the
     /// demo dumps land on the same screen a real tap would.
     fn goto_root(&mut self, screen: Screen) -> Result<()> {
+        // A sheet belongs to the screen it was raised over. Going somewhere
+        // else without dismissing it left it floating above a screen it says
+        // nothing about — and covering that screen's nav bar.
+        self.sheet = None;
         // Settings always opens at the top: arriving on page 2 because that
         // is where you left it a session ago reads as a bug, not a memory.
         if matches!(screen, Screen::Settings) {
@@ -1805,7 +1901,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Where the quick-settings sheet sits and how it is laid out:
     /// `(top, height, tile grid, first action row's y)`.
-    fn quick_sheet_layout(&self) -> (u32, u32, widgets::GridLayout, u32) {
+    fn quick_sheet_layout(&self) -> QuickSheet {
         let l = &self.layout;
         let gap = SETTINGS_GAP;
         let title_h = (l.text_px * 1.6) as u32;
@@ -1814,18 +1910,55 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let rows = (tiles as u32).div_ceil(SETTINGS_COLS);
         let grid_h = rows * cell_h + gap * rows.saturating_sub(1);
         let actions_h = l.row_h * Self::QUICK_ACTIONS.len() as u32;
-        let h = (title_h + gap + grid_h + gap + actions_h).min(l.height);
+        // The lamp comes first: reaching for the light is the most common
+        // reason to open this sheet mid-chapter, and a slider says what the
+        // level *is* at a glance where a number has to be read and compared
+        // against one you no longer remember.
+        let sliders = self.quick_sliders().len() as u32;
+        let slider_h = if sliders == 0 { 0 } else { l.row_h };
+        let sliders_h = sliders * slider_h + gap * sliders.saturating_sub(1);
+        let h = (title_h
+            + gap
+            + sliders_h
+            + if sliders == 0 { 0 } else { gap }
+            + grid_h
+            + gap
+            + actions_h)
+            .min(l.height);
         let top = l.height - h;
-        let grid = widgets::GridLayout::new(
-            l.pad,
-            top + title_h + gap,
-            l.width.saturating_sub(l.pad * 2),
-            SETTINGS_COLS,
-            cell_h,
-            gap,
-        );
-        let actions_top = top + title_h + gap + grid_h + gap;
-        (top, h, grid, actions_top)
+        let sliders_top = top + title_h + gap;
+        let grid_top = sliders_top + sliders_h + if sliders == 0 { 0 } else { gap };
+        QuickSheet {
+            top,
+            height: h,
+            sliders_top,
+            slider_h,
+            grid: widgets::GridLayout::new(
+                l.pad,
+                grid_top,
+                l.width.saturating_sub(l.pad * 2),
+                SETTINGS_COLS,
+                cell_h,
+                gap,
+            ),
+            actions_top: grid_top + grid_h + gap,
+        }
+    }
+
+    /// The lamp controls the quick sheet offers, when the device has a lamp:
+    /// `(label, percent)`. Empty on hardware (or a test) with no light hook,
+    /// so the sheet does not draw a control that cannot do anything.
+    fn quick_sliders(&self) -> Vec<(&'static str, u8)> {
+        match self.lights.as_ref() {
+            // "Night" rather than "warmth": the amber mixer is what people
+            // reach for at night, and naming it after the moment beats
+            // naming it after the LED.
+            Some(lights) => vec![
+                ("Brightness", lights.brightness()),
+                ("Night warmth", lights.warmth()),
+            ],
+            None => Vec::new(),
+        }
     }
 
     /// The rows an open sheet shows. Kept beside the tap routing so drawing
@@ -1837,6 +1970,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // are two thirds of the panel as a stack and a third of it as
             // tiles, and the sheet covers what you were reading.
             Some(Sheet::QuickSettings) => (String::new(), Vec::new()),
+            Some(Sheet::Profiles { ref names }) => {
+                let mut rows: Vec<(String, String, bool)> = names
+                    .iter()
+                    .map(|name| {
+                        // The active one is marked by a word, not by a dot:
+                        // a 6px glyph is the first thing the colour filter
+                        // eats, and "reading" says what the mark means.
+                        let mark = if *name == self.active_profile {
+                            "reading"
+                        } else {
+                            ""
+                        };
+                        (name.clone(), mark.to_string(), false)
+                    })
+                    .collect();
+                rows.push(("New profile…".into(), String::new(), false));
+                // The default profile's library IS the library root; naming
+                // it makes it an ordinary "@name" profile like the rest.
+                if names.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) {
+                    rows.push(("Name the default profile…".into(), String::new(), false));
+                }
+                rows.push(("Close".into(), String::new(), true));
+                ("Profiles".to_string(), rows)
+            }
             Some(Sheet::Book {
                 ref series_dir,
                 ref read_key,
@@ -1888,8 +2045,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// need. Everything above it stays on screen and unrepainted.
     fn sheet_bounds(&self) -> Option<(u32, u32)> {
         if matches!(self.sheet, Some(Sheet::QuickSettings)) {
-            let (top, h, ..) = self.quick_sheet_layout();
-            return Some((top, h));
+            let sheet = self.quick_sheet_layout();
+            return Some((sheet.top, sheet.height));
         }
         let (_, rows) = self.sheet_rows();
         if rows.is_empty() {
@@ -1971,11 +2128,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Top edge of the settings pager strip: the last row of content height,
     /// sitting directly on the nav bar.
-    fn settings_pager_top(&self) -> u32 {
-        self.layout.nav_top().saturating_sub(self.layout.row_h)
-    }
-
-    #[cfg(test)]
     fn settings_page_count(&self) -> usize {
         self.settings_layout().1
     }
@@ -2037,19 +2189,32 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn overlay_quick_settings(&self, canvas: &mut RgbPage) {
         let l = &self.layout;
         let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
-        let (top, h, grid, actions_top) = self.quick_sheet_layout();
+        let sheet = self.quick_sheet_layout();
         widgets::draw_panel(
             canvas,
             0,
-            top,
+            sheet.top,
             l.width,
-            h,
+            sheet.height,
             "Quick settings",
             l.text_px,
             &theme,
         );
+        for (i, (label, percent)) in self.quick_sliders().iter().enumerate() {
+            widgets::draw_slider(
+                canvas,
+                l.pad,
+                sheet.sliders_top + i as u32 * (sheet.slider_h + SETTINGS_GAP),
+                l.width.saturating_sub(l.pad * 2),
+                sheet.slider_h,
+                label,
+                *percent,
+                l.text_px,
+                &theme,
+            );
+        }
         for (i, (label, value)) in self.quick_tiles().iter().enumerate() {
-            let (cx, cy, cw, ch) = grid.cell(i);
+            let (cx, cy, cw, ch) = sheet.grid.cell(i);
             widgets::draw_tile(
                 canvas,
                 cx,
@@ -2070,7 +2235,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             widgets::draw_setting_row(
                 canvas,
                 l.pad,
-                actions_top + i as u32 * l.row_h,
+                sheet.actions_top + i as u32 * l.row_h,
                 inner,
                 l.row_h,
                 &widgets::SettingRow {
@@ -2127,6 +2292,39 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 series_dir,
                 read_key,
             }) => self.tap_book_sheet(index, entry, series_dir, read_key),
+            Some(Sheet::Profiles { names }) => {
+                self.sheet = None;
+                match names.get(index) {
+                    // Tapping the profile you are already in just closes.
+                    Some(name) if *name == self.active_profile => {
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                    Some(name) => {
+                        let name = name.clone();
+                        self.switch_profile(&name)?;
+                    }
+                    None if index == names.len() => {
+                        self.keyboard_paints = 0;
+                        self.keyboard_shift = false;
+                        self.push(Screen::NewProfile {
+                            name: String::new(),
+                        })?;
+                    }
+                    None if index == names.len() + 1
+                        && names.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) =>
+                    {
+                        self.keyboard_paints = 0;
+                        self.keyboard_shift = false;
+                        self.push(Screen::ConvertDefault {
+                            name: String::new(),
+                        })?;
+                    }
+                    None => {
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                }
+                Ok(Flow::Continue)
+            }
             Some(Sheet::ConfirmDelete {
                 entry,
                 series_dir,
@@ -2154,7 +2352,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Act on a tap in the quick-settings sheet: a tile cycles its value, the
     /// action rows go through or dismiss.
     fn tap_quick_settings(&mut self, x: u32, y: u32) -> Result<Flow> {
-        let (top, _, grid, actions_top) = self.quick_sheet_layout();
+        let sheet = self.quick_sheet_layout();
+        let (top, grid, actions_top) = (sheet.top, sheet.grid, sheet.actions_top);
         if y < top {
             self.sheet = None;
             return self
@@ -2170,6 +2369,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return self
                 .render_current(RefreshMode::Full)
                 .map(|_| Flow::Continue);
+        }
+        // A tap on a slider sets it to where you tapped — the whole point of
+        // a track is that the position IS the value, and making the reader
+        // step a level at a time to cross it would be worse than the edge
+        // slide they already have.
+        let sliders = self.quick_sliders();
+        if !sliders.is_empty() && y >= sheet.sliders_top && y < grid.y {
+            let row = ((y - sheet.sliders_top) / (sheet.slider_h + SETTINGS_GAP).max(1)) as usize;
+            if let Some((label, _)) = sliders.get(row) {
+                let track = self.layout.width.saturating_sub(self.layout.pad * 2).max(1) as u64;
+                // Rounded, not truncated: tapping the middle of the track has
+                // to give 50, and the far end 100.
+                let along = x.saturating_sub(self.layout.pad) as u64;
+                let percent = (((along * 100 + track / 2) / track).min(100)) as u8;
+                if let Some(lights) = self.lights.as_mut() {
+                    match *label {
+                        "Brightness" => lights.set_brightness(percent),
+                        _ => lights.set_warmth(percent),
+                    }
+                }
+                // The device's `LightControl` persists the level itself (see
+                // `PersistedLights` in main.rs), so there is nothing to save
+                // here — and nothing to forget to save.
+                // One slider's fill changed. Partial, and no flash.
+                self.render_current(RefreshMode::Partial)?;
+            }
+            return Ok(Flow::Continue);
         }
         let tiles = self.quick_tiles();
         let Some(index) = grid.hit(x, y, tiles.len()) else {
@@ -2631,30 +2857,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.tap_account_password(&email, &password, x, y)?;
                 Ok(Flow::Continue)
             }
-            Screen::ProfileMenu { profiles } => {
-                if let Some(name) = profiles.get(row).cloned() {
-                    if name == self.active_profile {
-                        self.pop()?; // already there — just close the menu
-                    } else {
-                        self.switch_profile(&name)?;
-                    }
-                } else if row == profiles.len() {
-                    self.keyboard_paints = 0;
-                    self.keyboard_shift = false;
-                    self.push(Screen::NewProfile {
-                        name: String::new(),
-                    })?;
-                } else if row == profiles.len() + 1
-                    && profiles.iter().any(|p| p == gideon_core::DEFAULT_PROFILE)
-                {
-                    self.keyboard_paints = 0;
-                    self.keyboard_shift = false;
-                    self.push(Screen::ConvertDefault {
-                        name: String::new(),
-                    })?;
-                }
-                Ok(Flow::Continue)
-            }
             Screen::NewProfile { name } => {
                 self.tap_new_profile(&name, x, y)?;
                 Ok(Flow::Continue)
@@ -2727,7 +2929,47 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Fully background — the shelf renders immediately regardless.
         self.trigger_sync();
         let items = self.scan_library_items()?;
-        self.push(Screen::Library { items, page: 0 })
+        self.trigger_metadata_backfill(&items);
+        // The Library is a nav DESTINATION, not a child screen: it replaces
+        // the root the way the other three tabs do. Pushing it instead put a
+        // Back button and the paging buttons in the bottom strip and took
+        // the nav bar away entirely, so the tab you just tapped vanished.
+        self.goto_root(Screen::Library { items, page: 0 })
+    }
+
+    /// Look up MyAnimeList metadata, in the background, for series in the
+    /// library that have none.
+    ///
+    /// The rows are built around a score, a status and a genre list, and
+    /// until now those only ever arrived on the tail of a download — so a
+    /// library of sideloads, or one downloaded before that code existed,
+    /// showed a title and nothing else no matter how long you owned it.
+    ///
+    /// Fully background and bounded: it never blocks the repaint, never
+    /// fails outward, does nothing at all offline, and takes a handful of
+    /// series per pass so opening a large library is not a burst of
+    /// requests. What it fills in shows up on the next repaint of the
+    /// screen.
+    fn trigger_metadata_backfill(&self, items: &[SeriesCard]) {
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let missing: Vec<(String, String)> = items
+            .iter()
+            .filter_map(|card| {
+                let dir = card.series.clone()?;
+                let has_meta = index
+                    .get(&dir)
+                    .is_some_and(|s| s.meta.as_ref().is_some_and(|m| !m.is_empty()));
+                (!has_meta).then(|| (dir, card.title()))
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let library_dir = self.library_dir.clone();
+        std::thread::spawn(move || {
+            gideon_device::power::lower_current_thread_to_idle();
+            crate::manga::backfill_series_metadata(&library_dir, &missing, METADATA_BACKFILL_BATCH);
+        });
     }
 
     fn build_source_rows(&self) -> Result<Vec<SourceRow>> {
@@ -3040,20 +3282,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// draws — rather than an index into a parallel list. Two lists is exactly
     /// how every row here ended up firing a different setting than its label.
     fn tap_setting_at(&mut self, x: u32, y: u32) -> Result<()> {
-        // The pager strip, when settings runs to more than one page: left
-        // half back, right half forward, both wrapping.
-        let (_, pages) = self.settings_layout();
-        if pages > 1 && y >= self.settings_pager_top() && y < self.layout.nav_top() {
-            let back = x < self.layout.width / 2;
-            self.settings_page = if back {
-                (self.settings_page + pages - 1) % pages
-            } else {
-                (self.settings_page + 1) % pages
-            };
-            // A page flip replaces the whole content area, so it flashes —
-            // this is the one settings interaction that legitimately does.
-            return self.render_current(RefreshMode::Full);
-        }
         let Some((.., action)) = self
             .settings_hit_map()
             .into_iter()
@@ -3220,8 +3448,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Open the profile picker from Home's title bar.
     fn open_profile_menu(&mut self) -> Result<()> {
-        let profiles = self.known_profiles();
-        self.push(Screen::ProfileMenu { profiles })
+        self.sheet = Some(Sheet::Profiles {
+            names: self.known_profiles(),
+        });
+        // A sheet over what you were looking at: partial, no flash.
+        self.render_current(RefreshMode::Partial)
     }
 
     /// Switch to (creating if needed) the named profile: persist the
@@ -5201,7 +5432,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(None);
         }
         let page_count = items.len().div_ceil(capacity).max(1);
-        let chrome = compose_chrome_opts(l, "Library", *page, page_count, !nav);
+        // A screen with the nav bar must not also put paging buttons in the
+        // bottom strip — they land underneath the tabs. Paging lives in the
+        // title bar's "‹ 2/3 ›" instead (see `title_pager_zones`).
+        let chrome = compose_chrome_paged(l, "Library", *page, page_count, !nav, 0, !nav);
         let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, &shelf), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
@@ -5645,12 +5879,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
         // A top-level destination draws the nav bar in that strip, so the
         // chrome must not also put a Back button there.
-        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(
-            l,
-            "Library",
-            page,
-            page_count,
-            !self.screen_has_nav(),
+        let nav = self.screen_has_nav();
+        let mut canvas = RgbPage::from_gray(&compose_chrome_paged(
+            l, "Library", page, page_count, !nav, 0, !nav,
         ));
         let row_h = self.list_row_height();
 
@@ -5764,7 +5995,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
             }
         });
-        if self.screen_has_nav() {
+        if nav {
             let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
             widgets::draw_nav_bar(
                 &mut canvas,
@@ -6047,24 +6278,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             y += grid.height(rows.len()) + SETTINGS_GAP;
         }
 
-        if pages > 1 {
-            widgets::draw_setting_row(
-                &mut canvas,
-                l.pad,
-                self.settings_pager_top(),
-                inner,
-                l.row_h,
-                &widgets::SettingRow {
-                    label: "‹  Previous",
-                    value: "Next  ›",
-                    detail: &format!("page {} of {}", at + 1, pages),
-                    selected: false,
-                },
-                l.text_px,
-                &theme,
-            );
-        }
-
         if self.screen_has_nav() {
             widgets::draw_nav_bar(
                 &mut canvas,
@@ -6124,27 +6337,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("(downloaded chapters stay)".to_string(), false),
                 ];
                 compose_list(l, &format!("Remove \"{}\"?", source.name), &rows, 0, 1)
-            }
-            Screen::ProfileMenu { profiles } => {
-                let mut rows: Vec<(String, bool)> = profiles
-                    .iter()
-                    .map(|p| {
-                        let mark = if *p == self.active_profile {
-                            "● "
-                        } else {
-                            ""
-                        };
-                        (format!("{mark}{p}"), true)
-                    })
-                    .collect();
-                rows.push(("New profile…".to_string(), true));
-                // The default profile's library IS the library root — give it a
-                // name and it becomes an ordinary "@name" profile like the rest.
-                // Offered only while a default profile still exists.
-                if profiles.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) {
-                    rows.push(("Name the default profile…".to_string(), true));
-                }
-                compose_list(l, "Profiles", &rows, 0, 1)
             }
             Screen::NewProfile { name } => {
                 compose_keyboard(l, "New profile", name, "Create", self.keyboard_shift)
@@ -6558,8 +6750,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let capacity = shelf.capacity().max(1);
         let page_count = items.len().div_ceil(capacity).max(1);
 
-        let mut canvas =
-            compose_chrome_opts(l, "Library", page, page_count, !self.screen_has_nav());
+        let nav = self.screen_has_nav();
+        let mut canvas = compose_chrome_paged(l, "Library", page, page_count, !nav, 0, !nav);
         if items.is_empty() {
             draw_text(
                 &mut canvas,
@@ -6971,6 +7163,32 @@ fn compose_chrome(l: &UiLayout, title: &str, page: usize, page_count: usize) -> 
 
 /// Like [`compose_chrome`], but Home passes `show_back = false`: its
 /// bottom-left corner has no Back (quitting goes through the power menu).
+/// The page indicator's text: `"2/3"`.
+fn page_label(page: usize, page_count: usize) -> String {
+    format!("{}/{}", page + 1, page_count)
+}
+
+/// Where the title bar's pager sits: `(prev zone, next zone, label x)`, each
+/// zone an `(x0, x1)` pair.
+///
+/// One function for drawing and for hit-testing, because a chevron you can
+/// see but not hit is worse than no chevron. The zones are a full title-bar
+/// height wide so they are finger-sized rather than glyph-sized.
+fn title_pager_zones(
+    l: &UiLayout,
+    page: usize,
+    page_count: usize,
+    right_reserved: u32,
+) -> ((u32, u32), (u32, u32), u32) {
+    let label_w = measure_text(l.text_px, &page_label(page, page_count), false).min(l.width / 3);
+    let hit = l.title_h.max(l.pad * 2);
+    let right = l.width.saturating_sub(l.pad + right_reserved);
+    let next = (right.saturating_sub(hit), right);
+    let label_x = next.0.saturating_sub(label_w);
+    let prev = (label_x.saturating_sub(hit), label_x);
+    (prev, next, label_x)
+}
+
 fn compose_chrome_opts(
     l: &UiLayout,
     title: &str,
@@ -7032,17 +7250,27 @@ fn compose_chrome_paged(
         true,
     );
     if page_count > 1 {
-        let label = format!("{}/{}", page + 1, page_count);
+        // The page indicator IS the pager: "‹ 2/3 ›" in the title bar, with
+        // the chevrons as the tap targets. A separate row of Previous/Next
+        // above the nav bar said the same thing twice and cost a row of
+        // content to do it.
+        let (prev, next, label_x) = title_pager_zones(l, page, page_count, right_reserved);
+        let label = page_label(page, page_count);
         let w = measure_text(l.text_px, &label, false).min(l.width / 3);
-        draw_text(
-            &mut canvas,
-            l.width.saturating_sub(w + l.pad + right_reserved),
-            text_y(0, l.title_h),
-            l.text_px,
-            &label,
-            w,
-            false,
-        );
+        let y = text_y(0, l.title_h);
+        draw_text(&mut canvas, label_x, y, l.text_px, &label, w, false);
+        for (zone, glyph) in [(prev, "‹"), (next, "›")] {
+            let gw = measure_text(l.text_px, glyph, true);
+            draw_text(
+                &mut canvas,
+                zone.0 + (zone.1 - zone.0).saturating_sub(gw) / 2,
+                y,
+                l.text_px,
+                glyph,
+                gw,
+                true,
+            );
+        }
     }
     hline(&mut canvas, l.title_h - 1, 0x55);
 
