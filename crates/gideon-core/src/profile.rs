@@ -215,6 +215,125 @@ mod tests {
         assert!(discover(Path::new("/definitely/not/a/library")).is_empty());
     }
 
+    /// Every file under `dir`, as (path relative to `dir`, contents), sorted.
+    fn snapshot(dir: &Path) -> Vec<(String, String)> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, String)>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((rel, fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn conversion_loses_no_file_and_no_byte() {
+        // The property that matters most: a conversion relocates the library
+        // whole. Every file that was under the root is under @me afterwards, at
+        // the same relative path, with identical contents — nothing dropped,
+        // nothing truncated, nothing merged into anything else.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = [
+            ("Series A/ch1.cbz", "first chapter bytes"),
+            ("Series A/ch2.cbz", "second chapter bytes"),
+            ("Series B/Volume 1/ch1.cbz", "nested deeper"),
+            ("loose.cbz", "a book at the top level"),
+            (
+                ".gideon/progress.json",
+                r#"{"progress":{"Series A/ch1.cbz":1}}"#,
+            ),
+            (".gideon/series.json", r#"{"series":{}}"#),
+            (".gideon/sync_session.json", r#"{"refresh_token":"secret"}"#),
+            (
+                "cover art.png",
+                "not a cbz, but the user's file all the same",
+            ),
+        ];
+        for (path, contents) in files {
+            write(&root.join(path), contents);
+        }
+        let before = snapshot(root);
+        assert_eq!(before.len(), files.len());
+
+        let target = convert_default(root, "me").unwrap();
+
+        // Same files, same relative paths, same bytes — just one level deeper.
+        assert_eq!(snapshot(&target), before);
+        // And the root now holds nothing but the profile directory: no orphan
+        // left behind, no copy left at the old location.
+        let left: Vec<String> = fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["@me".to_string()]);
+    }
+
+    /// Whether a read-only directory actually blocks writes for this user.
+    /// It doesn't for root, which ignores the permission bits — so a test that
+    /// fault-injects that way would quietly assert nothing when run as root
+    /// (which is exactly how CI and the device run).
+    #[cfg(unix)]
+    fn read_only_dirs_are_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = tempfile::tempdir().unwrap();
+        let mut perms = fs::metadata(probe.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(probe.path(), perms).unwrap();
+        let blocked = fs::create_dir(probe.path().join("probe")).is_err();
+        let mut perms = fs::metadata(probe.path()).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(probe.path(), perms).unwrap();
+        blocked
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_conversion_leaves_every_file_in_place() {
+        // A conversion that can't complete must leave the library exactly as it
+        // was, never half-moved. A read-only root makes it fail at its first
+        // write — the earliest point it can go wrong.
+        if !read_only_dirs_are_enforced() {
+            eprintln!("skipped: running as root, where read-only directories don't block writes");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Series/ch1.cbz"), "book");
+        write(&root.join("loose.cbz"), "book");
+        let before = snapshot(root);
+
+        let mut perms = fs::metadata(root).unwrap().permissions();
+        perms.set_mode(0o500); // r-x: no creating or renaming entries here
+        fs::set_permissions(root, perms).unwrap();
+
+        let result = convert_default(root, "me");
+
+        // Restore write access before asserting, so the temp dir can clean up.
+        let mut perms = fs::metadata(root).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(root, perms).unwrap();
+
+        assert!(
+            result.is_err(),
+            "the conversion must fail, not half-succeed"
+        );
+        assert_eq!(snapshot(root), before, "every file must still be there");
+    }
+
     #[test]
     fn conversion_refuses_bad_and_taken_names() {
         let dir = tempfile::tempdir().unwrap();
