@@ -104,6 +104,24 @@ enum Sheet {
     /// The settings you change often, over whatever you were doing. Anything
     /// device-wide lives behind the "All settings" row rather than here.
     QuickSettings,
+    /// What a long press on a library card offers. A modal, not a screen:
+    /// the book you pressed stays visible behind it, which is the whole
+    /// point of pressing THAT one.
+    Book {
+        entry: LibraryEntry,
+        series_dir: String,
+        /// The chapter "mark as unread" clears: the most recently read one in
+        /// this card, which may differ from `entry` (the resume target).
+        /// `None` when nothing in the card has been read.
+        read_key: Option<String>,
+    },
+    /// Confirmation before an irreversible delete. Nothing leaves the disk
+    /// until the confirm row is tapped; dismissing cancels harmlessly.
+    ConfirmDelete {
+        entry: LibraryEntry,
+        series_dir: String,
+        scope: DeleteScope,
+    },
 }
 
 /// What a settings row does when tapped. The grouped list is built once and
@@ -427,25 +445,6 @@ enum Screen {
         manga: MangaEntry,
         chapters: Vec<ChapterEntry>,
         index: usize,
-    },
-    /// Context menu for a library book (long press on its card).
-    BookMenu {
-        entry: LibraryEntry,
-        series_dir: String,
-        /// The chapter to "mark as unread": the most recently read one in this
-        /// card (which may differ from `entry`, the resume target — if you
-        /// finished a chapter, the card resumes at the *next* one but unread
-        /// should clear the chapter you actually read). `None` when nothing in
-        /// the card has been read yet.
-        read_key: Option<String>,
-    },
-    /// Confirmation before an irreversible delete from the book menu. Carries
-    /// everything the delete needs, so nothing is removed from disk until the
-    /// user taps the confirm row — Back cancels harmlessly.
-    ConfirmDelete {
-        entry: LibraryEntry,
-        series_dir: String,
-        scope: DeleteScope,
     },
     /// Confirmation before removing an installed source (long press on its
     /// row in Sources). Only the source package is removed — downloaded
@@ -1013,6 +1012,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.stack.last().expect("screen stack is never empty")
     }
 
+    /// The open modal sheet, if any. Long-press menus and confirmations are
+    /// sheets over the screen you were on, not screens of their own, so tests
+    /// assert on this rather than on the stack.
+    #[cfg(test)]
+    fn sheet(&self) -> Option<&Sheet> {
+        self.sheet.as_ref()
+    }
+
     /// Render the current screen without entering the event loop (used by
     /// the headless `--screenshot` mode).
     pub fn render_once(&mut self) -> Result<()> {
@@ -1437,11 +1444,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .next()
                     .unwrap_or(&entry.relative_path)
                     .to_string();
-                self.push(Screen::BookMenu {
+                self.sheet = Some(Sheet::Book {
                     entry,
                     series_dir,
                     read_key,
-                })?;
+                });
+                // The card you pressed stays on screen behind the sheet, and
+                // only the strip it covers repaints. See docs/REFRESH.md.
+                self.render_current(RefreshMode::Partial)?;
                 Ok(Flow::Continue)
             }
             Screen::ChapterList {
@@ -1761,6 +1771,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 (
                     "Quick settings".to_string(),
                     vec![
+                        // Who is reading comes first: it decides which
+                        // library and which of these values you are looking
+                        // at in the first place.
+                        ("Profile".into(), self.active_profile.clone(), false),
                         ("Library view".into(), s.library_view.clone(), false),
                         (
                             "Reader fit".into(),
@@ -1770,14 +1784,57 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             },
                             false,
                         ),
-                        ("Colour profile".into(), s.color_profile.clone(), false),
                         (
-                            "Delete finished".into(),
-                            cleanup_label(s.finished_cleanup_hours),
+                            "Full refresh".into(),
+                            format!("every {} pages", s.reader_full_refresh_interval),
                             false,
                         ),
+                        ("Colour profile".into(), s.color_profile.clone(), false),
                         ("All settings".into(), String::new(), false),
                         ("Close".into(), String::new(), true),
+                    ],
+                )
+            }
+            Some(Sheet::Book {
+                ref series_dir,
+                ref read_key,
+                ..
+            }) => {
+                let unread = match read_key {
+                    Some(key) => format!("Mark \"{}\" as unread", entry_title(key)),
+                    None => "Mark as unread".to_string(),
+                };
+                (
+                    series_dir.clone(),
+                    vec![
+                        ("All chapters".into(), "›".into(), false),
+                        (unread, String::new(), false),
+                        ("Delete this chapter".into(), String::new(), false),
+                        ("Delete whole series".into(), String::new(), false),
+                        ("Close".into(), String::new(), true),
+                    ],
+                )
+            }
+            Some(Sheet::ConfirmDelete {
+                ref entry,
+                ref series_dir,
+                scope,
+            }) => {
+                let (title, confirm) = match scope {
+                    DeleteScope::Chapter => (
+                        format!("Delete \"{}\"?", entry_title(&entry.relative_path)),
+                        "Delete this chapter",
+                    ),
+                    DeleteScope::Series => (
+                        format!("Delete all of \"{series_dir}\"?"),
+                        "Delete whole series",
+                    ),
+                };
+                (
+                    title,
+                    vec![
+                        (confirm.to_string(), String::new(), false),
+                        ("Cancel".into(), String::new(), true),
                     ],
                 )
             }
@@ -1929,6 +1986,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let Some((label, _, _)) = rows.get(index) else {
             return Ok(Flow::Continue);
         };
+        match self.sheet.clone() {
+            Some(Sheet::Book {
+                entry,
+                series_dir,
+                read_key,
+            }) => return self.tap_book_sheet(index, entry, series_dir, read_key),
+            Some(Sheet::ConfirmDelete {
+                entry,
+                series_dir,
+                scope,
+            }) => {
+                self.sheet = None;
+                if index == 0 {
+                    self.perform_delete(&entry, &series_dir, scope)?;
+                } else {
+                    self.render_current(RefreshMode::Full)?;
+                }
+                return Ok(Flow::Continue);
+            }
+            _ => {}
+        }
         let mut settings = self.load_settings();
         match label.as_str() {
             "Library view" => {
@@ -1957,12 +2035,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 settings.color_profile = COLOR_PROFILE_STEPS[at].to_string();
                 self.save_settings(&settings);
             }
-            "Delete finished" => {
-                settings.finished_cleanup_hours = cycle(
-                    &gideon_core::FINISHED_CLEANUP_STEPS,
-                    settings.finished_cleanup_hours,
-                );
+            "Full refresh" => {
+                settings.reader_full_refresh_interval =
+                    cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
+                // Live, so the book you are in picks up the new cadence.
+                self.full_refresh_interval = settings.reader_full_refresh_interval;
                 self.save_settings(&settings);
+            }
+            "Profile" => {
+                self.sheet = None;
+                return self.open_profile_menu().map(|_| Flow::Continue);
             }
             "All settings" => {
                 self.sheet = None;
@@ -1980,6 +2062,56 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         // A value cycle repaints one line. Partial, and no flash.
         self.render_current(RefreshMode::Partial)?;
+        Ok(Flow::Continue)
+    }
+
+    /// Act on a row of the library book sheet. Delete goes through a second
+    /// sheet rather than firing on the press: a mis-hold once wiped a title
+    /// outright.
+    fn tap_book_sheet(
+        &mut self,
+        index: usize,
+        entry: LibraryEntry,
+        series_dir: String,
+        read_key: Option<String>,
+    ) -> Result<Flow> {
+        match index {
+            0 => {
+                self.sheet = None;
+                self.open_series_chapters(&series_dir)?;
+            }
+            1 => {
+                self.sheet = None;
+                // Mark as unread: forget the latest-read chapter's progress
+                // (an "I tapped the wrong thing" undo). The card's resume
+                // point falls back to the prior read.
+                if let Some(key) = read_key {
+                    if self.mark_unread(&key)? {
+                        self.show_status(&["Marked as unread."])?;
+                    }
+                }
+                self.render_current(RefreshMode::Full)?;
+            }
+            2 | 3 => {
+                let scope = if index == 2 {
+                    DeleteScope::Chapter
+                } else {
+                    DeleteScope::Series
+                };
+                self.sheet = Some(Sheet::ConfirmDelete {
+                    entry,
+                    series_dir,
+                    scope,
+                });
+                // One sheet replaces another over the same screen: the strip
+                // repaints, nothing underneath it does.
+                self.render_current(RefreshMode::Partial)?;
+            }
+            _ => {
+                self.sheet = None;
+                self.render_current(RefreshMode::Full)?;
+            }
+        }
         Ok(Flow::Continue)
     }
 
@@ -2064,9 +2196,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
-            // Nothing on the stats screen is tappable — Back in the chrome is
-            // handled before row dispatch, like every other read-only screen.
-            Screen::Stats => Ok(Flow::Continue),
+            // Today's one tap target: the Continue card resumes the chapter
+            // it names. A card that says "page 12 of 40" and does nothing
+            // when you press it is the screen lying about what it is.
+            Screen::Stats => {
+                if self.continue_card_hit(y) {
+                    if let Some(card) = self.continue_series_card() {
+                        return self.open_series_card(&card);
+                    }
+                }
+                Ok(Flow::Continue)
+            }
             Screen::Library { items, page } => self.tap_library_cell(&items, page, x, y),
             Screen::Sources { rows, page } => {
                 let index = page * self.layout.rows_per_page() + row;
@@ -2284,59 +2424,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         title: "Downloading".to_string(),
                         body,
                     })?;
-                }
-                Ok(Flow::Continue)
-            }
-            Screen::BookMenu {
-                entry,
-                series_dir,
-                read_key,
-            } => {
-                match row {
-                    0 => self.open_series_chapters(&series_dir)?,
-                    1 => {
-                        // Mark as unread: forget the latest-read chapter's
-                        // progress (an "I tapped the wrong thing" undo). The
-                        // card's resume point falls back to the prior read.
-                        if let Some(key) = read_key {
-                            if self.mark_unread(&key)? {
-                                self.show_status(&["Marked as unread."])?;
-                            }
-                        }
-                        self.pop()?;
-                    }
-                    2 => {
-                        // Deleting is irreversible, so confirm first instead of
-                        // acting on the long press directly (a mis-hold once wiped
-                        // a title outright).
-                        self.push(Screen::ConfirmDelete {
-                            entry,
-                            series_dir,
-                            scope: DeleteScope::Chapter,
-                        })?;
-                    }
-                    3 => {
-                        self.push(Screen::ConfirmDelete {
-                            entry,
-                            series_dir,
-                            scope: DeleteScope::Series,
-                        })?;
-                    }
-                    _ => {}
-                }
-                Ok(Flow::Continue)
-            }
-            Screen::ConfirmDelete {
-                entry,
-                series_dir,
-                scope,
-            } => {
-                // Row 0 confirms the delete; anything else (the Cancel row) just
-                // backs out to the book menu, touching nothing on disk.
-                if row == 0 {
-                    self.perform_delete(&entry, &series_dir, scope)?;
-                } else {
-                    self.pop()?;
                 }
                 Ok(Flow::Continue)
             }
@@ -3945,6 +4032,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let Some(card) = self.library_cell_at(items, page, x, y) else {
             return Ok(Flow::Continue);
         };
+        let card = card.clone();
+        self.open_series_card(&card)
+    }
+
+    /// Open a series and read on: resume where it was left, and keep going
+    /// into the next chapter (downloaded, or from its source) as the reader
+    /// turns past the last page. Shared by a library tap and Today's Continue
+    /// card, so both land in exactly the same place.
+    fn open_series_card(&mut self, card: &SeriesCard) -> Result<Flow> {
         // Resume the series where it was left: the most recently read
         // unfinished chapter, else its first chapter.
         let mut entry = self.with_progress(|_, store| card.resume_chapter(store).clone());
@@ -5051,7 +5147,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let weeks = STATS_HEATMAP_WEEKS;
         let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
         heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
-        y += grid.height() + l.pad * 2;
+        y = self.continue_card_top();
 
         // Continue: the chapter a tap resumes. Omitted on a fresh device
         // rather than drawn as an empty card.
@@ -5110,6 +5206,40 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// The series and chapter a Continue tap resumes, with its progress: the
     /// most recently read chapter anywhere in the library.
+    /// Top of the Continue card on Today, and the bottom of the area it can
+    /// use. Shared with `compose_stats` so what is drawn is what is tapped —
+    /// the card was drawn for a week before anything would open it.
+    fn continue_card_top(&self) -> u32 {
+        let l = &self.layout;
+        let grid = heatmap::HeatmapLayout::fit(
+            l.pad,
+            0,
+            STATS_HEATMAP_WEEKS,
+            l.width.saturating_sub(l.pad * 2),
+            6,
+        );
+        l.content_top() + l.pad + l.row_h * 2 + l.pad + grid.height() + l.pad * 2
+    }
+
+    /// Whether a tap at `y` on Today lands on the Continue card.
+    fn continue_card_hit(&self, y: u32) -> bool {
+        let top = self.continue_card_top();
+        let nav_top = self.layout.nav_top();
+        nav_top.saturating_sub(top) >= self.layout.row_h * 2 && y >= top && y < nav_top
+    }
+
+    /// The series the Continue card names: the most recently read one.
+    fn continue_series_card(&self) -> Option<SeriesCard> {
+        let cards = group_library(Library::new(&self.library_dir).scan().ok()?);
+        self.with_progress(|_, store| {
+            cards
+                .iter()
+                .filter(|c| c.latest_read_at(store) > 0)
+                .max_by_key(|c| c.latest_read_at(store))
+                .cloned()
+        })
+    }
+
     fn continue_card(&self) -> Option<(String, String, f32)> {
         let cards = group_library(Library::new(&self.library_dir).scan().ok()?);
         self.with_progress(|_, store| {
@@ -5561,41 +5691,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .map(|(label, _)| (label, true))
                     .collect();
                 let title = format!("Download — {}", manga.title);
-                compose_list(l, &title, &rows, 0, 1)
-            }
-            Screen::BookMenu {
-                series_dir,
-                read_key,
-                ..
-            } => {
-                let unread = match read_key {
-                    Some(key) => format!("Mark \"{}\" as unread", entry_title(key)),
-                    None => "Mark as unread".to_string(),
-                };
-                let rows = vec![
-                    ("All chapters".to_string(), true),
-                    (unread, read_key.is_some()),
-                    ("Delete this chapter".to_string(), true),
-                    ("Delete whole series".to_string(), true),
-                ];
-                compose_list(l, series_dir, &rows, 0, 1)
-            }
-            Screen::ConfirmDelete {
-                entry,
-                series_dir,
-                scope,
-            } => {
-                let (title, confirm) = match scope {
-                    DeleteScope::Chapter => (
-                        format!("Delete \"{}\"?", entry_title(&entry.relative_path)),
-                        "Delete this chapter",
-                    ),
-                    DeleteScope::Series => (
-                        format!("Delete all of \"{series_dir}\"?"),
-                        "Delete whole series",
-                    ),
-                };
-                let rows = vec![(confirm.to_string(), true), ("Cancel".to_string(), true)];
                 compose_list(l, &title, &rows, 0, 1)
             }
             Screen::ConfirmRemoveSource { source } => {

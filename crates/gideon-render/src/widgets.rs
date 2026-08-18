@@ -2115,11 +2115,14 @@ pub fn draw_sheet(
     let pad = (text_px * 0.5) as u32;
 
     let mut layer = GrayPage::new_white(w.max(1), h.max(1));
+    // The title names what the sheet acts on, so it leads the rows rather
+    // than whispering above them: a modal whose subject is set smaller than
+    // its choices reads as a caption on someone else's menu.
     draw_text(
         &mut layer,
         pad,
         (title_h.saturating_sub(text_px as u32)) / 2,
-        text_px * 0.62,
+        text_px * 0.95,
         title,
         w.saturating_sub(pad * 2),
         true,

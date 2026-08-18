@@ -236,23 +236,39 @@ fn tap_today() -> UiEvent {
     tap_nav(1)
 }
 
-/// Tap row `i` of the quick-settings sheet the Settings tab opens.
-fn tap_quick_row(i: usize) -> UiEvent {
+/// Tap row `i` of a modal sheet with `rows` rows. Sheets are anchored to the
+/// bottom and `sheet_height` is a title row plus one row each, so the
+/// geometry follows from the row count alone.
+fn tap_modal_row(rows: u32, i: usize) -> UiEvent {
     let l = layout();
-    // `sheet_height` = title (one row) + one row each.
-    let rows = QUICK_SETTINGS_ROWS;
-    let h = (rows + 1) * l.row_h;
-    let top = H - h;
+    let top = H - (rows + 1) * l.row_h;
     UiEvent::Tap {
         x: W / 2,
         y: top + l.row_h + i as u32 * l.row_h + l.row_h / 2,
     }
 }
 
+/// Tap row `i` of the quick-settings sheet the Settings tab opens.
+fn tap_quick_row(i: usize) -> UiEvent {
+    tap_modal_row(QUICK_SETTINGS_ROWS, i)
+}
+
+/// Tap row `i` of the book sheet a long press on a library card opens:
+/// 0 all chapters, 1 mark as unread, 2 delete chapter, 3 delete series,
+/// 4 close.
+fn tap_book_row(i: usize) -> UiEvent {
+    tap_modal_row(5, i)
+}
+
+/// Tap row `i` of the delete confirmation sheet: 0 confirms, 1 cancels.
+fn tap_confirm_row(i: usize) -> UiEvent {
+    tap_modal_row(2, i)
+}
+
 /// Number of rows in the quick-settings sheet, and the index of the row that
 /// opens the full device-wide settings screen.
-const QUICK_SETTINGS_ROWS: u32 = 6;
-const QUICK_ALL_SETTINGS: usize = 4;
+const QUICK_SETTINGS_ROWS: u32 = 7;
+const QUICK_ALL_SETTINGS: usize = 5;
 
 /// Open the full Settings screen the way a user does: the Settings tab raises
 /// the quick sheet, and "All settings" goes through to the whole list.
@@ -1549,8 +1565,8 @@ fn resume_honors_stored_last_opened_over_any_timestamp() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { entry, .. } = app.screen() else {
-        panic!("expected the book menu");
+    let Some(Sheet::Book { entry, .. }) = app.sheet() else {
+        panic!("expected the book sheet");
     };
     assert_eq!(
         entry.relative_path, "Series/vol3.cbz",
@@ -1637,13 +1653,13 @@ fn book_menu_targets_the_chapter_a_tap_would_open() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu {
+    let Some(Sheet::Book {
         entry,
         series_dir,
         read_key,
-    } = app.screen()
+    }) = app.sheet()
     else {
-        panic!("expected the book menu");
+        panic!("expected the book sheet");
     };
     assert_eq!(entry.relative_path, "Series/vol2.cbz");
     assert_eq!(series_dir, "Series");
@@ -1681,8 +1697,8 @@ fn cover_tap_without_a_record_resumes_the_furthest_read_chapter() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { entry, .. } = app.screen() else {
-        panic!("expected the book menu");
+    let Some(Sheet::Book { entry, .. }) = app.sheet() else {
+        panic!("expected the book sheet");
     };
     assert_eq!(
         entry.relative_path, "Series/vol3.cbz",
@@ -3110,7 +3126,7 @@ fn offline_series_swaps_to_downloads_and_reads_without_network() {
         nav_discover(),
         tap_row(1),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> BookMenu
-        tap_row(0),                  // "All chapters" -> downloads (offline)
+        tap_book_row(0),             // "All chapters" -> downloads (offline)
         tap_row(0),                  // first downloaded chapter -> reader
         reader_tap_next(),           // turn a page
         reader_tap_back(),           // back to the list
@@ -3250,7 +3266,7 @@ fn online_series_opens_the_source_chapter_list() {
         nav_discover(),
         tap_row(0),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> BookMenu
-        tap_row(0),                  // "All chapters" -> source list (online)
+        tap_book_row(0),             // "All chapters" -> source list (online)
     ];
     let mut app = app(&lib, source_gateway(), events).with_online_probe(Box::new(|| true));
     app.run().unwrap();
@@ -4777,7 +4793,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(0),
+        tap_book_row(0),
     ];
     let mut app = app(&lib, gateway, events);
     app.run().unwrap();
@@ -4840,7 +4856,7 @@ fn open_chapters(cell: (u32, u32)) -> Vec<UiEvent> {
         nav_discover(),
         tap_row(0),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> book menu
-        tap_row(0),                  // "All chapters (from source)"
+        tap_book_row(0),             // "All chapters (from source)"
     ]
 }
 
@@ -4967,7 +4983,7 @@ fn long_press_opens_the_book_menu() {
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { series_dir, .. } = app.screen() else {
+    let Some(Sheet::Book { series_dir, .. }) = app.sheet() else {
         panic!("expected the book menu");
     };
     assert_eq!(series_dir, "Sideload");
@@ -4990,7 +5006,7 @@ fn unlinked_book_chapters_shows_downloaded_list() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(0),
+        tap_book_row(0),
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -5019,8 +5035,8 @@ fn book_menu_deletes_a_chapter() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(2), // Delete this chapter -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(2),    // Delete this chapter -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -5064,8 +5080,8 @@ fn deleting_a_chapter_keeps_its_reading_record() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(2), // Delete this chapter -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(2),    // Delete this chapter -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -5110,8 +5126,8 @@ fn deleting_a_whole_series_keeps_its_reading_records() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(3), // Delete whole series -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(3),    // Delete whole series -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -5143,12 +5159,12 @@ fn book_menu_delete_asks_for_confirmation_first() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(2),
+        tap_book_row(2),
     ];
     let mut opened = app(&lib, FakeGateway::default(), events);
     opened.run().unwrap();
     assert!(
-        matches!(opened.screen(), Screen::ConfirmDelete { .. }),
+        matches!(opened.sheet(), Some(Sheet::ConfirmDelete { .. })),
         "delete asks before removing anything"
     );
     assert!(
@@ -5161,14 +5177,14 @@ fn book_menu_delete_asks_for_confirmation_first() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(2), // -> confirm screen
-        tap_row(1), // Cancel
+        tap_book_row(2),    // -> confirm screen
+        tap_confirm_row(1), // Cancel
     ];
     let mut cancelled = app(&lib, FakeGateway::default(), events);
     cancelled.run().unwrap();
     assert!(
-        matches!(cancelled.screen(), Screen::BookMenu { .. }),
-        "cancelling returns to the book menu"
+        cancelled.sheet().is_none(),
+        "cancelling dismisses the sheet without touching disk"
     );
     assert!(
         lib.join("Series/vol1.cbz").exists(),
@@ -5194,8 +5210,8 @@ fn book_menu_deletes_the_whole_series() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(3), // Delete whole series -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(3),    // Delete whole series -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -5261,7 +5277,7 @@ fn book_menu_marks_the_latest_read_chapter_unread() {
         nav_discover(),
         tap_row(0),
         UiEvent::LongPress { x, y },
-        tap_row(1),
+        tap_book_row(1),
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -7831,6 +7847,12 @@ fn dump_demo() {
         "quick" => {
             app.open_quick_settings().unwrap();
         }
+        // The long-press book sheet, over the library it was raised from.
+        "book" => {
+            let l = UiLayout::new(1264, 1680);
+            app.handle_long_press(l.width / 2, l.content_top() + l.row_h)
+                .unwrap();
+        }
         other => panic!("unknown screen {other}"),
     }
 
@@ -7879,7 +7901,15 @@ fn quick_settings_opens_and_cycles_without_flashing() {
     let row_h = l.row_h;
     let title_h = h.saturating_sub(row_h * rows);
     let at = |i: u32| (l.width / 2, top + title_h + i * row_h + row_h / 2);
-    let (x, y) = at(2);
+    // By label, not by index: the sheet's contents are a design decision and
+    // will move again.
+    let colour = app
+        .sheet_rows()
+        .1
+        .iter()
+        .position(|(label, ..)| label == "Colour profile")
+        .expect("the sheet offers the colour profile") as u32;
+    let (x, y) = at(colour);
     app.tap_sheet(x, y).unwrap();
     assert_eq!(
         app.display().flushes.last(),
@@ -8081,4 +8111,125 @@ fn settings_pages_reach_every_row_and_open_at_the_top() {
     .unwrap();
     app.goto_root(Screen::Settings).unwrap();
     assert_eq!(app.settings_page(), 0);
+}
+
+#[test]
+fn todays_continue_card_opens_the_chapter_it_names() {
+    // The card was drawn with a title, a "page N of M" and a progress bar,
+    // and tapping it did nothing at all: Today's whole tap dispatch returned
+    // early. A card that names your place has to take you there.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 6);
+    make_cbz(&lib.join("Vinland Saga/vol1.cbz"), 6);
+    let now = now_unix();
+    // Vinland Saga is the more recent read, so it is what Continue names.
+    write_progress(
+        &lib,
+        &[
+            ("Berserk/vol1.cbz", 1, 6, now - 90_000),
+            ("Vinland Saga/vol1.cbz", 2, 6, now - 600),
+        ],
+    );
+
+    let l = layout();
+    let mut probe =
+        app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    probe.run().unwrap();
+    probe.goto_root(Screen::Stats).unwrap();
+
+    let (title, _, _) = probe.continue_card().expect("something has been read");
+    assert_eq!(title, "Vinland Saga");
+    let top = probe.continue_card_top();
+    assert!(
+        probe.continue_card_hit(top + l.row_h / 2),
+        "the drawn card must be inside its own hit box"
+    );
+    assert!(
+        !probe.continue_card_hit(top.saturating_sub(1)),
+        "the heatmap above it is not a Continue tap"
+    );
+
+    // Tapping it opens the reader on that chapter and reading advances it.
+    let events = vec![
+        tap_today(),
+        UiEvent::Tap {
+            x: l.width / 2,
+            y: top + l.row_h / 2,
+        },
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Vinland Saga/vol1.cbz").unwrap().current_page,
+        3,
+        "the tap resumed page 3 of Vinland Saga and turned to page 4"
+    );
+    assert_eq!(
+        store.get("Berserk/vol1.cbz").unwrap().current_page,
+        1,
+        "the series the card did not name is untouched"
+    );
+}
+
+#[test]
+fn a_long_press_opens_a_modal_over_the_book_without_flashing() {
+    // Long-press options are a sheet over the library, not a screen of their
+    // own: the card you pressed stays visible behind it (which is the point
+    // of pressing THAT one), and only the strip it covers repaints.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    make_cbz(&lib.join("Berserk/vol2.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    let before = app.display().flushes.len();
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    app.handle_long_press(x, y).unwrap();
+
+    assert!(
+        matches!(app.sheet(), Some(Sheet::Book { .. })),
+        "the long press opens the book sheet"
+    );
+    assert!(
+        matches!(app.screen(), Screen::Library { .. }),
+        "and leaves you on the library, not on a menu screen"
+    );
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "raising a sheet must not flash the panel"
+    );
+
+    // Delete swaps one sheet for another — still no flash, still no delete.
+    let before = app.display().flushes.len();
+    app.tap_sheet(W / 2, tap_y(tap_book_row(2))).unwrap();
+    assert!(matches!(app.sheet(), Some(Sheet::ConfirmDelete { .. })));
+    assert_eq!(app.display().flushes[before..], [RefreshMode::Partial]);
+    assert!(lib.join("Berserk/vol1.cbz").exists());
+
+    // Dismissing by tapping above the sheet restores what it covered, which
+    // is the one interaction here that legitimately flashes.
+    let before = app.display().flushes.len();
+    app.tap_sheet(W / 2, 1).unwrap();
+    assert!(app.sheet().is_none());
+    assert_eq!(app.display().flushes[before..], [RefreshMode::Full]);
+    assert!(lib.join("Berserk/vol1.cbz").exists());
+}
+
+/// The y of a scripted tap event.
+fn tap_y(event: UiEvent) -> u32 {
+    match event {
+        UiEvent::Tap { y, .. } => y,
+        other => panic!("not a tap: {other:?}"),
+    }
 }
