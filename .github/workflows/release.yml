@@ -21,6 +21,13 @@ name: Release
 on:
   push:
     branches: [main]
+    # A docs-only merge ships no new binary, so it should not cut a release.
+    # Safe to filter here (unlike CI) because this workflow is not a required
+    # status check — skipping it blocks nothing.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
   workflow_dispatch:
     inputs:
       bump:
@@ -47,7 +54,8 @@ jobs:
   release:
     name: Build and publish release
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Slowest observed end-to-end: 5m07 (build + QEMU tests + publish).
+    timeout-minutes: 20
     if: >
       github.event_name == 'workflow_dispatch' ||
       !contains(github.event.head_commit.message, '[skip release]')
