@@ -804,7 +804,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             library_dir,
             active_profile: "default".to_string(),
             layout,
-            stack: vec![Screen::Home],
+            stack: vec![Screen::Stats],
             reader_fit: FitMode::Contain,
             full_refresh_interval: 8,
             auto_rotate_spreads: false,
@@ -1293,6 +1293,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.move_page(PageMove::Last)?;
                 Ok(Flow::Continue)
             }
+            // Today draws a four-item nav bar where other screens draw Back,
+            // so its bottom strip is routed here instead of falling through
+            // to the generic targets.
+            _ if matches!(self.screen(), Screen::Stats) && y >= self.layout.nav_top() => {
+                self.tap_today_nav(x)
+            }
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
@@ -1300,7 +1306,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // right edge; tapping it cycles the order.
                 if self.screen_has_sort() && x >= sort_button_x(&self.layout) {
                     self.cycle_chapter_sort()?;
-                } else if matches!(self.screen(), Screen::Home) {
+                } else if matches!(self.screen(), Screen::Home | Screen::Stats) {
                     let (w, th) = (self.layout.width, self.layout.title_h);
                     let sends = crate::sync::cached_sends(&self.library_dir);
                     // Power sits at the far right; when a notification bell is
@@ -1643,6 +1649,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.render_current(RefreshMode::Partial)?;
         }
         Ok(())
+    }
+
+    /// Route a tap on Today's bottom nav bar. Four equal zones, matching
+    /// what [`Self::compose_stats`] draws, so hit-testing and drawing cannot
+    /// drift apart.
+    ///
+    /// "Discover" opens the menu that used to be Home: the sources, search,
+    /// popular and update entries keep the row order they have always had,
+    /// so every tap zone below the nav bar is unchanged.
+    fn tap_today_nav(&mut self, x: u32) -> Result<Flow> {
+        let zone = (x * 4 / self.layout.width.max(1)).min(3);
+        match zone {
+            0 => {}
+            1 => self.open_library()?,
+            2 => self.push(Screen::Home)?,
+            3 => self.push(Screen::Settings)?,
+            _ => {}
+        }
+        Ok(Flow::Continue)
     }
 
     /// Activate whatever sits at content row `row` (tap at `x`, `y`).
@@ -4560,7 +4585,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let palette = heatmap::Palette::from_setting(&settings.color_profile);
         let inner = l.width.saturating_sub(l.pad * 2);
 
-        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(l, "Today", 0, 1, false));
+        // Today is the landing screen, so it carries what Home's title bar
+        // used to: version, profile, battery, and the power / bell / Bluetooth
+        // status icons. Those belong wherever the device opens, not buried a
+        // level down.
+        let title = home_title(
+            env!("CARGO_PKG_VERSION"),
+            &self.active_profile,
+            self.battery_now(),
+        );
+        let mut chrome = compose_chrome_opts(l, &title, 0, 1, false);
+        draw_power_icon(&mut chrome, l);
+        let mut slot = 1;
+        if !crate::sync::cached_sends(&self.library_dir).is_empty() {
+            draw_bell_icon(&mut chrome, l, slot);
+            slot += 1;
+        }
+        if self.input.bluetooth_connected() {
+            draw_bluetooth_icon(&mut chrome, l, slot);
+        }
+        let mut canvas = RgbPage::from_gray(&chrome);
         let mut y = l.content_top() + l.pad;
 
         // The totals the web dashboard derives from Supabase — here they come
