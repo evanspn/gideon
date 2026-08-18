@@ -27,6 +27,17 @@ crashed the Kobo on every exit in the field; reverted in PR #122. The
 exit-with-BT-connected reboot is an upstream platform issue
 (koreader/koreader#12739) and is accepted, not worked around.
 
+# Front-end work: demo first
+
+UI work in this repo goes through the design review gallery before any code
+lands here. Publish a self-contained mockup to `evanspn/demo-environment`
+(its `design-review` skill has the procedure), send the link, and wait for
+approval — feedback arrives as pinned comments in the gallery.
+
+- Gallery: https://design-review-seven-brown.vercel.app
+- Design mobile-first for iPhone 14 Pro Max (430x932 logical viewport).
+- Tag published designs with this repo as `parent_repo`.
+
 ## E-ink refresh
 
 Which refresh a repaint asks for is a user-visible design decision, not an
