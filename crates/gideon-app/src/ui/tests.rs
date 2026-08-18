@@ -211,6 +211,208 @@ fn layout() -> UiLayout {
     UiLayout::new(W, H)
 }
 
+/// A tap on the four-zone nav bar the top-level destinations carry:
+/// 0 Library, 1 Today, 2 Discover, 3 Settings. Mirrors the zone maths in
+/// `tap_main_nav`.
+fn tap_nav(zone: u32) -> UiEvent {
+    let l = layout();
+    UiEvent::Tap {
+        x: l.width * (2 * zone + 1) / 8,
+        y: l.nav_top() + l.nav_h / 2,
+    }
+}
+
+/// The library is the landing screen now, so a test that wants the old Home
+/// menu (sources, search, popular, updates) opens Discover first. Every row
+/// index below that is unchanged, which is what keeps this a one-line
+/// migration.
+fn nav_discover() -> UiEvent {
+    tap_nav(2)
+}
+
+/// Today: the destination that carries the device's status chrome — battery
+/// in the title, and the power / bell / Bluetooth icons beside it.
+fn tap_today() -> UiEvent {
+    tap_nav(1)
+}
+
+/// Tap row `i` of a modal sheet with `rows` rows. Sheets are anchored to the
+/// bottom and `sheet_height` is a title row plus one row each, so the
+/// geometry follows from the row count alone.
+fn tap_modal_row(rows: u32, i: usize) -> UiEvent {
+    let l = layout();
+    let top = H - (rows + 1) * l.row_h;
+    UiEvent::Tap {
+        x: W / 2,
+        y: top + l.row_h + i as u32 * l.row_h + l.row_h / 2,
+    }
+}
+
+/// Tap row `i` of the book sheet a long press on a library card opens:
+/// 0 all chapters, 1 mark as unread, 2 delete chapter, 3 delete series,
+/// 4 close.
+fn tap_book_row(i: usize) -> UiEvent {
+    tap_modal_row(5, i)
+}
+
+/// Tap row `i` of the delete confirmation sheet: 0 confirms, 1 cancels.
+fn tap_confirm_row(i: usize) -> UiEvent {
+    tap_modal_row(2, i)
+}
+
+/// The quick-settings sheet's geometry, mirroring `quick_sheet_layout`:
+/// `(top, tile grid, first action row's y)`.
+fn quick_sheet() -> (u32, gideon_render::widgets::GridLayout, u32) {
+    let l = layout();
+    let gap = super::SETTINGS_GAP;
+    let title_h = (l.text_px * 1.6) as u32;
+    let cell_h = l.row_h * 5 / 4;
+    let rows = (QUICK_TILES as u32).div_ceil(super::SETTINGS_COLS);
+    let grid_h = rows * cell_h + gap * rows.saturating_sub(1);
+    let actions_h = l.row_h * QUICK_ACTIONS as u32;
+    let h = (title_h + gap + grid_h + gap + actions_h).min(l.height);
+    let top = l.height - h;
+    let grid = gideon_render::widgets::GridLayout::new(
+        l.pad,
+        top + title_h + gap,
+        l.width.saturating_sub(l.pad * 2),
+        super::SETTINGS_COLS,
+        cell_h,
+        gap,
+    );
+    (top, grid, top + title_h + gap + grid_h + gap)
+}
+
+/// How many value tiles the quick sheet shows, and how many action rows sit
+/// under them ("All settings", "Close").
+const QUICK_TILES: usize = 5;
+const QUICK_ACTIONS: usize = 2;
+
+/// Tap tile `i` of the quick-settings grid.
+fn tap_quick_tile(i: usize) -> UiEvent {
+    let (_, grid, _) = quick_sheet();
+    let (cx, cy, cw, ch) = grid.cell(i);
+    UiEvent::Tap {
+        x: cx + cw / 2,
+        y: cy + ch / 2,
+    }
+}
+
+/// Tap action row `i` of the quick-settings sheet: 0 "All settings", 1 "Close".
+fn tap_quick_action(i: usize) -> UiEvent {
+    let l = layout();
+    let (_, _, actions_top) = quick_sheet();
+    UiEvent::Tap {
+        x: W / 2,
+        y: actions_top + i as u32 * l.row_h + l.row_h / 2,
+    }
+}
+
+/// Open the full Settings screen the way a user does: the Settings tab raises
+/// the quick sheet, and "All settings" goes through to everything else.
+fn open_settings() -> Vec<UiEvent> {
+    vec![tap_nav(3), tap_quick_action(0)]
+}
+
+/// The page a setting's tile is drawn on, and a tap at the centre of it.
+/// Computed from the same grid the screen uses, so a test never has to know
+/// which page or column a setting landed in — and a tile that moves takes its
+/// tap with it instead of quietly firing its neighbour.
+fn settings_row_at(label: &str) -> (usize, UiEvent) {
+    let l = layout();
+    let head_h = l.row_h * 2 / 3;
+    let cell_h = l.row_h * 5 / 4;
+    let cols = super::SETTINGS_COLS;
+    let gap = super::SETTINGS_GAP;
+    let avail = l
+        .nav_top()
+        .saturating_sub(l.content_top() + l.pad / 2 + l.pad);
+    let groups = super::settings_groups(&gideon_core::Settings::default());
+    let paginate =
+        |groups, avail| super::paginate_settings(groups, head_h, cell_h, gap, cols as usize, avail);
+    let mut pages = paginate(groups.clone(), avail);
+    if pages.len() > 1 {
+        pages = paginate(groups, avail.saturating_sub(l.row_h));
+    }
+    for (p, page) in pages.iter().enumerate() {
+        let mut y = l.content_top() + l.pad / 2;
+        for (_, rows) in page {
+            y += head_h;
+            let grid = gideon_render::widgets::GridLayout::new(
+                l.pad,
+                y,
+                l.width.saturating_sub(l.pad * 2),
+                cols,
+                cell_h,
+                gap,
+            );
+            for (i, (name, ..)) in rows.iter().enumerate() {
+                if name == label {
+                    let (cx, cy, cw, ch) = grid.cell(i);
+                    return (
+                        p,
+                        UiEvent::Tap {
+                            x: cx + cw / 2,
+                            y: cy + ch / 2,
+                        },
+                    );
+                }
+            }
+            y += grid.height(rows.len()) + gap;
+        }
+    }
+    panic!("no setting labelled {label:?}");
+}
+
+/// A tap on the settings pager strip: left half back, right half forward.
+fn settings_pager(forward: bool) -> UiEvent {
+    let l = layout();
+    UiEvent::Tap {
+        x: if forward {
+            l.width * 3 / 4
+        } else {
+            l.width / 4
+        },
+        y: l.nav_top() - l.row_h / 2,
+    }
+}
+
+/// Everything needed to tap the settings row labelled `label` from page 0 of
+/// the Settings screen, ending back on page 0 so calls compose.
+fn tap_setting(label: &str) -> Vec<UiEvent> {
+    let (page, tap) = settings_row_at(label);
+    let mut events: Vec<UiEvent> = (0..page).map(|_| settings_pager(true)).collect();
+    events.push(tap);
+    events.extend((0..page).map(|_| settings_pager(false)));
+    events
+}
+
+/// Tap card `i` of Discover's grid. Discover is two columns of cards now, so
+/// a tap at the middle of the screen lands in the gutter between them.
+fn tap_card(i: usize) -> UiEvent {
+    let l = layout();
+    let gap = l.pad / 2;
+    let top = l.content_top() + gap;
+    let avail = l.nav_top().saturating_sub(top + gap);
+    // Mirrors `discover_grid`: cards are laid out for the count on screen,
+    // which is four, or five when the offline reconnect card is showing.
+    let rows = 2u32;
+    let cell_h = (avail.saturating_sub(gap * (rows - 1)) / rows).clamp(l.row_h, l.row_h * 5 / 2);
+    let grid = gideon_render::widgets::GridLayout::new(
+        l.pad,
+        top,
+        l.width.saturating_sub(l.pad * 2),
+        super::SETTINGS_COLS,
+        cell_h,
+        gap,
+    );
+    let (cx, cy, cw, ch) = grid.cell(i);
+    UiEvent::Tap {
+        x: cx + cw / 2,
+        y: cy + ch / 2,
+    }
+}
+
 fn tap_row(i: usize) -> UiEvent {
     let l = layout();
     UiEvent::Tap {
@@ -325,6 +527,27 @@ fn panel_point_for(rx: u32, ry: u32, rot: u32) -> (u32, u32) {
 }
 
 /// [`tap_row`] aimed at a menu rendered at rotation `rot`.
+/// [`tap_card`] at rotation `rot`: the card centre in reading orientation,
+/// mapped back into panel coordinates.
+fn tap_card_rot(i: usize, rot: u32) -> UiEvent {
+    let l = menu_layout(rot);
+    let gap = l.pad / 2;
+    let top = l.content_top() + gap;
+    let avail = l.nav_top().saturating_sub(top + gap);
+    let cell_h = (avail.saturating_sub(gap) / 2).clamp(l.row_h, l.row_h * 5 / 2);
+    let grid = gideon_render::widgets::GridLayout::new(
+        l.pad,
+        top,
+        l.width.saturating_sub(l.pad * 2),
+        super::SETTINGS_COLS,
+        cell_h,
+        gap,
+    );
+    let (cx, cy, cw, ch) = grid.cell(i);
+    let (x, y) = panel_point_for(cx + cw / 2, cy + ch / 2, rot);
+    UiEvent::Tap { x, y }
+}
+
 fn tap_row_rot(i: usize, rot: u32) -> UiEvent {
     let l = menu_layout(rot);
     let (x, y) = panel_point_for(l.width / 2, l.row_top(i) + l.row_h / 2, rot);
@@ -371,15 +594,18 @@ fn make_tall_cbz(path: &Path, pages: usize) {
 // --- tests ---
 
 #[test]
-fn home_renders_rows_and_is_not_blank() {
+fn the_landing_screen_is_the_library_and_is_not_blank() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    // Exactly one paint, and a full one: e-ink flashes on every full
+    // refresh, so a launch that painted the landing twice would flash twice
+    // before the reader saw anything.
     assert_eq!(app.display().flushes, vec![RefreshMode::Full]);
     assert!(
         app.display().buffer.iter().any(|&p| p < 0x80),
-        "home screen is blank"
+        "landing screen is blank"
     );
 }
 
@@ -392,6 +618,7 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
     // Offline (forced): content row 0 is the reconnect button — tapping it
     // attempts a reconnect and stays on Home (off-device that's a no-op).
     let mut a = app(&lib, FakeGateway::default(), vec![]);
+    a.goto_root(Screen::Home).unwrap();
     a.home_offline = true;
     a.activate(0, 10, 10).unwrap();
     assert!(
@@ -399,22 +626,33 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
         "offline row 0 reconnects, stays on Home"
     );
 
-    // Offline: the standard entries are offset past the reconnect row, so the
-    // first real entry (Library) is row 1.
+    // Offline: the cards are offset past the reconnect card, so "Browse
+    // sources" — the second destination — is card 2.
     let mut b = app(&lib, FakeGateway::default(), vec![]);
+    b.goto_root(Screen::Home).unwrap();
     b.home_offline = true;
-    b.activate(1, 10, 10).unwrap();
+    let UiEvent::Tap { x, y } = tap_card(2) else {
+        unreachable!()
+    };
+    b.handle_tap(x, y).unwrap();
     assert!(
-        matches!(b.screen(), Screen::Library { .. }),
-        "offline row 1 is Library"
+        matches!(b.screen(), Screen::Sources { .. }),
+        "offline card 2 is Browse sources"
     );
 
-    // Online (the default): no reconnect row, so Library is row 0.
+    // Online (the default): no reconnect card, so Browse sources is card 1.
     let mut c = app(&lib, FakeGateway::default(), vec![]);
-    c.activate(0, 10, 10).unwrap();
+    c.goto_root(Screen::Home).unwrap();
+    // Painting Discover probes connectivity; pin the online case so the
+    // offset under test is the one being asserted and not the probe's mood.
+    c.home_offline = false;
+    let UiEvent::Tap { x, y } = tap_card(1) else {
+        unreachable!()
+    };
+    c.handle_tap(x, y).unwrap();
     assert!(
-        matches!(c.screen(), Screen::Library { .. }),
-        "online row 0 is Library"
+        matches!(c.screen(), Screen::Sources { .. }),
+        "online card 1 is Browse sources"
     );
 }
 
@@ -425,18 +663,17 @@ fn home_to_library_to_reader_page_turns_and_back() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        tap_row(0),        // Home -> Library
+        tap_nav(0),        // Home -> Library
         tap_shelf_cell0(), // open the reader
         reader_tap_next(), // page 2
         reader_tap_next(), // page 3
         reader_tap_prev(), // page 2
         reader_tap_back(), // back to Library
-        tap_back(),        // back to Home
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     // Progress was saved under the library-relative key.
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
     let progress = store.get("Sample/vol1.cbz").expect("progress saved");
@@ -445,7 +682,7 @@ fn home_to_library_to_reader_page_turns_and_back() {
 
     // Screen changes are full refreshes; reader page turns are partial.
     let flushes = &app.display().flushes;
-    assert_eq!(flushes[0], RefreshMode::Full); // home
+    assert_eq!(flushes[0], RefreshMode::Full); // the landing library
     assert!(flushes.contains(&RefreshMode::Partial)); // page turns
 }
 
@@ -458,7 +695,7 @@ fn reader_resumes_from_saved_progress() {
     store.update("Sample/vol1.cbz", 3, 5);
     store.save(&progress_path(&lib)).unwrap();
 
-    let events = vec![tap_row(0), tap_shelf_cell0(), reader_tap_next()];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), reader_tap_next()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -476,7 +713,7 @@ fn fit_width_setting_makes_next_scroll_within_the_page() {
     // at 740px per step needs four taps to reach the bottom), so the saved
     // progress stays on page 0.
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_next(),
@@ -503,7 +740,7 @@ fn fit_width_setting_turns_the_page_from_the_bottom() {
     make_tall_cbz(&lib.join("Tall/vol1.cbz"), 2);
 
     // The fifth "next" tap happens at the bottom and turns to page 1.
-    let mut events = vec![tap_row(0), tap_shelf_cell0()];
+    let mut events = vec![tap_nav(0), tap_shelf_cell0()];
     events.extend(std::iter::repeat_with(reader_tap_next).take(5));
     events.push(reader_tap_back());
     let mut app =
@@ -523,7 +760,7 @@ fn default_contain_mode_turns_pages_directly() {
     // Without the fit-width setting, two next taps mean two page turns
     // even on a tall page.
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_next(),
@@ -575,23 +812,28 @@ fn menu_taps_land_the_right_row_at_each_rotation() {
         let lib = dir.path().join("Manga");
         make_cbz(&lib.join("Sample/vol1.cbz"), 2);
 
-        // Row 0 opens the Library…
-        let mut library_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(0, rot)])
+        // Row 1 of the Discover menu opens Sources… (the row indices are
+        // Discover's, so each app starts there rather than on the library
+        // the device lands on.)
+        let mut sources_app = app(&lib, FakeGateway::default(), vec![tap_card_rot(1, rot)])
             .with_reader_settings(FitMode::Contain, rot);
-        library_app.run().unwrap();
+        sources_app.goto_root(Screen::Home).unwrap();
+        sources_app.run().unwrap();
         assert!(
-            matches!(library_app.screen(), Screen::Library { .. }),
-            "rotation {rot}: the Library row tap must open the Library"
+            matches!(sources_app.screen(), Screen::Sources { .. }),
+            "rotation {rot}: the Browse sources row tap must open Sources"
         );
 
-        // …and row 3 opens Settings: per-row precision, not just "hit
-        // something".
-        let mut settings_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(3, rot)])
+        // …and row 0 opens search, which with no sources installed says so
+        // rather than opening a dead keyboard: per-row precision, not just
+        // "hit something".
+        let mut search_app = app(&lib, FakeGateway::default(), vec![tap_card_rot(0, rot)])
             .with_reader_settings(FitMode::Contain, rot);
-        settings_app.run().unwrap();
+        search_app.goto_root(Screen::Home).unwrap();
+        search_app.run().unwrap();
         assert!(
-            matches!(settings_app.screen(), Screen::Settings),
-            "rotation {rot}: the Settings row tap must open Settings"
+            matches!(search_app.screen(), Screen::Message { title, .. } if title == "Search"),
+            "rotation {rot}: the search row tap must open search"
         );
     }
 }
@@ -631,7 +873,7 @@ fn leaving_the_reader_drains_the_exit_gestures_tail() {
         y1: H - 20, // well past the quarter-height exit threshold
     };
     let events = vec![
-        tap_row(0),        // Home -> Library
+        tap_nav(0),        // Home -> Library
         tap_shelf_cell0(), // open the book
         swipe_down_exit,   // swipe down -> back to the library
     ];
@@ -678,7 +920,7 @@ fn controls_sheet_opens_from_bottom_edge_swipe_only() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),         // opens the sheet — must NOT rotate
         tap_sheet_row(SHEET_ROW_CLOSE), // Close
@@ -713,7 +955,7 @@ fn controls_sheet_rotate_matches_the_swipe_rotation() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),
         tap_sheet_row(0), // Rotate 90°
@@ -745,7 +987,7 @@ fn orientation_lock_toggle_persists_and_auto_keeps_rotation_session_only() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),
         tap_sheet_row(SHEET_ROW_ORIENTATION), // locked -> auto (persisted)
@@ -888,7 +1130,7 @@ fn gyro_rotates_the_reader_in_auto_mode() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::Rotate { rotation: 90 },
         tap_panel_bottom,
@@ -968,7 +1210,7 @@ fn waking_snaps_the_reader_to_the_current_orientation() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::Sleep,
         tap_panel_bottom,
@@ -995,7 +1237,7 @@ fn physical_forward_button_advances_when_upright() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::PageForward, // upright: forward advances to page 1
         reader_tap_back(),
@@ -1191,7 +1433,7 @@ fn fast_page_turn_keeps_queued_presses() {
 fn empty_library_shows_hint_not_error() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga"); // does not exist yet
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
     assert!(lib.exists(), "library directory should be created");
@@ -1208,7 +1450,7 @@ fn library_paginates_with_prev_next() {
         make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
     }
 
-    let events = vec![tap_row(0), tap_nav_next(), tap_nav_next(), tap_nav_prev()];
+    let events = vec![tap_nav(0), tap_nav_next(), tap_nav_next(), tap_nav_prev()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1216,6 +1458,11 @@ fn library_paginates_with_prev_next() {
     let Screen::Library { page, items } = app.screen() else {
         panic!("expected library screen");
     };
+    eprintln!(
+        "DBG capacity={capacity} items={} page={page} flushes={:?}",
+        items.len(),
+        app.display().flushes
+    );
     assert_eq!(items.len(), capacity + 2);
     assert_eq!(*page, 0);
     // Page flips within a screen are partial refreshes.
@@ -1239,7 +1486,7 @@ fn three_chapters_of_one_series_make_one_card() {
     make_cbz(&lib.join("Series/vol2.cbz"), 2);
     make_cbz(&lib.join("Series/vol3.cbz"), 2);
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     let Screen::Library { items, .. } = app.screen() else {
@@ -1340,7 +1587,7 @@ fn tapping_a_series_card_resumes_the_in_progress_chapter() {
     .unwrap();
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // vol2: page 1 -> 2
         reader_tap_back(),
@@ -1391,12 +1638,12 @@ fn resume_honors_stored_last_opened_over_any_timestamp() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { entry, .. } = app.screen() else {
-        panic!("expected the book menu");
+    let Some(Sheet::Book { entry, .. }) = app.sheet() else {
+        panic!("expected the book sheet");
     };
     assert_eq!(
         entry.relative_path, "Series/vol3.cbz",
@@ -1415,7 +1662,7 @@ fn resuming_a_series_still_flows_into_the_next_chapter() {
     make_cbz(&lib.join("Series/vol2.cbz"), 2);
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // vol1 page 2 (last)
         reader_tap_next(), // past the end -> vol2 opens
@@ -1438,7 +1685,7 @@ fn sideloaded_loose_file_still_gets_a_card() {
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
     make_cbz(&lib.join("loose.cbz"), 2);
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     let Screen::Library { items, .. } = app.screen() else {
@@ -1474,17 +1721,17 @@ fn book_menu_targets_the_chapter_a_tap_would_open() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu {
+    let Some(Sheet::Book {
         entry,
         series_dir,
         read_key,
-    } = app.screen()
+    }) = app.sheet()
     else {
-        panic!("expected the book menu");
+        panic!("expected the book sheet");
     };
     assert_eq!(entry.relative_path, "Series/vol2.cbz");
     assert_eq!(series_dir, "Series");
@@ -1518,12 +1765,12 @@ fn cover_tap_without_a_record_resumes_the_furthest_read_chapter() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { entry, .. } = app.screen() else {
-        panic!("expected the book menu");
+    let Some(Sheet::Book { entry, .. }) = app.sheet() else {
+        panic!("expected the book sheet");
     };
     assert_eq!(
         entry.relative_path, "Series/vol3.cbz",
@@ -1546,8 +1793,16 @@ fn library_with_cover_art_renders_in_color() {
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
     make_red_cover(&lib.join("Series"));
+    // This test is about the cover SHELF specifically; the dense list is the
+    // default view now, so pin this profile to the shelf.
+    gideon_core::ProfileSettings {
+        library_view: Some("shelf".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
 
@@ -1588,7 +1843,16 @@ fn color_library_page_flips_stay_partial() {
         make_red_cover(&lib.join(format!("Series {i:02}")));
     }
 
-    let events = vec![tap_row(0), tap_nav_next()];
+    // Pin this profile to the cover shelf: the flip under test is the
+    // colour one, and the dense list is the default view now.
+    gideon_core::ProfileSettings {
+        library_view: Some("shelf".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
+
+    let events = vec![tap_nav(0), tap_nav_next()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1679,7 +1943,7 @@ fn library_without_covers_stays_on_the_grayscale_path() {
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     // The CBZ's first page is gray; nothing here may take the color path
@@ -1712,7 +1976,7 @@ fn sources_screen_lists_installed_then_available() {
         ]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1736,7 +2000,7 @@ fn source_list_fetch_error_shows_note_row_and_continues() {
         available: Err("network unreachable".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1760,7 +2024,11 @@ fn tapping_available_source_installs_and_refreshes() {
         ..FakeGateway::default()
     };
     // Rows: [Separator, Available("New Source")] -> tap row 1 installs.
-    let mut app = app(dir.path(), gateway, vec![tap_row(2), tap_row(1)]);
+    let mut app = app(
+        dir.path(),
+        gateway,
+        vec![nav_discover(), tap_card(1), tap_row(1)],
+    );
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1815,7 +2083,8 @@ fn full_browse_download_and_read_flow() {
     };
 
     let events = vec![
-        tap_row(2),        // Home -> Sources
+        nav_discover(),
+        tap_card(1),       // Home -> Sources
         tap_row(0),        // installed "Src" -> Listings
         tap_row(0),        // Popular -> MangaList
         tap_row(0),        // Manga One -> ChapterList
@@ -1863,7 +2132,8 @@ fn manga_list_paginates() {
     };
 
     let events = vec![
-        tap_row(2),     // Sources
+        nav_discover(),
+        tap_card(1),    // Sources
         tap_row(0),     // Listings
         tap_row(0),     // Popular
         tap_nav_next(), // page 2
@@ -1894,10 +2164,11 @@ fn listing_failure_shows_error_screen_with_back() {
     };
 
     let events = vec![
-        tap_row(2), // Sources
-        tap_row(0), // Listings
-        tap_row(0), // Popular -> fails
-        tap_row(0), // tap the error screen -> back
+        nav_discover(),
+        tap_card(1), // Sources
+        tap_row(0),  // Listings
+        tap_row(0),  // Popular -> fails
+        tap_row(0),  // tap the error screen -> back
     ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
@@ -1917,7 +2188,7 @@ fn error_screen_renders_the_message() {
         mangas: Err("server exploded".into()),
         ..FakeGateway::default()
     };
-    let events = vec![tap_row(2), tap_row(0), tap_row(0)];
+    let events = vec![nav_discover(), tap_card(1), tap_row(0), tap_row(0)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -1935,7 +2206,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(4)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(3)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -1953,12 +2224,13 @@ fn back_on_home_does_nothing() {
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![tap_back(), tap_back(), tap_row(0)],
+        vec![nav_discover(), tap_back(), tap_back(), tap_card(0)],
     );
-    let lib = dir.path().join("x");
-    let _ = lib; // silence unused in case of edits
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(
+        matches!(app.screen(), Screen::Message { title, .. } if title == "Search"),
+        "the row tap after two ignored Back taps still works"
+    );
 }
 
 // --- power menu ---
@@ -1975,17 +2247,19 @@ fn tap_power_icon() -> UiEvent {
 #[test]
 fn power_icon_opens_the_menu_and_back_returns() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_power_icon(), tap_back()];
+    // Today carries the status chrome (battery, power, bell), so that is
+    // where the power symbol is tapped from.
+    let events = vec![tap_today(), tap_power_icon(), tap_back()];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Close); // input exhausted
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 #[test]
 fn power_menu_close_quits() {
     let dir = tempfile::tempdir().unwrap();
     // Row 0 is the Wi-Fi toggle now; Restart is 1, Close is 2.
-    let events = vec![tap_power_icon(), tap_row(2)];
+    let events = vec![nav_discover(), tap_power_icon(), tap_row(2)];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Close);
 }
@@ -1993,7 +2267,7 @@ fn power_menu_close_quits() {
 #[test]
 fn power_menu_restart_requests_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_power_icon(), tap_row(1)];
+    let events = vec![nav_discover(), tap_power_icon(), tap_row(1)];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Restart);
 }
@@ -2914,9 +3188,9 @@ fn offline_series_swaps_to_downloads_and_reads_without_network() {
     };
     // Offline, Home shows the "reconnect" row at row 0, so Library is row 1.
     let events = vec![
-        tap_row(1),                  // Home -> Library
+        tap_nav(0),                  // Library
         UiEvent::LongPress { x, y }, // card -> BookMenu
-        tap_row(0),                  // "All chapters" -> downloads (offline)
+        tap_book_row(0),             // "All chapters" -> downloads (offline)
         tap_row(0),                  // first downloaded chapter -> reader
         reader_tap_next(),           // turn a page
         reader_tap_back(),           // back to the list
@@ -3053,9 +3327,9 @@ fn online_series_opens_the_source_chapter_list() {
     };
     // Online, Home has no reconnect row, so Library is row 0.
     let events = vec![
-        tap_row(0),                  // Home -> Library
+        tap_nav(0),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> BookMenu
-        tap_row(0),                  // "All chapters" -> source list (online)
+        tap_book_row(0),             // "All chapters" -> source list (online)
     ];
     let mut app = app(&lib, source_gateway(), events).with_online_probe(Box::new(|| true));
     app.run().unwrap();
@@ -3247,10 +3521,11 @@ fn storage_screen_reports_usage_and_frees_space() {
     s.storage_size_limit = gideon_core::StorageSize(1024 * 1024);
     app.save_settings(&s);
 
-    // Open the storage screen and tap "Free up space now".
+    // Open the storage screen and tap "Free up space now" — the last row of
+    // content, sitting on the Back bar, wherever the series list ends.
     app.push(Screen::Storage).unwrap();
     let l = layout();
-    app.handle_tap(l.width / 2, l.row_top(STORAGE_FREE_ROW) + l.row_h / 2)
+    app.handle_tap(l.width / 2, l.nav_top() - l.row_h / 2)
         .unwrap();
     assert_eq!(
         app.storage_stats().chapters,
@@ -3288,13 +3563,13 @@ fn wifi_list_tap_secured_network_asks_for_password() {
 fn wifi_list_toggle_off_returns_to_previous_screen() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
-    // [Home, WifiList]; rows: Wi-Fi toggle(0), net(1), "Scan again"(2).
+    // [Library, WifiList]; rows: Wi-Fi toggle(0), net(1), "Scan again"(2).
     app.stack.push(Screen::WifiList {
         networks: vec![wifi_net("X", true, false)],
     });
     app.activate(0, 10, 10).unwrap();
     assert!(
-        matches!(app.screen(), Screen::Home),
+        matches!(app.screen(), Screen::Library { .. }),
         "flipping the Wi-Fi toggle off pops back to the previous screen"
     );
 }
@@ -3311,8 +3586,8 @@ fn wifi_toggle_off_closes_the_whole_menu_from_the_power_menu() {
     });
     app.activate(0, 10, 10).unwrap();
     assert!(
-        matches!(app.screen(), Screen::Home),
-        "the Wi-Fi toggle closes the entire menu stack back to Home"
+        matches!(app.screen(), Screen::Library { .. }),
+        "the Wi-Fi toggle closes the entire menu stack back to the library"
     );
 }
 
@@ -3323,15 +3598,15 @@ fn title_taps_off_the_power_icon_are_ignored() {
     // 2 × title_h): a dead-zone tap must do nothing.
     let l = layout();
     let x = (l.width / 2 + l.width.saturating_sub(l.title_h * 2)) / 2;
-    let events = vec![UiEvent::Tap { x, y: 5 }];
+    let events = vec![tap_today(), UiEvent::Tap { x, y: 5 }];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 // --- profiles ---
 
-/// Tap the left half of the title bar (the profile name on Home).
+/// Tap the left half of the title bar (the profile name).
 fn tap_title_left() -> UiEvent {
     let l = layout();
     UiEvent::Tap {
@@ -3355,7 +3630,7 @@ fn profile_settings_dir(dir: &Path, profiles: &[&str]) -> PathBuf {
 fn title_left_tap_opens_the_profile_menu() {
     let dir = tempfile::tempdir().unwrap();
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
-    let events = vec![tap_title_left()];
+    let events = vec![nav_discover(), tap_title_left()];
     let mut app = app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
@@ -3374,9 +3649,10 @@ fn switching_profile_shows_only_that_profiles_books() {
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(), // profile menu
-        tap_row(1),       // switch to alex -> back on Home
-        tap_row(0),       // Library
+        tap_row(1),       // switch to alex -> back on Discover
+        tap_nav(0),       // Library
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3398,7 +3674,7 @@ fn default_profile_does_not_see_other_profiles_books() {
     make_cbz(&lib.join("Shared/vol1.cbz"), 2);
     make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     let Screen::Library { items, .. } = app.screen() else {
@@ -3441,9 +3717,10 @@ fn downloads_land_in_the_active_profiles_directory() {
     };
 
     let events = vec![
+        nav_discover(),
         tap_title_left(), // profile menu
         tap_row(1),       // switch to alex
-        tap_row(2),       // Sources
+        tap_card(1),      // Sources
         tap_row(0),       // Listings
         tap_row(0),       // Popular
         tap_row(0),       // Manga One
@@ -3470,13 +3747,14 @@ fn new_profile_keyboard_creates_and_switches() {
     let settings_dir = profile_settings_dir(dir.path(), &["default"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(), // profile menu: [default, New profile…]
         tap_row(1),       // New profile…
         tap_key(Key::Char('b')),
         tap_key(Key::Char('o')),
         tap_key(Key::Char('b')),
         tap_key(Key::Search), // create
-        tap_row(0),           // Library (of the new profile)
+        tap_nav(0),           // Library (of the new profile)
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3509,7 +3787,7 @@ fn a_profile_with_a_library_is_listed_even_when_settings_forgot_it() {
     std::fs::create_dir_all(&settings_dir).unwrap();
     std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
 
-    let events = vec![tap_title_left()];
+    let events = vec![nav_discover(), tap_title_left()];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
@@ -3535,6 +3813,7 @@ fn switching_profiles_cannot_persist_a_list_that_read_back_short() {
     std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
 
     let events = vec![
+        nav_discover(),
         tap_title_left(),
         tap_row(1), // switch to the first rescued profile
     ];
@@ -3561,6 +3840,7 @@ fn converting_the_default_profile_keeps_profiles_settings_forgot() {
     std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
 
     let events = vec![
+        nav_discover(),
         tap_title_left(),
         tap_row(3), // [default, alex, New profile…, Name the default…]
         tap_key(Key::Char('m')),
@@ -3594,12 +3874,13 @@ fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(), // [default, alex, New profile…, Name the default…]
         tap_row(3),       // Name the default profile…
         tap_key(Key::Char('m')),
         tap_key(Key::Char('e')),
         tap_key(Key::Search), // convert
-        tap_row(0),           // Library (now @me's)
+        tap_nav(0),           // Library (now @me's)
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3633,6 +3914,7 @@ fn naming_the_default_profile_a_taken_name_changes_nothing() {
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(),
         tap_row(3), // Name the default profile…
         tap_key(Key::Char('a')),
@@ -3670,7 +3952,7 @@ fn the_profile_menu_stops_offering_conversion_once_default_is_gone() {
 
     // Row 3 would be "Name the default profile…" if it were offered; with no
     // default profile the row doesn't exist, so the tap does nothing.
-    let events = vec![tap_title_left(), tap_row(3)];
+    let events = vec![nav_discover(), tap_title_left(), tap_row(3)];
     let mut app = app(&lib, FakeGateway::default(), events)
         .with_settings_dir(settings_dir)
         .with_profile("me");
@@ -3687,6 +3969,7 @@ fn keyboard_shift_types_uppercase() {
     let settings_dir = profile_settings_dir(dir.path(), &["default"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(),
         tap_row(1),              // New profile…
         tap_key(Key::Shift),     // caps on
@@ -3745,7 +4028,7 @@ fn keyboard_shift_and_at_sign_editing() {
 fn picking_the_active_profile_just_closes_the_menu() {
     let dir = tempfile::tempdir().unwrap();
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
-    let events = vec![tap_title_left(), tap_row(0)];
+    let events = vec![nav_discover(), tap_title_left(), tap_row(0)];
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3772,7 +4055,8 @@ fn one_installed_source_gateway() -> FakeGateway {
 fn long_press_removes_an_installed_source_after_confirming() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(2),        // Home -> Sources
+        nav_discover(),
+        tap_card(1),       // Home -> Sources
         long_press_row(0), // installed "Src" -> confirmation
         tap_row(0),        // "Remove source"
     ];
@@ -3799,7 +4083,8 @@ fn long_press_removes_an_installed_source_after_confirming() {
 fn cancelling_the_source_removal_keeps_it_installed() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(2),        // Home -> Sources
+        nav_discover(),
+        tap_card(1),       // Home -> Sources
         long_press_row(0), // installed "Src" -> confirmation
         tap_row(1),        // Cancel
     ];
@@ -3826,7 +4111,7 @@ fn long_press_on_an_available_source_is_just_a_tap() {
         ..FakeGateway::default()
     };
     // Row 0 is the "— available —" separator; the source sits on row 1.
-    let events = vec![tap_row(2), long_press_row(1)];
+    let events = vec![nav_discover(), tap_card(1), long_press_row(1)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -3885,19 +4170,17 @@ fn settings_rows_cycle_and_persist_to_disk() {
         .save(&settings_dir)
         .unwrap();
 
-    let events = vec![
-        tap_row(3), // Home -> Settings
-        tap_row(0), // pre-download 2 -> 3
-        tap_row(0), // 3 -> 5
-        tap_row(1), // storage 2 GB -> 5 GB
-        tap_row(3), // auto-check on -> off
-        tap_back(),
-    ];
+    let mut events = open_settings();
+    events.extend(tap_setting("Pre-download ahead")); // 2 -> 3
+    events.extend(tap_setting("Pre-download ahead")); // 3 -> 5
+    events.extend(tap_setting("Storage limit")); // 2 GB -> 5 GB
+    events.extend(tap_setting("Check updates automatically")); // on -> off
+    events.push(tap_nav(0));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     let settings = effective_settings(&settings_dir, dir.path());
     assert_eq!(settings.predownload_unread_chapters, 5);
     assert_eq!(
@@ -3919,7 +4202,8 @@ fn idle_suspend_setting_cycles_and_persists() {
         .unwrap();
 
     // Default 15 min -> 30 min (the Nickel/KOReader increments).
-    let events = vec![tap_row(3), tap_row(9)];
+    let mut events = open_settings();
+    events.extend(tap_setting("Sleep when idle"));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3944,7 +4228,8 @@ fn idle_suspend_cycles_past_an_hour_to_never() {
     .save(&settings_dir)
     .unwrap();
 
-    let events = vec![tap_row(3), tap_row(9)];
+    let mut events = open_settings();
+    events.extend(tap_setting("Sleep when idle"));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3978,12 +4263,13 @@ fn storage_limit_cycle_wraps_around() {
     .save(&settings_dir)
     .unwrap();
 
-    let events = vec![tap_row(3), tap_row(1)];
+    let mut events = open_settings();
+    events.extend(tap_setting("Storage limit"));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
-    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    let settings = effective_settings(&settings_dir, dir.path());
     assert_eq!(
         settings.storage_size_limit.bytes(),
         500 * 1024 * 1024,
@@ -4003,15 +4289,21 @@ fn reader_fit_toggle_applies_to_the_next_book_immediately() {
 
     // Toggle contain -> fit-width, then open a tall page: a "next" tap
     // must scroll within the page (no page turn), without a restart.
-    let events = vec![
-        tap_row(3), // Settings
-        tap_row(2), // Reader fit: contain -> fit-width
-        tap_back(), // Home
-        tap_row(0), // Library
+    // The cover shelf, so opening the book is one tap on a known cell.
+    gideon_core::ProfileSettings {
+        library_view: Some("shelf".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
+    let mut events = open_settings();
+    events.extend(tap_setting("Reader fit")); // contain -> fit-width
+    events.extend([
+        tap_nav(0), // Library
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_back(),
-    ];
+    ]);
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
@@ -4071,7 +4363,7 @@ fn right_edge_slide_up_raises_brightness() {
         x1: W - 5,
         y1: H - 100 - H / 2,
     };
-    let events = vec![tap_row(0), tap_shelf_cell0(), slide, reader_tap_back()];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), slide, reader_tap_back()];
     let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
     app.run().unwrap();
 
@@ -4136,7 +4428,7 @@ fn left_edge_slide_adjusts_night_light() {
         x1: 3,
         y1: H - 50 - H / 4, // +25
     };
-    let events = vec![tap_row(0), tap_shelf_cell0(), slide_up, reader_tap_back()];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), slide_up, reader_tap_back()];
     let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
     app.run().unwrap();
 
@@ -4155,7 +4447,7 @@ fn edge_slides_without_a_light_hook_are_ignored() {
         x1: W - 5,
         y1: 100,
     };
-    let events = vec![tap_row(0), tap_shelf_cell0(), slide, reader_tap_back()];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), slide, reader_tap_back()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
@@ -4180,7 +4472,7 @@ fn swipe_up_rotates_and_locks_the_reader() {
     // In the 90° orientation the back zone is the panel's vertical middle.
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         swipe_up,         // rotate to 90 and lock
         tap_panel_bottom, // next page in the rotated orientation
@@ -4232,7 +4524,7 @@ fn four_up_swipes_come_back_around_to_zero() {
         y1: H / 2,
     };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         up_at_0,
         up_at_90,
@@ -4269,7 +4561,7 @@ fn sloppy_tap_drift_neither_rotates_nor_exits() {
         y1: 400,
     };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         drift_up,
         drift_down,
@@ -4313,7 +4605,7 @@ fn rotation_gestures_follow_the_reading_orientation() {
         x1: W - 150,
         y1: H / 2,
     };
-    let events = vec![tap_row(0), tap_shelf_cell0(), panel_up, rotated_up];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), panel_up, rotated_up];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
@@ -4365,7 +4657,8 @@ fn finishing_a_chapter_flows_into_the_next() {
     };
 
     let events = vec![
-        tap_row(2),        // Sources
+        nav_discover(),
+        tap_card(1),       // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -4393,7 +4686,7 @@ fn last_chapter_end_stays_put() {
     make_cbz(&lib.join("Solo/only.cbz"), 2);
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // page 2 (last)
         reader_tap_next(), // past the end, no next chapter: ignored
@@ -4415,7 +4708,7 @@ fn library_reading_continues_into_the_next_file() {
     make_cbz(&lib.join("Series/vol02.cbz"), 2);
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // vol01 page 2
         reader_tap_next(), // past the end -> vol02 opens
@@ -4468,7 +4761,7 @@ fn swipe_down_leaves_the_manga() {
         x1: W / 2,
         y1: H - 100,
     };
-    let events = vec![tap_row(0), tap_shelf_cell0(), reader_tap_next(), swipe_down];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), reader_tap_next(), swipe_down];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -4521,7 +4814,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
         unreachable!()
     };
     // Long press -> book menu -> "All chapters (from source)".
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(0)];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(0)];
     let mut app = app(&lib, gateway, events);
     app.run().unwrap();
 
@@ -4580,9 +4873,9 @@ fn linked_series(dir: &Path, n: usize) -> (PathBuf, FakeGateway) {
 fn open_chapters(cell: (u32, u32)) -> Vec<UiEvent> {
     let (x, y) = cell;
     vec![
-        tap_row(0),                  // Home -> Library
+        tap_nav(0),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> book menu
-        tap_row(0),                  // "All chapters (from source)"
+        tap_book_row(0),             // "All chapters (from source)"
     ]
 }
 
@@ -4705,11 +4998,11 @@ fn long_press_opens_the_book_menu() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    let Screen::BookMenu { series_dir, .. } = app.screen() else {
+    let Some(Sheet::Book { series_dir, .. }) = app.sheet() else {
         panic!("expected the book menu");
     };
     assert_eq!(series_dir, "Sideload");
@@ -4728,7 +5021,7 @@ fn unlinked_book_chapters_shows_downloaded_list() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(0)];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(0)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -4753,10 +5046,10 @@ fn book_menu_deletes_a_chapter() {
     // Row 2 is "Delete this chapter" (row 1 is "Mark as unread"); the delete now
     // routes through a confirmation whose row 0 confirms.
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
-        tap_row(2), // Delete this chapter -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(2),    // Delete this chapter -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -4797,10 +5090,10 @@ fn deleting_a_chapter_keeps_its_reading_record() {
         unreachable!()
     };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
-        tap_row(2), // Delete this chapter -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(2),    // Delete this chapter -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -4842,10 +5135,10 @@ fn deleting_a_whole_series_keeps_its_reading_records() {
         unreachable!()
     };
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
-        tap_row(3), // Delete whole series -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(3),    // Delete whole series -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -4873,11 +5166,11 @@ fn book_menu_delete_asks_for_confirmation_first() {
     };
 
     // Tapping "Delete this chapter" opens the confirmation without touching disk.
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(2)];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(2)];
     let mut opened = app(&lib, FakeGateway::default(), events);
     opened.run().unwrap();
     assert!(
-        matches!(opened.screen(), Screen::ConfirmDelete { .. }),
+        matches!(opened.sheet(), Some(Sheet::ConfirmDelete { .. })),
         "delete asks before removing anything"
     );
     assert!(
@@ -4887,16 +5180,16 @@ fn book_menu_delete_asks_for_confirmation_first() {
 
     // Now cancel it (confirmation row 1) and confirm the file survives.
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
-        tap_row(2), // -> confirm screen
-        tap_row(1), // Cancel
+        tap_book_row(2),    // -> confirm screen
+        tap_confirm_row(1), // Cancel
     ];
     let mut cancelled = app(&lib, FakeGateway::default(), events);
     cancelled.run().unwrap();
     assert!(
-        matches!(cancelled.screen(), Screen::BookMenu { .. }),
-        "cancelling returns to the book menu"
+        cancelled.sheet().is_none(),
+        "cancelling dismisses the sheet without touching disk"
     );
     assert!(
         lib.join("Series/vol1.cbz").exists(),
@@ -4919,10 +5212,10 @@ fn book_menu_deletes_the_whole_series() {
     // Row 3 is "Delete whole series" (shifted by the new "Mark as unread" row);
     // confirm on the follow-up screen (row 0).
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
-        tap_row(3), // Delete whole series -> confirm screen
-        tap_row(0), // confirm
+        tap_book_row(3),    // Delete whole series -> confirm screen
+        tap_confirm_row(0), // confirm
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -4984,7 +5277,7 @@ fn book_menu_marks_the_latest_read_chapter_unread() {
         unreachable!()
     };
     // Long press → BookMenu, then row 1 = "Mark as unread".
-    let events = vec![tap_row(0), UiEvent::LongPress { x, y }, tap_row(1)];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(1)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -5029,11 +5322,12 @@ fn downloading_records_the_series_origin() {
     };
 
     let events = vec![
-        tap_row(2), // Sources
-        tap_row(0), // Listings
-        tap_row(0), // Popular
-        tap_row(0), // Manga One
-        tap_row(0), // download + Reader
+        nav_discover(),
+        tap_card(1), // Sources
+        tap_row(0),  // Listings
+        tap_row(0),  // Popular
+        tap_row(0),  // Manga One
+        tap_row(0),  // download + Reader
         reader_tap_back(),
     ];
     let mut app = app(&lib, gateway, events);
@@ -5087,7 +5381,8 @@ fn downloaded_chapters_open_instantly_without_redownloading() {
     };
 
     let events = vec![
-        tap_row(2),        // Sources
+        nav_discover(),
+        tap_card(1),       // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -5140,7 +5435,8 @@ fn long_press_a_chapter_downloads_without_opening_the_reader() {
         unreachable!()
     };
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(0),
         tap_row(0),                  // ChapterList
@@ -5192,7 +5488,11 @@ fn update_prompt_installs_on_tap() {
     // Home row 4 = "Check for updates" -> prompt; content tap installs,
     // and a successful install restarts the app in place so the new
     // binary is live immediately.
-    let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_row(0)]);
+    let mut app = app(
+        dir.path(),
+        gateway,
+        vec![nav_discover(), tap_card(3), tap_row(0)],
+    );
     assert_eq!(app.run().unwrap(), Exit::Restart);
     assert_eq!(
         app.gateway().installs.get(),
@@ -5231,8 +5531,9 @@ fn home_popular_lists_titles_and_tap_searches_installed_sources() {
         ..FakeGateway::default()
     };
     let events = vec![
-        tap_row(5), // Home -> Popular manga
-        tap_row(0), // first popular title -> global search for it
+        nav_discover(),
+        tap_card(2), // Home -> Popular manga
+        tap_row(0),  // first popular title -> global search for it
     ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
@@ -5262,7 +5563,7 @@ fn home_popular_renders_the_titles() {
         }]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(5)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(2)]);
     app.run().unwrap();
 
     let Screen::Popular { mangas, .. } = app.screen() else {
@@ -5280,7 +5581,11 @@ fn home_popular_empty_explains_instead_of_a_blank_tab() {
     // No popular titles came back (offline, or MyAnimeList hiccup): the user
     // gets a message, not an empty list.
     let dir = tempfile::tempdir().unwrap();
-    let mut app = app(dir.path(), FakeGateway::default(), vec![tap_row(5)]);
+    let mut app = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![nav_discover(), tap_card(2)],
+    );
     app.run().unwrap();
 
     let Screen::Message { title, .. } = app.screen() else {
@@ -5298,7 +5603,7 @@ fn home_popular_outage_explains_instead_of_an_error_screen() {
         popular: Err("Jikan 504".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(5)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(2)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -5343,7 +5648,11 @@ fn home_search_goes_straight_to_the_keyboard() {
     // One tap from Home — e-ink refreshes cost a second each, so search
     // must not hide behind Sources -> source -> Search.
     let dir = tempfile::tempdir().unwrap();
-    let mut app = app(dir.path(), search_gateway(), vec![tap_row(1)]);
+    let mut app = app(
+        dir.path(),
+        search_gateway(),
+        vec![nav_discover(), tap_card(0)],
+    );
     app.run().unwrap();
 
     let Screen::Search { source, query } = app.screen() else {
@@ -5356,7 +5665,11 @@ fn home_search_goes_straight_to_the_keyboard() {
 #[test]
 fn home_search_without_sources_explains_instead_of_a_dead_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut app = app(dir.path(), FakeGateway::default(), vec![tap_row(1)]);
+    let mut app = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![nav_discover(), tap_card(0)],
+    );
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -5394,7 +5707,8 @@ fn global_search_queries_every_source_and_labels_results() {
         ..FakeGateway::default()
     };
     let events = vec![
-        tap_row(1), // Home -> global search keyboard
+        nav_discover(),
+        tap_card(0), // Home -> global search keyboard
         tap_key(Key::Char('n')),
         tap_key(Key::Search),
         tap_row(1), // second result -> ChapterList via its own source
@@ -5425,7 +5739,8 @@ fn global_search_with_no_hits_opens_results_then_back_to_keyboard() {
     let mut gateway = search_gateway();
     gateway.search_results = Ok(Vec::new());
     let events = vec![
-        tap_row(1),
+        nav_discover(),
+        tap_card(0),
         tap_key(Key::Char('z')),
         tap_key(Key::Search),
         tap_back(), // leave the (empty) results -> back to the keyboard
@@ -5448,7 +5763,12 @@ fn global_search_retries_with_title_variants_on_a_miss() {
     let mut gateway = search_gateway();
     gateway.variants = vec!["ジャッジ".into()];
     gateway.hit_query = Some("ジャッジ".into());
-    let events = vec![tap_row(1), tap_key(Key::Char('j')), tap_key(Key::Search)];
+    let events = vec![
+        nav_discover(),
+        tap_card(0),
+        tap_key(Key::Char('j')),
+        tap_key(Key::Search),
+    ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -5471,7 +5791,12 @@ fn global_search_with_a_hit_never_looks_up_variants() {
     let dir = tempfile::tempdir().unwrap();
     let mut gateway = search_gateway();
     gateway.variants = vec!["Some Other Name".into()];
-    let events = vec![tap_row(1), tap_key(Key::Char('n')), tap_key(Key::Search)];
+    let events = vec![
+        nav_discover(),
+        tap_card(0),
+        tap_key(Key::Char('n')),
+        tap_key(Key::Search),
+    ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -5490,7 +5815,12 @@ fn global_search_with_a_failing_source_still_opens_results() {
     let dir = tempfile::tempdir().unwrap();
     let mut gateway = search_gateway();
     gateway.search_results = Err("cloudflare tantrum".into());
-    let events = vec![tap_row(1), tap_key(Key::Char('a')), tap_key(Key::Search)];
+    let events = vec![
+        nav_discover(),
+        tap_card(0),
+        tap_key(Key::Char('a')),
+        tap_key(Key::Search),
+    ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -5503,7 +5833,7 @@ fn global_search_with_a_failing_source_still_opens_results() {
 #[test]
 fn listings_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_row(2), tap_row(0), tap_row(2)];
+    let events = vec![nav_discover(), tap_card(1), tap_row(0), tap_row(2)];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
 
@@ -5522,7 +5852,8 @@ fn listings_search_row_opens_the_keyboard() {
 fn typing_builds_the_query_with_partial_refreshes() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5551,7 +5882,7 @@ fn typing_builds_the_query_with_partial_refreshes() {
 #[test]
 fn every_eighth_keystroke_flashes_the_panel_clean() {
     let dir = tempfile::tempdir().unwrap();
-    let mut events = vec![tap_row(2), tap_row(0), tap_row(2)];
+    let mut events = vec![nav_discover(), tap_card(1), tap_row(0), tap_row(2)];
     events.extend(std::iter::repeat_with(|| tap_key(Key::Char('a'))).take(8));
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
@@ -5568,7 +5899,8 @@ fn every_eighth_keystroke_flashes_the_panel_clean() {
 fn punctuation_for_manga_titles_is_typeable() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('r')),
@@ -5591,7 +5923,8 @@ fn punctuation_for_manga_titles_is_typeable() {
 fn space_is_not_allowed_leading_or_doubled() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Space), // leading — ignored
@@ -5612,7 +5945,8 @@ fn space_is_not_allowed_leading_or_doubled() {
 fn search_key_queries_the_gateway_and_shows_results() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5645,7 +5979,8 @@ fn search_results_open_chapters_like_any_list() {
         lang: None,
     }];
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5664,7 +5999,13 @@ fn search_results_open_chapters_like_any_list() {
 #[test]
 fn empty_query_search_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_row(2), tap_row(0), tap_row(2), tap_key(Key::Search)];
+    let events = vec![
+        nav_discover(),
+        tap_card(1),
+        tap_row(0),
+        tap_row(2),
+        tap_key(Key::Search),
+    ];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
 
@@ -5678,7 +6019,8 @@ fn empty_results_show_a_message_and_keep_the_keyboard_below() {
     let mut gateway = search_gateway();
     gateway.search_results = Ok(Vec::new());
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('z')),
@@ -5700,7 +6042,8 @@ fn search_failure_shows_error_screen() {
     let mut gateway = search_gateway();
     gateway.search_results = Err("source exploded".into());
     let events = vec![
-        tap_row(2),
+        nav_discover(),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('a')),
@@ -5719,7 +6062,13 @@ fn search_failure_shows_error_screen() {
 #[test]
 fn back_leaves_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_row(2), tap_row(0), tap_row(2), tap_back()];
+    let events = vec![
+        nav_discover(),
+        tap_card(1),
+        tap_row(0),
+        tap_row(2),
+        tap_back(),
+    ];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Listings { .. }));
@@ -5756,7 +6105,8 @@ fn widen_installs_matching_sources_and_merges_their_results() {
         ..FakeGateway::default()
     };
     let events = vec![
-        tap_row(1), // Home -> global search keyboard (no history)
+        nav_discover(),
+        tap_card(0), // Home -> global search keyboard (no history)
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults (1 hit from src)
         tap_row(1),           // the "Search more sources" row (index 1)
@@ -5809,7 +6159,8 @@ fn widen_with_no_matches_uninstalls_the_sources_it_tried() {
         ..FakeGateway::default()
     };
     let events = vec![
-        tap_row(1),
+        nav_discover(),
+        tap_card(0),
         tap_key(Key::Char('z')),
         tap_key(Key::Search), // -> empty SearchResults
         tap_row(0),           // the "Search more sources" row (index 0)
@@ -5931,7 +6282,8 @@ fn widen_with_nothing_left_to_try_says_so() {
         ..FakeGateway::default()
     };
     let events = vec![
-        tap_row(1),
+        nav_discover(),
+        tap_card(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults (1 hit)
         tap_row(1),           // "Search more sources"
@@ -5955,12 +6307,13 @@ fn recent_search_is_remembered_and_reopened_from_cache() {
     // re-querying any source.
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1), // Home -> keyboard (no history yet)
+        nav_discover(),
+        tap_card(0), // Home -> keyboard (no history yet)
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults, remembers "n"
         tap_back(),           // -> keyboard
-        tap_back(),           // -> Home
-        tap_row(1),           // -> RecentSearches (history exists now)
+        tap_back(),           // -> Discover
+        tap_card(0),          // -> RecentSearches (history exists now)
         tap_row(1),           // tap the recent "n" -> cached results
     ];
     let mut app = app(dir.path(), search_gateway(), events);
@@ -5979,13 +6332,14 @@ fn recent_search_is_remembered_and_reopened_from_cache() {
 fn recents_screen_new_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
-        tap_row(1),
+        nav_discover(),
+        tap_card(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // remembers "n"
         tap_back(),
         tap_back(),
-        tap_row(1), // -> RecentSearches
-        tap_row(0), // "New search…" -> keyboard
+        tap_card(0), // -> RecentSearches
+        tap_row(0),  // "New search…" -> keyboard
     ];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
@@ -6011,7 +6365,7 @@ fn page_buttons_flip_library_pages() {
     }
 
     let events = vec![
-        tap_row(0), // Library
+        tap_nav(0), // Library
         UiEvent::PageForward,
         UiEvent::PageForward, // clamped at the last page
         UiEvent::PageBack,
@@ -6034,7 +6388,7 @@ fn page_buttons_turn_reader_pages() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::PageForward, // page 1
         UiEvent::PageForward, // page 2
@@ -6088,7 +6442,7 @@ fn sleep_event_suspends_and_repaints_in_full() {
         app.display().flushes,
         vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
     );
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     assert_eq!(
         app.input().refreshes,
         1,
@@ -6123,7 +6477,7 @@ fn skipped_suspend_explains_itself_and_stays_awake() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1);
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     // Initial paint, "Sleeping…", the "staying awake" notice, the restore.
     assert_eq!(app.display().flushes.len(), 4);
     assert!(app
@@ -6159,7 +6513,7 @@ fn charging_sleep_finishes_once_unplugged() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 2, "the refused suspend must be retried");
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
 }
 
 #[test]
@@ -6181,7 +6535,7 @@ fn charging_wait_aborts_when_the_user_is_using_the_device() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "a tap must abort the wait, not re-suspend");
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
 }
 
 #[test]
@@ -6247,7 +6601,8 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
 
     let (count, sleeper) = counting_sleeper();
     let events = vec![
-        tap_row(2),        // Sources
+        nav_discover(),
+        tap_card(1),       // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -6347,7 +6702,7 @@ fn sleep_in_the_reader_saves_progress_first_and_resumes() {
     });
 
     let events = vec![
-        tap_row(0),        // Library
+        tap_nav(0),        // Library
         tap_shelf_cell0(), // Reader, page 0
         reader_tap_next(), // page 1
         UiEvent::Sleep,    // suspend mid-read
@@ -6414,7 +6769,7 @@ fn home_title_includes_battery_percent_when_known() {
 }
 
 #[test]
-fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
+fn today_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
     let dir = tempfile::tempdir().unwrap();
     let l = layout();
     // The box just left of the power icon where draw_bluetooth_icon paints,
@@ -6442,7 +6797,7 @@ fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
             FakeGateway::default(),
             dir.path().to_path_buf(),
         );
-        app.render_once().unwrap();
+        app.goto_root(Screen::Stats).unwrap();
         ink(&app.display().buffer)
     };
 
@@ -6454,7 +6809,7 @@ fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
 }
 
 /// Prime the local "send to Kobo" cache the sync sweep would normally write, so
-/// Home tests can exercise the bell/list without a network round-trip.
+/// the bell/list can be exercised without a network round-trip.
 fn seed_sends(library_dir: &Path, items: &[(&str, &str)]) {
     let sends: Vec<gideon_sync::supabase::SendItem> = items
         .iter()
@@ -6469,7 +6824,7 @@ fn seed_sends(library_dir: &Path, items: &[(&str, &str)]) {
 }
 
 #[test]
-fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
+fn today_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
     let l = layout();
     // Slot 1 sits one title-bar height left of the power symbol — where the
     // bell paints — minus the always-drawn title separator row.
@@ -6495,7 +6850,7 @@ fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
             seed_sends(dir.path(), &[("s1", "Berserk")]);
         }
         let mut app = app(dir.path(), FakeGateway::default(), vec![]);
-        app.render_once().unwrap();
+        app.goto_root(Screen::Stats).unwrap();
         ink(&app.display().buffer)
     };
 
@@ -6504,7 +6859,7 @@ fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
 }
 
 #[test]
-fn tapping_the_home_bell_opens_the_sent_list() {
+fn tapping_the_bell_opens_the_sent_list() {
     let dir = tempfile::tempdir().unwrap();
     seed_sends(dir.path(), &[("s1", "Berserk")]);
     let l = layout();
@@ -6514,7 +6869,7 @@ fn tapping_the_home_bell_opens_the_sent_list() {
         x: l.width - l.title_h - l.title_h / 2,
         y: 1,
     };
-    let mut app = app(dir.path(), FakeGateway::default(), vec![bell]);
+    let mut app = app(dir.path(), FakeGateway::default(), vec![tap_today(), bell]);
     app.run().unwrap();
     assert!(
         matches!(app.screen(), Screen::SentList { items } if items.len() == 1),
@@ -6543,8 +6898,8 @@ fn opening_a_sent_item_searches_for_it_and_clears_the_badge() {
         x: l.width - l.title_h - l.title_h / 2,
         y: 1,
     };
-    let mut app =
-        app(dir.path(), gateway, vec![bell, tap_row(0)]).with_online_probe(Box::new(|| true));
+    let mut app = app(dir.path(), gateway, vec![tap_today(), bell, tap_row(0)])
+        .with_online_probe(Box::new(|| true));
     app.run().unwrap();
 
     let Screen::SearchResults { query, results, .. } = app.screen() else {
@@ -6559,28 +6914,32 @@ fn opening_a_sent_item_searches_for_it_and_clears_the_badge() {
 }
 
 #[test]
-fn battery_probe_feeds_home_and_sleep_without_breaking_either() {
+fn battery_probe_feeds_today_and_sleep_without_breaking_either() {
     let dir = tempfile::tempdir().unwrap();
     let (count, sleeper) = counting_sleeper();
     let reads = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let probe = reads.clone();
-    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
-        .with_sleeper(sleeper)
-        .with_battery(Box::new(move || {
-            probe.set(probe.get() + 1);
-            Some(47)
-        }));
+    let mut app = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![tap_today(), UiEvent::Sleep],
+    )
+    .with_sleeper(sleeper)
+    .with_battery(Box::new(move || {
+        probe.set(probe.get() + 1);
+        Some(47)
+    }));
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "sleep still suspends with a battery probe");
     assert!(
         reads.get() >= 2,
-        "both the Home title and the sleep notice must read the battery"
+        "both the Today title and the sleep notice must read the battery"
     );
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Stats));
     assert!(
         app.display().buffer.iter().any(|&p| p < 0x80),
-        "home screen is blank"
+        "today screen is blank"
     );
 }
 
@@ -6592,7 +6951,11 @@ fn update_prompt_back_declines() {
         update_message: "Update available.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![tap_row(4), tap_back()]);
+    let mut app = app(
+        dir.path(),
+        gateway,
+        vec![nav_discover(), tap_card(3), tap_back()],
+    );
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
 }
@@ -6656,7 +7019,7 @@ fn library_reading_downloads_the_next_chapter_when_it_runs_out() {
     };
 
     let events = vec![
-        tap_row(0),        // Home -> Library
+        tap_nav(0),        // Home -> Library
         tap_shelf_cell0(), // the card -> vol1 (the only download)
         reader_tap_next(), // vol1 page 2 (last)
         reader_tap_next(), // past the end -> fetch and open c2
@@ -6699,7 +7062,7 @@ fn library_reading_says_so_when_the_series_is_finished() {
     };
 
     let events = vec![
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_next(), // past the end -> nothing newer at the source
@@ -6817,7 +7180,7 @@ fn home_opens_reading_stats_and_draws_it_in_color() {
     make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
     write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
 
-    let events = vec![tap_row(6)];
+    let events = vec![tap_nav(1)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -6841,7 +7204,7 @@ fn the_heatmap_darkens_a_day_that_was_read() {
     make_cbz(&lib.join("Berserk/vol1.cbz"), 40);
     write_progress(&lib, &[("Berserk/vol1.cbz", 39, 40, now_unix())]);
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(6)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(1)]);
     app.run().unwrap();
 
     // The empty-day step is 0xEE; a read day is darker than that everywhere
@@ -6860,7 +7223,7 @@ fn stats_survive_an_empty_library() {
     let lib = dir.path().join("Manga");
     std::fs::create_dir_all(&lib).unwrap();
 
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(6)]);
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(1)]);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Stats));
 }
@@ -6947,14 +7310,14 @@ fn the_library_title_bar_toggles_between_shelf_and_list() {
         x: l.width / 2,
         y: l.title_h / 2,
     };
-    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0), title_tap])
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0), title_tap])
         .with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
     assert_eq!(
         effective_settings(&settings_dir, &lib).library_view,
-        "list",
-        "tapping the Library title bar should switch to the dense list"
+        "shelf",
+        "the list is the default, so a title-bar tap swaps to the cover shelf"
     );
     assert!(
         matches!(app.screen(), Screen::Library { .. }),
@@ -6972,13 +7335,15 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
     let settings_dir = dir.path().join("data");
 
     for (view, want_colour) in [("shelf", false), ("list", true)] {
-        gideon_core::Settings {
-            library_view: view.into(),
-            ..gideon_core::Settings::default()
+        // The view is a per-profile setting, so it has to be written to the
+        // profile's own file — a device-file value would be overlaid away.
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
         }
-        .save(&settings_dir)
+        .save(&lib)
         .unwrap();
-        let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)])
+        let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)])
             .with_settings_dir(settings_dir.clone());
         app.run().unwrap();
         assert_eq!(
@@ -6990,27 +7355,40 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
 }
 
 #[test]
-fn home_grows_a_data_band_only_once_there_is_something_to_show() {
-    // A fresh device must not display a band of zeroes, so the band is
-    // absent until something has actually been read.
+fn discover_offers_only_what_the_tabs_do_not_and_keeps_its_nav_bar() {
+    // Discover used to be the whole menu, and still listed Library, Settings
+    // and Reading stats after those became nav destinations — a tab bar drawn
+    // over a menu that duplicated it. It also carried a copy of Today's
+    // reading band, so two tabs showed the same thing. What is left is the
+    // one job no tab does: finding something new to read.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
-
-    let mut fresh = app(&lib, FakeGateway::default(), vec![]);
-    fresh.run().unwrap();
-    assert!(
-        fresh.compose_color_current().unwrap().is_none(),
-        "no reading yet: Home should stay on the plain grayscale menu"
-    );
-
     write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
-    let mut read = app(&lib, FakeGateway::default(), vec![]);
-    read.run().unwrap();
-    assert!(
-        read.compose_color_current().unwrap().is_some(),
-        "with progress recorded, Home should draw the data band in colour"
-    );
+
+    let mut app = app(&lib, FakeGateway::default(), vec![nav_discover()]);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Home));
+
+    for tab in ["Library", "Settings", "Reading stats"] {
+        assert!(
+            !super::HOME_ROWS.contains(&tab),
+            "{tab} is a nav destination; Discover must not list it too"
+        );
+    }
+
+    // Discover takes the colour path unconditionally — the nav bar is drawn
+    // in RGB, and without it the screen shows no route anywhere else.
+    let page = app
+        .compose_color_current()
+        .unwrap()
+        .expect("Discover composes in colour so it can draw the nav bar");
+    let l = layout();
+    let strip = l.nav_top() + l.nav_h / 2;
+    let inked = (0..l.width)
+        .filter(|&x| page.pixel(x, strip) != [0xFF; 3])
+        .count();
+    assert!(inked > 0, "the nav bar must actually be drawn on Discover");
 }
 
 /// Cover tints for the dump fixtures — muted the way real cover art reads
@@ -7190,27 +7568,29 @@ fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
         x: l.width / 2,
         y: l.title_h / 2,
     };
-    let mut a = app(&root, FakeGateway::default(), vec![tap_row(0), title_tap])
+    let mut a = app(&root, FakeGateway::default(), vec![tap_nav(0), title_tap])
         .with_settings_dir(settings_dir.clone());
     a.run().unwrap();
 
     let alex_lib = root.join("@alex");
     assert_eq!(
         effective_settings(&settings_dir, &root).library_view,
-        "list",
-        "the profile that toggled should be on the list"
+        "shelf",
+        "the profile that toggled should have left the default list view"
     );
     assert_eq!(
         effective_settings(&settings_dir, &alex_lib).library_view,
-        "shelf",
-        "the other profile must not inherit it"
+        "list",
+        "the other profile keeps the default, and must not inherit the toggle"
     );
 
     // Device-global settings stay shared: a storage-limit change made by one
     // profile is the same limit the other sees, because there is one disk.
     let before = effective_settings(&settings_dir, &alex_lib).storage_size_limit;
-    let mut b = app(&root, FakeGateway::default(), vec![tap_row(3), tap_row(1)])
-        .with_settings_dir(settings_dir.clone());
+    let mut storage_events = open_settings();
+    storage_events.extend(tap_setting("Storage limit"));
+    let mut b =
+        app(&root, FakeGateway::default(), storage_events).with_settings_dir(settings_dir.clone());
     b.run().unwrap();
     let after_self = effective_settings(&settings_dir, &root).storage_size_limit;
     let after_other = effective_settings(&settings_dir, &alex_lib).storage_size_limit;
@@ -7218,5 +7598,868 @@ fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
     assert_eq!(
         after_self, after_other,
         "one disk, one limit: both profiles must see the same value"
+    );
+}
+
+#[test]
+#[ignore]
+fn dump_today_png() {
+    // Not part of CI: renders Home at real Libra Colour size for eyeballing.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Vinland Saga/vol1.cbz"), 40);
+    let now = now_unix();
+    let pattern = [
+        0usize, 14, 3, 0, 41, 22, 0, 0, 7, 33, 18, 0, 9, 27, 0, 44, 2, 0, 11, 36,
+    ];
+    let mut entries: Vec<(String, usize, usize, u64)> = Vec::new();
+    for d in 0..126u64 {
+        let pages = pattern[(d as usize * 7 + d as usize / 5) % pattern.len()];
+        if pages == 0 {
+            continue;
+        }
+        entries.push((
+            format!("Vinland Saga/ch{d}.cbz"),
+            pages - 1,
+            pages,
+            now - d * 86_400,
+        ));
+    }
+    let refs: Vec<(&str, usize, usize, u64)> = entries
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        color_profile: std::env::var("GIDEON_PROFILE").unwrap_or_else(|_| "ink-rust".into()),
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let mut app = UiApp::new(
+        MemoryDisplay::new(1264, 1680),
+        FakeInput::new(vec![]),
+        FakeGateway::default(),
+        lib.clone(),
+    )
+    .with_settings_dir(settings_dir);
+    app.push(Screen::Stats).unwrap();
+
+    let page = app
+        .compose_color_current()
+        .unwrap()
+        .expect("Home draws its band in colour");
+    let mut img = image::RgbImage::new(page.width, page.height);
+    for y in 0..page.height {
+        for x in 0..page.width {
+            img.put_pixel(x, y, image::Rgb(page.pixel(x, y)));
+        }
+    }
+    let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| "home.png".into());
+    img.save(&out).unwrap();
+    eprintln!("wrote {out}");
+}
+
+/// Render any screen to a PNG for the 1.0 demo. Not part of CI.
+/// `GIDEON_SCREEN` picks the screen, `GIDEON_PROFILE` the colour profile.
+/// `cargo test -p gideon-app dump_demo -- --ignored`
+#[test]
+#[ignore]
+fn dump_demo() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let now = now_unix();
+    let series = [
+        (
+            "Vinland Saga",
+            8.74f32,
+            "Publishing",
+            vec!["Action", "Drama", "Historical"],
+            213u32,
+            18usize,
+            16usize,
+            2u64,
+        ),
+        (
+            "Chainsaw Man",
+            8.61,
+            "Publishing",
+            vec!["Action", "Supernatural"],
+            97,
+            9,
+            5,
+            4,
+        ),
+        (
+            "Frieren",
+            9.02,
+            "Publishing",
+            vec!["Adventure", "Fantasy"],
+            126,
+            12,
+            11,
+            6,
+        ),
+        (
+            "Oyasumi Punpun",
+            9.01,
+            "Finished",
+            vec!["Drama", "Psychological"],
+            147,
+            3,
+            3,
+            30,
+        ),
+        (
+            "Dandadan",
+            8.55,
+            "Publishing",
+            vec!["Action", "Comedy", "Sci-Fi"],
+            188,
+            5,
+            5,
+            45,
+        ),
+        (
+            "Blue Period",
+            8.33,
+            "Publishing",
+            vec!["Drama", "Slice of Life"],
+            74,
+            4,
+            0,
+            14,
+        ),
+    ];
+    let mut index = gideon_core::SeriesIndex::default();
+    let mut progress: Vec<(String, usize, usize, u64)> = Vec::new();
+    for (i, (title, score, status, genres, total, downloaded, read, days)) in
+        series.iter().enumerate()
+    {
+        for c in 0..*downloaded {
+            make_cbz(&lib.join(format!("{title}/ch{c}.cbz")), 20);
+        }
+        let cover =
+            image::RgbImage::from_pixel(200, 300, image::Rgb(COVER_TINTS[i % COVER_TINTS.len()]));
+        image::DynamicImage::ImageRgb8(cover)
+            .save(lib.join(title).join(".cover.jpg"))
+            .unwrap();
+        index.record(
+            title,
+            gideon_core::SeriesRef {
+                source_id: "s".into(),
+                source_name: "src".into(),
+                manga_id: "m".into(),
+                manga_title: (*title).into(),
+                meta: Some(gideon_core::SeriesMeta {
+                    score: Some(*score),
+                    status: Some((*status).into()),
+                    genres: genres.iter().map(|g| (*g).to_string()).collect(),
+                    rank: None,
+                    total_chapters: Some(*total),
+                }),
+                ..Default::default()
+            },
+        );
+        for c in 0..*read {
+            progress.push((format!("{title}/ch{c}.cbz"), 19, 20, now - days * 86_400));
+        }
+        // Record the files as downloads too, so the storage screen has a
+        // breakdown to draw.
+        for i in 0..*downloaded {
+            index.record_download(title, &format!("c{i}"), &format!("ch{i}.cbz"));
+        }
+    }
+    // A partly-read chapter so Continue has somewhere to point.
+    progress.push((
+        "Vinland Saga/ch16.cbz".to_string(),
+        11,
+        44,
+        now - 2 * 86_400,
+    ));
+    // Longer history so the heatmap has range.
+    let pattern = [
+        0usize, 14, 3, 0, 41, 22, 0, 0, 7, 33, 18, 0, 9, 27, 0, 44, 2, 0, 11, 36,
+    ];
+    for d in 20..126u64 {
+        let pages = pattern[(d as usize * 7 + d as usize / 5) % pattern.len()];
+        if pages > 0 {
+            progress.push((
+                format!("Frieren/h{d}.cbz"),
+                pages - 1,
+                pages,
+                now - d * 86_400,
+            ));
+        }
+    }
+    index.save(&lib).unwrap();
+    let refs: Vec<(&str, usize, usize, u64)> = progress
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let screen = std::env::var("GIDEON_SCREEN").unwrap_or_else(|_| "today".into());
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        color_profile: std::env::var("GIDEON_PROFILE").unwrap_or_else(|_| "ink-rust".into()),
+        library_view: if screen == "shelf" {
+            "shelf".into()
+        } else {
+            "list".into()
+        },
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let mut app = UiApp::new(
+        MemoryDisplay::new(1264, 1680),
+        FakeInput::new(vec![]),
+        FakeGateway::default(),
+        lib.clone(),
+    )
+    .with_settings_dir(settings_dir);
+
+    // Top-level destinations REPLACE the root screen the way the nav bar
+    // does; pushing them would make them look like pushed screens (Back
+    // instead of the nav bar) and misrepresent the design.
+    app.run().unwrap();
+    match screen.as_str() {
+        "library" | "shelf" => {}
+        "today" => app.goto_root(Screen::Stats).unwrap(),
+        "discover" => app.goto_root(Screen::Home).unwrap(),
+        "settings" => app.goto_root(Screen::Settings).unwrap(),
+        "storage" => app.push(Screen::Storage).unwrap(),
+        // The quick-settings sheet, layered over the library the way a real
+        // nav tap produces it.
+        "quick" => {
+            app.open_quick_settings().unwrap();
+        }
+        // The long-press book sheet, over the library it was raised from.
+        "book" => {
+            let l = UiLayout::new(1264, 1680);
+            app.handle_long_press(l.width / 2, l.content_top() + l.row_h)
+                .unwrap();
+        }
+        other => panic!("unknown screen {other}"),
+    }
+
+    let page = app.compose_final().unwrap();
+    let mut img = image::RgbImage::new(page.width, page.height);
+    for y in 0..page.height {
+        for x in 0..page.width {
+            img.put_pixel(x, y, image::Rgb(page.pixel(x, y)));
+        }
+    }
+    let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| format!("{screen}.png"));
+    img.save(&out).unwrap();
+    eprintln!("wrote {out}");
+}
+
+#[test]
+fn quick_settings_opens_and_cycles_without_flashing() {
+    // The panel has a non-flashing partial waveform (GLR16, GLRC16 for
+    // colour). Sliding a sheet up changes only the strip it covers, and
+    // cycling one tile changes one value — flashing the whole screen for
+    // either is what makes an e-ink UI feel cheap. Closing DOES flash,
+    // because it restores a region the panel has been holding stale.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+    let before = app.display().flushes.len();
+
+    app.open_quick_settings().unwrap();
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "opening the sheet must not flash"
+    );
+
+    // The tiles the sheet offers, and where they are: by label, because the
+    // contents are a design decision and will move again.
+    let tiles = app.quick_tiles();
+    assert_eq!(tiles.len(), QUICK_TILES, "the helpers know the tile count");
+    let colour = tiles
+        .iter()
+        .position(|(label, _)| *label == "Colour profile")
+        .expect("the sheet offers the colour profile");
+
+    let UiEvent::Tap { x, y } = tap_quick_tile(colour) else {
+        unreachable!()
+    };
+    app.tap_sheet(x, y).unwrap();
+    assert_eq!(
+        app.display().flushes.last(),
+        Some(&RefreshMode::Partial),
+        "cycling a tile repaints one value; it must not flash"
+    );
+    assert_eq!(
+        effective_settings(&settings_dir, &lib).color_profile,
+        "indigo",
+        "the tap should have advanced the colour profile"
+    );
+
+    // The gutter between the columns is not a tile: a tap there changes
+    // nothing rather than cycling whichever neighbour rounding lands on.
+    let (_, grid, _) = quick_sheet();
+    let (cx, cy, cw, ch) = grid.cell(0);
+    let flushes = app.display().flushes.len();
+    app.tap_sheet(cx + cw + 1, cy + ch / 2).unwrap();
+    assert_eq!(
+        app.display().flushes.len(),
+        flushes,
+        "a tap in the gutter repaints nothing"
+    );
+
+    // A tap above the sheet dismisses it, and that one flashes.
+    let (top, ..) = quick_sheet();
+    app.tap_sheet(W / 2, top.saturating_sub(10)).unwrap();
+    assert!(app.sheet().is_none(), "tapping outside dismisses");
+    assert_eq!(
+        app.display().flushes.last(),
+        Some(&RefreshMode::Full),
+        "closing restores what the sheet covered, so it flashes"
+    );
+}
+
+#[test]
+fn every_series_is_reachable_by_paging_in_either_library_view() {
+    // The two views hold different counts per page — the shelf packs a cover
+    // grid, the list gives each series a double-height row. Paging that asks
+    // the wrong one strands everything past the last reachable page, which
+    // with the list as the default meant half a library was simply gone.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..14 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 2);
+    }
+    let settings_dir = dir.path().join("data");
+
+    for view in ["list", "shelf"] {
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&lib)
+        .unwrap();
+        let mut app =
+            app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+        app.run().unwrap();
+
+        let per_page = app.library_page_capacity();
+        let Screen::Library { items, .. } = app.screen() else {
+            panic!("the landing screen is the library");
+        };
+        let total = items.len();
+        assert_eq!(total, 14, "{view}: every series should be listed");
+
+        // Jump to the last page and confirm it really covers the tail.
+        let pages = total.div_ceil(per_page);
+        app.move_page(PageMove::Last).unwrap();
+        let Screen::Library { page, .. } = app.screen() else {
+            unreachable!()
+        };
+        let page = *page;
+        assert_eq!(
+            page,
+            pages - 1,
+            "{view}: Last should reach the final page, not stop short"
+        );
+        assert!(
+            (page + 1) * per_page >= total,
+            "{view}: the last page must cover the final series ({} of {total} covered)",
+            (page + 1) * per_page
+        );
+    }
+}
+
+#[test]
+fn every_settings_row_changes_the_setting_its_label_names() {
+    // The screen drew from a grouped list while the tap dispatch indexed a
+    // different flat one, so every row fired someone else's setting — "Library
+    // view" opened the Wi-Fi scanner. Nothing caught it, because the only test
+    // exercised the model rather than a tap at the y a row is drawn at.
+    // This taps the drawn centre of each row and asserts THAT row's field moved.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+    app.goto_root(Screen::Settings).unwrap();
+
+    let mut seen = Vec::new();
+    let pages = app.settings_page_count();
+    assert!(pages >= 1);
+    for page in 0..pages {
+        app.set_settings_page(page);
+        let map = app.settings_hit_map();
+        assert!(!map.is_empty(), "page {page} laid out no rows");
+        for (cx, cy, cw, ch, action) in map {
+            seen.push(action);
+            let before = effective_settings(&settings_dir, &lib);
+            app.tap_setting_at(cx + cw / 2, cy + ch / 2).unwrap();
+            let after = effective_settings(&settings_dir, &lib);
+
+            // The three navigation rows move the screen instead of a value.
+            let changed = match action {
+                SettingAction::ReaderFit => before.reader_fit != after.reader_fit,
+                SettingAction::FullRefresh => {
+                    before.reader_full_refresh_interval != after.reader_full_refresh_interval
+                }
+                SettingAction::RotateSpreads => {
+                    before.auto_rotate_spreads != after.auto_rotate_spreads
+                }
+                SettingAction::ColorProfile => before.color_profile != after.color_profile,
+                SettingAction::LibraryView => before.library_view != after.library_view,
+                SettingAction::Predownload => {
+                    before.predownload_unread_chapters != after.predownload_unread_chapters
+                }
+                SettingAction::CleanupHours => {
+                    before.finished_cleanup_hours != after.finished_cleanup_hours
+                }
+                SettingAction::StorageLimit => {
+                    before.storage_size_limit != after.storage_size_limit
+                }
+                SettingAction::IdleSuspend => {
+                    before.idle_suspend_minutes != after.idle_suspend_minutes
+                }
+                SettingAction::WifiAutoConnect => {
+                    before.wifi_auto_connect != after.wifi_auto_connect
+                }
+                SettingAction::ColorBoost => before.color_post_process != after.color_post_process,
+                SettingAction::AutoUpdate => before.auto_check_updates != after.auto_check_updates,
+                SettingAction::OpenWifi
+                | SettingAction::OpenStorage
+                | SettingAction::OpenAccount => {
+                    // A navigation row leaves every value alone.
+                    assert_eq!(before, after, "{action:?} must not change a setting");
+                    app.goto_root(Screen::Settings).unwrap();
+                    app.set_settings_page(page);
+                    continue;
+                }
+            };
+            assert!(changed, "tapping the {action:?} row changed nothing");
+        }
+    }
+
+    // Paging must not lose a row: every setting the model defines has to be
+    // reachable on some page. Dropping the tail off the fold is exactly the
+    // bug this screen shipped with.
+    for (_, rows) in super::settings_groups(&effective_settings(&settings_dir, &lib)) {
+        for (label, _, _, action) in rows {
+            assert!(
+                seen.contains(&action),
+                "{label:?} is defined but on no page"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_setting_fits_on_one_screen_as_a_grid() {
+    // Fifteen settings stacked as rows needed two panels, and the version
+    // before that simply drew the last group past the fold — visible
+    // nowhere, tappable nowhere. Two columns of tiles fit the lot on one
+    // screen, so there is no pager to get lost in.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+    app.goto_root(Screen::Settings).unwrap();
+
+    assert_eq!(app.settings_page_count(), 1, "everything fits on one page");
+    let map = app.settings_hit_map();
+    let defined: usize = super::settings_groups(&effective_settings(&settings_dir, &lib))
+        .iter()
+        .map(|(_, rows)| rows.len())
+        .sum();
+    assert_eq!(map.len(), defined, "every setting has a tile to tap");
+
+    // Tiles must not overlap each other or spill past the nav bar — the two
+    // ways a grid silently eats a tap.
+    let nav_top = layout().nav_top();
+    for (i, (ax, ay, aw, ah, _)) in map.iter().enumerate() {
+        assert!(
+            ay + ah <= nav_top,
+            "tile {i} runs under the nav bar ({ay}+{ah} > {nav_top})"
+        );
+        for (bx, by, bw, bh, _) in map.iter().skip(i + 1) {
+            let overlaps = ax < &(bx + bw) && bx < &(ax + aw) && ay < &(by + bh) && by < &(ay + ah);
+            assert!(!overlaps, "tiles overlap: {ax},{ay} and {bx},{by}");
+        }
+    }
+}
+
+#[test]
+fn the_settings_pager_still_works_when_a_panel_is_too_small_for_the_grid() {
+    // The packing stays even though nothing pages today: a smaller panel, a
+    // larger font or one more group of settings all overflow it, and the
+    // failure mode without paging is a tile drawn past the fold.
+    let groups = super::settings_groups(&gideon_core::Settings::default());
+    let total: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+
+    // Room for two tile-rows per page, against three groups of settings.
+    let pages = super::paginate_settings(groups, 20, 100, 8, 2, 20 + 100 + 8 + 100);
+    assert!(pages.len() > 1, "a short panel has to page");
+    let placed: usize = pages
+        .iter()
+        .flat_map(|p| p.iter().map(|(_, rows)| rows.len()))
+        .sum();
+    assert_eq!(placed, total, "paging must not drop a setting");
+    for page in &pages {
+        assert!(!page.is_empty(), "no page is drawn empty");
+        for (_, rows) in page {
+            assert!(!rows.is_empty(), "a heading never sits alone on a page");
+        }
+    }
+}
+
+#[test]
+fn todays_continue_card_opens_the_chapter_it_names() {
+    // The card was drawn with a title, a "page N of M" and a progress bar,
+    // and tapping it did nothing at all: Today's whole tap dispatch returned
+    // early. A card that names your place has to take you there.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 6);
+    make_cbz(&lib.join("Vinland Saga/vol1.cbz"), 6);
+    let now = now_unix();
+    // Vinland Saga is the more recent read, so it is what Continue names.
+    write_progress(
+        &lib,
+        &[
+            ("Berserk/vol1.cbz", 1, 6, now - 90_000),
+            ("Vinland Saga/vol1.cbz", 2, 6, now - 600),
+        ],
+    );
+
+    let l = layout();
+    let mut probe =
+        app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    probe.run().unwrap();
+    probe.goto_root(Screen::Stats).unwrap();
+
+    let (title, _, _) = probe.continue_card().expect("something has been read");
+    assert_eq!(title, "Vinland Saga");
+    let top = probe.continue_card_top();
+    assert!(
+        probe.continue_card_hit(top + l.row_h / 2),
+        "the drawn card must be inside its own hit box"
+    );
+    assert!(
+        !probe.continue_card_hit(top.saturating_sub(1)),
+        "the heatmap above it is not a Continue tap"
+    );
+
+    // Tapping it opens the reader on that chapter and reading advances it.
+    let events = vec![
+        tap_today(),
+        UiEvent::Tap {
+            x: l.width / 2,
+            y: top + l.row_h / 2,
+        },
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Vinland Saga/vol1.cbz").unwrap().current_page,
+        3,
+        "the tap resumed page 3 of Vinland Saga and turned to page 4"
+    );
+    assert_eq!(
+        store.get("Berserk/vol1.cbz").unwrap().current_page,
+        1,
+        "the series the card did not name is untouched"
+    );
+}
+
+#[test]
+fn a_long_press_opens_a_modal_over_the_book_without_flashing() {
+    // Long-press options are a sheet over the library, not a screen of their
+    // own: the card you pressed stays visible behind it (which is the point
+    // of pressing THAT one), and only the strip it covers repaints.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    make_cbz(&lib.join("Berserk/vol2.cbz"), 2);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    let before = app.display().flushes.len();
+
+    let cell = tap_shelf_cell0();
+    let UiEvent::Tap { x, y } = cell else {
+        unreachable!()
+    };
+    app.handle_long_press(x, y).unwrap();
+
+    assert!(
+        matches!(app.sheet(), Some(Sheet::Book { .. })),
+        "the long press opens the book sheet"
+    );
+    assert!(
+        matches!(app.screen(), Screen::Library { .. }),
+        "and leaves you on the library, not on a menu screen"
+    );
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "raising a sheet must not flash the panel"
+    );
+
+    // Delete swaps one sheet for another — still no flash, still no delete.
+    let before = app.display().flushes.len();
+    app.tap_sheet(W / 2, tap_y(tap_book_row(2))).unwrap();
+    assert!(matches!(app.sheet(), Some(Sheet::ConfirmDelete { .. })));
+    assert_eq!(app.display().flushes[before..], [RefreshMode::Partial]);
+    assert!(lib.join("Berserk/vol1.cbz").exists());
+
+    // Dismissing by tapping above the sheet restores what it covered, which
+    // is the one interaction here that legitimately flashes.
+    let before = app.display().flushes.len();
+    app.tap_sheet(W / 2, 1).unwrap();
+    assert!(app.sheet().is_none());
+    assert_eq!(app.display().flushes[before..], [RefreshMode::Full]);
+    assert!(lib.join("Berserk/vol1.cbz").exists());
+}
+
+/// The y of a scripted tap event.
+fn tap_y(event: UiEvent) -> u32 {
+    match event {
+        UiEvent::Tap { y, .. } => y,
+        other => panic!("not a tap: {other:?}"),
+    }
+}
+
+#[test]
+fn todays_waiting_list_shows_unread_series_and_opens_them() {
+    // Today ended at the Continue card with a third of the panel blank — on a
+    // screen whose job is "what should I read next", the one question it
+    // declined to answer. The waiting list is what is downloaded and unread,
+    // most recently read first, and each row opens its series.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for (series, chapters) in [("Berserk", 3), ("Frieren", 2), ("Punpun", 1)] {
+        for c in 1..=chapters {
+            make_cbz(&lib.join(format!("{series}/vol{c}.cbz")), 4);
+        }
+    }
+    let now = now_unix();
+    write_progress(
+        &lib,
+        &[
+            // Berserk: vol1 finished, vol2 part-read → 2 unread. Read today.
+            ("Berserk/vol1.cbz", 3, 4, now - 300),
+            ("Berserk/vol2.cbz", 1, 4, now - 200),
+            // Frieren: nothing finished → 2 unread, read a week ago.
+            ("Frieren/vol1.cbz", 0, 4, now - 7 * 86_400),
+            // Punpun: its only chapter finished → nothing waiting.
+            ("Punpun/vol1.cbz", 3, 4, now - 86_400),
+        ],
+    );
+
+    let mut probe =
+        app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    probe.run().unwrap();
+    probe.goto_root(Screen::Stats).unwrap();
+
+    let rows = probe.waiting_rows();
+    let listed: Vec<(String, usize)> = rows.iter().map(|(c, n)| (c.title(), *n)).collect();
+    assert_eq!(
+        listed,
+        vec![("Berserk".to_string(), 2), ("Frieren".to_string(), 2)],
+        "finished series drop off; the most recently read leads"
+    );
+
+    // Each row's drawn y opens that row's series, not its neighbour's.
+    let l = layout();
+    let head_h = l.row_h * 2 / 3;
+    let top = probe.waiting_top() + head_h + l.pad;
+    for (i, (card, _)) in rows.iter().enumerate() {
+        let y = top + i as u32 * l.row_h + l.row_h / 2;
+        assert_eq!(
+            probe.waiting_row_at(y).map(|c| c.title()),
+            Some(card.title()),
+            "row {i} must hit the series drawn there"
+        );
+    }
+    assert!(
+        probe.waiting_row_at(top.saturating_sub(l.row_h)).is_none(),
+        "the header above the list is not a row"
+    );
+
+    // And a tap on the second row reads it.
+    let events = vec![
+        tap_today(),
+        UiEvent::Tap {
+            x: l.width / 2,
+            y: top + l.row_h + l.row_h / 2,
+        },
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Frieren/vol1.cbz").unwrap().current_page,
+        1,
+        "tapping the Frieren row resumed and turned a page in Frieren"
+    );
+}
+
+#[test]
+fn storage_breaks_down_by_series_and_reads_sizes_in_human_units() {
+    // The screen used to be four sentences: "Used: 0 MB of 2048 MB" and a
+    // promise that auto-cleanup takes the least-recently-read first. Neither
+    // told you what was actually taking the space.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let mut index = gideon_core::SeriesIndex::default();
+    for (series, chapters, pages) in [("Big Series", 3, 12), ("Small Series", 1, 2)] {
+        index.record(
+            series,
+            gideon_core::SeriesRef {
+                source_id: "s".into(),
+                source_name: "src".into(),
+                manga_id: series.into(),
+                manga_title: series.into(),
+                ..Default::default()
+            },
+        );
+        for c in 0..chapters {
+            let file = format!("ch{c}.cbz");
+            make_cbz(&lib.join(series).join(&file), pages);
+            index.record_download(series, &format!("c{c}"), &file);
+        }
+    }
+    index.save(&lib).unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+
+    let rows = app.storage_by_series();
+    let names: Vec<&str> = rows.iter().map(|(t, ..)| t.as_str()).collect();
+    assert_eq!(names, vec!["Big Series", "Small Series"], "biggest first");
+    assert_eq!(rows[0].2, 3, "chapter counts come from the download index");
+    assert!(rows[0].1 > rows[1].1);
+    assert_eq!(
+        rows.iter().map(|(_, b, _)| b).sum::<u64>(),
+        app.storage_stats().used,
+        "the breakdown accounts for every byte the total claims"
+    );
+
+    // `StorageSize`'s Display floors to whole MB because it has to round-trip
+    // through the settings parser, which renders a 700 KB chapter as "0 MB".
+    assert_eq!(super::human_size(700 * 1024), "700 KB");
+    assert_eq!(super::human_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    assert_eq!(super::human_size(2 * 1024 * 1024 * 1024), "2.00 GB");
+}
+
+#[test]
+fn discover_cards_are_a_grid_and_each_one_opens_its_own_destination() {
+    // Four rows of a list left two thirds of the panel white. Two columns of
+    // cards fill it — but a grid resolves taps by x AND y, and the old row
+    // dispatch would have sent every card in the right-hand column to its
+    // left-hand neighbour.
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = app(dir.path(), source_gateway(), vec![]);
+    probe.run().unwrap();
+    probe.goto_root(Screen::Home).unwrap();
+
+    let cards = probe.discover_cards();
+    assert_eq!(cards.len(), 4, "online, the four destinations");
+    let grid = probe.discover_grid(cards.len());
+    assert!(grid.cell(1).0 > grid.cell(0).0, "two columns");
+    assert!(grid.cell(2).1 > grid.cell(0).1, "two rows");
+
+    // The gutter between the columns is not a card: a tap there does nothing
+    // rather than activating whichever neighbour rounding lands on.
+    let l = layout();
+    let (cx, cy, cw, ch) = grid.cell(0);
+    assert_eq!(grid.hit(cx + cw / 2, cy + ch / 2, cards.len()), Some(0));
+    assert_eq!(grid.hit(cx + cw + 1, cy + ch / 2, cards.len()), None);
+    assert!(cy + ch <= l.nav_top(), "cards stay clear of the nav bar");
+
+    // Each card lands on its own screen.
+    for (i, want) in [(0usize, "search"), (1, "sources"), (2, "popular")] {
+        let mut card_app = app(
+            dir.path(),
+            source_gateway(),
+            vec![nav_discover(), tap_card(i)],
+        );
+        card_app.run().unwrap();
+        let landed = match card_app.screen() {
+            Screen::Search { .. } | Screen::RecentSearches { .. } => "search",
+            Screen::Sources { .. } => "sources",
+            Screen::MangaList { .. } | Screen::Message { .. } => "popular",
+            other => panic!("card {i} landed on {other:?}"),
+        };
+        assert_eq!(landed, want, "card {i}");
+    }
+}
+
+#[test]
+fn discovers_installed_sources_open_their_listings() {
+    // The strip under the cards is the one part of Discover that still says
+    // something with the radio off. Listing what you have installed and then
+    // ignoring a tap on it is the kind of dead text that teaches people not
+    // to try, so each line opens that source.
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), source_gateway(), vec![]);
+    app.run().unwrap();
+    app.goto_root(Screen::Home).unwrap();
+
+    let sources = app.gateway().installed_sources().unwrap();
+    assert!(!sources.is_empty(), "the fixture installs a source");
+
+    let l = layout();
+    let head_h = l.row_h * 2 / 3;
+    let top = app.discover_sources_top() + head_h + l.pad / 2;
+    let line_h = app.discover_source_line_h();
+
+    // The header above the strip is not a row.
+    assert!(app.discover_source_at(top.saturating_sub(1)).is_none());
+    for (i, source) in sources.iter().enumerate() {
+        let y = top + i as u32 * line_h + line_h / 2;
+        assert_eq!(
+            app.discover_source_at(y).map(|s| s.id.clone()),
+            Some(source.id.clone()),
+            "line {i} must hit the source drawn there"
+        );
+    }
+
+    // And a tap actually goes there, without disturbing the cards above it.
+    let y = top + line_h / 2;
+    app.handle_tap(l.width / 2, y).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::Listings { source } if source.id == sources[0].id),
+        "the tap opened the source's listings"
     );
 }

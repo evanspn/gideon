@@ -1305,8 +1305,34 @@ function statTilesHtml(s) {
 // GitHub-style calendar heatmap: one column per week, seven day-cells each,
 // shaded by how many pages were read that day. Month labels ride above the
 // columns where the month changes.
+// Cut points the cells shade against: the 25th, 50th and 75th percentile of
+// the days that had any reading. Scaling against the busiest day instead —
+// which this did — means one 400-page afternoon against a habit of 30 drags
+// every ordinary day onto level 1, leaving a pale wash with a single dark
+// square. `heatmap_thresholds` in crates/gideon-core/src/stats.rs does the
+// same arithmetic so the device and the dashboard shade a day identically.
+function heatmapLevels(byDay) {
+  const counts = [...byDay.values()].filter((v) => v > 0).sort((a, b) => a - b);
+  if (!counts.length) return [0, 0, 0];
+  const at = (pct) => counts[Math.min(counts.length - 1, Math.floor((pct * counts.length) / 100))];
+  return [at(25), at(50), at(75)];
+}
+
+// Level 0..4 for a day, against those cut points. All three equal means every
+// active day read the same amount: nothing to rank, so they share one mid tone
+// rather than all collapsing onto the palest.
+function heatmapLevel(val, levels) {
+  if (!val) return 0;
+  if (levels[0] === levels[2]) return 3;
+  if (val <= levels[0]) return 1;
+  if (val <= levels[1]) return 2;
+  if (val <= levels[2]) return 3;
+  return 4;
+}
+
 function heatmapHtml(s) {
   const WEEKS = 18;
+  const levels = heatmapLevels(s.byDay);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const start = new Date(today);
@@ -1334,7 +1360,7 @@ function heatmapHtml(s) {
       } else {
         const key = keyFromDate(cursor);
         const val = s.byDay.get(key) || 0;
-        const lvl = val === 0 ? 0 : Math.min(4, Math.ceil((val / (s.maxDay || 1)) * 4));
+        const lvl = heatmapLevel(val, levels);
         const label = val ? `${val} page${val === 1 ? "" : "s"} · ${prettyDate(key)}` : `No reading · ${prettyDate(key)}`;
         cells.push(`<span class="hm-cell lvl-${lvl}" title="${esc(label)}"></span>`);
       }

@@ -492,6 +492,20 @@ impl ReadingStats {
     }
 
     /// Pages read on a given local day index.
+    /// The three cut points the heatmap shades against: the 25th, 50th and
+    /// 75th percentile of the days that had any reading, ascending. All zeros
+    /// when nothing has been read.
+    pub fn heatmap_thresholds(&self) -> [usize; 3] {
+        let mut counts: Vec<usize> = self.by_day.values().copied().filter(|&v| v > 0).collect();
+        if counts.is_empty() {
+            return [0; 3];
+        }
+        counts.sort_unstable();
+        let n = counts.len();
+        let at = |pct: usize| counts[(pct * n / 100).min(n - 1)];
+        [at(25), at(50), at(75)]
+    }
+
     pub fn pages_on(&self, day_index: i64) -> usize {
         self.by_day.get(&day_index).copied().unwrap_or(0)
     }
@@ -506,13 +520,19 @@ impl ReadingStats {
     /// the caller draws the trailing ones as padding if it wants to, using
     /// [`Self::heatmap_start`] to work out which dates the cells stand for.
     ///
-    /// Quantisation matches the web: 0 pages is level 0, anything else is
-    /// `ceil(pages / max_day * 4)` capped at 4 — a relative scale, so the
-    /// busiest day is always the darkest square no matter how much the reader
-    /// reads. Integer `ceil` here, not floating point, so the levels are
+    /// Quantisation is by *rank*, not by fraction of the busiest day, and
+    /// `heatmapHtml` in `web/app.js` does the same so both surfaces shade a
+    /// day identically. Scaling against the maximum reads well in theory and
+    /// terribly in practice: one binge — a 400-page afternoon against a
+    /// habit of 30 — drags the thresholds so far up that every ordinary day
+    /// lands on level 1, and the grid becomes a single pale wash with one
+    /// dark square. Instead the days that had reading are sorted and split at
+    /// their 25th, 50th and 75th percentiles, so the levels describe this
+    /// reader against themselves and roughly a quarter of active days lands
+    /// in each. Integer arithmetic throughout, so the levels are
     /// bit-identical on every device.
     pub fn heatmap(&self, weeks: usize) -> Vec<[u8; 7]> {
-        let max = self.max_day();
+        let levels = self.heatmap_thresholds();
         let start = self.heatmap_start(weeks);
         let mut grid = Vec::with_capacity(weeks + 1);
         let mut col_start = start;
@@ -523,7 +543,7 @@ impl ReadingStats {
                 *cell = if day > self.today {
                     0 // future padding
                 } else {
-                    quantise(self.pages_on(day), max)
+                    quantise(self.pages_on(day), &levels)
                 };
             }
             grid.push(col);
@@ -541,14 +561,25 @@ impl ReadingStats {
     }
 }
 
-/// Intensity level `0..=4` for `pages` against the busiest day's `max`.
-fn quantise(pages: usize, max: usize) -> u8 {
-    if pages == 0 || max == 0 {
+/// Intensity level `0..=4` for `pages` against the reader's own quartiles.
+///
+/// `levels` are the three cut points from [`ReadingStats::heatmap_thresholds`],
+/// ascending. All three equal means every active day read the same amount:
+/// there is nothing to rank, so they share one mid tone rather than all
+/// collapsing onto the palest.
+fn quantise(pages: usize, levels: &[usize; 3]) -> u8 {
+    if pages == 0 {
         return 0;
     }
-    // ceil(pages * 4 / max), capped — integer arithmetic, no float rounding.
-    let level = pages.saturating_mul(4).div_ceil(max);
-    level.min(4) as u8
+    if levels[0] == levels[2] {
+        return 3;
+    }
+    match pages {
+        p if p <= levels[0] => 1,
+        p if p <= levels[1] => 2,
+        p if p <= levels[2] => 3,
+        _ => 4,
+    }
 }
 
 /// Current and longest runs of consecutive active days.
@@ -833,8 +864,9 @@ mod tests {
         let today = days_from_civil(2026, 8, 17); // a Monday
         let now = (today * SECS_PER_DAY + 12 * 3600) as u64;
 
-        // A busiest day of 40 pages makes the level thresholds 1..=10, 11..=20,
-        // 21..=30, 31..=40 — the same relative ramp the web draws.
+        // Five active days of 1, 11, 21, 30 and 40 pages. Sorted, their 25th,
+        // 50th and 75th percentiles are 11, 21 and 30, so each level holds
+        // roughly a quarter of the days rather than a fraction of the busiest.
         let rows: Vec<(String, ReadingProgress)> =
             [(0i64, 40usize), (1, 30), (2, 21), (3, 11), (4, 1)]
                 .iter()
@@ -867,11 +899,15 @@ mod tests {
             let off = (day - start) as usize;
             grid[off / 7][off % 7]
         };
-        assert_eq!(level_at(today), 4, "40/40 -> 4");
-        assert_eq!(level_at(today - 1), 3, "30/40 -> ceil(3.0) = 3");
-        assert_eq!(level_at(today - 2), 3, "21/40 -> ceil(2.1) = 3");
-        assert_eq!(level_at(today - 3), 2, "11/40 -> ceil(1.1) = 2");
-        assert_eq!(level_at(today - 4), 1, "1/40 -> ceil(0.1) = 1, never 0");
+        assert_eq!(level_at(today), 4, "40 pages is past the 75th percentile");
+        assert_eq!(level_at(today - 1), 3, "30 is the 75th percentile itself");
+        assert_eq!(level_at(today - 2), 2, "21 is the median");
+        assert_eq!(level_at(today - 3), 1, "11 is the 25th percentile");
+        assert_eq!(
+            level_at(today - 4),
+            1,
+            "a single page still shades, never 0"
+        );
         assert_eq!(level_at(today - 5), 0, "a day with no reading");
 
         // Today is a Monday, so the rest of its column is future padding.
@@ -887,8 +923,58 @@ mod tests {
         // Every level stays in range for a pathological single-page maximum.
         let one = stats(&[("S/v.cbz", progress(0, 1, now))], &tz, now);
         assert!(one.heatmap(4).iter().all(|c| c.iter().all(|&l| l <= 4)));
-        assert_eq!(quantise(0, 0), 0, "no data means no shading");
-        assert_eq!(quantise(7, 7), 4);
+        assert_eq!(quantise(0, &[1, 2, 3]), 0, "no reading means no shading");
+        assert_eq!(quantise(7, &[1, 2, 3]), 4);
+        assert_eq!(
+            quantise(20, &[20, 20, 20]),
+            3,
+            "every day the same: one mid tone, not the palest"
+        );
+    }
+
+    #[test]
+    fn one_binge_does_not_wash_the_whole_grid_out() {
+        // Scaling against the busiest day made a single 400-page afternoon
+        // push a month of ordinary 30-page days onto level 1 — a pale wash
+        // with one dark square, which says nothing about the habit it is
+        // supposed to show. Ranking against the reader's own days keeps the
+        // ordinary days legible.
+        let tz = LocalTimeZone::fixed(0);
+        let today = days_from_civil(2026, 8, 17);
+        let now = (today * SECS_PER_DAY + 12 * 3600) as u64;
+
+        let mut rows: Vec<(String, ReadingProgress)> = (1..=20i64)
+            .map(|back| {
+                let pages = 20 + (back as usize % 4) * 10; // 20, 30, 40, 50
+                let at = ((today - back) * SECS_PER_DAY + 10 * 3600) as u64;
+                (format!("S/v{back}.cbz"), progress(pages - 1, pages, at))
+            })
+            .collect();
+        rows.push((
+            "S/binge.cbz".into(),
+            progress(399, 400, (today * SECS_PER_DAY + 10 * 3600) as u64),
+        ));
+        let rows: Vec<(&str, ReadingProgress)> =
+            rows.iter().map(|(k, p)| (k.as_str(), *p)).collect();
+        let s = stats(&rows, &tz, now);
+        assert_eq!(s.max_day(), 400);
+
+        let grid = s.heatmap(18);
+        let mut seen = [0usize; 5];
+        for col in &grid {
+            for &level in col {
+                seen[level as usize] += 1;
+            }
+        }
+        let active: usize = seen[1..].iter().sum();
+        assert_eq!(active, 21, "every day with reading is shaded");
+        assert!(
+            seen[1] < active * 3 / 4,
+            "the binge must not flatten the rest onto level 1 ({seen:?})"
+        );
+        for level in 1..=4 {
+            assert!(seen[level] > 0, "every level is in use ({seen:?})");
+        }
     }
 
     #[test]

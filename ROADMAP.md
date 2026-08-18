@@ -13,8 +13,8 @@
 
 ## v1 — read manga on the device
 
-- [ ] Touch input via evdev (tap zones: next/prev/menu)
-- [ ] On-device library browser UI (cover grid, progress badges) — pure
+- [x] Touch input via evdev (tap zones: next/prev/menu)
+- [x] On-device library browser UI (cover grid, progress badges) — pure
       Rust, drawn through the `Display` trait; every text API takes explicit
       bounds and clips/ellipsizes, with headless pixel tests asserting no
       widget ever draws outside its box (see docs/LESSONS.md §1 — bobo's Lua
@@ -47,13 +47,41 @@
       list chapters, like bobo's backend does (gideon-aidoku, ported from
       bobo; handles classic and next-SDK sources, unknown host imports
       degrade gracefully)
-- [ ] Search + browse UI for sources
-- [ ] Chapter download queue with offline storage limits
+- [x] Search + browse UI for sources
+- [x] Chapter download queue with offline storage limits
 - [x] Source install from the configured lists (`gideon source install`)
 
 ## Later
 
 - [ ] CBR (rar) support
-- [ ] OTA self-update from GitHub releases
-- [ ] Reading stats
-- [ ] Cloud sync of progress
+- [x] OTA self-update from GitHub releases
+- [x] Reading stats
+- [x] Cloud sync of progress
+
+## v1.0 — the data-rich reader
+
+Everything v1 and v2 set out to do is on the device, and the library now
+shows what gideon actually knows about a series rather than just its cover.
+
+- [x] MyAnimeList metadata cached per series (score, publication status,
+      genres, rank, chapter count) — fetched once per series, never blocking
+      a download, silently skipped offline
+- [x] Dense library list beside the cover shelf: score, status, genres,
+      "18 downloaded · 2 unread", progress and next chapter per row
+- [x] Reading statistics derived on-device from the progress store — streak,
+      chapters, pages, active days — bucketed by local calendar day, so a
+      streak is honest in any timezone
+- [x] Activity heatmap on Home
+- [x] Five colour profiles (ink-rust, indigo, sumi, botanical, mono), with
+      mono a real target for panels without a Kaleido filter rather than a
+      degraded fallback
+- [x] Finished-chapter cleanup on a configurable timer (default 48h), run
+      ahead of size-based eviction
+- [x] Settings split by scope: personal taste per profile, hardware and disk
+      device-global
+
+Known gap, deliberately not blocking 1.0:
+
+- [ ] CBR (rar) support — the one item from the original roadmap never built.
+      Every source gideon downloads from serves CBZ; CBR only matters for
+      sideloaded archives.

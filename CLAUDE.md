@@ -37,3 +37,30 @@ approval — feedback arrives as pinned comments in the gallery.
 - Gallery: https://design-review-seven-brown.vercel.app
 - Design mobile-first for iPhone 14 Pro Max (430x932 logical viewport).
 - Tag published designs with this repo as `parent_repo`.
+
+## E-ink refresh
+
+Which refresh a repaint asks for is a user-visible design decision, not an
+implementation detail. **Read `docs/REFRESH.md` before changing any
+`render_current` / `flush` call.**
+
+The short version: the panel has non-flashing partial waveforms for BOTH
+grayscale and colour (GLR16 / GLRC16), and callers select
+`RefreshMode::{Full, Partial}` while `kobo.rs` picks the waveform from
+`last_blit_color`.
+
+- **Partial** when a bounded region changes and the rest of the frame is
+  byte-identical to what the panel already shows — a value, a row, a page
+  turn, a sheet sliding over content that is not moving.
+- **Full** when a whole screen changes, or when a region the panel has been
+  holding stale behind something opaque is revealed again.
+
+Hard rules: never flash for a one-line change; never flash to reveal a modal;
+any surface that repaints partially in a loop must force a Full every N
+repaints so ghosting has somewhere to go; and pin the mode in a test —
+`MemoryDisplay.flushes` records every flush, and this codebase has already
+shipped a comment claiming "this does not flash" that was false.
+
+REAGL waveforms are paired with `UPDATE_MODE_FULL` on purpose. That flag is
+about the update region, not the flash. "Fixing" that pairing breaks partial
+refresh everywhere.

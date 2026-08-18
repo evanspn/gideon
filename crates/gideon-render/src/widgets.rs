@@ -605,19 +605,25 @@ pub fn draw_library_row(
             cx += used + gap / 2;
         }
     }
+    // Genres are plain text, not a second chip. Two tinted pills a single
+    // luma level apart read as one smear at 150ppi, and on a panel without a
+    // colour filter they were literally the same grey — so the two roles
+    // separate by FORM: the status is a filled chip because it is one of a
+    // few fixed states, the genres are a line of words because they are a
+    // list.
     if !row.genres.is_empty() {
-        draw_chip(
-            canvas,
-            &mut layer,
-            &clip,
-            cx,
-            chip_y,
-            chips_right.saturating_sub(cx),
-            chip_h,
-            row.genres,
-            small,
-            t.genre_tint,
-        );
+        let room = chips_right.saturating_sub(cx);
+        if room > 0 {
+            draw_text(
+                &mut layer,
+                cx.saturating_sub(clip.x0),
+                center_y(b1, band, small).saturating_sub(clip.y0),
+                small,
+                row.genres,
+                room,
+                false,
+            );
+        }
     }
 
     // --- band 2: progress bar, then how much is read and what is next.
@@ -2055,4 +2061,365 @@ mod tests {
             }
         }
     }
+}
+
+/// One row in a [`draw_sheet`] modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheetRow<'a> {
+    pub label: &'a str,
+    /// The current value, right-aligned — empty for a plain action row.
+    pub value: &'a str,
+    /// Draws the row as the way out of the sheet rather than a choice in it.
+    pub dismiss: bool,
+}
+
+/// Height a sheet needs for `rows` at `row_h`, including its title bar.
+pub fn sheet_height(rows: usize, row_h: u32) -> u32 {
+    row_h + row_h * rows as u32
+}
+
+/// A bottom-sheet modal: a solid panel anchored to the bottom of the screen,
+/// carrying a title and a short list of choices.
+///
+/// Deliberately NOT a dimmed backdrop. E-ink has no cheap translucency, and
+/// tinting the whole screen behind the sheet would force a full flashing
+/// refresh of everything the sheet is supposed to be layered over. Instead
+/// the panel is opaque and its top edge is a heavy 3px rule — the same trick
+/// the reader's controls sheet uses — so it reads as *in front of* the screen
+/// without repainting it.
+///
+/// The caller places it; `sheet_height` says how tall it wants to be. Rows are
+/// `row_h` tall so they clear the 88px touch floor at any panel size the
+/// layout produces.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+/// The bare sheet: opaque panel, heavy top edge, accent-marked title. Returns
+/// the y its content may start at.
+///
+/// Split out of [`draw_sheet`] because a sheet of VALUES wants a grid and a
+/// sheet of ACTIONS wants rows, and the panel itself is the same either way.
+/// Opaque, never a dimmed backdrop: dimming what a sheet covers means
+/// repainting it, which on this panel means flashing the very content the
+/// sheet is supposed to leave alone.
+pub fn draw_panel(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    title: &str,
+    text_px: f32,
+    t: &Theme,
+) -> u32 {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() {
+        return y;
+    }
+    fill_rect(canvas, &clip, x, y, w, h, [0xFF, 0xFF, 0xFF]);
+    fill_rect(canvas, &clip, x, y, w, 3, [0x00, 0x00, 0x00]);
+
+    let pad = (text_px * 0.5) as u32;
+    let title_h = (text_px * 1.6) as u32;
+    let mut layer = GrayPage::new_white(w.max(1), title_h.max(1));
+    draw_text(
+        &mut layer,
+        pad,
+        (title_h.saturating_sub(text_px as u32)) / 2,
+        text_px * 0.95,
+        title,
+        w.saturating_sub(pad * 2),
+        true,
+    );
+    fill_rect(
+        canvas,
+        &clip,
+        x + pad / 2,
+        y + pad,
+        6,
+        title_h.saturating_sub(pad * 2),
+        t.accent,
+    );
+    overlay_ink_at(canvas, &layer, x, y);
+    y + title_h
+}
+
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_sheet(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    title: &str,
+    rows: &[SheetRow],
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() {
+        return;
+    }
+    // Opaque panel, so whatever it covers needs no repaint.
+    fill_rect(canvas, &clip, x, y, w, h, [0xFF, 0xFF, 0xFF]);
+    // The heavy top edge is what makes it read as layered.
+    fill_rect(canvas, &clip, x, y, w, 3, [0x00, 0x00, 0x00]);
+
+    let row_h = if rows.is_empty() {
+        h
+    } else {
+        (h.saturating_sub(h / (rows.len() as u32 + 1))) / rows.len().max(1) as u32
+    };
+    let title_h = h.saturating_sub(row_h * rows.len() as u32);
+    let pad = (text_px * 0.5) as u32;
+
+    let mut layer = GrayPage::new_white(w.max(1), h.max(1));
+    // The title names what the sheet acts on, so it leads the rows rather
+    // than whispering above them: a modal whose subject is set smaller than
+    // its choices reads as a caption on someone else's menu.
+    draw_text(
+        &mut layer,
+        pad,
+        (title_h.saturating_sub(text_px as u32)) / 2,
+        text_px * 0.95,
+        title,
+        w.saturating_sub(pad * 2),
+        true,
+    );
+
+    for (i, row) in rows.iter().enumerate() {
+        let ry = title_h + i as u32 * row_h;
+        // A hairline between choices, never around them.
+        if i > 0 {
+            fill_rect(
+                canvas,
+                &clip,
+                x + pad,
+                y + ry,
+                w.saturating_sub(pad * 2),
+                1,
+                RULE,
+            );
+        }
+        let text_y = ry + (row_h.saturating_sub(text_px as u32)) / 2;
+        draw_text(
+            &mut layer,
+            pad,
+            text_y,
+            text_px * 0.85,
+            row.label,
+            w.saturating_sub(pad * 2),
+            !row.dismiss,
+        );
+        if !row.value.is_empty() {
+            let vw = measure_text(text_px * 0.85, row.value, false);
+            draw_text(
+                &mut layer,
+                w.saturating_sub(pad + vw),
+                text_y,
+                text_px * 0.85,
+                row.value,
+                vw + pad,
+                false,
+            );
+        }
+    }
+    // An accent stripe down the title, the same mark section headers carry, so
+    // the sheet belongs to the same family rather than looking like an alert.
+    fill_rect(
+        canvas,
+        &clip,
+        x + pad / 2,
+        y + pad,
+        6,
+        title_h.saturating_sub(pad * 2),
+        t.accent,
+    );
+    overlay_ink_at(canvas, &layer, x, y);
+}
+
+// ---------------------------------------------------------------------------
+// Grids
+// ---------------------------------------------------------------------------
+
+/// A grid of equal cells inside a box, and the arithmetic to place them.
+///
+/// Kept as data rather than baked into a draw call because every grid on the
+/// device has to be hit-tested as well as drawn, and the only way those two
+/// stay in agreement is to ask the same value for both. Rows are derived from
+/// the item count, never from the height: a grid that quietly reflowed under a
+/// caller's feet would put a tap on the wrong cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridLayout {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub cols: u32,
+    pub cell_h: u32,
+    pub gap: u32,
+}
+
+impl GridLayout {
+    /// A grid `cols` wide with cells `cell_h` tall.
+    pub fn new(x: u32, y: u32, width: u32, cols: u32, cell_h: u32, gap: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            cols: cols.max(1),
+            cell_h,
+            gap,
+        }
+    }
+
+    /// Cell width: the leftover after the gaps between columns.
+    pub fn cell_w(&self) -> u32 {
+        let gaps = self.gap.saturating_mul(self.cols.saturating_sub(1));
+        self.width.saturating_sub(gaps) / self.cols
+    }
+
+    /// Rows needed for `count` cells.
+    pub fn rows(&self, count: usize) -> u32 {
+        (count as u32).div_ceil(self.cols)
+    }
+
+    /// Total height for `count` cells, gaps included.
+    pub fn height(&self, count: usize) -> u32 {
+        let rows = self.rows(count);
+        rows.saturating_mul(self.cell_h)
+            .saturating_add(self.gap.saturating_mul(rows.saturating_sub(1)))
+    }
+
+    /// The rect of cell `index`: `(x, y, w, h)`.
+    pub fn cell(&self, index: usize) -> (u32, u32, u32, u32) {
+        let col = index as u32 % self.cols;
+        let row = index as u32 / self.cols;
+        (
+            self.x + col * (self.cell_w() + self.gap),
+            self.y + row * (self.cell_h + self.gap),
+            self.cell_w(),
+            self.cell_h,
+        )
+    }
+
+    /// Which cell a point lands in, or `None` for the gaps and everything
+    /// outside. `count` bounds it so a tap past the last cell in a ragged
+    /// final row does nothing instead of activating a cell that isn't there.
+    pub fn hit(&self, x: u32, y: u32, count: usize) -> Option<usize> {
+        (0..count).find(|i| {
+            let (cx, cy, cw, ch) = self.cell(*i);
+            x >= cx && x < cx + cw && y >= cy && y < cy + ch
+        })
+    }
+}
+
+/// One cell of a settings grid: what it is, what it is set to, and the line
+/// of explanation under it.
+pub struct Tile<'a> {
+    pub label: &'a str,
+    /// The current value. Empty for a cell that navigates rather than cycles.
+    pub value: &'a str,
+    pub detail: &'a str,
+}
+
+/// Draw one tile: label above, value below it in the size that carries, and
+/// the detail line last.
+///
+/// A framed cell rather than a full row, because on a panel this shape a
+/// fifteen-item list is two screens of scrolling while the same fifteen items
+/// as tiles are one screen you can take in at a glance. The frame is a 1px
+/// rule and the fills are flat — a partial refresh has to be able to repaint
+/// one cell without the panel reconstructing a gradient.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_tile(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    tile: &Tile,
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let mut layer = clip.text_layer();
+
+    let pad = scaled(text_px, 0.32, 3);
+    let label_px = text_px * 0.62;
+    let value_px = text_px * 0.92;
+    let detail_px = text_px * 0.55;
+    let inner = w.saturating_sub(pad * 2);
+
+    // The frame, and an accent bar down its left edge — the same mark the
+    // section headers carry, so a tile reads as part of the same family.
+    fill_rect(canvas, &clip, x, y, w, 1, RULE);
+    fill_rect(canvas, &clip, x, y + h.saturating_sub(1), w, 1, RULE);
+    fill_rect(canvas, &clip, x, y, 1, h, RULE);
+    fill_rect(canvas, &clip, x + w.saturating_sub(1), y, 1, h, RULE);
+    let mark_w = scaled(text_px, 0.14, 2);
+    fill_rect(canvas, &clip, x, y, mark_w, h, t.accent);
+
+    let tx = x + mark_w + pad;
+    let inner = inner.saturating_sub(mark_w);
+    // A tile that navigates rather than cycles carries a chevron at its top
+    // right instead of a value: "›" set as the value read as a shrug on a
+    // line of its own.
+    let navigates = tile.value == "›";
+
+    // Lines first, then centre the block: a grid sizes its cells to fill the
+    // panel, and two lines pinned to the top-left of a tall card read as a
+    // rendering accident rather than a card.
+    let mut lines: Vec<(&str, f32, bool)> = Vec::new();
+    if !tile.label.is_empty() {
+        lines.push((tile.label, label_px, false));
+    }
+    if !tile.value.is_empty() && !navigates {
+        lines.push((tile.value, value_px, true));
+    }
+    if !tile.detail.is_empty() {
+        lines.push((tile.detail, detail_px, false));
+    }
+    let block: u32 = lines.iter().map(|(_, px, _)| (px * 1.3) as u32).sum();
+    let mut ty = y + (h.saturating_sub(block) / 2).max(pad);
+
+    let chevron_w = if navigates {
+        measure_text(label_px, "›", false)
+    } else {
+        0
+    };
+    if navigates {
+        draw_text(
+            &mut layer,
+            (x + w).saturating_sub(pad + chevron_w + clip.x0),
+            ty.saturating_sub(clip.y0),
+            label_px,
+            "›",
+            chevron_w,
+            false,
+        );
+    }
+    for (i, (text, px, bold)) in lines.iter().enumerate() {
+        if ty + *px as u32 > y + h {
+            break;
+        }
+        // Only the first line makes room for the chevron; the lines under it
+        // run the full width.
+        let width = if i == 0 {
+            inner.saturating_sub(chevron_w)
+        } else {
+            inner
+        };
+        draw_text(
+            &mut layer,
+            tx.saturating_sub(clip.x0),
+            ty.saturating_sub(clip.y0),
+            *px,
+            text,
+            width,
+            *bold,
+        );
+        ty += (px * 1.3) as u32;
+    }
+    overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
 }

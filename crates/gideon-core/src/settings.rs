@@ -359,19 +359,33 @@ fn default_color_profile() -> String {
 }
 
 /// The Library view a fresh install uses.
+///
+/// The dense list, not the cover shelf. The list is the view that answers
+/// the question you actually have in front of a library — what is on the
+/// device, how much of it is unread, what is next — and hiding it behind a
+/// title-bar tap meant nobody would ever find it. The shelf is still one tap
+/// away for browsing by art, and the choice is per profile and sticky.
 fn default_library_view() -> String {
-    "shelf".to_string()
+    "list".to_string()
 }
 
-/// Lenient `library_view` parsing: "list" passes through, anything else
-/// means the cover shelf.
+/// Lenient `library_view` parsing: "list" and "shelf" pass through, anything
+/// else falls back to the default.
+///
+/// This used to read "anything that isn't `list` means the shelf", which was
+/// right while the shelf WAS the default. Once the dense list became the
+/// default the same branch quietly inverted: `"library_view": "shelf"` fell
+/// through to the fallback and came back as `"list"`, so choosing the cover
+/// shelf survived until the next read of the file — which is every repaint.
+/// Both known values are named explicitly now, so neither depends on which
+/// one the default happens to be.
 fn lenient_library_view<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(
         match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
-            Some(s) if s == "list" => s,
+            Some(s) if s == "list" || s == "shelf" => s,
             _ => default_library_view(),
         },
     )
@@ -1365,5 +1379,27 @@ mod tests {
             err.to_string().contains("much wow"),
             "unhelpful error: {err}"
         );
+    }
+    #[test]
+    fn the_cover_shelf_survives_a_round_trip_through_settings_json() {
+        // The lenient parser said "anything that isn't list means the shelf",
+        // which inverted the moment the list became the default: "shelf"
+        // fell through to the fallback and read back as "list", so choosing
+        // the shelf lasted until the next read of the file.
+        let dir = tempfile::tempdir().unwrap();
+        Settings {
+            library_view: "shelf".into(),
+            ..Settings::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        assert_eq!(Settings::load(dir.path()).unwrap().library_view, "shelf");
+
+        // And a value from neither vocabulary still lands on the default
+        // rather than erroring.
+        let path = Settings::path(dir.path());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("\"shelf\"", "\"grid\"")).unwrap();
+        assert_eq!(Settings::load(dir.path()).unwrap().library_view, "list");
     }
 }
