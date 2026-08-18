@@ -525,27 +525,27 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
         "offline row 0 reconnects, stays on Home"
     );
 
-    // Offline: the standard entries are offset past the reconnect row, so the
-    // first real entry (Library) is row 1.
+    // Offline: the standard entries are offset past the reconnect row, so
+    // "Browse sources" — the second entry — is row 2.
     let mut b = app(&lib, FakeGateway::default(), vec![]);
     b.goto_root(Screen::Home).unwrap();
     b.home_offline = true;
-    b.activate(1, 10, 10).unwrap();
+    b.activate(2, 10, 10).unwrap();
     assert!(
-        matches!(b.screen(), Screen::Library { .. }),
-        "offline row 1 is Library"
+        matches!(b.screen(), Screen::Sources { .. }),
+        "offline row 2 is Browse sources"
     );
 
-    // Online (the default): no reconnect row, so Library is row 0.
+    // Online (the default): no reconnect row, so Browse sources is row 1.
     let mut c = app(&lib, FakeGateway::default(), vec![]);
     c.goto_root(Screen::Home).unwrap();
     // Painting Home probes connectivity; pin the online case so the row
     // offset under test is the one being asserted and not the probe's mood.
     c.home_offline = false;
-    c.activate(0, 10, 10).unwrap();
+    c.activate(1, 10, 10).unwrap();
     assert!(
-        matches!(c.screen(), Screen::Library { .. }),
-        "online row 0 is Library"
+        matches!(c.screen(), Screen::Sources { .. }),
+        "online row 1 is Browse sources"
     );
 }
 
@@ -556,19 +556,17 @@ fn home_to_library_to_reader_page_turns_and_back() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),        // Home -> Library
+        tap_nav(0),        // Home -> Library
         tap_shelf_cell0(), // open the reader
         reader_tap_next(), // page 2
         reader_tap_next(), // page 3
         reader_tap_prev(), // page 2
         reader_tap_back(), // back to Library
-        tap_back(),        // back to Home
     ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     // Progress was saved under the library-relative key.
     let store = ProgressStore::load(&progress_path(&lib)).unwrap();
     let progress = store.get("Sample/vol1.cbz").expect("progress saved");
@@ -577,7 +575,7 @@ fn home_to_library_to_reader_page_turns_and_back() {
 
     // Screen changes are full refreshes; reader page turns are partial.
     let flushes = &app.display().flushes;
-    assert_eq!(flushes[0], RefreshMode::Full); // home
+    assert_eq!(flushes[0], RefreshMode::Full); // the landing library
     assert!(flushes.contains(&RefreshMode::Partial)); // page turns
 }
 
@@ -590,12 +588,7 @@ fn reader_resumes_from_saved_progress() {
     store.update("Sample/vol1.cbz", 3, 5);
     store.save(&progress_path(&lib)).unwrap();
 
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_shelf_cell0(),
-        reader_tap_next(),
-    ];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), reader_tap_next()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -613,8 +606,7 @@ fn fit_width_setting_makes_next_scroll_within_the_page() {
     // at 740px per step needs four taps to reach the bottom), so the saved
     // progress stays on page 0.
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_next(),
@@ -641,7 +633,7 @@ fn fit_width_setting_turns_the_page_from_the_bottom() {
     make_tall_cbz(&lib.join("Tall/vol1.cbz"), 2);
 
     // The fifth "next" tap happens at the bottom and turns to page 1.
-    let mut events = vec![nav_discover(), tap_row(0), tap_shelf_cell0()];
+    let mut events = vec![tap_nav(0), tap_shelf_cell0()];
     events.extend(std::iter::repeat_with(reader_tap_next).take(5));
     events.push(reader_tap_back());
     let mut app =
@@ -661,8 +653,7 @@ fn default_contain_mode_turns_pages_directly() {
     // Without the fit-width setting, two next taps mean two page turns
     // even on a tall page.
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_next(),
@@ -714,27 +705,28 @@ fn menu_taps_land_the_right_row_at_each_rotation() {
         let lib = dir.path().join("Manga");
         make_cbz(&lib.join("Sample/vol1.cbz"), 2);
 
-        // Row 0 of the Discover menu opens the Library… (the row indices
-        // are Discover's, so each app starts there rather than on the
-        // library the device lands on.)
-        let mut library_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(0, rot)])
+        // Row 1 of the Discover menu opens Sources… (the row indices are
+        // Discover's, so each app starts there rather than on the library
+        // the device lands on.)
+        let mut sources_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(1, rot)])
             .with_reader_settings(FitMode::Contain, rot);
-        library_app.goto_root(Screen::Home).unwrap();
-        library_app.run().unwrap();
+        sources_app.goto_root(Screen::Home).unwrap();
+        sources_app.run().unwrap();
         assert!(
-            matches!(library_app.screen(), Screen::Library { .. }),
-            "rotation {rot}: the Library row tap must open the Library"
+            matches!(sources_app.screen(), Screen::Sources { .. }),
+            "rotation {rot}: the Browse sources row tap must open Sources"
         );
 
-        // …and row 3 opens Settings: per-row precision, not just "hit
-        // something".
-        let mut settings_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(3, rot)])
+        // …and row 0 opens search, which with no sources installed says so
+        // rather than opening a dead keyboard: per-row precision, not just
+        // "hit something".
+        let mut search_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(0, rot)])
             .with_reader_settings(FitMode::Contain, rot);
-        settings_app.goto_root(Screen::Home).unwrap();
-        settings_app.run().unwrap();
+        search_app.goto_root(Screen::Home).unwrap();
+        search_app.run().unwrap();
         assert!(
-            matches!(settings_app.screen(), Screen::Settings),
-            "rotation {rot}: the Settings row tap must open Settings"
+            matches!(search_app.screen(), Screen::Message { title, .. } if title == "Search"),
+            "rotation {rot}: the search row tap must open search"
         );
     }
 }
@@ -774,8 +766,7 @@ fn leaving_the_reader_drains_the_exit_gestures_tail() {
         y1: H - 20, // well past the quarter-height exit threshold
     };
     let events = vec![
-        nav_discover(),
-        tap_row(0),        // Home -> Library
+        tap_nav(0),        // Home -> Library
         tap_shelf_cell0(), // open the book
         swipe_down_exit,   // swipe down -> back to the library
     ];
@@ -822,8 +813,7 @@ fn controls_sheet_opens_from_bottom_edge_swipe_only() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),         // opens the sheet — must NOT rotate
         tap_sheet_row(SHEET_ROW_CLOSE), // Close
@@ -858,8 +848,7 @@ fn controls_sheet_rotate_matches_the_swipe_rotation() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),
         tap_sheet_row(0), // Rotate 90°
@@ -891,8 +880,7 @@ fn orientation_lock_toggle_persists_and_auto_keeps_rotation_session_only() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         bottom_edge_swipe_up(),
         tap_sheet_row(SHEET_ROW_ORIENTATION), // locked -> auto (persisted)
@@ -1035,8 +1023,7 @@ fn gyro_rotates_the_reader_in_auto_mode() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::Rotate { rotation: 90 },
         tap_panel_bottom,
@@ -1116,8 +1103,7 @@ fn waking_snaps_the_reader_to_the_current_orientation() {
     let tap_panel_bottom = UiEvent::Tap { x: W / 2, y: H - 1 };
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::Sleep,
         tap_panel_bottom,
@@ -1144,8 +1130,7 @@ fn physical_forward_button_advances_when_upright() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::PageForward, // upright: forward advances to page 1
         reader_tap_back(),
@@ -1341,11 +1326,7 @@ fn fast_page_turn_keeps_queued_presses() {
 fn empty_library_shows_hint_not_error() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga"); // does not exist yet
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
     assert!(lib.exists(), "library directory should be created");
@@ -1362,13 +1343,7 @@ fn library_paginates_with_prev_next() {
         make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
     }
 
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_nav_next(),
-        tap_nav_next(),
-        tap_nav_prev(),
-    ];
+    let events = vec![tap_nav(0), tap_nav_next(), tap_nav_next(), tap_nav_prev()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1404,11 +1379,7 @@ fn three_chapters_of_one_series_make_one_card() {
     make_cbz(&lib.join("Series/vol2.cbz"), 2);
     make_cbz(&lib.join("Series/vol3.cbz"), 2);
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     let Screen::Library { items, .. } = app.screen() else {
@@ -1509,8 +1480,7 @@ fn tapping_a_series_card_resumes_the_in_progress_chapter() {
     .unwrap();
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // vol2: page 1 -> 2
         reader_tap_back(),
@@ -1561,7 +1531,7 @@ fn resume_honors_stored_last_opened_over_any_timestamp() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![nav_discover(), tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1585,8 +1555,7 @@ fn resuming_a_series_still_flows_into_the_next_chapter() {
     make_cbz(&lib.join("Series/vol2.cbz"), 2);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // vol1 page 2 (last)
         reader_tap_next(), // past the end -> vol2 opens
@@ -1609,11 +1578,7 @@ fn sideloaded_loose_file_still_gets_a_card() {
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
     make_cbz(&lib.join("loose.cbz"), 2);
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     let Screen::Library { items, .. } = app.screen() else {
@@ -1649,7 +1614,7 @@ fn book_menu_targets_the_chapter_a_tap_would_open() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![nav_discover(), tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1693,7 +1658,7 @@ fn cover_tap_without_a_record_resumes_the_furthest_read_chapter() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![nav_discover(), tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1730,11 +1695,7 @@ fn library_with_cover_art_renders_in_color() {
     .save(&lib)
     .unwrap();
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
 
@@ -1784,7 +1745,7 @@ fn color_library_page_flips_stay_partial() {
     .save(&lib)
     .unwrap();
 
-    let events = vec![nav_discover(), tap_row(0), tap_nav_next()];
+    let events = vec![tap_nav(0), tap_nav_next()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1875,11 +1836,7 @@ fn library_without_covers_stays_on_the_grayscale_path() {
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     // The CBZ's first page is gray; nothing here may take the color path
@@ -1912,7 +1869,7 @@ fn sources_screen_lists_installed_then_available() {
         ]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1936,7 +1893,7 @@ fn source_list_fetch_error_shows_note_row_and_continues() {
         available: Err("network unreachable".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1963,7 +1920,7 @@ fn tapping_available_source_installs_and_refreshes() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_row(2), tap_row(1)],
+        vec![nav_discover(), tap_row(1), tap_row(1)],
     );
     app.run().unwrap();
 
@@ -2020,7 +1977,7 @@ fn full_browse_download_and_read_flow() {
 
     let events = vec![
         nav_discover(),
-        tap_row(2),        // Home -> Sources
+        tap_row(1),        // Home -> Sources
         tap_row(0),        // installed "Src" -> Listings
         tap_row(0),        // Popular -> MangaList
         tap_row(0),        // Manga One -> ChapterList
@@ -2069,7 +2026,7 @@ fn manga_list_paginates() {
 
     let events = vec![
         nav_discover(),
-        tap_row(2),     // Sources
+        tap_row(1),     // Sources
         tap_row(0),     // Listings
         tap_row(0),     // Popular
         tap_nav_next(), // page 2
@@ -2101,7 +2058,7 @@ fn listing_failure_shows_error_screen_with_back() {
 
     let events = vec![
         nav_discover(),
-        tap_row(2), // Sources
+        tap_row(1), // Sources
         tap_row(0), // Listings
         tap_row(0), // Popular -> fails
         tap_row(0), // tap the error screen -> back
@@ -2124,7 +2081,7 @@ fn error_screen_renders_the_message() {
         mangas: Err("server exploded".into()),
         ..FakeGateway::default()
     };
-    let events = vec![nav_discover(), tap_row(2), tap_row(0), tap_row(0)];
+    let events = vec![nav_discover(), tap_row(1), tap_row(0), tap_row(0)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -2142,7 +2099,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(4)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(3)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -2162,10 +2119,11 @@ fn back_on_home_does_nothing() {
         FakeGateway::default(),
         vec![nav_discover(), tap_back(), tap_back(), tap_row(0)],
     );
-    let lib = dir.path().join("x");
-    let _ = lib; // silence unused in case of edits
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(
+        matches!(app.screen(), Screen::Message { title, .. } if title == "Search"),
+        "the row tap after two ignored Back taps still works"
+    );
 }
 
 // --- power menu ---
@@ -3123,8 +3081,7 @@ fn offline_series_swaps_to_downloads_and_reads_without_network() {
     };
     // Offline, Home shows the "reconnect" row at row 0, so Library is row 1.
     let events = vec![
-        nav_discover(),
-        tap_row(1),                  // Home -> Library
+        tap_nav(0),                  // Library
         UiEvent::LongPress { x, y }, // card -> BookMenu
         tap_book_row(0),             // "All chapters" -> downloads (offline)
         tap_row(0),                  // first downloaded chapter -> reader
@@ -3263,8 +3220,7 @@ fn online_series_opens_the_source_chapter_list() {
     };
     // Online, Home has no reconnect row, so Library is row 0.
     let events = vec![
-        nav_discover(),
-        tap_row(0),                  // Home -> Library
+        tap_nav(0),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> BookMenu
         tap_book_row(0),             // "All chapters" -> source list (online)
     ];
@@ -3587,8 +3543,8 @@ fn switching_profile_shows_only_that_profiles_books() {
     let events = vec![
         nav_discover(),
         tap_title_left(), // profile menu
-        tap_row(1),       // switch to alex -> back on Home
-        tap_row(0),       // Library
+        tap_row(1),       // switch to alex -> back on Discover
+        tap_nav(0),       // Library
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3610,11 +3566,7 @@ fn default_profile_does_not_see_other_profiles_books() {
     make_cbz(&lib.join("Shared/vol1.cbz"), 2);
     make_cbz(&lib.join("@alex/Alexs Series/vol1.cbz"), 2);
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
     app.run().unwrap();
 
     let Screen::Library { items, .. } = app.screen() else {
@@ -3660,7 +3612,7 @@ fn downloads_land_in_the_active_profiles_directory() {
         nav_discover(),
         tap_title_left(), // profile menu
         tap_row(1),       // switch to alex
-        tap_row(2),       // Sources
+        tap_row(1),       // Sources
         tap_row(0),       // Listings
         tap_row(0),       // Popular
         tap_row(0),       // Manga One
@@ -3694,7 +3646,7 @@ fn new_profile_keyboard_creates_and_switches() {
         tap_key(Key::Char('o')),
         tap_key(Key::Char('b')),
         tap_key(Key::Search), // create
-        tap_row(0),           // Library (of the new profile)
+        tap_nav(0),           // Library (of the new profile)
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3820,7 +3772,7 @@ fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
         tap_key(Key::Char('m')),
         tap_key(Key::Char('e')),
         tap_key(Key::Search), // convert
-        tap_row(0),           // Library (now @me's)
+        tap_nav(0),           // Library (now @me's)
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3996,7 +3948,7 @@ fn long_press_removes_an_installed_source_after_confirming() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),        // Home -> Sources
+        tap_row(1),        // Home -> Sources
         long_press_row(0), // installed "Src" -> confirmation
         tap_row(0),        // "Remove source"
     ];
@@ -4024,7 +3976,7 @@ fn cancelling_the_source_removal_keeps_it_installed() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),        // Home -> Sources
+        tap_row(1),        // Home -> Sources
         long_press_row(0), // installed "Src" -> confirmation
         tap_row(1),        // Cancel
     ];
@@ -4051,7 +4003,7 @@ fn long_press_on_an_available_source_is_just_a_tap() {
         ..FakeGateway::default()
     };
     // Row 0 is the "— available —" separator; the source sits on row 1.
-    let events = vec![nav_discover(), tap_row(2), long_press_row(1)];
+    let events = vec![nav_discover(), tap_row(1), long_press_row(1)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -4303,13 +4255,7 @@ fn right_edge_slide_up_raises_brightness() {
         x1: W - 5,
         y1: H - 100 - H / 2,
     };
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_shelf_cell0(),
-        slide,
-        reader_tap_back(),
-    ];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), slide, reader_tap_back()];
     let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
     app.run().unwrap();
 
@@ -4374,13 +4320,7 @@ fn left_edge_slide_adjusts_night_light() {
         x1: 3,
         y1: H - 50 - H / 4, // +25
     };
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_shelf_cell0(),
-        slide_up,
-        reader_tap_back(),
-    ];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), slide_up, reader_tap_back()];
     let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
     app.run().unwrap();
 
@@ -4399,13 +4339,7 @@ fn edge_slides_without_a_light_hook_are_ignored() {
         x1: W - 5,
         y1: 100,
     };
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_shelf_cell0(),
-        slide,
-        reader_tap_back(),
-    ];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), slide, reader_tap_back()];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Library { .. }));
@@ -4430,8 +4364,7 @@ fn swipe_up_rotates_and_locks_the_reader() {
     // In the 90° orientation the back zone is the panel's vertical middle.
     let tap_rotated_back = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         swipe_up,         // rotate to 90 and lock
         tap_panel_bottom, // next page in the rotated orientation
@@ -4483,8 +4416,7 @@ fn four_up_swipes_come_back_around_to_zero() {
         y1: H / 2,
     };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         up_at_0,
         up_at_90,
@@ -4521,8 +4453,7 @@ fn sloppy_tap_drift_neither_rotates_nor_exits() {
         y1: 400,
     };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         drift_up,
         drift_down,
@@ -4566,13 +4497,7 @@ fn rotation_gestures_follow_the_reading_orientation() {
         x1: W - 150,
         y1: H / 2,
     };
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_shelf_cell0(),
-        panel_up,
-        rotated_up,
-    ];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), panel_up, rotated_up];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
@@ -4625,7 +4550,7 @@ fn finishing_a_chapter_flows_into_the_next() {
 
     let events = vec![
         nav_discover(),
-        tap_row(2),        // Sources
+        tap_row(1),        // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -4653,8 +4578,7 @@ fn last_chapter_end_stays_put() {
     make_cbz(&lib.join("Solo/only.cbz"), 2);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // page 2 (last)
         reader_tap_next(), // past the end, no next chapter: ignored
@@ -4676,8 +4600,7 @@ fn library_reading_continues_into_the_next_file() {
     make_cbz(&lib.join("Series/vol02.cbz"), 2);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(), // vol01 page 2
         reader_tap_next(), // past the end -> vol02 opens
@@ -4730,13 +4653,7 @@ fn swipe_down_leaves_the_manga() {
         x1: W / 2,
         y1: H - 100,
     };
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        tap_shelf_cell0(),
-        reader_tap_next(),
-        swipe_down,
-    ];
+    let events = vec![tap_nav(0), tap_shelf_cell0(), reader_tap_next(), swipe_down];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -4789,12 +4706,7 @@ fn long_press_on_a_downloaded_book_opens_its_chapter_list() {
         unreachable!()
     };
     // Long press -> book menu -> "All chapters (from source)".
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        UiEvent::LongPress { x, y },
-        tap_book_row(0),
-    ];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(0)];
     let mut app = app(&lib, gateway, events);
     app.run().unwrap();
 
@@ -4853,8 +4765,7 @@ fn linked_series(dir: &Path, n: usize) -> (PathBuf, FakeGateway) {
 fn open_chapters(cell: (u32, u32)) -> Vec<UiEvent> {
     let (x, y) = cell;
     vec![
-        nav_discover(),
-        tap_row(0),                  // Home -> Library
+        tap_nav(0),                  // Home -> Library
         UiEvent::LongPress { x, y }, // card -> book menu
         tap_book_row(0),             // "All chapters (from source)"
     ]
@@ -4979,7 +4890,7 @@ fn long_press_opens_the_book_menu() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![nav_discover(), tap_row(0), UiEvent::LongPress { x, y }];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -5002,12 +4913,7 @@ fn unlinked_book_chapters_shows_downloaded_list() {
     let UiEvent::Tap { x, y } = cell else {
         unreachable!()
     };
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        UiEvent::LongPress { x, y },
-        tap_book_row(0),
-    ];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(0)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -5032,8 +4938,7 @@ fn book_menu_deletes_a_chapter() {
     // Row 2 is "Delete this chapter" (row 1 is "Mark as unread"); the delete now
     // routes through a confirmation whose row 0 confirms.
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
         tap_book_row(2),    // Delete this chapter -> confirm screen
         tap_confirm_row(0), // confirm
@@ -5077,8 +4982,7 @@ fn deleting_a_chapter_keeps_its_reading_record() {
         unreachable!()
     };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
         tap_book_row(2),    // Delete this chapter -> confirm screen
         tap_confirm_row(0), // confirm
@@ -5123,8 +5027,7 @@ fn deleting_a_whole_series_keeps_its_reading_records() {
         unreachable!()
     };
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
         tap_book_row(3),    // Delete whole series -> confirm screen
         tap_confirm_row(0), // confirm
@@ -5155,12 +5058,7 @@ fn book_menu_delete_asks_for_confirmation_first() {
     };
 
     // Tapping "Delete this chapter" opens the confirmation without touching disk.
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        UiEvent::LongPress { x, y },
-        tap_book_row(2),
-    ];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(2)];
     let mut opened = app(&lib, FakeGateway::default(), events);
     opened.run().unwrap();
     assert!(
@@ -5174,8 +5072,7 @@ fn book_menu_delete_asks_for_confirmation_first() {
 
     // Now cancel it (confirmation row 1) and confirm the file survives.
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
         tap_book_row(2),    // -> confirm screen
         tap_confirm_row(1), // Cancel
@@ -5207,8 +5104,7 @@ fn book_menu_deletes_the_whole_series() {
     // Row 3 is "Delete whole series" (shifted by the new "Mark as unread" row);
     // confirm on the follow-up screen (row 0).
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         UiEvent::LongPress { x, y },
         tap_book_row(3),    // Delete whole series -> confirm screen
         tap_confirm_row(0), // confirm
@@ -5273,12 +5169,7 @@ fn book_menu_marks_the_latest_read_chapter_unread() {
         unreachable!()
     };
     // Long press → BookMenu, then row 1 = "Mark as unread".
-    let events = vec![
-        nav_discover(),
-        tap_row(0),
-        UiEvent::LongPress { x, y },
-        tap_book_row(1),
-    ];
+    let events = vec![tap_nav(0), UiEvent::LongPress { x, y }, tap_book_row(1)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -5324,7 +5215,7 @@ fn downloading_records_the_series_origin() {
 
     let events = vec![
         nav_discover(),
-        tap_row(2), // Sources
+        tap_row(1), // Sources
         tap_row(0), // Listings
         tap_row(0), // Popular
         tap_row(0), // Manga One
@@ -5383,7 +5274,7 @@ fn downloaded_chapters_open_instantly_without_redownloading() {
 
     let events = vec![
         nav_discover(),
-        tap_row(2),        // Sources
+        tap_row(1),        // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -5437,7 +5328,7 @@ fn long_press_a_chapter_downloads_without_opening_the_reader() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(0),
         tap_row(0),                  // ChapterList
@@ -5492,7 +5383,7 @@ fn update_prompt_installs_on_tap() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_row(4), tap_row(0)],
+        vec![nav_discover(), tap_row(3), tap_row(0)],
     );
     assert_eq!(app.run().unwrap(), Exit::Restart);
     assert_eq!(
@@ -5533,7 +5424,7 @@ fn home_popular_lists_titles_and_tap_searches_installed_sources() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(5), // Home -> Popular manga
+        tap_row(2), // Home -> Popular manga
         tap_row(0), // first popular title -> global search for it
     ];
     let mut app = app(dir.path(), gateway, events);
@@ -5564,7 +5455,7 @@ fn home_popular_renders_the_titles() {
         }]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(5)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(2)]);
     app.run().unwrap();
 
     let Screen::Popular { mangas, .. } = app.screen() else {
@@ -5585,7 +5476,7 @@ fn home_popular_empty_explains_instead_of_a_blank_tab() {
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_row(5)],
+        vec![nav_discover(), tap_row(2)],
     );
     app.run().unwrap();
 
@@ -5604,7 +5495,7 @@ fn home_popular_outage_explains_instead_of_an_error_screen() {
         popular: Err("Jikan 504".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(5)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(2)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -5652,7 +5543,7 @@ fn home_search_goes_straight_to_the_keyboard() {
     let mut app = app(
         dir.path(),
         search_gateway(),
-        vec![nav_discover(), tap_row(1)],
+        vec![nav_discover(), tap_row(0)],
     );
     app.run().unwrap();
 
@@ -5669,7 +5560,7 @@ fn home_search_without_sources_explains_instead_of_a_dead_keyboard() {
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_row(1)],
+        vec![nav_discover(), tap_row(0)],
     );
     app.run().unwrap();
 
@@ -5709,7 +5600,7 @@ fn global_search_queries_every_source_and_labels_results() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(1), // Home -> global search keyboard
+        tap_row(0), // Home -> global search keyboard
         tap_key(Key::Char('n')),
         tap_key(Key::Search),
         tap_row(1), // second result -> ChapterList via its own source
@@ -5741,7 +5632,7 @@ fn global_search_with_no_hits_opens_results_then_back_to_keyboard() {
     gateway.search_results = Ok(Vec::new());
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('z')),
         tap_key(Key::Search),
         tap_back(), // leave the (empty) results -> back to the keyboard
@@ -5766,7 +5657,7 @@ fn global_search_retries_with_title_variants_on_a_miss() {
     gateway.hit_query = Some("ジャッジ".into());
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('j')),
         tap_key(Key::Search),
     ];
@@ -5794,7 +5685,7 @@ fn global_search_with_a_hit_never_looks_up_variants() {
     gateway.variants = vec!["Some Other Name".into()];
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search),
     ];
@@ -5818,7 +5709,7 @@ fn global_search_with_a_failing_source_still_opens_results() {
     gateway.search_results = Err("cloudflare tantrum".into());
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('a')),
         tap_key(Key::Search),
     ];
@@ -5834,7 +5725,7 @@ fn global_search_with_a_failing_source_still_opens_results() {
 #[test]
 fn listings_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![nav_discover(), tap_row(2), tap_row(0), tap_row(2)];
+    let events = vec![nav_discover(), tap_row(1), tap_row(0), tap_row(2)];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
 
@@ -5854,7 +5745,7 @@ fn typing_builds_the_query_with_partial_refreshes() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5883,7 +5774,7 @@ fn typing_builds_the_query_with_partial_refreshes() {
 #[test]
 fn every_eighth_keystroke_flashes_the_panel_clean() {
     let dir = tempfile::tempdir().unwrap();
-    let mut events = vec![nav_discover(), tap_row(2), tap_row(0), tap_row(2)];
+    let mut events = vec![nav_discover(), tap_row(1), tap_row(0), tap_row(2)];
     events.extend(std::iter::repeat_with(|| tap_key(Key::Char('a'))).take(8));
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
@@ -5901,7 +5792,7 @@ fn punctuation_for_manga_titles_is_typeable() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('r')),
@@ -5925,7 +5816,7 @@ fn space_is_not_allowed_leading_or_doubled() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Space), // leading — ignored
@@ -5947,7 +5838,7 @@ fn search_key_queries_the_gateway_and_shows_results() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5981,7 +5872,7 @@ fn search_results_open_chapters_like_any_list() {
     }];
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -6002,7 +5893,7 @@ fn empty_query_search_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Search),
@@ -6021,7 +5912,7 @@ fn empty_results_show_a_message_and_keep_the_keyboard_below() {
     gateway.search_results = Ok(Vec::new());
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('z')),
@@ -6044,7 +5935,7 @@ fn search_failure_shows_error_screen() {
     gateway.search_results = Err("source exploded".into());
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('a')),
@@ -6065,7 +5956,7 @@ fn back_leaves_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(2),
+        tap_row(1),
         tap_row(0),
         tap_row(2),
         tap_back(),
@@ -6107,7 +5998,7 @@ fn widen_installs_matching_sources_and_merges_their_results() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(1), // Home -> global search keyboard (no history)
+        tap_row(0), // Home -> global search keyboard (no history)
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults (1 hit from src)
         tap_row(1),           // the "Search more sources" row (index 1)
@@ -6161,7 +6052,7 @@ fn widen_with_no_matches_uninstalls_the_sources_it_tried() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('z')),
         tap_key(Key::Search), // -> empty SearchResults
         tap_row(0),           // the "Search more sources" row (index 0)
@@ -6284,7 +6175,7 @@ fn widen_with_nothing_left_to_try_says_so() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults (1 hit)
         tap_row(1),           // "Search more sources"
@@ -6309,12 +6200,12 @@ fn recent_search_is_remembered_and_reopened_from_cache() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1), // Home -> keyboard (no history yet)
+        tap_row(0), // Home -> keyboard (no history yet)
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults, remembers "n"
         tap_back(),           // -> keyboard
-        tap_back(),           // -> Home
-        tap_row(1),           // -> RecentSearches (history exists now)
+        tap_back(),           // -> Discover
+        tap_row(0),           // -> RecentSearches (history exists now)
         tap_row(1),           // tap the recent "n" -> cached results
     ];
     let mut app = app(dir.path(), search_gateway(), events);
@@ -6334,12 +6225,12 @@ fn recents_screen_new_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_row(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // remembers "n"
         tap_back(),
         tap_back(),
-        tap_row(1), // -> RecentSearches
+        tap_row(0), // -> RecentSearches
         tap_row(0), // "New search…" -> keyboard
     ];
     let mut app = app(dir.path(), search_gateway(), events);
@@ -6366,8 +6257,7 @@ fn page_buttons_flip_library_pages() {
     }
 
     let events = vec![
-        nav_discover(),
-        tap_row(0), // Library
+        tap_nav(0), // Library
         UiEvent::PageForward,
         UiEvent::PageForward, // clamped at the last page
         UiEvent::PageBack,
@@ -6390,8 +6280,7 @@ fn page_buttons_turn_reader_pages() {
     make_cbz(&lib.join("Sample/vol1.cbz"), 5);
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         UiEvent::PageForward, // page 1
         UiEvent::PageForward, // page 2
@@ -6605,7 +6494,7 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
     let (count, sleeper) = counting_sleeper();
     let events = vec![
         nav_discover(),
-        tap_row(2),        // Sources
+        tap_row(1),        // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -6705,8 +6594,7 @@ fn sleep_in_the_reader_saves_progress_first_and_resumes() {
     });
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),        // Library
+        tap_nav(0),        // Library
         tap_shelf_cell0(), // Reader, page 0
         reader_tap_next(), // page 1
         UiEvent::Sleep,    // suspend mid-read
@@ -6958,7 +6846,7 @@ fn update_prompt_back_declines() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_row(4), tap_back()],
+        vec![nav_discover(), tap_row(3), tap_back()],
     );
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
@@ -7023,8 +6911,7 @@ fn library_reading_downloads_the_next_chapter_when_it_runs_out() {
     };
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),        // Home -> Library
+        tap_nav(0),        // Home -> Library
         tap_shelf_cell0(), // the card -> vol1 (the only download)
         reader_tap_next(), // vol1 page 2 (last)
         reader_tap_next(), // past the end -> fetch and open c2
@@ -7067,8 +6954,7 @@ fn library_reading_says_so_when_the_series_is_finished() {
     };
 
     let events = vec![
-        nav_discover(),
-        tap_row(0),
+        tap_nav(0),
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_next(), // past the end -> nothing newer at the source
@@ -7186,7 +7072,7 @@ fn home_opens_reading_stats_and_draws_it_in_color() {
     make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
     write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
 
-    let events = vec![nav_discover(), tap_row(6)];
+    let events = vec![tap_nav(1)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -7210,11 +7096,7 @@ fn the_heatmap_darkens_a_day_that_was_read() {
     make_cbz(&lib.join("Berserk/vol1.cbz"), 40);
     write_progress(&lib, &[("Berserk/vol1.cbz", 39, 40, now_unix())]);
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(6)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(1)]);
     app.run().unwrap();
 
     // The empty-day step is 0xEE; a read day is darker than that everywhere
@@ -7233,11 +7115,7 @@ fn stats_survive_an_empty_library() {
     let lib = dir.path().join("Manga");
     std::fs::create_dir_all(&lib).unwrap();
 
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(6)],
-    );
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(1)]);
     app.run().unwrap();
     assert!(matches!(app.screen(), Screen::Stats));
 }
@@ -7324,12 +7202,8 @@ fn the_library_title_bar_toggles_between_shelf_and_list() {
         x: l.width / 2,
         y: l.title_h / 2,
     };
-    let mut app = app(
-        &lib,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0), title_tap],
-    )
-    .with_settings_dir(settings_dir.clone());
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0), title_tap])
+        .with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
     assert_eq!(
@@ -7361,12 +7235,8 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
         }
         .save(&lib)
         .unwrap();
-        let mut app = app(
-            &lib,
-            FakeGateway::default(),
-            vec![nav_discover(), tap_row(0)],
-        )
-        .with_settings_dir(settings_dir.clone());
+        let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)])
+            .with_settings_dir(settings_dir.clone());
         app.run().unwrap();
         assert_eq!(
             app.compose_color_current().unwrap().is_some(),
@@ -7377,27 +7247,40 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
 }
 
 #[test]
-fn home_grows_a_data_band_only_once_there_is_something_to_show() {
-    // A fresh device must not display a band of zeroes, so the band is
-    // absent until something has actually been read.
+fn discover_offers_only_what_the_tabs_do_not_and_keeps_its_nav_bar() {
+    // Discover used to be the whole menu, and still listed Library, Settings
+    // and Reading stats after those became nav destinations — a tab bar drawn
+    // over a menu that duplicated it. It also carried a copy of Today's
+    // reading band, so two tabs showed the same thing. What is left is the
+    // one job no tab does: finding something new to read.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
-
-    let mut fresh = app(&lib, FakeGateway::default(), vec![nav_discover()]);
-    fresh.run().unwrap();
-    assert!(
-        fresh.compose_color_current().unwrap().is_none(),
-        "no reading yet: Home should stay on the plain grayscale menu"
-    );
-
     write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
-    let mut read = app(&lib, FakeGateway::default(), vec![nav_discover()]);
-    read.run().unwrap();
-    assert!(
-        read.compose_color_current().unwrap().is_some(),
-        "with progress recorded, Home should draw the data band in colour"
-    );
+
+    let mut app = app(&lib, FakeGateway::default(), vec![nav_discover()]);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Home));
+
+    for tab in ["Library", "Settings", "Reading stats"] {
+        assert!(
+            !super::HOME_ROWS.contains(&tab),
+            "{tab} is a nav destination; Discover must not list it too"
+        );
+    }
+
+    // Discover takes the colour path unconditionally — the nav bar is drawn
+    // in RGB, and without it the screen shows no route anywhere else.
+    let page = app
+        .compose_color_current()
+        .unwrap()
+        .expect("Discover composes in colour so it can draw the nav bar");
+    let l = layout();
+    let strip = l.nav_top() + l.nav_h / 2;
+    let inked = (0..l.width)
+        .filter(|&x| page.pixel(x, strip) != [0xFF; 3])
+        .count();
+    assert!(inked > 0, "the nav bar must actually be drawn on Discover");
 }
 
 /// Cover tints for the dump fixtures — muted the way real cover art reads
@@ -7577,12 +7460,8 @@ fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
         x: l.width / 2,
         y: l.title_h / 2,
     };
-    let mut a = app(
-        &root,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(0), title_tap],
-    )
-    .with_settings_dir(settings_dir.clone());
+    let mut a = app(&root, FakeGateway::default(), vec![tap_nav(0), title_tap])
+        .with_settings_dir(settings_dir.clone());
     a.run().unwrap();
 
     let alex_lib = root.join("@alex");

@@ -35,15 +35,15 @@ use gideon_render::{heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, Gra
 
 use crate::reader::Reader;
 
-const HOME_ROWS: [&str; 7] = [
-    "Library",
+/// Discover's rows: finding something NEW to read. Library, Settings and
+/// Reading stats used to sit here too, back when this screen was the whole
+/// menu; they are nav-bar destinations now, and listing them here as well
+/// made the tab bar look like decoration over a menu that still ran the app.
+const HOME_ROWS: [&str; 4] = [
     "Search all sources",
     "Browse sources",
-    "Settings",
-    "Check for updates",
-    // Appended (not inserted) so the existing Home rows keep their indices.
     "Popular manga",
-    "Reading stats",
+    "Check for updates",
 ];
 /// A tappable top row shown on Home ONLY when offline (device only): a manual
 /// "scan + reconnect" for the roam-while-idle case, without a battery-draining
@@ -2185,13 +2185,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     row -= 1;
                 }
                 match row {
-                    0 => self.open_library()?,
-                    1 => self.open_global_search()?,
-                    2 => self.open_sources()?,
-                    3 => self.push(Screen::Settings)?,
-                    4 => self.check_updates()?,
-                    5 => self.open_popular()?,
-                    6 => self.push(Screen::Stats)?,
+                    0 => self.open_global_search()?,
+                    1 => self.open_sources()?,
+                    2 => self.open_popular()?,
+                    3 => self.check_updates()?,
                     _ => {}
                 }
                 Ok(Flow::Continue)
@@ -5019,14 +5016,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(Some(self.compose_settings()));
         }
         if matches!(self.stack.last(), Some(Screen::Home)) {
-            let rows = HOME_ROWS.len() + usize::from(self.home_offline);
+            // Discover is a top-level destination, so it takes the colour
+            // path unconditionally: the nav bar is drawn in RGB, and without
+            // it the screen has no visible route anywhere else. The reading
+            // band that used to fill the space below the rows lives on Today
+            // now — showing it twice made two tabs look like one screen.
+            let l = &self.layout;
+            let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
             let mut canvas = RgbPage::from_gray(&self.compose_current()?);
-            // No band (nothing read yet, or no room) means the plain menu is
-            // all there is — fall back to the grayscale path so Home does not
-            // pay for a colour refresh it makes no use of.
-            if self.compose_home_band(&mut canvas, rows).is_none() {
-                return Ok(None);
-            }
+            widgets::draw_nav_bar(
+                &mut canvas,
+                0,
+                l.nav_top(),
+                l.width,
+                l.nav_h,
+                &self.nav_items(),
+                l.text_px,
+                &theme,
+            );
             return Ok(Some(canvas));
         }
         let Some(Screen::Library { items, page }) = self.stack.last() else {
@@ -5462,84 +5469,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             };
             Some((card.title(), where_at, pct))
         })
-    }
-    /// Home's data band: the reading totals and the activity heatmap, drawn
-    /// in the space below the menu rows.
-    ///
-    /// The menu keeps every row index it has always had — the band lives
-    /// strictly *below* the last row, so taps, row geometry and the tests
-    /// that depend on them are untouched. On a 1264x1680 Libra Colour the
-    /// seven rows fill 816px of 1680, so this is otherwise dead panel.
-    ///
-    /// Returns `None` when there is nothing to say (no reading recorded yet)
-    /// or no room to say it, so a fresh device shows the plain menu rather
-    /// than a band of zeroes.
-    fn compose_home_band(&self, canvas: &mut RgbPage, first_free_row: usize) -> Option<()> {
-        let l = &self.layout;
-        let top = l.row_top(first_free_row) + l.pad;
-        let bottom = l.height.saturating_sub(l.nav_h);
-        if bottom.saturating_sub(top) < l.row_h * 2 {
-            return None;
-        }
-        let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
-        if stats.chapters_tracked == 0 {
-            return None;
-        }
-        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
-        let inner = l.width.saturating_sub(l.pad * 2);
-
-        // A separator sets the band apart from the tappable rows above it, so
-        // nothing here reads as another menu entry.
-        fill_rect_rgb(canvas, l.pad, top, inner, 1, [0x55, 0x55, 0x55]);
-
-        let tiles_y = top + l.pad;
-        // Two rows tall: a tile stacks a value, a label and a qualifier,
-        // and a single row height clips the bottom two away.
-        let tile_h = l.row_h * 2;
-        widgets::draw_stat_tiles(
-            canvas,
-            l.pad,
-            tiles_y,
-            inner,
-            tile_h,
-            &[
-                widgets::StatTile {
-                    value: &stats.current_streak.to_string(),
-                    label: "day streak",
-                    sub: &format!("best {}", stats.longest_streak),
-                },
-                widgets::StatTile {
-                    value: &stats.chapters_finished.to_string(),
-                    label: "chapters",
-                    sub: &format!("{} series", stats.series_count),
-                },
-                widgets::StatTile {
-                    value: &stats.pages_read.to_string(),
-                    label: "pages",
-                    sub: &format!("{} days", stats.active_days),
-                },
-            ],
-            l.text_px,
-            &theme,
-        );
-
-        // Fit the heatmap to whatever is left rather than a fixed cell size,
-        // so this is right on a 1072-wide Clara as well as a Libra Colour.
-        let grid_y = tiles_y + tile_h + l.pad;
-        if bottom.saturating_sub(grid_y) < l.row_h {
-            return Some(());
-        }
-        let weeks = STATS_HEATMAP_WEEKS;
-        let layout = heatmap::HeatmapLayout::fit(l.pad, grid_y, weeks, inner, 6);
-        if grid_y + layout.height() <= bottom {
-            heatmap::draw_heatmap(
-                canvas,
-                &layout,
-                &stats.heatmap(weeks as usize),
-                &heatmap::Palette::from_setting(&self.load_settings().color_profile),
-            );
-        }
-        Some(())
     }
 
     /// How many dense library rows fit on a page. Each row carries a cover
