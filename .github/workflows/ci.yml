@@ -13,45 +13,108 @@ env:
   FONTCONFIG_NO_PKG_CONFIG: "1"
   RUSTFLAGS: -D warnings
 
+# Every job carries a timeout. Without one they inherit GitHub's six-hour
+# default, which is not a timeout so much as a whole workday: an unreachable
+# apt mirror once held a 10-second job for 50 minutes, indistinguishable in
+# the UI from a slow build. Budgets below are ~3x the slowest observed run,
+# then rounded up for a cold Swatinem cache (the measurements were all warm).
+# They are ceilings, not targets — a job brushing its limit is telling you
+# something worth reading, not something to raise.
+
 jobs:
+  # Which parts of the tree changed. Heavy jobs still RUN on every PR so the
+  # required status checks always report — they just skip their expensive
+  # steps when nothing they cover was touched. Filtering the jobs away
+  # instead would leave required checks permanently pending and block the
+  # merge, which is the classic way this optimisation backfires.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      shell: ${{ steps.filter.outputs.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Cross.toml'
+              - 'ci/**'
+              - '.github/workflows/**'
+            shell:
+              - 'installer/**'
+              - 'ci/**'
+              - '.github/workflows/**'
+
   lint:
     name: Format & Clippy
     runs-on: ubuntu-latest
+    # Slowest observed: 38s.
+    timeout-minutes: 8
+    needs: changes
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - name: Check formatting
+        if: needs.changes.outputs.code == 'true'
         run: cargo fmt --all -- --check
       - name: Clippy (default features)
+        if: needs.changes.outputs.code == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (kobo feature)
+        if: needs.changes.outputs.code == 'true'
         run: cargo clippy --workspace --all-targets --features gideon-app/kobo -- -D warnings
 
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # Slowest observed: 1m51.
+    timeout-minutes: 12
+    needs: changes
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - name: Run tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test --workspace
       - name: Run tests (kobo feature)
+        if: needs.changes.outputs.code == 'true'
         run: cargo test --workspace --features gideon-app/kobo
 
   smoke:
     name: CLI smoke test
     runs-on: ubuntu-latest
+    # Slowest observed: 41s.
+    timeout-minutes: 8
+    needs: changes
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - name: Build
+        if: needs.changes.outputs.code == 'true'
         run: cargo build --workspace
       - name: Generate a CBZ fixture and exercise the CLI
+        if: needs.changes.outputs.code == 'true'
         run: |
           python3 ci/make_fixture.py /tmp/manga
           ./target/debug/gideon info "/tmp/manga/Sample Manga/vol1.cbz"
@@ -64,8 +127,12 @@ jobs:
   installer:
     name: Installer tests
     runs-on: ubuntu-latest
+    # Slowest observed: 20s. No Rust build here, so a cold cache costs nothing.
+    timeout-minutes: 5
+    needs: changes
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.shell == 'true'
       # No apt install for shellcheck: the ubuntu-latest image ships it, and
       # fetching it anyway made this job the flakiest thing in CI — three runs
       # in a row hung for tens of minutes on `apt-get update` when the mirror
@@ -73,22 +140,32 @@ jobs:
       # that installed a tool already present. If a future image drops it, the
       # lint below fails with command-not-found, which is loud and obvious.
       - name: Lint shell scripts
+        if: needs.changes.outputs.shell == 'true'
         run: shellcheck installer/install.sh installer/gideon-launch.sh ci/installer_test.sh ci/qemu_integration.sh
       - name: Run installer test suite
+        if: needs.changes.outputs.shell == 'true'
         run: ./ci/installer_test.sh
 
   kobo-cross:
     name: Cross-check (Kobo armv7)
     runs-on: ubuntu-latest
+    # Slowest observed: 2m37.
+    timeout-minutes: 15
+    needs: changes
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
         with:
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - name: Install cross
+        if: needs.changes.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cross
       - name: Build for Kobo target (full build catches link errors)
+        if: needs.changes.outputs.code == 'true'
         run: cross build --release --features gideon-app/kobo --target armv7-unknown-linux-musleabihf

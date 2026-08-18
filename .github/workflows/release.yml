@@ -21,6 +21,13 @@ name: Release
 on:
   push:
     branches: [main]
+    # A docs-only merge ships no new binary, so it should not cut a release.
+    # Safe to filter here (unlike CI) because this workflow is not a required
+    # status check — skipping it blocks nothing.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
   workflow_dispatch:
     inputs:
       bump:
@@ -47,6 +54,8 @@ jobs:
   release:
     name: Build and publish release
     runs-on: ubuntu-latest
+    # Slowest observed end-to-end: 5m07 (build + QEMU tests + publish).
+    timeout-minutes: 20
     if: >
       github.event_name == 'workflow_dispatch' ||
       !contains(github.event.head_commit.message, '[skip release]')
@@ -96,8 +105,22 @@ jobs:
           components: rustfmt, clippy
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
+      # Bounded and retried: an unreachable apt mirror used to hang this step
+      # for tens of minutes with no signal, holding up every release behind it.
+      # Three short attempts fail in ~5 minutes with a clear message instead.
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            if timeout 60 sudo apt-get update \
+              && timeout 60 sudo apt-get install -y qemu-user-static; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying" >&2
+            sleep 15
+          done
+          echo "could not install qemu-user-static after 3 attempts" >&2
+          exit 1
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
