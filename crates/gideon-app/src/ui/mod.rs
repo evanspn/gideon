@@ -112,6 +112,20 @@ impl SourceRow {
     }
 }
 
+/// Where the quick-settings sheet's parts sit. A struct rather than a tuple
+/// because it is read by the compositor and the hit test alike, and a
+/// four-tuple of `u32`s is exactly the shape that gets destructured in the
+/// wrong order once.
+struct QuickSheet {
+    top: u32,
+    height: u32,
+    sliders_top: u32,
+    /// Height of one slider row; 0 when the device has no lamp.
+    slider_h: u32,
+    grid: widgets::GridLayout,
+    actions_top: u32,
+}
+
 /// An open modal sheet: what it is titled, and what it offers.
 ///
 /// Kinds rather than free-form callbacks so the tap routing stays a match on
@@ -132,6 +146,15 @@ enum Sheet {
         /// `None` when nothing in the card has been read.
         read_key: Option<String>,
     },
+    /// Who is reading. A sheet rather than a screen: switching profile is a
+    /// thing you do to what is already on screen, and it is reached from the
+    /// quick sheet, which would otherwise hand you off to a full-screen list
+    /// styled like nothing else in the app.
+    ///
+    /// Carries only the names — everything the switch actually does (the
+    /// library dir, the progress cache, the pre-downloader, the settings
+    /// file) is unchanged and still lives in `switch_profile`.
+    Profiles { names: Vec<String> },
     /// Confirmation before an irreversible delete. Nothing leaves the disk
     /// until the confirm row is tapped; dismissing cancels harmlessly.
     ConfirmDelete {
@@ -468,10 +491,6 @@ enum Screen {
     /// chapters and reading progress stay in the library.
     ConfirmRemoveSource {
         source: SourceEntry,
-    },
-    /// Profile picker, opened from the left half of Home's title bar.
-    ProfileMenu {
-        profiles: Vec<String>,
     },
     /// On-screen keyboard for naming a new profile; the action key creates
     /// it and switches to it.
@@ -1046,18 +1065,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Main loop: render, then process events until the user quits through
     /// the power menu (or the input source ends). Returns how to exit.
     pub fn run(&mut self) -> Result<Exit> {
-        // The library IS the landing screen. Opening onto a menu, or onto a
-        // dashboard about reading, puts a screen between the reader and the
-        // thing they picked the device up for. Today, Discover and Settings
-        // are one nav tap away.
+        // Today is the landing screen: it opens on the chapter you were in
+        // the middle of and what is waiting unread, which is the answer to
+        // why the device was picked up. The Library is one nav tap away —
+        // and the whole library, rather than the two rows a launcher shows.
+        //
+        // The metadata backfill is kicked here rather than from the Library,
+        // so it has already run by the time you get there.
         if matches!(self.stack.last(), Some(Screen::Library { items, .. }) if items.is_empty()) {
-            self.stack.pop();
-            // `open_library` scans and paints; painting again here would
-            // cost the user a second full-screen flash on every launch.
-            self.open_library()?;
-        } else {
-            self.render_current(RefreshMode::Full)?;
+            if let Ok(items) = self.scan_library_items() {
+                self.trigger_metadata_backfill(&items);
+            }
+            self.stack[0] = Screen::Stats;
         }
+        self.render_current(RefreshMode::Full)?;
         loop {
             // With a suspend hook installed, wait in ticks instead of
             // blocking forever, and auto-suspend after 15 idle minutes —
@@ -1814,7 +1835,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Where the quick-settings sheet sits and how it is laid out:
     /// `(top, height, tile grid, first action row's y)`.
-    fn quick_sheet_layout(&self) -> (u32, u32, widgets::GridLayout, u32) {
+    fn quick_sheet_layout(&self) -> QuickSheet {
         let l = &self.layout;
         let gap = SETTINGS_GAP;
         let title_h = (l.text_px * 1.6) as u32;
@@ -1823,18 +1844,55 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let rows = (tiles as u32).div_ceil(SETTINGS_COLS);
         let grid_h = rows * cell_h + gap * rows.saturating_sub(1);
         let actions_h = l.row_h * Self::QUICK_ACTIONS.len() as u32;
-        let h = (title_h + gap + grid_h + gap + actions_h).min(l.height);
+        // The lamp comes first: reaching for the light is the most common
+        // reason to open this sheet mid-chapter, and a slider says what the
+        // level *is* at a glance where a number has to be read and compared
+        // against one you no longer remember.
+        let sliders = self.quick_sliders().len() as u32;
+        let slider_h = if sliders == 0 { 0 } else { l.row_h };
+        let sliders_h = sliders * slider_h + gap * sliders.saturating_sub(1);
+        let h = (title_h
+            + gap
+            + sliders_h
+            + if sliders == 0 { 0 } else { gap }
+            + grid_h
+            + gap
+            + actions_h)
+            .min(l.height);
         let top = l.height - h;
-        let grid = widgets::GridLayout::new(
-            l.pad,
-            top + title_h + gap,
-            l.width.saturating_sub(l.pad * 2),
-            SETTINGS_COLS,
-            cell_h,
-            gap,
-        );
-        let actions_top = top + title_h + gap + grid_h + gap;
-        (top, h, grid, actions_top)
+        let sliders_top = top + title_h + gap;
+        let grid_top = sliders_top + sliders_h + if sliders == 0 { 0 } else { gap };
+        QuickSheet {
+            top,
+            height: h,
+            sliders_top,
+            slider_h,
+            grid: widgets::GridLayout::new(
+                l.pad,
+                grid_top,
+                l.width.saturating_sub(l.pad * 2),
+                SETTINGS_COLS,
+                cell_h,
+                gap,
+            ),
+            actions_top: grid_top + grid_h + gap,
+        }
+    }
+
+    /// The lamp controls the quick sheet offers, when the device has a lamp:
+    /// `(label, percent)`. Empty on hardware (or a test) with no light hook,
+    /// so the sheet does not draw a control that cannot do anything.
+    fn quick_sliders(&self) -> Vec<(&'static str, u8)> {
+        match self.lights.as_ref() {
+            // "Night" rather than "warmth": the amber mixer is what people
+            // reach for at night, and naming it after the moment beats
+            // naming it after the LED.
+            Some(lights) => vec![
+                ("Brightness", lights.brightness()),
+                ("Night warmth", lights.warmth()),
+            ],
+            None => Vec::new(),
+        }
     }
 
     /// The rows an open sheet shows. Kept beside the tap routing so drawing
@@ -1846,6 +1904,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // are two thirds of the panel as a stack and a third of it as
             // tiles, and the sheet covers what you were reading.
             Some(Sheet::QuickSettings) => (String::new(), Vec::new()),
+            Some(Sheet::Profiles { ref names }) => {
+                let mut rows: Vec<(String, String, bool)> = names
+                    .iter()
+                    .map(|name| {
+                        // The active one is marked by a word, not by a dot:
+                        // a 6px glyph is the first thing the colour filter
+                        // eats, and "reading" says what the mark means.
+                        let mark = if *name == self.active_profile {
+                            "reading"
+                        } else {
+                            ""
+                        };
+                        (name.clone(), mark.to_string(), false)
+                    })
+                    .collect();
+                rows.push(("New profile…".into(), String::new(), false));
+                // The default profile's library IS the library root; naming
+                // it makes it an ordinary "@name" profile like the rest.
+                if names.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) {
+                    rows.push(("Name the default profile…".into(), String::new(), false));
+                }
+                rows.push(("Close".into(), String::new(), true));
+                ("Profiles".to_string(), rows)
+            }
             Some(Sheet::Book {
                 ref series_dir,
                 ref read_key,
@@ -1897,8 +1979,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// need. Everything above it stays on screen and unrepainted.
     fn sheet_bounds(&self) -> Option<(u32, u32)> {
         if matches!(self.sheet, Some(Sheet::QuickSettings)) {
-            let (top, h, ..) = self.quick_sheet_layout();
-            return Some((top, h));
+            let sheet = self.quick_sheet_layout();
+            return Some((sheet.top, sheet.height));
         }
         let (_, rows) = self.sheet_rows();
         if rows.is_empty() {
@@ -2097,19 +2179,32 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn overlay_quick_settings(&self, canvas: &mut RgbPage) {
         let l = &self.layout;
         let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
-        let (top, h, grid, actions_top) = self.quick_sheet_layout();
+        let sheet = self.quick_sheet_layout();
         widgets::draw_panel(
             canvas,
             0,
-            top,
+            sheet.top,
             l.width,
-            h,
+            sheet.height,
             "Quick settings",
             l.text_px,
             &theme,
         );
+        for (i, (label, percent)) in self.quick_sliders().iter().enumerate() {
+            widgets::draw_slider(
+                canvas,
+                l.pad,
+                sheet.sliders_top + i as u32 * (sheet.slider_h + SETTINGS_GAP),
+                l.width.saturating_sub(l.pad * 2),
+                sheet.slider_h,
+                label,
+                *percent,
+                l.text_px,
+                &theme,
+            );
+        }
         for (i, (label, value)) in self.quick_tiles().iter().enumerate() {
-            let (cx, cy, cw, ch) = grid.cell(i);
+            let (cx, cy, cw, ch) = sheet.grid.cell(i);
             widgets::draw_tile(
                 canvas,
                 cx,
@@ -2130,7 +2225,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             widgets::draw_setting_row(
                 canvas,
                 l.pad,
-                actions_top + i as u32 * l.row_h,
+                sheet.actions_top + i as u32 * l.row_h,
                 inner,
                 l.row_h,
                 &widgets::SettingRow {
@@ -2187,6 +2282,39 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 series_dir,
                 read_key,
             }) => self.tap_book_sheet(index, entry, series_dir, read_key),
+            Some(Sheet::Profiles { names }) => {
+                self.sheet = None;
+                match names.get(index) {
+                    // Tapping the profile you are already in just closes.
+                    Some(name) if *name == self.active_profile => {
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                    Some(name) => {
+                        let name = name.clone();
+                        self.switch_profile(&name)?;
+                    }
+                    None if index == names.len() => {
+                        self.keyboard_paints = 0;
+                        self.keyboard_shift = false;
+                        self.push(Screen::NewProfile {
+                            name: String::new(),
+                        })?;
+                    }
+                    None if index == names.len() + 1
+                        && names.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) =>
+                    {
+                        self.keyboard_paints = 0;
+                        self.keyboard_shift = false;
+                        self.push(Screen::ConvertDefault {
+                            name: String::new(),
+                        })?;
+                    }
+                    None => {
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                }
+                Ok(Flow::Continue)
+            }
             Some(Sheet::ConfirmDelete {
                 entry,
                 series_dir,
@@ -2214,7 +2342,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Act on a tap in the quick-settings sheet: a tile cycles its value, the
     /// action rows go through or dismiss.
     fn tap_quick_settings(&mut self, x: u32, y: u32) -> Result<Flow> {
-        let (top, _, grid, actions_top) = self.quick_sheet_layout();
+        let sheet = self.quick_sheet_layout();
+        let (top, grid, actions_top) = (sheet.top, sheet.grid, sheet.actions_top);
         if y < top {
             self.sheet = None;
             return self
@@ -2230,6 +2359,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return self
                 .render_current(RefreshMode::Full)
                 .map(|_| Flow::Continue);
+        }
+        // A tap on a slider sets it to where you tapped — the whole point of
+        // a track is that the position IS the value, and making the reader
+        // step a level at a time to cross it would be worse than the edge
+        // slide they already have.
+        let sliders = self.quick_sliders();
+        if !sliders.is_empty() && y >= sheet.sliders_top && y < grid.y {
+            let row = ((y - sheet.sliders_top) / (sheet.slider_h + SETTINGS_GAP).max(1)) as usize;
+            if let Some((label, _)) = sliders.get(row) {
+                let track = self.layout.width.saturating_sub(self.layout.pad * 2).max(1) as u64;
+                // Rounded, not truncated: tapping the middle of the track has
+                // to give 50, and the far end 100.
+                let along = x.saturating_sub(self.layout.pad) as u64;
+                let percent = (((along * 100 + track / 2) / track).min(100)) as u8;
+                if let Some(lights) = self.lights.as_mut() {
+                    match *label {
+                        "Brightness" => lights.set_brightness(percent),
+                        _ => lights.set_warmth(percent),
+                    }
+                }
+                // The device's `LightControl` persists the level itself (see
+                // `PersistedLights` in main.rs), so there is nothing to save
+                // here — and nothing to forget to save.
+                // One slider's fill changed. Partial, and no flash.
+                self.render_current(RefreshMode::Partial)?;
+            }
+            return Ok(Flow::Continue);
         }
         let tiles = self.quick_tiles();
         let Some(index) = grid.hit(x, y, tiles.len()) else {
@@ -2717,30 +2873,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             Screen::AccountPassword { email, password } => {
                 self.tap_account_password(&email, &password, x, y)?;
-                Ok(Flow::Continue)
-            }
-            Screen::ProfileMenu { profiles } => {
-                if let Some(name) = profiles.get(row).cloned() {
-                    if name == self.active_profile {
-                        self.pop()?; // already there — just close the menu
-                    } else {
-                        self.switch_profile(&name)?;
-                    }
-                } else if row == profiles.len() {
-                    self.keyboard_paints = 0;
-                    self.keyboard_shift = false;
-                    self.push(Screen::NewProfile {
-                        name: String::new(),
-                    })?;
-                } else if row == profiles.len() + 1
-                    && profiles.iter().any(|p| p == gideon_core::DEFAULT_PROFILE)
-                {
-                    self.keyboard_paints = 0;
-                    self.keyboard_shift = false;
-                    self.push(Screen::ConvertDefault {
-                        name: String::new(),
-                    })?;
-                }
                 Ok(Flow::Continue)
             }
             Screen::NewProfile { name } => {
@@ -3344,8 +3476,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Open the profile picker from Home's title bar.
     fn open_profile_menu(&mut self) -> Result<()> {
-        let profiles = self.known_profiles();
-        self.push(Screen::ProfileMenu { profiles })
+        self.sheet = Some(Sheet::Profiles {
+            names: self.known_profiles(),
+        });
+        // A sheet over what you were looking at: partial, no flash.
+        self.render_current(RefreshMode::Partial)
     }
 
     /// Switch to (creating if needed) the named profile: persist the
@@ -6259,27 +6394,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("(downloaded chapters stay)".to_string(), false),
                 ];
                 compose_list(l, &format!("Remove \"{}\"?", source.name), &rows, 0, 1)
-            }
-            Screen::ProfileMenu { profiles } => {
-                let mut rows: Vec<(String, bool)> = profiles
-                    .iter()
-                    .map(|p| {
-                        let mark = if *p == self.active_profile {
-                            "● "
-                        } else {
-                            ""
-                        };
-                        (format!("{mark}{p}"), true)
-                    })
-                    .collect();
-                rows.push(("New profile…".to_string(), true));
-                // The default profile's library IS the library root — give it a
-                // name and it becomes an ordinary "@name" profile like the rest.
-                // Offered only while a default profile still exists.
-                if profiles.iter().any(|p| p == gideon_core::DEFAULT_PROFILE) {
-                    rows.push(("Name the default profile…".to_string(), true));
-                }
-                compose_list(l, "Profiles", &rows, 0, 1)
             }
             Screen::NewProfile { name } => {
                 compose_keyboard(l, "New profile", name, "Create", self.keyboard_shift)

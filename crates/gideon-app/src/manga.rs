@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use gideon_aidoku::source::Source;
-use gideon_core::{SeriesIndex, SeriesRef, Settings};
+use gideon_core::{SeriesIndex, SeriesMeta, SeriesRef, Settings};
 use gideon_sources::storage::sanitize;
 use gideon_sources::{pages_to_cbz, Fetcher, SourceLists, UreqFetcher};
 
@@ -386,6 +386,24 @@ pub fn cmd_manga_download(
     Ok(())
 }
 
+/// How long cached MyAnimeList metadata is trusted before it is worth
+/// re-checking.
+///
+/// Metadata is not news. A score and a genre list are effectively fixed; the
+/// two fields that move are the chapter count, when new chapters are
+/// released, and the score, when a series ends badly enough to drag it. A
+/// fortnight catches both long before anyone would notice, and keeps a
+/// library open from being a burst of requests every single time.
+const METADATA_MAX_AGE: u64 = 14 * 24 * 60 * 60;
+
+/// Seconds since the unix epoch, or 0 if the clock is before it.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Series titles whose MyAnimeList lookup has already been attempted in this
 /// run of gideon, matched or not.
 ///
@@ -432,8 +450,12 @@ fn cache_series_metadata_with(library: &Path, series_dir: &str, fetcher: &dyn Fe
     let Some(series) = index.get(series_dir) else {
         return; // sideloaded, or not recorded (yet) — nothing to attach to
     };
-    if series.meta.as_ref().is_some_and(|meta| !meta.is_empty()) {
-        return; // already cached: never pay for it twice
+    if series
+        .meta
+        .as_ref()
+        .is_some_and(|meta| !meta.is_empty() && !meta.is_stale(now_unix(), METADATA_MAX_AGE))
+    {
+        return; // cached and still fresh: never pay for it twice
     }
     let origin = series.clone();
     if !claim_metadata_lookup(&origin.manga_title) {
@@ -458,7 +480,10 @@ fn cache_series_metadata_with(library: &Path, series_dir: &str, fetcher: &dyn Fe
     index.record(
         series_dir,
         SeriesRef {
-            meta: Some(meta),
+            meta: Some(SeriesMeta {
+                fetched_at: Some(now_unix()),
+                ..meta
+            }),
             ..origin
         },
     );
@@ -508,11 +533,12 @@ fn backfill_series_metadata_with(
         }
         let mut index = SeriesIndex::load(library);
         let existing = index.get(dir).cloned();
-        if existing
-            .as_ref()
-            .is_some_and(|s| s.meta.as_ref().is_some_and(|m| !m.is_empty()))
-        {
-            continue; // already cached: never pay for it twice
+        if existing.as_ref().is_some_and(|s| {
+            s.meta
+                .as_ref()
+                .is_some_and(|m| !m.is_empty() && !m.is_stale(now_unix(), METADATA_MAX_AGE))
+        }) {
+            continue; // cached and still fresh: never pay for it twice
         }
         let base = existing.unwrap_or_else(|| SeriesRef {
             manga_title: title.clone(),
@@ -536,7 +562,10 @@ fn backfill_series_metadata_with(
         index.record(
             dir,
             SeriesRef {
-                meta: Some(meta),
+                meta: Some(SeriesMeta {
+                    fetched_at: Some(now_unix()),
+                    ..meta
+                }),
                 manga_title: lookup_title,
                 ..base
             },
@@ -1396,10 +1425,14 @@ mod series_metadata_tests {
     }
 
     #[test]
-    fn a_series_that_has_metadata_is_never_looked_up_again() {
+    fn fresh_metadata_is_never_looked_up_again_but_stale_metadata_refreshes() {
+        // Metadata is stored beside the manga and trusted for a fortnight:
+        // a score and a genre list do not move, and re-fetching them every
+        // time the library opens is a burst of requests for nothing.
         let dir = tempfile::tempdir().unwrap();
         let cached = gideon_core::SeriesMeta {
             score: Some(8.5),
+            fetched_at: Some(now_unix()),
             ..gideon_core::SeriesMeta::default()
         };
         library_with(dir.path(), "Vagabond", Some(cached.clone()));
@@ -1410,10 +1443,38 @@ mod series_metadata_tests {
 
         cache_series_metadata_with(dir.path(), "Vagabond", &fetcher);
 
-        assert_eq!(fetcher.calls.get(), 0, "cached metadata must not hit MAL");
+        assert_eq!(fetcher.calls.get(), 0, "fresh metadata must not hit MAL");
         assert_eq!(
             SeriesIndex::load(dir.path()).get("Vagabond").unwrap().meta,
             Some(cached)
+        );
+
+        // Past the cadence, it is re-checked once — which is how a new
+        // chapter count or a score that slid after a bad ending arrives.
+        let stale = gideon_core::SeriesMeta {
+            score: Some(8.5),
+            fetched_at: Some(now_unix().saturating_sub(METADATA_MAX_AGE + 1)),
+            ..gideon_core::SeriesMeta::default()
+        };
+        library_with(dir.path(), "Vagabond Stale", Some(stale));
+        let fetcher = CountingFetcher::new(FakeFetcher::new().with(
+            &jikan("Vagabond Stale"),
+            r#"{"data":[{"title":"Vagabond Stale","type":"manga","score":9.2}]}"#,
+        ));
+
+        cache_series_metadata_with(dir.path(), "Vagabond Stale", &fetcher);
+
+        assert_eq!(fetcher.calls.get(), 1, "stale metadata is re-checked");
+        let refreshed = SeriesIndex::load(dir.path())
+            .get("Vagabond Stale")
+            .unwrap()
+            .meta
+            .clone()
+            .unwrap();
+        assert_eq!(refreshed.score, Some(9.2), "the newer score is kept");
+        assert!(
+            !refreshed.is_stale(now_unix(), METADATA_MAX_AGE),
+            "and the refresh restamps it, so the next open costs nothing"
         );
     }
 

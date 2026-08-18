@@ -255,6 +255,14 @@ fn tap_book_row(i: usize) -> UiEvent {
     tap_modal_row(5, i)
 }
 
+/// Tap row `i` of the profiles sheet. `names` is how many profiles it lists;
+/// the rows after them are "New profile…", "Name the default profile…" when
+/// a default still exists, and "Close".
+fn tap_profile_row(i: usize, names: usize, has_default: bool) -> UiEvent {
+    let rows = names + 2 + usize::from(has_default);
+    tap_modal_row(rows as u32, i)
+}
+
 /// Tap row `i` of the delete confirmation sheet: 0 confirms, 1 cancels.
 fn tap_confirm_row(i: usize) -> UiEvent {
     tap_modal_row(2, i)
@@ -548,6 +556,14 @@ fn tap_card_rot(i: usize, rot: u32) -> UiEvent {
     UiEvent::Tap { x, y }
 }
 
+/// [`tap_nav`] at rotation `rot`: the nav zone in reading orientation,
+/// mapped back into panel coordinates.
+fn tap_nav_rot(zone: u32, rot: u32) -> UiEvent {
+    let l = menu_layout(rot);
+    let (x, y) = panel_point_for(l.width * (2 * zone + 1) / 8, l.nav_top() + l.nav_h / 2, rot);
+    UiEvent::Tap { x, y }
+}
+
 fn tap_row_rot(i: usize, rot: u32) -> UiEvent {
     let l = menu_layout(rot);
     let (x, y) = panel_point_for(l.width / 2, l.row_top(i) + l.row_h / 2, rot);
@@ -594,11 +610,14 @@ fn make_tall_cbz(path: &Path, pages: usize) {
 // --- tests ---
 
 #[test]
-fn the_landing_screen_is_the_library_and_is_not_blank() {
+fn the_landing_screen_is_today_and_is_not_blank() {
+    // Today is what the device opens on: the chapter you were in the middle
+    // of and what is waiting unread. The Library is one nav tap away, and it
+    // is the whole library rather than the couple of rows a launcher shows.
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
     // Exactly one paint, and a full one: e-ink flashes on every full
     // refresh, so a launch that painted the landing twice would flash twice
     // before the reader saw anything.
@@ -787,6 +806,7 @@ fn rotated_reader_taps_follow_reading_orientation() {
     let tap_panel_top = UiEvent::Tap { x: W / 2, y: 0 };
     let tap_panel_middle = UiEvent::Tap { x: W / 2, y: H / 2 };
     let events = vec![
+        tap_nav_rot(0, 90),
         tap_row_rot(0, 90),
         tap_shelf_cell0_rot(90),
         tap_panel_bottom, // next -> page 1
@@ -1263,6 +1283,7 @@ fn physical_buttons_swap_when_upside_down() {
     store.save(&progress_path(&lib)).unwrap();
 
     let events = vec![
+        tap_nav_rot(0, 180),
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
         UiEvent::PageBack, // 180°: the back button goes forward -> page 3
@@ -1295,6 +1316,7 @@ fn bluetooth_remote_direction_is_absolute_upside_down() {
     store.save(&progress_path(&lib)).unwrap();
 
     let events = vec![
+        tap_nav_rot(0, 180),
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
         UiEvent::RemoteNext, // 180°: still advances -> page 3 (no swap)
@@ -3634,7 +3656,7 @@ fn title_left_tap_opens_the_profile_menu() {
     let mut app = app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
-    let Screen::ProfileMenu { profiles } = app.screen() else {
+    let Some(Sheet::Profiles { names: profiles }) = app.sheet() else {
         panic!("expected the profile menu");
     };
     assert_eq!(profiles, &vec!["default".to_string(), "alex".to_string()]);
@@ -3650,9 +3672,9 @@ fn switching_profile_shows_only_that_profiles_books() {
 
     let events = vec![
         nav_discover(),
-        tap_title_left(), // profile menu
-        tap_row(1),       // switch to alex -> back on Discover
-        tap_nav(0),       // Library
+        tap_title_left(),            // profile menu
+        tap_profile_row(1, 2, true), // switch to alex
+        tap_nav(0),                  // Library
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3718,13 +3740,13 @@ fn downloads_land_in_the_active_profiles_directory() {
 
     let events = vec![
         nav_discover(),
-        tap_title_left(), // profile menu
-        tap_row(1),       // switch to alex
-        tap_card(1),      // Sources
-        tap_row(0),       // Listings
-        tap_row(0),       // Popular
-        tap_row(0),       // Manga One
-        tap_row(0),       // download + Reader
+        tap_title_left(),            // profile menu
+        tap_profile_row(1, 2, true), // switch to alex
+        tap_card(1),                 // Sources
+        tap_row(0),                  // Listings
+        tap_row(0),                  // Popular
+        tap_row(0),                  // Manga One
+        tap_row(0),                  // download + Reader
         reader_tap_back(),
     ];
     let mut app = app(&lib, gateway, events).with_settings_dir(settings_dir);
@@ -3748,8 +3770,8 @@ fn new_profile_keyboard_creates_and_switches() {
 
     let events = vec![
         nav_discover(),
-        tap_title_left(), // profile menu: [default, New profile…]
-        tap_row(1),       // New profile…
+        tap_title_left(),            // profile menu: [default, New profile…]
+        tap_profile_row(1, 1, true), // New profile…
         tap_key(Key::Char('b')),
         tap_key(Key::Char('o')),
         tap_key(Key::Char('b')),
@@ -3791,7 +3813,7 @@ fn a_profile_with_a_library_is_listed_even_when_settings_forgot_it() {
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
-    let Screen::ProfileMenu { profiles } = app.screen() else {
+    let Some(Sheet::Profiles { names: profiles }) = app.sheet() else {
         panic!("expected the profile menu");
     };
     assert!(
@@ -3815,7 +3837,7 @@ fn switching_profiles_cannot_persist_a_list_that_read_back_short() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(1), // switch to the first rescued profile
+        tap_profile_row(1, 2, true), // switch to the first rescued profile
     ];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -3842,7 +3864,7 @@ fn converting_the_default_profile_keeps_profiles_settings_forgot() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(3), // [default, alex, New profile…, Name the default…]
+        tap_profile_row(3, 2, true), // [default, alex, New profile…, Name the default…]
         tap_key(Key::Char('m')),
         tap_key(Key::Char('e')),
         tap_key(Key::Search),
@@ -3876,7 +3898,7 @@ fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
     let events = vec![
         nav_discover(),
         tap_title_left(), // [default, alex, New profile…, Name the default…]
-        tap_row(3),       // Name the default profile…
+        tap_profile_row(3, 2, true), // Name the default profile…
         tap_key(Key::Char('m')),
         tap_key(Key::Char('e')),
         tap_key(Key::Search), // convert
@@ -3916,7 +3938,7 @@ fn naming_the_default_profile_a_taken_name_changes_nothing() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(3), // Name the default profile…
+        tap_profile_row(3, 2, true), // Name the default profile…
         tap_key(Key::Char('a')),
         tap_key(Key::Char('l')),
         tap_key(Key::Char('e')),
@@ -3950,14 +3972,19 @@ fn the_profile_menu_stops_offering_conversion_once_default_is_gone() {
     .save(&settings_dir)
     .unwrap();
 
-    // Row 3 would be "Name the default profile…" if it were offered; with no
-    // default profile the row doesn't exist, so the tap does nothing.
-    let events = vec![nav_discover(), tap_title_left(), tap_row(3)];
+    let events = vec![nav_discover(), tap_title_left()];
     let mut app = app(&lib, FakeGateway::default(), events)
         .with_settings_dir(settings_dir)
         .with_profile("me");
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::ProfileMenu { .. }));
+
+    // "Name the default profile…" is only worth offering while a default
+    // profile still exists; with none, the sheet is the profiles, a way to
+    // make another, and a way out.
+    let (title, rows) = app.sheet_rows();
+    assert_eq!(title, "Profiles");
+    let labels: Vec<&str> = rows.iter().map(|(l, ..)| l.as_str()).collect();
+    assert_eq!(labels, vec!["me", "alex", "New profile…", "Close"]);
 }
 
 #[test]
@@ -3971,10 +3998,10 @@ fn keyboard_shift_types_uppercase() {
     let events = vec![
         nav_discover(),
         tap_title_left(),
-        tap_row(1),              // New profile…
-        tap_key(Key::Shift),     // caps on
-        tap_key(Key::Char('b')), // -> 'B'
-        tap_key(Key::Shift),     // caps off
+        tap_profile_row(1, 1, true), // New profile…
+        tap_key(Key::Shift),         // caps on
+        tap_key(Key::Char('b')),     // -> 'B'
+        tap_key(Key::Shift),         // caps off
         tap_key(Key::Char('o')),
         tap_key(Key::Char('b')),
         tap_key(Key::Search), // create "Bob"
@@ -4393,6 +4420,7 @@ fn edge_slides_follow_reading_orientation_when_rotated() {
         y1: 500,
     };
     let events = vec![
+        tap_nav_rot(0, 180),
         tap_row_rot(0, 180),
         tap_shelf_cell0_rot(180),
         slide,
@@ -6406,7 +6434,12 @@ fn page_buttons_turn_reader_pages() {
 fn page_buttons_are_ignored_on_unpaged_screens() {
     // Home has no pages; a button press must not crash or navigate.
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![UiEvent::PageForward, UiEvent::PageBack, tap_row(0)];
+    let events = vec![
+        tap_nav(0),
+        UiEvent::PageForward,
+        UiEvent::PageBack,
+        tap_row(0),
+    ];
     let lib = dir.path().join("Manga");
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -6442,7 +6475,7 @@ fn sleep_event_suspends_and_repaints_in_full() {
         app.display().flushes,
         vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
     );
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
     assert_eq!(
         app.input().refreshes,
         1,
@@ -6477,7 +6510,7 @@ fn skipped_suspend_explains_itself_and_stays_awake() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1);
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
     // Initial paint, "Sleeping…", the "staying awake" notice, the restore.
     assert_eq!(app.display().flushes.len(), 4);
     assert!(app
@@ -6513,7 +6546,7 @@ fn charging_sleep_finishes_once_unplugged() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 2, "the refused suspend must be retried");
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 #[test]
@@ -6535,7 +6568,7 @@ fn charging_wait_aborts_when_the_user_is_using_the_device() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "a tap must abort the wait, not re-suspend");
-    assert!(matches!(app.screen(), Screen::Library { .. }));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 #[test]
@@ -6661,7 +6694,7 @@ fn waking_reapplies_the_frontlight() {
 #[test]
 fn sleep_without_a_hook_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![UiEvent::Sleep, tap_row(0)];
+    let events = vec![tap_nav(0), UiEvent::Sleep, tap_row(0)];
     let lib = dir.path().join("Manga");
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
@@ -7499,6 +7532,7 @@ fn dump_library_list_png() {
                     genres: genres.iter().map(|g| (*g).to_string()).collect(),
                     rank: None,
                     total_chapters: Some(*total),
+                    fetched_at: None,
                 }),
                 ..Default::default()
             },
@@ -7760,6 +7794,7 @@ fn dump_demo() {
                     genres: genres.iter().map(|g| (*g).to_string()).collect(),
                     rank: None,
                     total_chapters: Some(*total),
+                    fetched_at: None,
                 }),
                 ..Default::default()
             },
@@ -7827,7 +7862,10 @@ fn dump_demo() {
         FakeGateway::default(),
         lib.clone(),
     )
-    .with_settings_dir(settings_dir);
+    .with_settings_dir(settings_dir)
+    .with_lights(Box::new(FakeLights {
+        levels: std::rc::Rc::new(std::cell::RefCell::new((42, 15))),
+    }));
 
     // Top-level destinations REPLACE the root screen the way the nav bar
     // does; pushing them would make them look like pushed screens (Back
@@ -7843,6 +7881,10 @@ fn dump_demo() {
         // nav tap produces it.
         "quick" => {
             app.open_quick_settings().unwrap();
+        }
+        // The profiles sheet, over Today.
+        "profiles" => {
+            app.open_profile_menu().unwrap();
         }
         // The long-press book sheet, over the library it was raised from.
         "book" => {
@@ -7961,6 +8003,8 @@ fn every_series_is_reachable_by_paging_in_either_library_view() {
         let mut app =
             app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
         app.run().unwrap();
+        // Today is the landing screen; this test is about the library.
+        app.open_library().unwrap();
 
         let per_page = app.library_page_capacity();
         let Screen::Library { items, .. } = app.screen() else {
@@ -8216,6 +8260,8 @@ fn a_long_press_opens_a_modal_over_the_book_without_flashing() {
 
     let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
     app.run().unwrap();
+    // Today is the landing screen; this test is about the library.
+    app.open_library().unwrap();
     let before = app.display().flushes.len();
 
     let cell = tap_shelf_cell0();
@@ -8491,6 +8537,8 @@ fn a_paginated_library_does_not_draw_paging_buttons_under_the_nav_bar() {
 
         let mut paged = app(&profile_lib, FakeGateway::default(), vec![]);
         paged.run().unwrap();
+        // Today is the landing screen; this test is about the library.
+        paged.open_library().unwrap();
         assert!(paged.current_page_count() > 1, "{view}: needs to paginate");
 
         let page = paged.compose_final().unwrap();
@@ -8509,6 +8557,7 @@ fn a_paginated_library_does_not_draw_paging_buttons_under_the_nav_bar() {
         .unwrap();
         let mut single = app(&one, FakeGateway::default(), vec![]);
         single.run().unwrap();
+        single.open_library().unwrap();
         assert_eq!(single.current_page_count(), 1);
         let plain = single.compose_final().unwrap();
 
@@ -8523,4 +8572,69 @@ fn a_paginated_library_does_not_draw_paging_buttons_under_the_nav_bar() {
             "{view}: the paged nav strip must hold the tabs and nothing else"
         );
     }
+}
+
+#[test]
+fn quick_settings_sliders_set_the_lamp_where_you_tap() {
+    // Reaching for the light is the most common reason to open this sheet
+    // mid-chapter. A tap on the track sets the level to where you tapped —
+    // stepping across it a level at a time would be worse than the edge
+    // slide that already exists.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let (levels, lights) = lights();
+    let mut app = app(&lib, FakeGateway::default(), vec![])
+        .with_lights(lights)
+        .with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+
+    let sliders = app.quick_sliders();
+    assert_eq!(
+        sliders.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec!["Brightness", "Night warmth"],
+        "a device with a lamp offers both"
+    );
+
+    let l = layout();
+    let sheet_top = app.sheet_bounds().expect("a sheet is open").0;
+    let title_h = (l.text_px * 1.6) as u32;
+    let slider_row = |i: u32| {
+        sheet_top
+            + title_h
+            + super::SETTINGS_GAP
+            + i * (l.row_h + super::SETTINGS_GAP)
+            + l.row_h / 2
+    };
+
+    // Three quarters along the brightness track.
+    let before = app.display().flushes.len();
+    app.tap_sheet(l.pad + (l.width - l.pad * 2) * 3 / 4, slider_row(0))
+        .unwrap();
+    assert_eq!(levels.borrow().0, 75, "brightness follows the tap");
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "one slider's fill changed; it must not flash"
+    );
+
+    // And the warmth row is its own control, not the same one twice.
+    app.tap_sheet(l.pad + (l.width - l.pad * 2) / 4, slider_row(1))
+        .unwrap();
+    assert_eq!(levels.borrow().1, 25, "warmth follows its own tap");
+    assert_eq!(levels.borrow().0, 75, "and leaves brightness alone");
+}
+
+#[test]
+fn a_device_without_a_lamp_gets_no_sliders() {
+    // Drawing a control that cannot do anything is worse than not offering
+    // it: the desktop build and the test harness have no frontlight.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+    assert!(app.quick_sliders().is_empty());
 }
