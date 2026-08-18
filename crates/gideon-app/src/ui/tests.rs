@@ -7689,11 +7689,15 @@ fn dump_demo() {
     )
     .with_settings_dir(settings_dir);
 
+    // Top-level destinations REPLACE the root screen the way the nav bar
+    // does; pushing them would make them look like pushed screens (Back
+    // instead of the nav bar) and misrepresent the design.
+    app.run().unwrap();
     match screen.as_str() {
-        "today" => app.push(Screen::Stats).unwrap(),
-        "library" | "shelf" => app.open_library().unwrap(),
-        "discover" => app.push(Screen::Home).unwrap(),
-        "settings" => app.push(Screen::Settings).unwrap(),
+        "library" | "shelf" => {}
+        "today" => app.goto_root(Screen::Stats).unwrap(),
+        "discover" => app.goto_root(Screen::Home).unwrap(),
+        "settings" => app.goto_root(Screen::Settings).unwrap(),
         "storage" => app.push(Screen::Storage).unwrap(),
         other => panic!("unknown screen {other}"),
     }

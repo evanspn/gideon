@@ -804,7 +804,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             library_dir,
             active_profile: "default".to_string(),
             layout,
-            stack: vec![Screen::Stats],
+            stack: vec![Screen::Library {
+                items: Vec::new(),
+                page: 0,
+            }],
             reader_fit: FitMode::Contain,
             full_refresh_interval: 8,
             auto_rotate_spreads: false,
@@ -983,6 +986,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Main loop: render, then process events until the user quits through
     /// the power menu (or the input source ends). Returns how to exit.
     pub fn run(&mut self) -> Result<Exit> {
+        // The library IS the landing screen. Opening onto a menu, or onto a
+        // dashboard about reading, puts a screen between the reader and the
+        // thing they picked the device up for. Today, Discover and Settings
+        // are one nav tap away.
+        if matches!(self.stack.last(), Some(Screen::Library { items, .. }) if items.is_empty()) {
+            self.stack.pop();
+            self.open_library()?;
+        }
         self.render_current(RefreshMode::Full)?;
         loop {
             // With a suspend hook installed, wait in ticks instead of
@@ -1296,9 +1307,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // Today draws a four-item nav bar where other screens draw Back,
             // so its bottom strip is routed here instead of falling through
             // to the generic targets.
-            _ if matches!(self.screen(), Screen::Stats) && y >= self.layout.nav_top() => {
-                self.tap_today_nav(x)
-            }
+            _ if self.screen_has_nav() && y >= self.layout.nav_top() => self.tap_main_nav(x),
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
@@ -1658,16 +1667,76 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// "Discover" opens the menu that used to be Home: the sources, search,
     /// popular and update entries keep the row order they have always had,
     /// so every tap zone below the nav bar is unchanged.
-    fn tap_today_nav(&mut self, x: u32) -> Result<Flow> {
+    fn tap_main_nav(&mut self, x: u32) -> Result<Flow> {
         let zone = (x * 4 / self.layout.width.max(1)).min(3);
+        // Every destination is a sibling, not a child: switching tabs
+        // replaces the top-level screen rather than stacking another one, so
+        // Library -> Settings -> Library does not leave a trail to unwind.
+        self.stack.truncate(1);
         match zone {
-            0 => {}
-            1 => self.open_library()?,
-            2 => self.push(Screen::Home)?,
-            3 => self.push(Screen::Settings)?,
+            0 => self.open_library()?,
+            1 => {
+                self.stack[0] = Screen::Stats;
+                self.render_current(RefreshMode::Full)?;
+            }
+            2 => {
+                self.stack[0] = Screen::Home;
+                self.render_current(RefreshMode::Full)?;
+            }
+            3 => {
+                self.stack[0] = Screen::Settings;
+                self.render_current(RefreshMode::Full)?;
+            }
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// Switch to a top-level destination, replacing the root rather than
+    /// stacking onto it — what the nav bar does, exposed so tests and the
+    /// demo dumps land on the same screen a real tap would.
+    fn goto_root(&mut self, screen: Screen) -> Result<()> {
+        self.stack.truncate(1);
+        self.stack[0] = screen;
+        self.render_current(RefreshMode::Full)
+    }
+
+    /// Whether the current screen is a top-level destination, and so draws
+    /// the nav bar in place of a Back button.
+    fn screen_has_nav(&self) -> bool {
+        self.stack.len() == 1
+            && matches!(
+                self.stack.last(),
+                Some(Screen::Library { .. } | Screen::Stats | Screen::Home | Screen::Settings)
+            )
+    }
+
+    /// The nav items, with the current destination marked.
+    fn nav_items(&self) -> [widgets::NavItem<'static>; 4] {
+        let at = |s: &Screen| std::mem::discriminant(s);
+        let here = self.stack.last().map(at);
+        let is = |s: Screen| here == Some(at(&s));
+        [
+            widgets::NavItem {
+                label: "Library",
+                active: is(Screen::Library {
+                    items: Vec::new(),
+                    page: 0,
+                }),
+            },
+            widgets::NavItem {
+                label: "Today",
+                active: is(Screen::Stats),
+            },
+            widgets::NavItem {
+                label: "Discover",
+                active: is(Screen::Home),
+            },
+            widgets::NavItem {
+                label: "Settings",
+                active: is(Screen::Settings),
+            },
+        ]
     }
 
     /// Activate whatever sits at content row `row` (tap at `x`, `y`).
@@ -4528,6 +4597,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Stats)) {
             return Ok(Some(self.compose_stats()));
         }
+        if matches!(self.stack.last(), Some(Screen::Settings)) {
+            return Ok(Some(self.compose_settings()));
+        }
         if matches!(self.stack.last(), Some(Screen::Home)) {
             let rows = HOME_ROWS.len() + usize::from(self.home_offline);
             let mut canvas = RgbPage::from_gray(&self.compose_current()?);
@@ -4846,7 +4918,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
         let index = gideon_core::SeriesIndex::load(&self.library_dir);
 
-        let mut canvas = RgbPage::from_gray(&compose_chrome(l, "Library", page, page_count));
+        // A top-level destination draws the nav bar in that strip, so the
+        // chrome must not also put a Back button there.
+        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(
+            l,
+            "Library",
+            page,
+            page_count,
+            !self.screen_has_nav(),
+        ));
         let row_h = self.list_row_height();
 
         self.with_progress(|app, store| {
@@ -4959,6 +5039,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
             }
         });
+        if self.screen_has_nav() {
+            let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+            widgets::draw_nav_bar(
+                &mut canvas,
+                0,
+                l.height.saturating_sub(l.nav_h),
+                l.width,
+                l.nav_h,
+                &self.nav_items(),
+                l.text_px,
+                &theme,
+            );
+        }
         canvas
     }
 
@@ -4995,6 +5088,78 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Full refresh: the whole content area is being replaced, and a
         // partial would leave the previous view ghosting under the new one.
         self.render_current(RefreshMode::Full)
+    }
+
+    /// Settings, grouped under headings.
+    ///
+    /// A flat list of fourteen rows makes you read all of them to find one.
+    /// Grouping by what a setting is ABOUT — reading, the library, the
+    /// device, the account — means you look in one place. The groups also
+    /// say something true: the first two are yours alone, the third is the
+    /// hardware everyone sharing this Kobo shares.
+    fn compose_settings(&self) -> RgbPage {
+        let l = &self.layout;
+        let settings = self.load_settings();
+        let theme = widgets::Theme::from_setting(&settings.color_profile);
+        let inner = l.width.saturating_sub(l.pad * 2);
+        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(l, "Settings", 0, 1, false));
+
+        let head_h = (l.row_h * 2) / 3;
+        let row_h = l.row_h;
+        let mut y = l.content_top();
+        let nav_top = l.height.saturating_sub(l.nav_h);
+
+        for (heading, rows) in settings_groups(&settings) {
+            if y + head_h > nav_top {
+                break;
+            }
+            widgets::draw_section_header(
+                &mut canvas,
+                l.pad,
+                y,
+                inner,
+                head_h,
+                heading,
+                l.text_px,
+                &theme,
+            );
+            y += head_h;
+            for (label, value, detail) in rows {
+                if y + row_h > nav_top {
+                    break;
+                }
+                widgets::draw_setting_row(
+                    &mut canvas,
+                    l.pad,
+                    y,
+                    inner,
+                    row_h,
+                    &widgets::SettingRow {
+                        label: &label,
+                        value: &value,
+                        detail: &detail,
+                        selected: false,
+                    },
+                    l.text_px,
+                    &theme,
+                );
+                y += row_h;
+            }
+        }
+
+        if self.screen_has_nav() {
+            widgets::draw_nav_bar(
+                &mut canvas,
+                0,
+                nav_top,
+                l.width,
+                l.nav_h,
+                &self.nav_items(),
+                l.text_px,
+                &theme,
+            );
+        }
+        canvas
     }
 
     fn compose_current(&self) -> Result<GrayPage> {
@@ -7452,6 +7617,105 @@ fn cleanup_label(hours: u32) -> String {
 /// The colour profiles the settings row cycles through, in the order the
 /// palette reference presents them.
 const COLOR_PROFILE_STEPS: [&str; 5] = ["ink-rust", "indigo", "sumi", "botanical", "mono"];
+
+/// Settings, grouped by what each one is about. The order is deliberate:
+/// the things you change often come first, the hardware you set once comes
+/// last, and the split also marks scope — Reading and Library are per
+/// profile, Device is shared by everyone using this Kobo.
+///
+/// Returns `(heading, [(label, value, detail)])` so the compositor stays a
+/// drawing routine and the copy lives in one place.
+#[allow(clippy::type_complexity)]
+fn settings_groups(
+    s: &gideon_core::Settings,
+) -> Vec<(&'static str, Vec<(String, String, String)>)> {
+    let fit = match gideon_render::FitMode::from_setting(&s.reader_fit) {
+        gideon_render::FitMode::FitWidth => "fit-width",
+        _ => "contain",
+    };
+    let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+    let row = |l: &str, v: String, d: &str| (l.to_string(), v, d.to_string());
+
+    vec![
+        (
+            "Reading",
+            vec![
+                row(
+                    "Reader fit",
+                    fit.to_string(),
+                    "how a page is scaled to the panel",
+                ),
+                row(
+                    "Full refresh",
+                    format!("every {} pages", s.reader_full_refresh_interval),
+                    "flashes the panel clean to clear ghosting",
+                ),
+                row(
+                    "Rotate wide spreads",
+                    on_off(s.auto_rotate_spreads),
+                    "turn double pages to landscape",
+                ),
+                row(
+                    "Colour profile",
+                    s.color_profile.clone(),
+                    "the palette the interface draws in",
+                ),
+            ],
+        ),
+        (
+            "Library",
+            vec![
+                row(
+                    "Library view",
+                    s.library_view.clone(),
+                    "dense list, or the cover shelf",
+                ),
+                row(
+                    "Pre-download ahead",
+                    s.predownload_unread_chapters.to_string(),
+                    "chapters fetched past the one you are on",
+                ),
+                row(
+                    "Delete finished chapters",
+                    cleanup_label(s.finished_cleanup_hours),
+                    "reclaims space once you are done with them",
+                ),
+                row(
+                    "Storage limit",
+                    s.storage_size_limit.to_string(),
+                    "downloads are evicted past this",
+                ),
+            ],
+        ),
+        (
+            "Device",
+            vec![
+                row(
+                    "Sleep when idle",
+                    idle_suspend_label(s.idle_suspend_minutes),
+                    "shared by every profile",
+                ),
+                row(
+                    "Auto-connect Wi-Fi",
+                    on_off(s.wifi_auto_connect),
+                    "reconnect without asking",
+                ),
+                row(
+                    "Colour boost",
+                    gideon_device::ColorPostProcess::from_setting(&s.color_post_process)
+                        .as_setting()
+                        .to_string(),
+                    "Kaleido saturation; vivid can band gradients",
+                ),
+                row(
+                    "Check updates automatically",
+                    on_off(s.auto_check_updates),
+                    "look for new releases on start",
+                ),
+            ],
+        ),
+    ]
+}
 
 /// Next value in a cycle: the entry after `current`, wrapping around; the
 /// first entry when `current` isn't in the list (hand-edited settings).
