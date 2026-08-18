@@ -2205,6 +2205,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         return self.open_series_card(&card);
                     }
                 }
+                if let Some(card) = self.waiting_row_at(y) {
+                    return self.open_series_card(&card);
+                }
                 Ok(Flow::Continue)
             }
             Screen::Library { items, page } => self.tap_library_cell(&items, page, x, y),
@@ -5144,9 +5147,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         );
         y += tile_h + l.pad;
 
+        // The grid needs saying what it is. Unlabelled, a block of coloured
+        // squares is decoration; with a header and a Less→More key it is a
+        // chart, and the same header style the settings groups use ties it to
+        // the rest of the interface.
         let weeks = STATS_HEATMAP_WEEKS;
+        let head_h = l.row_h * 2 / 3;
+        widgets::draw_section_header(
+            &mut canvas,
+            l.pad,
+            y,
+            inner,
+            head_h,
+            &format!("Reading activity — last {weeks} weeks"),
+            l.text_px,
+            &theme,
+        );
+        y += head_h + l.pad / 2;
         let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
         heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
+        y += grid.height() + l.pad;
+        self.draw_heatmap_key(&mut canvas, y, &palette);
         y = self.continue_card_top();
 
         // Continue: the chapter a tap resumes. Omitted on a fresh device
@@ -5190,6 +5211,55 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
         }
 
+        // What is on the device and still unread. Today used to end here with
+        // a third of the panel blank, which on a screen whose whole job is
+        // "what should I read next" was the one question it declined to
+        // answer.
+        let waiting = self.waiting_rows();
+        if !waiting.is_empty() {
+            let mut wy = self.waiting_top();
+            widgets::draw_section_header(
+                &mut canvas,
+                l.pad,
+                wy,
+                inner,
+                head_h,
+                "Waiting for you",
+                l.text_px,
+                &theme,
+            );
+            wy += head_h + l.pad;
+            let mut layer = GrayPage::new_white(l.width, l.height);
+            for (card, unread) in &waiting {
+                let count = format!("{unread} unread");
+                let cw = measure_text(l.text_px * 0.72, &count, false);
+                let ty = wy + l.row_h.saturating_sub(l.text_px as u32) / 2;
+                draw_text(
+                    &mut layer,
+                    l.pad,
+                    ty,
+                    l.text_px * 0.85,
+                    &card.title(),
+                    inner.saturating_sub(cw + l.pad),
+                    true,
+                );
+                draw_text(
+                    &mut layer,
+                    l.width.saturating_sub(l.pad + cw),
+                    ty,
+                    l.text_px * 0.72,
+                    &count,
+                    cw,
+                    false,
+                );
+                wy += l.row_h;
+                if wy < nav_top {
+                    fill_rect_rgb(&mut canvas, l.pad, wy, inner, 1, [0xDD, 0xDD, 0xDD]);
+                }
+            }
+            copy_gray_into_rgb(&mut canvas, &layer);
+        }
+
         // The nav bar the whole design is built around.
         widgets::draw_nav_bar(
             &mut canvas,
@@ -5206,6 +5276,54 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// The series and chapter a Continue tap resumes, with its progress: the
     /// most recently read chapter anywhere in the library.
+    /// The heatmap's key: "Less" ▢▢▢▢▢ "More", drawn at `y`, right-aligned
+    /// under the grid. Without it the ramp is five arbitrary shades — and the
+    /// levels are relative to this reader, which the key is the only place
+    /// that admits.
+    fn draw_heatmap_key(&self, canvas: &mut RgbPage, y: u32, palette: &heatmap::Palette) {
+        let l = &self.layout;
+        let cell = (l.text_px * 0.5) as u32;
+        let gap = cell / 3;
+        let px = l.text_px * 0.6;
+        let strip = 5 * cell + 4 * gap;
+        let more_w = measure_text(px, "More", false);
+        let less_w = measure_text(px, "Less", false);
+        let right = l.width.saturating_sub(l.pad);
+        let strip_x = right.saturating_sub(more_w + gap * 2 + strip);
+        let text_y = y + cell.saturating_sub(px as u32) / 2;
+
+        let mut layer = GrayPage::new_white(l.width, l.height);
+        draw_text(
+            &mut layer,
+            strip_x.saturating_sub(less_w + gap * 2),
+            text_y,
+            px,
+            "Less",
+            less_w,
+            false,
+        );
+        draw_text(
+            &mut layer,
+            right - more_w,
+            text_y,
+            px,
+            "More",
+            more_w,
+            false,
+        );
+        copy_gray_into_rgb(canvas, &layer);
+        for (i, step) in palette.steps.iter().enumerate() {
+            fill_rect_rgb(
+                canvas,
+                strip_x + i as u32 * (cell + gap),
+                y,
+                cell,
+                cell,
+                *step,
+            );
+        }
+    }
+
     /// Top of the Continue card on Today, and the bottom of the area it can
     /// use. Shared with `compose_stats` so what is drawn is what is tapped —
     /// the card was drawn for a week before anything would open it.
@@ -5218,14 +5336,96 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             l.width.saturating_sub(l.pad * 2),
             6,
         );
-        l.content_top() + l.pad + l.row_h * 2 + l.pad + grid.height() + l.pad * 2
+        // tiles, then the activity header, the grid, and its key.
+        let head_h = l.row_h * 2 / 3;
+        let key_h = (l.text_px * 0.5) as u32;
+        l.content_top()
+            + l.pad
+            + l.row_h * 2
+            + l.pad
+            + head_h
+            + l.pad / 2
+            + grid.height()
+            + l.pad
+            + key_h
+            + l.pad * 2
+    }
+
+    /// How tall the Continue card is: eyebrow, title, chapter line, bar.
+    fn continue_card_height(&self) -> u32 {
+        (self.layout.text_px * 3.8) as u32
     }
 
     /// Whether a tap at `y` on Today lands on the Continue card.
     fn continue_card_hit(&self, y: u32) -> bool {
         let top = self.continue_card_top();
-        let nav_top = self.layout.nav_top();
-        nav_top.saturating_sub(top) >= self.layout.row_h * 2 && y >= top && y < nav_top
+        let bottom = (top + self.continue_card_height()).min(self.layout.nav_top());
+        self.layout.nav_top().saturating_sub(top) >= self.layout.row_h * 2 && y >= top && y < bottom
+    }
+
+    /// Top of the "waiting for you" list: below the Continue card when there
+    /// is one, in its place when there is not.
+    fn waiting_top(&self) -> u32 {
+        let top = self.continue_card_top();
+        if self.continue_card().is_some() {
+            top + self.continue_card_height() + self.layout.pad
+        } else {
+            top
+        }
+    }
+
+    /// The series with downloaded chapters still unread, most recently read
+    /// first, and how many each has waiting. Today's bottom third was empty
+    /// while this — the answer to "what do I have on the device to read" —
+    /// was only derivable by walking the library screen row by row.
+    fn waiting_rows(&self) -> Vec<(SeriesCard, usize)> {
+        let Ok(entries) = Library::new(&self.library_dir).scan() else {
+            return Vec::new();
+        };
+        let cards = group_library(entries);
+        let mut rows = self.with_progress(|_, store| {
+            let mut rows: Vec<(SeriesCard, usize, u64)> = cards
+                .into_iter()
+                .filter_map(|card| {
+                    let unread = card
+                        .chapters
+                        .iter()
+                        .filter(|c| !store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
+                        .count();
+                    let when = card.latest_read_at(store);
+                    (unread > 0).then_some((card, unread, when))
+                })
+                .collect();
+            // Most recently read first; a series never opened sorts last but
+            // still shows — it is exactly what a reader is looking for here.
+            rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.title().cmp(&b.0.title())));
+            rows
+        });
+        rows.truncate(self.waiting_capacity());
+        rows.into_iter().map(|(c, n, _)| (c, n)).collect()
+    }
+
+    /// The waiting-list series a tap at `y` lands on, if any. Walks the same
+    /// geometry the compositor draws, one row at a time.
+    fn waiting_row_at(&self, y: u32) -> Option<SeriesCard> {
+        let l = &self.layout;
+        let head_h = l.row_h * 2 / 3;
+        let top = self.waiting_top() + head_h + l.pad;
+        if y < top {
+            return None;
+        }
+        let index = ((y - top) / l.row_h.max(1)) as usize;
+        self.waiting_rows().into_iter().nth(index).map(|(c, _)| c)
+    }
+
+    /// How many waiting rows fit between the Continue card and the nav bar.
+    fn waiting_capacity(&self) -> usize {
+        let l = &self.layout;
+        let head_h = l.row_h * 2 / 3;
+        let room = l
+            .nav_top()
+            .saturating_sub(self.waiting_top() + head_h + l.pad);
+        (room / l.row_h.max(1)) as usize
     }
 
     /// The series the Continue card names: the most recently read one.

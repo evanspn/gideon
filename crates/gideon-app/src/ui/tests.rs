@@ -8233,3 +8233,80 @@ fn tap_y(event: UiEvent) -> u32 {
         other => panic!("not a tap: {other:?}"),
     }
 }
+
+#[test]
+fn todays_waiting_list_shows_unread_series_and_opens_them() {
+    // Today ended at the Continue card with a third of the panel blank — on a
+    // screen whose job is "what should I read next", the one question it
+    // declined to answer. The waiting list is what is downloaded and unread,
+    // most recently read first, and each row opens its series.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for (series, chapters) in [("Berserk", 3), ("Frieren", 2), ("Punpun", 1)] {
+        for c in 1..=chapters {
+            make_cbz(&lib.join(format!("{series}/vol{c}.cbz")), 4);
+        }
+    }
+    let now = now_unix();
+    write_progress(
+        &lib,
+        &[
+            // Berserk: vol1 finished, vol2 part-read → 2 unread. Read today.
+            ("Berserk/vol1.cbz", 3, 4, now - 300),
+            ("Berserk/vol2.cbz", 1, 4, now - 200),
+            // Frieren: nothing finished → 2 unread, read a week ago.
+            ("Frieren/vol1.cbz", 0, 4, now - 7 * 86_400),
+            // Punpun: its only chapter finished → nothing waiting.
+            ("Punpun/vol1.cbz", 3, 4, now - 86_400),
+        ],
+    );
+
+    let mut probe =
+        app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    probe.run().unwrap();
+    probe.goto_root(Screen::Stats).unwrap();
+
+    let rows = probe.waiting_rows();
+    let listed: Vec<(String, usize)> = rows.iter().map(|(c, n)| (c.title(), *n)).collect();
+    assert_eq!(
+        listed,
+        vec![("Berserk".to_string(), 2), ("Frieren".to_string(), 2)],
+        "finished series drop off; the most recently read leads"
+    );
+
+    // Each row's drawn y opens that row's series, not its neighbour's.
+    let l = layout();
+    let head_h = l.row_h * 2 / 3;
+    let top = probe.waiting_top() + head_h + l.pad;
+    for (i, (card, _)) in rows.iter().enumerate() {
+        let y = top + i as u32 * l.row_h + l.row_h / 2;
+        assert_eq!(
+            probe.waiting_row_at(y).map(|c| c.title()),
+            Some(card.title()),
+            "row {i} must hit the series drawn there"
+        );
+    }
+    assert!(
+        probe.waiting_row_at(top.saturating_sub(l.row_h)).is_none(),
+        "the header above the list is not a row"
+    );
+
+    // And a tap on the second row reads it.
+    let events = vec![
+        tap_today(),
+        UiEvent::Tap {
+            x: l.width / 2,
+            y: top + l.row_h + l.row_h / 2,
+        },
+        reader_tap_next(),
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    let store = ProgressStore::load(&progress_path(&lib)).unwrap();
+    assert_eq!(
+        store.get("Frieren/vol1.cbz").unwrap().current_page,
+        1,
+        "tapping the Frieren row resumed and turned a page in Frieren"
+    );
+}
