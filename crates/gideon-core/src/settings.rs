@@ -85,6 +85,17 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_color_profile")]
     pub color_profile: String,
 
+    /// How the Library draws itself: "shelf" (the cover grid, the default)
+    /// or "list" (a dense row per series carrying its MyAnimeList metadata,
+    /// download state and progress).
+    ///
+    /// Two honest views of the same library rather than a replacement: the
+    /// shelf is better for browsing by art, the list for deciding what to
+    /// read next. Parsed leniently — an unknown value means the default.
+    #[serde(default = "default_library_view")]
+    #[serde(deserialize_with = "lenient_library_view")]
+    pub library_view: String,
+
     /// Page turns between full (flashing) e-ink refreshes. Higher flashes
     /// less often (smoother reading) but lets ghosting build up longer.
     /// Parsed leniently — out-of-range or wrong-typed values fall back to the
@@ -138,6 +149,7 @@ impl Default for Settings {
             reader_rotation_locked: true,
             color_post_process: "vivid".to_string(),
             color_profile: default_color_profile(),
+            library_view: default_library_view(),
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
@@ -260,6 +272,25 @@ fn lenient_color_post_process<'de, D: serde::Deserializer<'de>>(
 /// The colour profile a fresh install draws in.
 fn default_color_profile() -> String {
     "ink-rust".to_string()
+}
+
+/// The Library view a fresh install uses.
+fn default_library_view() -> String {
+    "shelf".to_string()
+}
+
+/// Lenient `library_view` parsing: "list" passes through, anything else
+/// means the cover shelf.
+fn lenient_library_view<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "list" => s,
+            _ => default_library_view(),
+        },
+    )
 }
 
 /// Lenient `color_profile` parsing: known profiles pass through lowercased,
@@ -517,6 +548,7 @@ mod tests {
             auto_check_updates: false,
             reader_fit: "fit-width".into(),
             color_profile: "indigo".into(),
+            library_view: "list".into(),
             reader_rotation: 90,
             reader_rotation_locked: false,
             color_post_process: "standard".into(),

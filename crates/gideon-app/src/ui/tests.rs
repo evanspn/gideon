@@ -6835,3 +6835,230 @@ fn dump_stats_screen_png() {
     img.save(&out).unwrap();
     eprintln!("wrote {out}");
 }
+
+#[test]
+fn the_library_title_bar_toggles_between_shelf_and_list() {
+    // Two views of one library, and the choice has to survive a restart —
+    // it is stored in settings, not in the screen.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let l = layout();
+    let title_tap = UiEvent::Tap {
+        x: l.width / 2,
+        y: l.title_h / 2,
+    };
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0), title_tap])
+        .with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+
+    assert_eq!(
+        gideon_core::Settings::load(&settings_dir)
+            .unwrap()
+            .library_view,
+        "list",
+        "tapping the Library title bar should switch to the dense list"
+    );
+    assert!(
+        matches!(app.screen(), Screen::Library { .. }),
+        "still the Library"
+    );
+}
+
+#[test]
+fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
+    // The list carries score chips and a progress bar in the theme colour,
+    // so it must take the RGB path; a coverless shelf has no colour to show.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
+    let settings_dir = dir.path().join("data");
+
+    for (view, want_colour) in [("shelf", false), ("list", true)] {
+        gideon_core::Settings {
+            library_view: view.into(),
+            ..gideon_core::Settings::default()
+        }
+        .save(&settings_dir)
+        .unwrap();
+        let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)])
+            .with_settings_dir(settings_dir.clone());
+        app.run().unwrap();
+        assert_eq!(
+            app.compose_color_current().unwrap().is_some(),
+            want_colour,
+            "{view} view colour path"
+        );
+    }
+}
+
+#[test]
+fn home_grows_a_data_band_only_once_there_is_something_to_show() {
+    // A fresh device must not display a band of zeroes, so the band is
+    // absent until something has actually been read.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
+
+    let mut fresh = app(&lib, FakeGateway::default(), vec![]);
+    fresh.run().unwrap();
+    assert!(
+        fresh.compose_color_current().unwrap().is_none(),
+        "no reading yet: Home should stay on the plain grayscale menu"
+    );
+
+    write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
+    let mut read = app(&lib, FakeGateway::default(), vec![]);
+    read.run().unwrap();
+    assert!(
+        read.compose_color_current().unwrap().is_some(),
+        "with progress recorded, Home should draw the data band in colour"
+    );
+}
+
+#[test]
+#[ignore]
+fn dump_library_list_png() {
+    // Not part of CI: renders the dense Library list at real Libra Colour
+    // size, with metadata, for eyeballing.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let now = now_unix();
+    let series = [
+        (
+            "Vinland Saga",
+            8.74f32,
+            "Publishing",
+            vec!["Action", "Drama", "Historical"],
+            213u32,
+            18usize,
+            54usize,
+            2u64,
+        ),
+        (
+            "Chainsaw Man",
+            8.61,
+            "Publishing",
+            vec!["Action", "Supernatural"],
+            97,
+            9,
+            76,
+            4,
+        ),
+        (
+            "Frieren",
+            9.02,
+            "Publishing",
+            vec!["Adventure", "Fantasy"],
+            126,
+            12,
+            52,
+            6,
+        ),
+        (
+            "Blue Period",
+            8.33,
+            "Publishing",
+            vec!["Drama", "Slice of Life"],
+            74,
+            4,
+            9,
+            14,
+        ),
+        (
+            "Oyasumi Punpun",
+            9.01,
+            "Finished",
+            vec!["Drama", "Psychological"],
+            147,
+            3,
+            147,
+            30,
+        ),
+        (
+            "Dandadan",
+            8.55,
+            "Publishing",
+            vec!["Action", "Comedy", "Sci-Fi"],
+            188,
+            5,
+            31,
+            45,
+        ),
+    ];
+    let mut index = gideon_core::SeriesIndex::default();
+    let mut progress = Vec::new();
+    for (title, score, status, genres, total, downloaded, read, days) in &series {
+        for i in 0..*downloaded {
+            make_cbz(&lib.join(format!("{title}/ch{i}.cbz")), 20);
+        }
+        index.record(
+            title,
+            gideon_core::SeriesRef {
+                source_id: "s".into(),
+                source_name: "src".into(),
+                manga_id: "m".into(),
+                manga_title: (*title).into(),
+                meta: Some(gideon_core::SeriesMeta {
+                    score: Some(*score),
+                    status: Some((*status).into()),
+                    genres: genres.iter().map(|g| (*g).to_string()).collect(),
+                    rank: None,
+                    total_chapters: Some(*total),
+                }),
+                ..Default::default()
+            },
+        );
+        for i in 0..(*read).min(*downloaded) {
+            progress.push((
+                format!("{title}/ch{i}.cbz"),
+                19usize,
+                20usize,
+                now - days * 86_400,
+            ));
+        }
+    }
+    index.save(&lib).unwrap();
+    let refs: Vec<(&str, usize, usize, u64)> = progress
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        library_view: "list".into(),
+        color_profile: std::env::var("GIDEON_PROFILE").unwrap_or_else(|_| "ink-rust".into()),
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let mut app = UiApp::new(
+        MemoryDisplay::new(1264, 1680),
+        FakeInput::new(vec![]),
+        FakeGateway::default(),
+        lib.clone(),
+    )
+    .with_settings_dir(settings_dir);
+    app.open_library().unwrap();
+
+    let page = app
+        .compose_color_current()
+        .unwrap()
+        .expect("list view is colour");
+    let mut img = image::RgbImage::new(page.width, page.height);
+    for y in 0..page.height {
+        for x in 0..page.width {
+            img.put_pixel(x, y, image::Rgb(page.pixel(x, y)));
+        }
+    }
+    let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| "library.png".into());
+    img.save(&out).unwrap();
+    eprintln!("wrote {out}");
+}

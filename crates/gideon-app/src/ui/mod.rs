@@ -31,7 +31,7 @@ use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{heatmap, rotate_page, rotate_page_rgb, FitMode, GrayPage, RgbPage};
+use gideon_render::{heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
@@ -1317,6 +1317,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // half: tapping it opens the profile picker.
                         self.open_profile_menu()?;
                     }
+                } else if matches!(self.screen(), Screen::Library { .. }) {
+                    // The Library title bar toggles between the cover shelf
+                    // and the dense metadata list. Two views of one library:
+                    // art to browse by, data to decide by.
+                    self.toggle_library_view()?;
                 }
                 Ok(Flow::Continue)
             }
@@ -4382,9 +4387,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Stats)) {
             return Ok(Some(self.compose_stats()));
         }
+        if matches!(self.stack.last(), Some(Screen::Home)) {
+            let rows = HOME_ROWS.len() + usize::from(self.home_offline);
+            let mut canvas = RgbPage::from_gray(&self.compose_current()?);
+            // No band (nothing read yet, or no room) means the plain menu is
+            // all there is — fall back to the grayscale path so Home does not
+            // pay for a colour refresh it makes no use of.
+            if self.compose_home_band(&mut canvas, rows).is_none() {
+                return Ok(None);
+            }
+            return Ok(Some(canvas));
+        }
         let Some(Screen::Library { items, page }) = self.stack.last() else {
             return Ok(None);
         };
+        if self.load_settings().library_view == "list" {
+            return Ok(Some(self.compose_library_list(items, *page)));
+        }
         let l = &self.layout;
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
@@ -4476,6 +4495,223 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &palette,
         );
         canvas
+    }
+
+    /// Home's data band: the reading totals and the activity heatmap, drawn
+    /// in the space below the menu rows.
+    ///
+    /// The menu keeps every row index it has always had — the band lives
+    /// strictly *below* the last row, so taps, row geometry and the tests
+    /// that depend on them are untouched. On a 1264x1680 Libra Colour the
+    /// seven rows fill 816px of 1680, so this is otherwise dead panel.
+    ///
+    /// Returns `None` when there is nothing to say (no reading recorded yet)
+    /// or no room to say it, so a fresh device shows the plain menu rather
+    /// than a band of zeroes.
+    fn compose_home_band(&self, canvas: &mut RgbPage, first_free_row: usize) -> Option<()> {
+        let l = &self.layout;
+        let top = l.row_top(first_free_row) + l.pad;
+        let bottom = l.height.saturating_sub(l.nav_h);
+        if bottom.saturating_sub(top) < l.row_h * 2 {
+            return None;
+        }
+        let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
+        if stats.chapters_tracked == 0 {
+            return None;
+        }
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let inner = l.width.saturating_sub(l.pad * 2);
+
+        // A separator sets the band apart from the tappable rows above it, so
+        // nothing here reads as another menu entry.
+        fill_rect_rgb(canvas, l.pad, top, inner, 1, [0x55, 0x55, 0x55]);
+
+        let tiles_y = top + l.pad;
+        let tile_h = l.row_h;
+        widgets::draw_stat_tiles(
+            canvas,
+            l.pad,
+            tiles_y,
+            inner,
+            tile_h,
+            &[
+                widgets::StatTile {
+                    value: &stats.current_streak.to_string(),
+                    label: "day streak",
+                    sub: &format!("best {}", stats.longest_streak),
+                },
+                widgets::StatTile {
+                    value: &stats.chapters_finished.to_string(),
+                    label: "chapters",
+                    sub: &format!("{} series", stats.series_count),
+                },
+                widgets::StatTile {
+                    value: &stats.pages_read.to_string(),
+                    label: "pages",
+                    sub: &format!("{} days", stats.active_days),
+                },
+            ],
+            l.text_px,
+            &theme,
+        );
+
+        // Fit the heatmap to whatever is left rather than a fixed cell size,
+        // so this is right on a 1072-wide Clara as well as a Libra Colour.
+        let grid_y = tiles_y + tile_h + l.pad;
+        if bottom.saturating_sub(grid_y) < l.row_h {
+            return Some(());
+        }
+        let weeks = STATS_HEATMAP_WEEKS;
+        let layout = heatmap::HeatmapLayout::fit(l.pad, grid_y, weeks, inner, 6);
+        if grid_y + layout.height() <= bottom {
+            heatmap::draw_heatmap(
+                canvas,
+                &layout,
+                &stats.heatmap(weeks as usize),
+                &heatmap::Palette::from_setting(&self.load_settings().color_profile),
+            );
+        }
+        Some(())
+    }
+
+    /// How many dense library rows fit on a page. Each row carries a cover
+    /// thumbnail, the title, the MyAnimeList line and the progress column,
+    /// so it needs about twice a menu row.
+    fn list_row_height(&self) -> u32 {
+        self.layout.row_h * 2
+    }
+
+    fn list_rows_per_page(&self) -> usize {
+        ((self.layout.content_height() / self.list_row_height()).max(1)) as usize
+    }
+
+    /// The Library as a dense list: one row per series carrying everything
+    /// the device knows about it — score, publication status, genres, how
+    /// much is downloaded, how far in you are and what is next.
+    ///
+    /// This is the view the metadata exists for. The cover shelf stays the
+    /// default for people who browse by art; `library_view` picks between
+    /// them and the title bar toggles it.
+    fn compose_library_list(&self, items: &[SeriesCard], page: usize) -> RgbPage {
+        let l = &self.layout;
+        let per_page = self.list_rows_per_page();
+        let page_count = items.len().div_ceil(per_page).max(1);
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+
+        let mut canvas = RgbPage::from_gray(&compose_chrome(l, "Library", page, page_count));
+        let row_h = self.list_row_height();
+
+        self.with_progress(|app, store| {
+            for (i, card) in items
+                .iter()
+                .skip(page * per_page)
+                .take(per_page)
+                .enumerate()
+            {
+                let y = l.content_top() + i as u32 * row_h;
+                let meta = card
+                    .series
+                    .as_deref()
+                    .and_then(|dir| index.get(dir))
+                    .and_then(|r| r.meta.as_ref());
+
+                let finished = card
+                    .chapters
+                    .iter()
+                    .filter(|c| store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
+                    .count();
+                // Total prefers MyAnimeList's chapter count — what the series
+                // actually has — and falls back to what is on disk, so an
+                // un-looked-up series still reads honestly instead of
+                // claiming to be complete.
+                let total = meta
+                    .and_then(|m| m.total_chapters)
+                    .map(|t| t as usize)
+                    .unwrap_or(card.chapters.len())
+                    .max(finished);
+                let downloaded = card.chapters.len();
+                let genres = meta.map(|m| m.genres.join(" · ")).unwrap_or_default();
+                let when = card.latest_read_at(store);
+
+                let row = widgets::LibraryRow {
+                    title: &card.title(),
+                    score: meta.and_then(|m| m.score),
+                    status: meta.and_then(|m| m.status.as_deref()),
+                    genres: &genres,
+                    downloads: &format!("{downloaded} downloaded"),
+                    when: &app.ago(when),
+                    read: &format!("{finished} / {total}"),
+                    pct: if total == 0 {
+                        0.0
+                    } else {
+                        finished as f32 / total as f32
+                    },
+                    // Three distinct states, which an Option chain quietly
+                    // collapsed into one: nothing read yet, a next chapter
+                    // waiting on disk, and read as far as what is downloaded.
+                    // The last is the common case mid-series and must not
+                    // read as "start reading".
+                    next: &match card.furthest_read(store) {
+                        None => "start reading".to_string(),
+                        Some(current) => match card.next_after(current) {
+                            Some(next) => {
+                                format!("next: {}", entry_title(&next.relative_path))
+                            }
+                            None if finished >= total => "finished".to_string(),
+                            None => "caught up".to_string(),
+                        },
+                    },
+                    finished: finished > 0 && finished >= total,
+                };
+                widgets::draw_library_row(
+                    &mut canvas,
+                    0,
+                    y,
+                    l.width,
+                    row_h,
+                    &row,
+                    l.text_px,
+                    &theme,
+                );
+            }
+        });
+        canvas
+    }
+
+    /// "3 days ago" for a unix timestamp, or an empty string when nothing
+    /// has been read — the row then simply omits the age rather than
+    /// claiming the epoch.
+    fn ago(&self, at: u64) -> String {
+        if at == 0 {
+            return String::new();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(at);
+        let secs = now.saturating_sub(at);
+        match secs {
+            s if s < 3600 => "just now".to_string(),
+            s if s < 86_400 => format!("{}h ago", s / 3600),
+            s if s < 2_592_000 => format!("{}d ago", s / 86_400),
+            s => format!("{}mo ago", s / 2_592_000),
+        }
+    }
+
+    /// Swap the Library between the cover shelf and the dense metadata list,
+    /// persisting the choice so it survives a restart.
+    fn toggle_library_view(&mut self) -> Result<()> {
+        let mut settings = self.load_settings();
+        settings.library_view = if settings.library_view == "list" {
+            "shelf".to_string()
+        } else {
+            "list".to_string()
+        };
+        self.save_settings(&settings);
+        // Full refresh: the whole content area is being replaced, and a
+        // partial would leave the previous view ghosting under the new one.
+        self.render_current(RefreshMode::Full)
     }
 
     fn compose_current(&self) -> Result<GrayPage> {
@@ -6275,6 +6511,23 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
 /// Overlay a full-size grayscale layer onto an RGB canvas, keeping only its
 /// ink: white stays transparent so text can be drawn over colour without
 /// punching a white box through it.
+/// Fill a rectangle on an RGB canvas, clipped to it. Anything outside is
+/// dropped rather than wrapping onto the next row.
+fn fill_rect_rgb(dst: &mut RgbPage, x: u32, y: u32, w: u32, h: u32, color: [u8; 3]) {
+    if x >= dst.width || y >= dst.height {
+        return;
+    }
+    let w = w.min(dst.width - x);
+    let h = h.min(dst.height - y);
+    for row in 0..h {
+        let start = (((y + row) * dst.width + x) * 3) as usize;
+        for col in 0..w {
+            let idx = start + (col * 3) as usize;
+            dst.pixels[idx..idx + 3].copy_from_slice(&color);
+        }
+    }
+}
+
 fn copy_gray_into_rgb(dst: &mut RgbPage, src: &GrayPage) {
     for y in 0..src.height.min(dst.height) {
         for x in 0..src.width.min(dst.width) {
@@ -6701,6 +6954,14 @@ fn record_chapter_in_index(
     if let Err(e) = index.save(library_dir) {
         eprintln!("gideon: couldn't save the series index: {e}");
     }
+    // Drop the index guard before the metadata lookup: it reloads and saves
+    // the index itself, and it may touch the network. Holding the lock across
+    // a request would stall every other download's bookkeeping behind it.
+    drop(_g);
+    // Best-effort, and deliberately after the chapter is safely on disk: this
+    // can't fail the download, and it no-ops when offline, when the series
+    // already has metadata, or when MyAnimeList has never heard of it.
+    crate::manga::cache_series_metadata(library_dir, &dir);
 }
 
 /// Card name for a library entry: "Series — Chapter" when it lives in a

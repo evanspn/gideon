@@ -10,6 +10,7 @@ pub mod heatmap;
 pub mod panels;
 pub mod shelf;
 pub mod text;
+pub mod widgets;
 
 use image::imageops::FilterType;
 use image::DynamicImage;
