@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 
 /// Where a series came from, and which of its chapters are on disk.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `SeriesMeta::score` is a float (MAL means are quoted to two
+/// decimals), so only `PartialEq` is meaningful.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeriesRef {
     pub source_id: String,
     pub source_name: String,
@@ -26,6 +29,154 @@ pub struct SeriesRef {
     /// Downloaded chapters: chapter id → CBZ file name in the series dir.
     #[serde(default)]
     pub downloaded: BTreeMap<String, String>,
+    /// MyAnimeList metadata, if it has ever been fetched for this series.
+    ///
+    /// `#[serde(default)]` is the load-bearing part: every `.gideon/
+    /// series.json` already on a device predates this field, and those files
+    /// must keep loading with every other field intact. `skip_serializing_if`
+    /// is the other half — a series with no metadata is written exactly as it
+    /// was before, so upgrading gideon doesn't rewrite the whole index with
+    /// `"meta": null` noise.
+    ///
+    /// Parsed leniently (`lenient_meta`): metadata is a nicety fetched from a
+    /// third-party API, so a half-written or wrong-shaped `meta` object
+    /// degrades to `None`/absent fields rather than failing the load and
+    /// costing the user their download history.
+    #[serde(default, deserialize_with = "lenient_meta")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<SeriesMeta>,
+}
+
+/// MyAnimeList metadata about a series, cached on the device.
+///
+/// Every field is optional because MAL itself leaves them out: an
+/// unpublished series has no `score` or `rank`, an ongoing one has no final
+/// chapter count, and obscure entries can have no genres at all. Treating
+/// "absent" as normal (rather than as an error, or as a sentinel like 0)
+/// keeps the UI honest — it can show a dash instead of inventing a rating.
+///
+/// Fields are parsed leniently for the same reason the rest of gideon's
+/// persistence is: this file lives on a device that can lose power mid-write,
+/// and a single wrong-typed value must never cost the user the series index.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeriesMeta {
+    /// MAL mean score, e.g. 8.74. Parsed leniently — a non-finite or
+    /// non-numeric value becomes `None` (JSON cannot represent NaN/Infinity,
+    /// so storing one would silently round-trip to `null` anyway).
+    #[serde(default, deserialize_with = "lenient_score")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+
+    /// Publication status as MAL words it, e.g. "Publishing", "Finished".
+    /// Kept as a free-form string rather than an enum: MAL has added status
+    /// values before, and an unknown one should display as-is instead of
+    /// being flattened into "unknown". Parsed leniently — anything that
+    /// isn't a non-empty string becomes `None`.
+    #[serde(default, deserialize_with = "lenient_status")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+
+    /// Genre names, in MAL's order. Parsed leniently — non-string and blank
+    /// entries are dropped, and a wrong-typed list becomes empty.
+    #[serde(default, deserialize_with = "lenient_genres")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+
+    /// MAL popularity/score rank (1 = highest). Parsed leniently — anything
+    /// that isn't a whole number fitting in `u32` becomes `None`.
+    #[serde(default, deserialize_with = "lenient_count")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
+
+    /// Total chapters the series will have, when known. Ongoing series
+    /// report 0 on MAL for "not finished yet"; that is stored as `None` so
+    /// the UI never renders "chapter 5 of 0". Parsed leniently.
+    #[serde(default, deserialize_with = "lenient_count")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_chapters: Option<u32>,
+}
+
+impl SeriesMeta {
+    /// Whether nothing at all is known. Callers use this to avoid attaching
+    /// an all-empty `meta` to a series just because a lookup was attempted.
+    pub fn is_empty(&self) -> bool {
+        self.score.is_none()
+            && self.status.is_none()
+            && self.genres.is_empty()
+            && self.rank.is_none()
+            && self.total_chapters.is_none()
+    }
+}
+
+/// Lenient `meta` parsing: any JSON value is accepted, and only an object
+/// that actually parses becomes `Some`. A `null`, a leftover string, or a
+/// truncated object means "no metadata yet", never a failed load.
+fn lenient_meta<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<SeriesMeta>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<SeriesMeta>(value)
+        .ok()
+        .filter(|meta| !meta.is_empty()))
+}
+
+/// Lenient `score` parsing: a finite number (or a numeric string, which is
+/// how some MAL mirrors quote it) passes through; anything else is `None`.
+fn lenient_score<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<f32>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let number = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
+    Ok(number.map(|n| n as f32).filter(|n| n.is_finite()))
+}
+
+/// Lenient `status` parsing: a non-empty string passes through (trimmed);
+/// anything else means `None`.
+fn lenient_status<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string))
+}
+
+/// Lenient `genres` parsing: non-string and blank entries are dropped, and a
+/// wrong-typed value (or `null`) yields an empty list.
+fn lenient_genres<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Lenient count parsing for `rank` / `total_chapters`: a whole number that
+/// fits in `u32` passes through, and 0 is treated as "unknown" (MAL reports
+/// 0 for an ongoing series' chapter count and for unranked entries).
+/// Anything else — a float, a negative, a string, `null` — is `None`.
+fn lenient_count<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+        .map(|n| n as u32))
 }
 
 /// Map from series directory name (under the library root) to its origin.
@@ -50,13 +201,18 @@ impl SeriesIndex {
     }
 
     /// Record (or refresh) a series' origin, keeping any download history
-    /// already known for it.
+    /// already known for it — and likewise any MyAnimeList metadata, which
+    /// the download path doesn't carry: re-recording an origin after every
+    /// chapter download must not silently throw the cached metadata away.
+    /// An origin that *does* carry metadata wins, so a refresh can update it.
     pub fn record(&mut self, series_dir: &str, origin: SeriesRef) {
         match self.series.get_mut(series_dir) {
             Some(existing) => {
                 let downloaded = std::mem::take(&mut existing.downloaded);
+                let meta = origin.meta.clone().or_else(|| existing.meta.take());
                 *existing = SeriesRef {
                     downloaded,
+                    meta,
                     ..origin
                 };
             }
@@ -168,6 +324,154 @@ mod tests {
         );
         index.remove("Manga One");
         assert!(index.get("Manga One").is_none());
+    }
+
+    fn meta() -> SeriesMeta {
+        SeriesMeta {
+            score: Some(8.74),
+            status: Some("Publishing".into()),
+            genres: vec!["Action".into(), "Drama".into()],
+            rank: Some(42),
+            total_chapters: Some(120),
+        }
+    }
+
+    #[test]
+    fn metadata_round_trips_through_the_library_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = SeriesIndex::load(dir.path());
+        index.record(
+            "Manga One",
+            SeriesRef {
+                meta: Some(meta()),
+                ..origin()
+            },
+        );
+        index.save(dir.path()).unwrap();
+
+        let reloaded = SeriesIndex::load(dir.path());
+        assert_eq!(reloaded.get("Manga One").unwrap().meta, Some(meta()));
+    }
+
+    #[test]
+    fn an_old_file_without_metadata_still_loads() {
+        // Byte-for-byte the shape written by gideon builds that predate
+        // SeriesMeta. Every other field must survive, and meta is simply
+        // absent — this is the compatibility guarantee for devices in the
+        // field.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gideon")).unwrap();
+        std::fs::write(
+            dir.path().join(".gideon/series.json"),
+            r#"{
+              "series": {
+                "Manga One": {
+                  "source_id": "multi.mangadex",
+                  "source_name": "MangaDex",
+                  "manga_id": "m1",
+                  "manga_title": "Manga One",
+                  "cover_url": "https://example.invalid/c.jpg",
+                  "downloaded": { "c1": "Chapter 1.cbz" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let index = SeriesIndex::load(dir.path());
+        let series = index.get("Manga One").expect("old entry must still load");
+        assert_eq!(series.manga_title, "Manga One");
+        assert_eq!(
+            series.cover_url.as_deref(),
+            Some("https://example.invalid/c.jpg")
+        );
+        assert_eq!(series.downloaded.get("c1"), Some(&"Chapter 1.cbz".into()));
+        assert_eq!(series.meta, None);
+
+        // And re-saving such a series doesn't grow a "meta" key.
+        index.save(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join(".gideon/series.json")).unwrap();
+        assert!(!raw.contains("meta"), "{raw}");
+    }
+
+    #[test]
+    fn partial_metadata_survives_and_junk_degrades_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gideon")).unwrap();
+        std::fs::write(
+            dir.path().join(".gideon/series.json"),
+            r#"{
+              "series": {
+                "Partial": {
+                  "source_id": "s", "source_name": "S",
+                  "manga_id": "m", "manga_title": "Partial",
+                  "meta": { "score": 7.5, "genres": ["Comedy"] }
+                },
+                "Junk": {
+                  "source_id": "s", "source_name": "S",
+                  "manga_id": "m2", "manga_title": "Junk",
+                  "meta": {
+                    "score": "not a number",
+                    "status": "",
+                    "genres": "Action",
+                    "rank": -3,
+                    "total_chapters": 0
+                  }
+                },
+                "NotAnObject": {
+                  "source_id": "s", "source_name": "S",
+                  "manga_id": "m3", "manga_title": "NotAnObject",
+                  "meta": "???"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let index = SeriesIndex::load(dir.path());
+        let partial = index.get("Partial").unwrap().meta.clone().unwrap();
+        assert_eq!(partial.score, Some(7.5));
+        assert_eq!(partial.genres, vec!["Comedy".to_string()]);
+        assert_eq!(partial.status, None);
+        assert_eq!(partial.rank, None);
+        assert_eq!(partial.total_chapters, None);
+
+        // Every field junk (0/negative counts included) collapses to an
+        // empty struct, which is stored as "no metadata" rather than an
+        // empty object.
+        assert_eq!(index.get("Junk").unwrap().meta, None);
+        assert_eq!(index.get("NotAnObject").unwrap().meta, None);
+    }
+
+    #[test]
+    fn re_recording_keeps_metadata_unless_the_new_origin_has_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = SeriesIndex::load(dir.path());
+        index.record(
+            "Manga One",
+            SeriesRef {
+                meta: Some(meta()),
+                ..origin()
+            },
+        );
+
+        // The download path re-records without metadata: keep the cache.
+        index.record("Manga One", origin());
+        assert_eq!(index.get("Manga One").unwrap().meta, Some(meta()));
+
+        // A refresh that carries metadata replaces it.
+        let refreshed = SeriesMeta {
+            score: Some(9.0),
+            ..SeriesMeta::default()
+        };
+        index.record(
+            "Manga One",
+            SeriesRef {
+                meta: Some(refreshed.clone()),
+                ..origin()
+            },
+        );
+        assert_eq!(index.get("Manga One").unwrap().meta, Some(refreshed));
     }
 
     #[test]
