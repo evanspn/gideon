@@ -211,8 +211,9 @@ fn layout() -> UiLayout {
     UiLayout::new(W, H)
 }
 
-/// A tap on Today's four-zone nav bar: 0 Today, 1 Library, 2 Discover,
-/// 3 Settings. Mirrors the zone maths in `tap_today_nav`.
+/// A tap on the four-zone nav bar the top-level destinations carry:
+/// 0 Library, 1 Today, 2 Discover, 3 Settings. Mirrors the zone maths in
+/// `tap_main_nav`.
 fn tap_nav(zone: u32) -> UiEvent {
     let l = layout();
     UiEvent::Tap {
@@ -221,11 +222,18 @@ fn tap_nav(zone: u32) -> UiEvent {
     }
 }
 
-/// Today is the landing screen now, so a test that wants the old Home menu
-/// (sources, search, popular, updates) opens Discover first. Every row index
-/// below that is unchanged, which is what keeps this a one-line migration.
+/// The library is the landing screen now, so a test that wants the old Home
+/// menu (sources, search, popular, updates) opens Discover first. Every row
+/// index below that is unchanged, which is what keeps this a one-line
+/// migration.
 fn nav_discover() -> UiEvent {
     tap_nav(2)
+}
+
+/// Today: the destination that carries the device's status chrome — battery
+/// in the title, and the power / bell / Bluetooth icons beside it.
+fn tap_today() -> UiEvent {
+    tap_nav(1)
 }
 
 fn tap_row(i: usize) -> UiEvent {
@@ -388,15 +396,18 @@ fn make_tall_cbz(path: &Path, pages: usize) {
 // --- tests ---
 
 #[test]
-fn home_renders_rows_and_is_not_blank() {
+fn the_landing_screen_is_the_library_and_is_not_blank() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
+    // Exactly one paint, and a full one: e-ink flashes on every full
+    // refresh, so a launch that painted the landing twice would flash twice
+    // before the reader saw anything.
     assert_eq!(app.display().flushes, vec![RefreshMode::Full]);
     assert!(
         app.display().buffer.iter().any(|&p| p < 0x80),
-        "home screen is blank"
+        "landing screen is blank"
     );
 }
 
@@ -409,6 +420,7 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
     // Offline (forced): content row 0 is the reconnect button — tapping it
     // attempts a reconnect and stays on Home (off-device that's a no-op).
     let mut a = app(&lib, FakeGateway::default(), vec![]);
+    a.goto_root(Screen::Home).unwrap();
     a.home_offline = true;
     a.activate(0, 10, 10).unwrap();
     assert!(
@@ -419,6 +431,7 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
     // Offline: the standard entries are offset past the reconnect row, so the
     // first real entry (Library) is row 1.
     let mut b = app(&lib, FakeGateway::default(), vec![]);
+    b.goto_root(Screen::Home).unwrap();
     b.home_offline = true;
     b.activate(1, 10, 10).unwrap();
     assert!(
@@ -428,6 +441,10 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
 
     // Online (the default): no reconnect row, so Library is row 0.
     let mut c = app(&lib, FakeGateway::default(), vec![]);
+    c.goto_root(Screen::Home).unwrap();
+    // Painting Home probes connectivity; pin the online case so the row
+    // offset under test is the one being asserted and not the probe's mood.
+    c.home_offline = false;
     c.activate(0, 10, 10).unwrap();
     assert!(
         matches!(c.screen(), Screen::Library { .. }),
@@ -600,9 +617,12 @@ fn menu_taps_land_the_right_row_at_each_rotation() {
         let lib = dir.path().join("Manga");
         make_cbz(&lib.join("Sample/vol1.cbz"), 2);
 
-        // Row 0 opens the Library…
+        // Row 0 of the Discover menu opens the Library… (the row indices
+        // are Discover's, so each app starts there rather than on the
+        // library the device lands on.)
         let mut library_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(0, rot)])
             .with_reader_settings(FitMode::Contain, rot);
+        library_app.goto_root(Screen::Home).unwrap();
         library_app.run().unwrap();
         assert!(
             matches!(library_app.screen(), Screen::Library { .. }),
@@ -613,6 +633,7 @@ fn menu_taps_land_the_right_row_at_each_rotation() {
         // something".
         let mut settings_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(3, rot)])
             .with_reader_settings(FitMode::Contain, rot);
+        settings_app.goto_root(Screen::Home).unwrap();
         settings_app.run().unwrap();
         assert!(
             matches!(settings_app.screen(), Screen::Settings),
@@ -2055,10 +2076,12 @@ fn tap_power_icon() -> UiEvent {
 #[test]
 fn power_icon_opens_the_menu_and_back_returns() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![tap_power_icon(), tap_back()];
+    // Today carries the status chrome (battery, power, bell), so that is
+    // where the power symbol is tapped from.
+    let events = vec![tap_today(), tap_power_icon(), tap_back()];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     assert_eq!(app.run().unwrap(), Exit::Close); // input exhausted
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 #[test]
@@ -3370,13 +3393,13 @@ fn wifi_list_tap_secured_network_asks_for_password() {
 fn wifi_list_toggle_off_returns_to_previous_screen() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(dir.path(), FakeGateway::default(), vec![]);
-    // [Home, WifiList]; rows: Wi-Fi toggle(0), net(1), "Scan again"(2).
+    // [Library, WifiList]; rows: Wi-Fi toggle(0), net(1), "Scan again"(2).
     app.stack.push(Screen::WifiList {
         networks: vec![wifi_net("X", true, false)],
     });
     app.activate(0, 10, 10).unwrap();
     assert!(
-        matches!(app.screen(), Screen::Home),
+        matches!(app.screen(), Screen::Library { .. }),
         "flipping the Wi-Fi toggle off pops back to the previous screen"
     );
 }
@@ -3393,8 +3416,8 @@ fn wifi_toggle_off_closes_the_whole_menu_from_the_power_menu() {
     });
     app.activate(0, 10, 10).unwrap();
     assert!(
-        matches!(app.screen(), Screen::Home),
-        "the Wi-Fi toggle closes the entire menu stack back to Home"
+        matches!(app.screen(), Screen::Library { .. }),
+        "the Wi-Fi toggle closes the entire menu stack back to the library"
     );
 }
 
@@ -3405,15 +3428,15 @@ fn title_taps_off_the_power_icon_are_ignored() {
     // 2 × title_h): a dead-zone tap must do nothing.
     let l = layout();
     let x = (l.width / 2 + l.width.saturating_sub(l.title_h * 2)) / 2;
-    let events = vec![UiEvent::Tap { x, y: 5 }];
+    let events = vec![tap_today(), UiEvent::Tap { x, y: 5 }];
     let mut app = app(dir.path(), FakeGateway::default(), events);
     app.run().unwrap();
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Stats));
 }
 
 // --- profiles ---
 
-/// Tap the left half of the title bar (the profile name on Home).
+/// Tap the left half of the title bar (the profile name).
 fn tap_title_left() -> UiEvent {
     let l = layout();
     UiEvent::Tap {
@@ -3437,7 +3460,7 @@ fn profile_settings_dir(dir: &Path, profiles: &[&str]) -> PathBuf {
 fn title_left_tap_opens_the_profile_menu() {
     let dir = tempfile::tempdir().unwrap();
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
-    let events = vec![tap_title_left()];
+    let events = vec![nav_discover(), tap_title_left()];
     let mut app = app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
@@ -3558,6 +3581,7 @@ fn new_profile_keyboard_creates_and_switches() {
     let settings_dir = profile_settings_dir(dir.path(), &["default"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(), // profile menu: [default, New profile…]
         tap_row(1),       // New profile…
         tap_key(Key::Char('b')),
@@ -3597,7 +3621,7 @@ fn a_profile_with_a_library_is_listed_even_when_settings_forgot_it() {
     std::fs::create_dir_all(&settings_dir).unwrap();
     std::fs::write(settings_dir.join("settings.json"), "{ truncated").unwrap();
 
-    let events = vec![tap_title_left()];
+    let events = vec![nav_discover(), tap_title_left()];
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir);
     app.run().unwrap();
 
@@ -3684,6 +3708,7 @@ fn naming_the_default_profile_converts_it_into_an_ordinary_one() {
     let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
 
     let events = vec![
+        nav_discover(),
         tap_title_left(), // [default, alex, New profile…, Name the default…]
         tap_row(3),       // Name the default profile…
         tap_key(Key::Char('m')),
@@ -6309,7 +6334,7 @@ fn sleep_event_suspends_and_repaints_in_full() {
         app.display().flushes,
         vec![RefreshMode::Full, RefreshMode::Full, RefreshMode::Full]
     );
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     assert_eq!(
         app.input().refreshes,
         1,
@@ -6344,7 +6369,7 @@ fn skipped_suspend_explains_itself_and_stays_awake() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1);
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     // Initial paint, "Sleeping…", the "staying awake" notice, the restore.
     assert_eq!(app.display().flushes.len(), 4);
     assert!(app
@@ -6380,7 +6405,7 @@ fn charging_sleep_finishes_once_unplugged() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 2, "the refused suspend must be retried");
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
 }
 
 #[test]
@@ -6402,7 +6427,7 @@ fn charging_wait_aborts_when_the_user_is_using_the_device() {
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "a tap must abort the wait, not re-suspend");
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
 }
 
 #[test]
@@ -6637,7 +6662,7 @@ fn home_title_includes_battery_percent_when_known() {
 }
 
 #[test]
-fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
+fn today_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
     let dir = tempfile::tempdir().unwrap();
     let l = layout();
     // The box just left of the power icon where draw_bluetooth_icon paints,
@@ -6665,7 +6690,7 @@ fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
             FakeGateway::default(),
             dir.path().to_path_buf(),
         );
-        app.render_once().unwrap();
+        app.goto_root(Screen::Stats).unwrap();
         ink(&app.display().buffer)
     };
 
@@ -6677,7 +6702,7 @@ fn home_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
 }
 
 /// Prime the local "send to Kobo" cache the sync sweep would normally write, so
-/// Home tests can exercise the bell/list without a network round-trip.
+/// the bell/list can be exercised without a network round-trip.
 fn seed_sends(library_dir: &Path, items: &[(&str, &str)]) {
     let sends: Vec<gideon_sync::supabase::SendItem> = items
         .iter()
@@ -6692,7 +6717,7 @@ fn seed_sends(library_dir: &Path, items: &[(&str, &str)]) {
 }
 
 #[test]
-fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
+fn today_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
     let l = layout();
     // Slot 1 sits one title-bar height left of the power symbol — where the
     // bell paints — minus the always-drawn title separator row.
@@ -6718,7 +6743,7 @@ fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
             seed_sends(dir.path(), &[("s1", "Berserk")]);
         }
         let mut app = app(dir.path(), FakeGateway::default(), vec![]);
-        app.render_once().unwrap();
+        app.goto_root(Screen::Stats).unwrap();
         ink(&app.display().buffer)
     };
 
@@ -6727,7 +6752,7 @@ fn home_shows_a_notification_bell_only_when_the_web_has_queued_sends() {
 }
 
 #[test]
-fn tapping_the_home_bell_opens_the_sent_list() {
+fn tapping_the_bell_opens_the_sent_list() {
     let dir = tempfile::tempdir().unwrap();
     seed_sends(dir.path(), &[("s1", "Berserk")]);
     let l = layout();
@@ -6737,7 +6762,7 @@ fn tapping_the_home_bell_opens_the_sent_list() {
         x: l.width - l.title_h - l.title_h / 2,
         y: 1,
     };
-    let mut app = app(dir.path(), FakeGateway::default(), vec![bell]);
+    let mut app = app(dir.path(), FakeGateway::default(), vec![tap_today(), bell]);
     app.run().unwrap();
     assert!(
         matches!(app.screen(), Screen::SentList { items } if items.len() == 1),
@@ -6766,8 +6791,8 @@ fn opening_a_sent_item_searches_for_it_and_clears_the_badge() {
         x: l.width - l.title_h - l.title_h / 2,
         y: 1,
     };
-    let mut app =
-        app(dir.path(), gateway, vec![bell, tap_row(0)]).with_online_probe(Box::new(|| true));
+    let mut app = app(dir.path(), gateway, vec![tap_today(), bell, tap_row(0)])
+        .with_online_probe(Box::new(|| true));
     app.run().unwrap();
 
     let Screen::SearchResults { query, results, .. } = app.screen() else {
@@ -6782,28 +6807,32 @@ fn opening_a_sent_item_searches_for_it_and_clears_the_badge() {
 }
 
 #[test]
-fn battery_probe_feeds_home_and_sleep_without_breaking_either() {
+fn battery_probe_feeds_today_and_sleep_without_breaking_either() {
     let dir = tempfile::tempdir().unwrap();
     let (count, sleeper) = counting_sleeper();
     let reads = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let probe = reads.clone();
-    let mut app = app(dir.path(), FakeGateway::default(), vec![UiEvent::Sleep])
-        .with_sleeper(sleeper)
-        .with_battery(Box::new(move || {
-            probe.set(probe.get() + 1);
-            Some(47)
-        }));
+    let mut app = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![tap_today(), UiEvent::Sleep],
+    )
+    .with_sleeper(sleeper)
+    .with_battery(Box::new(move || {
+        probe.set(probe.get() + 1);
+        Some(47)
+    }));
     app.run().unwrap();
 
     assert_eq!(count.get(), 1, "sleep still suspends with a battery probe");
     assert!(
         reads.get() >= 2,
-        "both the Home title and the sleep notice must read the battery"
+        "both the Today title and the sleep notice must read the battery"
     );
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Stats));
     assert!(
         app.display().buffer.iter().any(|&p| p < 0x80),
-        "home screen is blank"
+        "today screen is blank"
     );
 }
 
@@ -7244,7 +7273,7 @@ fn home_grows_a_data_band_only_once_there_is_something_to_show() {
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
 
-    let mut fresh = app(&lib, FakeGateway::default(), vec![]);
+    let mut fresh = app(&lib, FakeGateway::default(), vec![nav_discover()]);
     fresh.run().unwrap();
     assert!(
         fresh.compose_color_current().unwrap().is_none(),
@@ -7252,7 +7281,7 @@ fn home_grows_a_data_band_only_once_there_is_something_to_show() {
     );
 
     write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
-    let mut read = app(&lib, FakeGateway::default(), vec![]);
+    let mut read = app(&lib, FakeGateway::default(), vec![nav_discover()]);
     read.run().unwrap();
     assert!(
         read.compose_color_current().unwrap().is_some(),
@@ -7722,4 +7751,60 @@ fn dump_demo() {
     let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| format!("{screen}.png"));
     img.save(&out).unwrap();
     eprintln!("wrote {out}");
+}
+
+#[test]
+fn quick_settings_opens_and_cycles_without_flashing() {
+    // The panel has a non-flashing partial waveform (GLR16, GLRC16 for
+    // colour). Sliding a sheet up changes only the strip it covers, and
+    // cycling a value changes one line — flashing the whole screen for
+    // either is what makes an e-ink UI feel cheap. Closing DOES flash,
+    // because it restores a region the panel has been holding stale.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+    let before = app.display().flushes.len();
+
+    app.open_quick_settings().unwrap();
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "opening the sheet must not flash"
+    );
+
+    // Cycle the colour profile from inside the sheet.
+    let l = layout();
+    let (top, h) = app.sheet_bounds().expect("a sheet is open");
+    let rows = app.sheet_rows().1.len() as u32;
+    let row_h = l.row_h;
+    let title_h = h.saturating_sub(row_h * rows);
+    let at = |i: u32| (l.width / 2, top + title_h + i * row_h + row_h / 2);
+    let (x, y) = at(2);
+    app.tap_sheet(x, y).unwrap();
+    assert_eq!(
+        app.display().flushes.last(),
+        Some(&RefreshMode::Partial),
+        "cycling a value repaints one line; it must not flash"
+    );
+    assert_eq!(
+        effective_settings(&settings_dir, &lib).color_profile,
+        "indigo",
+        "the tap should have advanced the colour profile"
+    );
+
+    // A tap above the sheet dismisses it, and that one flashes.
+    app.tap_sheet(l.width / 2, top.saturating_sub(10)).unwrap();
+    assert!(app.sheet_bounds().is_none(), "tapping outside dismisses");
+    assert_eq!(
+        app.display().flushes.last(),
+        Some(&RefreshMode::Full),
+        "closing restores what the sheet covered, so it flashes"
+    );
 }

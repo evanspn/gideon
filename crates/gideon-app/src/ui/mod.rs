@@ -1007,9 +1007,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // are one nav tap away.
         if matches!(self.stack.last(), Some(Screen::Library { items, .. }) if items.is_empty()) {
             self.stack.pop();
+            // `open_library` scans and paints; painting again here would
+            // cost the user a second full-screen flash on every launch.
             self.open_library()?;
+        } else {
+            self.render_current(RefreshMode::Full)?;
         }
-        self.render_current(RefreshMode::Full)?;
         loop {
             // With a suspend hook installed, wait in ticks instead of
             // blocking forever, and auto-suspend after 15 idle minutes —
@@ -1300,6 +1303,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     // --- input handling ---
 
     fn handle_tap(&mut self, x: u32, y: u32) -> Result<Flow> {
+        // A top-level destination draws the four-item nav bar in the bottom
+        // strip, so nothing else may claim that strip: it is routed here
+        // first, ahead of Back and the pagination buttons. Hit-testing it
+        // last left an invisible Prev/Next lying over the nav bar of any
+        // root list long enough to paginate — and then the tabs stopped
+        // responding as soon as the library outgrew one page.
+        if self.sheet.is_none() && self.screen_has_nav() && y >= self.layout.nav_top() {
+            return self.tap_main_nav(x);
+        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -1319,11 +1331,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.move_page(PageMove::Last)?;
                 Ok(Flow::Continue)
             }
-            // Today draws a four-item nav bar where other screens draw Back,
-            // so its bottom strip is routed here instead of falling through
-            // to the generic targets.
             _ if self.sheet.is_some() => self.tap_sheet(x, y),
-            _ if self.screen_has_nav() && y >= self.layout.nav_top() => self.tap_main_nav(x),
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
@@ -1705,7 +1713,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // "All settings" row.
             3 => {
                 self.sheet = Some(Sheet::QuickSettings);
-                self.render_current(RefreshMode::Full)?;
+                self.render_current(RefreshMode::Partial)?;
             }
             _ => {}
         }
@@ -1807,7 +1815,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Open the quick-settings sheet over the current screen.
     fn open_quick_settings(&mut self) -> Result<()> {
         self.sheet = Some(Sheet::QuickSettings);
-        self.render_current(RefreshMode::Full)
+        // Partial: the sheet only changes the strip it covers, and the panel
+        // has a non-flashing partial waveform for exactly this (GLR16, or
+        // GLRC16 when the frame carries colour). Flashing the whole screen to
+        // slide a panel up is the thing that makes e-ink UIs feel cheap.
+        self.render_current(RefreshMode::Partial)
     }
 
     /// Route a tap while a sheet is open. A tap outside it dismisses, which is
@@ -1869,9 +1881,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.sheet = None;
                 return self.goto_root(Screen::Settings).map(|_| Flow::Continue);
             }
-            _ => self.sheet = None,
+            // Closing restores whatever the sheet was covering, so it earns a
+            // flash: a partial would leave the panel to reconstruct a region
+            // it has been holding stale, which is where REAGL residue shows.
+            _ => {
+                self.sheet = None;
+                return self
+                    .render_current(RefreshMode::Full)
+                    .map(|_| Flow::Continue);
+            }
         }
-        self.render_current(RefreshMode::Full)?;
+        // A value cycle repaints one line. Partial, and no flash.
+        self.render_current(RefreshMode::Partial)?;
         Ok(Flow::Continue)
     }
 
