@@ -15,6 +15,18 @@ use crate::Result;
 /// Default storage limit for downloaded chapters: 2 GB, same as bobo.
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// How long a finished chapter is kept before automatic cleanup removes its
+/// CBZ, in hours. Two days: long enough that "I'll flip back to check that
+/// panel" still works the next evening, short enough that a binge doesn't
+/// silt up the device.
+pub const DEFAULT_FINISHED_CLEANUP_HOURS: u32 = 48;
+
+/// The values the settings screen cycles `finished_cleanup_hours` through:
+/// never / 1 day / 2 days / 3 days / 1 week. Deliberately coarse — this
+/// setting decides when user data is deleted, and a spinner that can land on
+/// "3 hours" invites a mis-set that eats a chapter someone was still using.
+pub const FINISHED_CLEANUP_STEPS: [u32; 5] = [0, 24, 48, 72, 168];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -132,6 +144,18 @@ pub struct Settings {
     /// startup and updated from the reader's left-edge slide.
     #[serde(deserialize_with = "lenient_percent")]
     pub frontlight_warmth: u32,
+
+    /// How many hours after finishing a chapter its CBZ may be deleted
+    /// automatically. 0 means never — the cleanup pass is skipped entirely.
+    ///
+    /// This is the only setting whose value deletes user files on its own, so
+    /// it parses defensively rather than merely leniently: a wrong-typed,
+    /// negative or absurd value falls back to the default (48) instead of
+    /// being coerced into something small. A settings file that got mangled
+    /// must never turn into "clean up everything read in the last hour".
+    #[serde(default = "default_finished_cleanup_hours")]
+    #[serde(deserialize_with = "lenient_finished_cleanup_hours")]
+    pub finished_cleanup_hours: u32,
 }
 
 impl Default for Settings {
@@ -156,8 +180,32 @@ impl Default for Settings {
             idle_suspend_minutes: 15,
             frontlight_brightness: 20,
             frontlight_warmth: 0,
+            finished_cleanup_hours: default_finished_cleanup_hours(),
         }
     }
+}
+
+/// The cleanup delay a fresh install uses.
+fn default_finished_cleanup_hours() -> u32 {
+    DEFAULT_FINISHED_CLEANUP_HOURS
+}
+
+/// Lenient `finished_cleanup_hours` parsing: a whole number of hours passes
+/// through (0 = never); anything else — a float, a negative, a string, a
+/// value too large for `u32` — means the default.
+///
+/// Note what this deliberately does *not* do: it never clamps a hostile value
+/// down into range. Clamping a bogus 4 000 000 000 to "1 hour" would make a
+/// corrupt file far more destructive than an unreadable one, and the whole
+/// point of a cleanup delay is that the user gets the grace period they chose.
+fn lenient_finished_cleanup_hours<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(DEFAULT_FINISHED_CLEANUP_HOURS))
 }
 
 /// Lenient `idle_suspend_minutes` parsing: any non-negative JSON number
@@ -448,6 +496,39 @@ mod tests {
         assert!(s.wifi_auto_connect);
         assert!(!s.auto_rotate_spreads);
         assert_eq!(s.idle_suspend_minutes, 15);
+        assert_eq!(s.finished_cleanup_hours, 48);
+    }
+
+    #[test]
+    fn finished_cleanup_hours_parses_defensively() {
+        let load = |json: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(Settings::path(dir.path()), json).unwrap();
+            Settings::load(dir.path()).unwrap().finished_cleanup_hours
+        };
+        assert_eq!(load(r#"{"finished_cleanup_hours": 24}"#), 24);
+        assert_eq!(load(r#"{"finished_cleanup_hours": 168}"#), 168);
+        assert_eq!(load(r#"{"finished_cleanup_hours": 0}"#), 0, "0 = never");
+        // Junk falls back to the default — never to a *shorter* delay, which
+        // would delete more than the user ever asked for.
+        assert_eq!(load(r#"{"finished_cleanup_hours": -5}"#), 48);
+        assert_eq!(load(r#"{"finished_cleanup_hours": "two days"}"#), 48);
+        assert_eq!(load(r#"{"finished_cleanup_hours": 1.5}"#), 48);
+        assert_eq!(load(r#"{"finished_cleanup_hours": null}"#), 48);
+        assert_eq!(load(r#"{"finished_cleanup_hours": 99999999999999}"#), 48);
+        assert_eq!(load(r#"{}"#), 48, "an older settings file gets the default");
+    }
+
+    #[test]
+    fn finished_cleanup_steps_are_usable_as_a_cycle() {
+        // The UI cycles through these; they must contain the default (so the
+        // current value is always on the wheel) and start at "never".
+        assert_eq!(FINISHED_CLEANUP_STEPS[0], 0);
+        assert!(FINISHED_CLEANUP_STEPS.contains(&DEFAULT_FINISHED_CLEANUP_HOURS));
+        assert!(
+            FINISHED_CLEANUP_STEPS.windows(2).all(|w| w[0] < w[1]),
+            "steps must be strictly increasing"
+        );
     }
 
     #[test]
@@ -558,6 +639,7 @@ mod tests {
             idle_suspend_minutes: 5,
             frontlight_brightness: 65,
             frontlight_warmth: 40,
+            finished_cleanup_hours: 168,
         };
         s.save(dir.path()).unwrap();
 

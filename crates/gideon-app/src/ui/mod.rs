@@ -4631,6 +4631,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .unwrap_or(card.chapters.len())
                     .max(finished);
                 let downloaded = card.chapters.len();
+                // "18 downloaded" alone does not answer the question you
+                // actually have in front of a library — how much of what is
+                // on the device is still waiting for you. Unread is the
+                // number that decides whether to open this series or another.
+                let unread = card
+                    .chapters
+                    .iter()
+                    .filter(|c| !store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
+                    .count();
                 let genres = meta.map(|m| m.genres.join(" · ")).unwrap_or_default();
                 let when = card.latest_read_at(store);
 
@@ -4639,7 +4648,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     score: meta.and_then(|m| m.score),
                     status: meta.and_then(|m| m.status.as_deref()),
                     genres: &genres,
-                    downloads: &format!("{downloaded} downloaded"),
+                    downloads: &if unread == 0 {
+                        format!("{downloaded} downloaded · all read")
+                    } else {
+                        format!("{downloaded} downloaded · {unread} unread")
+                    },
                     when: &app.ago(when),
                     read: &format!("{finished} / {total}"),
                     pct: if total == 0 {
@@ -4655,9 +4668,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     next: &match card.furthest_read(store) {
                         None => "start reading".to_string(),
                         Some(current) => match card.next_after(current) {
-                            Some(next) => {
-                                format!("next: {}", entry_title(&next.relative_path))
-                            }
+                            // Just the chapter, not "Series — Chapter":
+                            // the row is already titled with the series, and
+                            // repeating it crowds out the part that matters.
+                            Some(next) => format!("next: {}", chapter_label(&next.relative_path)),
                             None if finished >= total => "finished".to_string(),
                             None => "caught up".to_string(),
                         },

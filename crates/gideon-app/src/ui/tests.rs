@@ -7014,7 +7014,7 @@ fn dump_library_list_png() {
                 ..Default::default()
             },
         );
-        for i in 0..(*read).min(*downloaded) {
+        for i in 0..(*read).min(downloaded.saturating_sub(*days as usize % 5)) {
             progress.push((
                 format!("{title}/ch{i}.cbz"),
                 19usize,

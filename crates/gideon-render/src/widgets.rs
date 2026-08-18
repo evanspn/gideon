@@ -883,6 +883,271 @@ pub fn draw_meta_block(
     overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
 }
 
+// --- settings: section header ---------------------------------------------
+
+/// A section heading that groups settings rows.
+///
+/// An accent block sits at the left of the label — a block, not a rule, so the
+/// Kaleido filter resolves it — and a 1px grey rule closes the band along the
+/// bottom of the rect. The label itself is bold black at every size, and it is
+/// ellipsised into whatever the rect leaves after the block rather than
+/// running past it.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_section_header(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    label: &str,
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let mut layer = clip.text_layer();
+
+    let pad = scaled(text_px, 0.3, 2);
+    let gap = scaled(text_px, 0.35, 3);
+    let mark_w = scaled(text_px, 0.22, 2);
+    // The band the label lives in: everything above the closing rule.
+    let band = h.saturating_sub(1).max(1);
+
+    // The accent block, inset from the top and bottom of the band so it reads
+    // as a marker beside the label rather than a full-height slab.
+    let mark_h = band.saturating_sub(pad.saturating_mul(2)).max(1);
+    fill_rect(
+        canvas,
+        &clip,
+        x,
+        center_y(y, band, mark_h as f32),
+        mark_w,
+        mark_h,
+        t.accent,
+    );
+
+    let lx = x.saturating_add(mark_w).saturating_add(gap);
+    let avail = x.saturating_add(w).saturating_sub(lx);
+    if avail > 0 {
+        draw_text(
+            &mut layer,
+            lx.saturating_sub(clip.x0),
+            center_y(y, band, text_px).saturating_sub(clip.y0),
+            text_px,
+            label,
+            avail,
+            true,
+        );
+    }
+
+    // The closing rule, on the rect's last row so the next row of settings
+    // starts clean underneath it.
+    fill_rect(
+        canvas,
+        &clip,
+        x,
+        y.saturating_add(h).saturating_sub(1),
+        w,
+        1,
+        RULE,
+    );
+
+    overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
+}
+
+// --- settings: one row ----------------------------------------------------
+
+/// One settings row: a label on the left, its current value on the right,
+/// and an optional explanatory second line under the label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingRow<'a> {
+    pub label: &'a str,
+    pub value: &'a str,
+    pub detail: &'a str,
+    pub selected: bool,
+}
+
+/// Draw one settings row.
+///
+/// The selected row is marked three ways — an accent block down its left
+/// edge, a bold label, and the indent that block costs the label — so it
+/// stays obvious in [`Theme::MONO`], where the block is only a grey. The
+/// value is right-aligned and is the one string here that is never sacrificed:
+/// when the two would collide it is the *label* that gets ellipsised, because
+/// the value is the information the row exists to carry. `detail` is dropped
+/// when empty, and the label then takes the whole row height.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_setting_row(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    row: &SettingRow,
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let mut layer = clip.text_layer();
+
+    let pad = scaled(text_px, 0.35, 2);
+    let gap = scaled(text_px, 0.4, 3);
+    let small = text_px * 0.62;
+    let mark_w = scaled(text_px, 0.2, 2);
+
+    if row.selected {
+        // A block down the left edge, inset from the row's own rule.
+        let mark_h = h.saturating_sub(1).max(1);
+        fill_rect(canvas, &clip, x, y, mark_w, mark_h, t.accent);
+    }
+
+    // The selected row's text is indented past its marker: position carries
+    // the selection even with every hue thrown away.
+    let x0 = if row.selected {
+        x.saturating_add(mark_w).saturating_add(gap)
+    } else {
+        x.saturating_add(pad)
+    };
+    // Exclusive right edge. A degenerate `text_px` can make the padding wider
+    // than the rect, so this may never be allowed to cross the left.
+    let right = x.saturating_add(w).saturating_sub(pad).max(x0);
+    if right <= x0 {
+        overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
+        return;
+    }
+
+    // The band the label and value share; `detail` takes what is left.
+    let has_detail = !row.detail.is_empty();
+    let band = if has_detail { (h * 3 / 5).max(1) } else { h };
+
+    // The value first: it claims its full measured width (capped only by the
+    // rect itself) and the label gets what remains.
+    let value_w = measure_text(text_px, row.value, false).min(right - x0);
+    let value_x = right.saturating_sub(value_w);
+    draw_text(
+        &mut layer,
+        value_x.saturating_sub(clip.x0),
+        center_y(y, band, text_px).saturating_sub(clip.y0),
+        text_px,
+        row.value,
+        value_w,
+        false,
+    );
+
+    let text_right = value_x.saturating_sub(gap).max(x0);
+    draw_text(
+        &mut layer,
+        x0.saturating_sub(clip.x0),
+        center_y(y, band, text_px).saturating_sub(clip.y0),
+        text_px,
+        row.label,
+        text_right - x0,
+        row.selected,
+    );
+
+    if has_detail {
+        draw_text(
+            &mut layer,
+            x0.saturating_sub(clip.x0),
+            center_y(y + band, h.saturating_sub(band), small).saturating_sub(clip.y0),
+            small,
+            row.detail,
+            text_right - x0,
+            false,
+        );
+    }
+
+    // The row's own hairline, on its last row.
+    fill_rect(
+        canvas,
+        &clip,
+        x,
+        y.saturating_add(h).saturating_sub(1),
+        w,
+        1,
+        RULE,
+    );
+
+    overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
+}
+
+// --- settings: meter ------------------------------------------------------
+
+/// A horizontal meter for a used/total quantity (storage, cleanup budget).
+///
+/// `label` sits above the track and `detail` below it, both black; the only
+/// colour is the filled run, and its *length* is what carries the reading, so
+/// the meter is as legible in [`Theme::MONO`] as anywhere else. `fraction` is
+/// clamped to 0.0..=1.0 and a non-finite value reads as empty, so a ratio
+/// derived from a bad total can never paint past the track.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_meter(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    fraction: f32,
+    label: &str,
+    detail: &str,
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let mut layer = clip.text_layer();
+
+    let pad = scaled(text_px, 0.35, 2);
+    let small = text_px * 0.62;
+    let x0 = x.saturating_add(pad);
+    let avail = w.saturating_sub(pad.saturating_mul(2));
+    if avail == 0 {
+        overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
+        return;
+    }
+
+    let line_h = scaled(text_px, 1.25, 1);
+    let bar_h = scaled(text_px, 0.3, 3);
+    let gap = scaled(text_px, 0.25, 1);
+
+    // The label, on its own line above the track.
+    draw_text(
+        &mut layer,
+        x0.saturating_sub(clip.x0),
+        y.saturating_sub(clip.y0),
+        text_px,
+        label,
+        avail,
+        true,
+    );
+
+    // The track, and the run that reads. `draw_progress` does the clamping
+    // and clips to the same rect as everything else.
+    let bar_y = y.saturating_add(line_h).saturating_add(gap);
+    draw_progress(canvas, &clip, x0, bar_y, avail, bar_h, fraction, false, t);
+
+    // The qualifier, under the track.
+    let detail_y = bar_y.saturating_add(bar_h).saturating_add(gap);
+    draw_text(
+        &mut layer,
+        x0.saturating_sub(clip.x0),
+        detail_y.saturating_sub(clip.y0),
+        small,
+        detail,
+        avail,
+        false,
+    );
+
+    overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +1218,15 @@ mod tests {
         ]
     }
 
+    fn setting() -> SettingRow<'static> {
+        SettingRow {
+            label: "Sync interval",
+            value: "Every 6 hours",
+            detail: "Checks for new chapters over Wi-Fi",
+            selected: false,
+        }
+    }
+
     fn genres() -> Vec<String> {
         ["Action", "Adventure", "Drama", "Historical"]
             .iter()
@@ -994,6 +1268,29 @@ mod tests {
             &t,
         );
         out.push(("meta_block", c));
+
+        let mut c = RgbPage::new_white(cw, ch);
+        draw_section_header(&mut c, x, y, w, h, "Reading", px, &t);
+        out.push(("section_header", c));
+
+        let mut c = RgbPage::new_white(cw, ch);
+        draw_setting_row(&mut c, x, y, w, h, &setting(), px, &t);
+        out.push(("setting_row", c));
+
+        let mut c = RgbPage::new_white(cw, ch);
+        draw_meter(
+            &mut c,
+            x,
+            y,
+            w,
+            h,
+            0.62,
+            "Storage",
+            "3.1 GB of 5.0 GB used",
+            px,
+            &t,
+        );
+        out.push(("meter", c));
 
         out
     }
@@ -1185,6 +1482,9 @@ mod tests {
                 px,
                 &t,
             );
+            draw_section_header(&mut canvas, x, y, w, h, "Reading", px, &t);
+            draw_setting_row(&mut canvas, x, y, w, h, &setting(), px, &t);
+            draw_meter(&mut canvas, x, y, w, h, 0.5, "Storage", "3.1 GB", px, &t);
             for py in 0..canvas.height {
                 for cx in 0..canvas.width {
                     let inside = cx >= x && cx < x + w && py >= y && py < y + h;
@@ -1543,5 +1843,216 @@ mod tests {
         let libra = rightmost_ink(1264);
         assert!(libra > clara, "the widget ignored the wider panel");
         assert!(clara > 1072 / 2, "the widget left a Clara half empty");
+    }
+
+    // --- the settings widgets ---
+
+    #[test]
+    fn a_section_header_marks_itself_and_closes_with_a_rule() {
+        let t = Theme::INK_RUST;
+        let (w, h) = (300u32, 40u32);
+        let mut c = RgbPage::new_white(w, h);
+        draw_section_header(&mut c, 0, 0, w, h, "Reading", 20.0, &t);
+        assert_eq!(
+            c.pixel(0, h / 2),
+            t.accent,
+            "the header has no accent block"
+        );
+        assert_eq!(c.pixel(w / 2, h - 1), RULE, "the header does not close");
+        // The block is a marker, not a slab: the far side of the band is not
+        // painted with it.
+        assert_eq!(c.pixel(w - 1, h / 2), WHITE);
+        // An empty label still draws the band's furniture, nothing more.
+        let mut bare = RgbPage::new_white(w, h);
+        draw_section_header(&mut bare, 0, 0, w, h, "", 20.0, &t);
+        assert!(ink_pixels(&bare) > 0);
+        assert!(ink_pixels(&c) > ink_pixels(&bare), "the label drew no ink");
+    }
+
+    #[test]
+    fn a_selected_row_differs_by_more_than_its_hue() {
+        // Marker, weight and indent — so MONO, where the marker is only a
+        // grey block, still tells the two apart.
+        for t in [Theme::INK_RUST, Theme::MONO] {
+            let render = |selected: bool| {
+                let mut r = setting();
+                r.selected = selected;
+                let mut c = RgbPage::new_white(320, 70);
+                draw_setting_row(&mut c, 5, 5, 300, 60, &r, 20.0, &t);
+                c
+            };
+            let (on, off) = (render(true), render(false));
+            assert_ne!(on.pixels, off.pixels, "selection changed nothing");
+            assert_eq!(on.pixel(5, 20), t.accent, "the selected row is unmarked");
+            assert_eq!(off.pixel(5, 20), WHITE, "an unselected row is marked");
+            assert!(
+                ink_pixels(&on) > ink_pixels(&off),
+                "the selected row is not heavier"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_setting_label_ellipsises_while_the_value_stays_whole() {
+        // The value is the information the row exists to carry: it is the
+        // label that gives way, never the other way round.
+        let t = Theme::INK_RUST;
+        let (x, y, w, h) = (5u32, 5u32, 300u32, 60u32);
+        let render = |label: &str| {
+            let mut r = setting();
+            r.label = label;
+            let mut c = RgbPage::new_white(340, 80);
+            draw_setting_row(&mut c, x, y, w, h, &r, 20.0, &t);
+            c
+        };
+        let short = render("Sync");
+        let long =
+            render("An extraordinarily long setting label that could not possibly fit on this row");
+
+        assert!(
+            ink_pixels(&long) > ink_pixels(&short),
+            "the long label drew no more ink"
+        );
+        // The value's own column is untouched by the label beside it.
+        let value_left = x + w * 3 / 5;
+        for py in 0..long.height {
+            for px in value_left..long.width {
+                assert_eq!(
+                    long.pixel(px, py),
+                    short.pixel(px, py),
+                    "a long label pushed the value at ({px}, {py})"
+                );
+            }
+            // And nothing escaped the rect either way.
+            for px in 0..long.width {
+                if px < x || px >= x + w || py < y || py >= y + h {
+                    assert_eq!(long.pixel(px, py), WHITE, "label escaped at ({px}, {py})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_setting_value_is_clipped_to_the_row_not_overflowed() {
+        let t = Theme::INK_RUST;
+        let (x, y, w, h) = (6u32, 4u32, 200u32, 56u32);
+        let mut r = setting();
+        r.value = "A value far too long for any row this narrow to hold at all";
+        let mut c = RgbPage::new_white(260, 80);
+        draw_setting_row(&mut c, x, y, w, h, &r, 18.0, &t);
+        for py in 0..c.height {
+            for px in 0..c.width {
+                if px < x || px >= x + w || py < y || py >= y + h {
+                    assert_eq!(c.pixel(px, py), WHITE, "value escaped at ({px}, {py})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_without_a_detail_line_simply_draws_less() {
+        let t = Theme::INK_RUST;
+        let render = |detail: &str| {
+            let mut r = setting();
+            r.detail = detail;
+            let mut c = RgbPage::new_white(320, 70);
+            draw_setting_row(&mut c, 5, 5, 300, 60, &r, 20.0, &t);
+            c
+        };
+        assert!(ink_pixels(&render("Over Wi-Fi")) > ink_pixels(&render("")));
+    }
+
+    #[test]
+    fn a_meters_fraction_clamps_instead_of_overrunning() {
+        let t = Theme::INK_RUST;
+        let render = |f: f32| {
+            let mut c = RgbPage::new_white(320, 100);
+            draw_meter(&mut c, 5, 5, 300, 90, f, "Storage", "3.1 GB", 20.0, &t);
+            c
+        };
+        assert_eq!(
+            render(5.0).pixels,
+            render(1.0).pixels,
+            "over 1.0 did not clamp"
+        );
+        assert_eq!(
+            render(-3.0).pixels,
+            render(0.0).pixels,
+            "below 0.0 did not clamp"
+        );
+        assert_eq!(
+            render(f32::NAN).pixels,
+            render(0.0).pixels,
+            "a non-finite fraction did not read as empty"
+        );
+        assert_eq!(
+            render(f32::INFINITY).pixels,
+            render(0.0).pixels,
+            "an infinite fraction did not read as empty"
+        );
+        assert_ne!(
+            render(0.0).pixels,
+            render(1.0).pixels,
+            "fraction changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_fuller_meter_paints_more_of_its_track() {
+        for (name, t) in THEMES {
+            // No label or detail: a dark theme's ink and its bar can be the
+            // same value, and this is a measurement of the track alone.
+            let filled = |f: f32| {
+                let mut c = RgbPage::new_white(320, 100);
+                draw_meter(&mut c, 5, 5, 300, 90, f, "", "", 20.0, &t);
+                c.pixels.chunks_exact(3).filter(|p| *p == t.bar).count()
+            };
+            assert_eq!(filled(0.0), 0, "{name} filled an empty meter");
+            assert!(filled(0.5) > 0, "{name} drew no fill at all");
+            assert!(
+                filled(1.0) > filled(0.5),
+                "{name}'s meter does not read its fraction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_meter_still_reads_with_no_hue_at_all() {
+        // Length is the carrier; MONO must show the same geometry the
+        // coloured themes do.
+        let render = |t: &Theme| {
+            let mut c = RgbPage::new_white(320, 100);
+            draw_meter(&mut c, 5, 5, 300, 90, 0.4, "Storage", "3.1 GB", 20.0, t);
+            c
+        };
+        let (mono, color) = (render(&Theme::MONO), render(&Theme::INK_RUST));
+        assert!(ink_pixels(&mono) > 0, "the mono meter drew nothing");
+        assert_eq!(
+            ink_pixels(&mono),
+            ink_pixels(&color),
+            "the mono meter lost marks the colour one drew"
+        );
+        assert_ne!(mono.pixels, color.pixels, "the themes are not different");
+    }
+
+    #[test]
+    fn the_settings_widgets_resolve_in_every_theme() {
+        for (name, t) in THEMES {
+            let mut c = RgbPage::new_white(320, 220);
+            draw_section_header(&mut c, 5, 5, 300, 40, "Reading", 20.0, &t);
+            draw_setting_row(&mut c, 5, 50, 300, 60, &setting(), 20.0, &t);
+            let mut sel = setting();
+            sel.selected = true;
+            draw_setting_row(&mut c, 5, 110, 300, 60, &sel, 20.0, &t);
+            draw_meter(&mut c, 5, 170, 300, 45, 0.62, "Storage", "3.1 GB", 20.0, &t);
+            assert!(ink_pixels(&c) > 0, "{name} drew nothing");
+            for py in 0..c.height {
+                for px in 0..c.width {
+                    if !(5..305).contains(&px) || !(5..215).contains(&py) {
+                        assert_eq!(c.pixel(px, py), WHITE, "{name} escaped at ({px}, {py})");
+                    }
+                }
+            }
+        }
     }
 }
