@@ -31,7 +31,7 @@ use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{heatmap, rotate_page, rotate_page_rgb, FitMode, GrayPage, RgbPage};
+use gideon_render::{heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
@@ -74,10 +74,10 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
 /// Index of the trailing "Storage" row on the Settings screen — appended after
 /// the ten cycling rows ([`settings_rows`]), it opens the storage detail
 /// screen instead of cycling a value.
-const SETTINGS_STORAGE_ROW: usize = 10;
+const SETTINGS_STORAGE_ROW: usize = 12;
 /// Index of the trailing "Account" row on the Settings screen — appended after
 /// the storage row, it opens the sync account menu (sign in / sync / sign out).
-const SETTINGS_ACCOUNT_ROW: usize = 11;
+const SETTINGS_ACCOUNT_ROW: usize = 13;
 /// Row of the "Free up space now" action on the Storage screen (after three
 /// read-only info rows). Shared by the renderer and the tap handler.
 const STORAGE_FREE_ROW: usize = 3;
@@ -1317,6 +1317,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // half: tapping it opens the profile picker.
                         self.open_profile_menu()?;
                     }
+                } else if matches!(self.screen(), Screen::Library { .. }) {
+                    // The Library title bar toggles between the cover shelf
+                    // and the dense metadata list. Two views of one library:
+                    // art to browse by, data to decide by.
+                    self.toggle_library_view()?;
                 }
                 Ok(Flow::Continue)
             }
@@ -2401,6 +2406,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         let mut settings = self.load_settings();
         match row {
+            10 => {
+                let current = settings.color_profile.as_str();
+                let next = COLOR_PROFILE_STEPS
+                    .iter()
+                    .position(|p| *p == current)
+                    .map_or(0, |i| (i + 1) % COLOR_PROFILE_STEPS.len());
+                settings.color_profile = COLOR_PROFILE_STEPS[next].to_string();
+            }
+            11 => {
+                settings.finished_cleanup_hours = cycle(
+                    &gideon_core::FINISHED_CLEANUP_STEPS,
+                    settings.finished_cleanup_hours,
+                );
+            }
             0 => {
                 settings.predownload_unread_chapters =
                     cycle(&PREDOWNLOAD_STEPS, settings.predownload_unread_chapters);
@@ -2477,18 +2496,51 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Current settings; defaults when no settings dir is configured
     /// (tests, headless) or the file is unreadable.
+    /// The settings in force for the active profile: the device-global file,
+    /// overlaid with whatever this profile has stated for itself.
+    ///
+    /// Two readers sharing a Kobo share the frontlight, the radio and the
+    /// disk, but not a reading fit or a colour theme. A profile that has
+    /// stated nothing inherits the device value, so an upgrading device
+    /// behaves exactly as it did before any per-profile file existed.
     fn load_settings(&self) -> gideon_core::Settings {
-        self.settings_dir
+        let device = self
+            .settings_dir
             .as_deref()
             .map(|dir| gideon_core::Settings::load(dir).unwrap_or_default())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        device.with_profile(&gideon_core::ProfileSettings::load(&self.library_dir))
     }
 
     /// Persist settings (no-op without a settings dir); a failed save is
     /// logged, never fatal.
+    /// Persist a settings change to whichever file owns each field.
+    ///
+    /// The personal fields go to this profile's own file. The device-global
+    /// ones are written back onto the device file as it is on disk, rather
+    /// than saving the merged struct wholesale — saving the merge would bake
+    /// this profile's taste into the device defaults, which is precisely what
+    /// every other profile falls back to.
     fn save_settings(&self, settings: &gideon_core::Settings) {
+        if let Err(e) =
+            gideon_core::ProfileSettings::from_settings(settings).save(&self.library_dir)
+        {
+            eprintln!("gideon: couldn't save profile settings: {e}");
+        }
         if let Some(dir) = &self.settings_dir {
-            if let Err(e) = settings.save(dir) {
+            let mut device = gideon_core::Settings::load(dir).unwrap_or_default();
+            device.profiles = settings.profiles.clone();
+            device.active_profile = settings.active_profile.clone();
+            device.source_lists = settings.source_lists.clone();
+            device.languages = settings.languages.clone();
+            device.storage_size_limit = settings.storage_size_limit;
+            device.auto_check_updates = settings.auto_check_updates;
+            device.color_post_process = settings.color_post_process.clone();
+            device.wifi_auto_connect = settings.wifi_auto_connect;
+            device.idle_suspend_minutes = settings.idle_suspend_minutes;
+            device.frontlight_brightness = settings.frontlight_brightness;
+            device.frontlight_warmth = settings.frontlight_warmth;
+            if let Err(e) = device.save(dir) {
                 eprintln!("gideon: couldn't save settings: {e}");
             }
         }
@@ -3394,8 +3446,53 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// unused) size-budget engine — wired into the download paths so the
     /// "Storage limit" setting actually takes effect.
     fn enforce_storage_limit(&self) -> u64 {
-        let limit = self.load_settings().storage_size_limit.bytes();
-        evict_to_storage_limit(&self.library_dir, &self.index_guard, limit)
+        let settings = self.load_settings();
+        // Finished-and-stale chapters go first. This is not the same thing as
+        // the size budget below: eviction runs because the disk is full and
+        // takes the least-recently-read chapter whether or not you finished
+        // it, while this takes only chapters you are done with. Running it
+        // first means a full disk reclaims what you no longer want before it
+        // starts taking what you might.
+        let reclaimed = self.reclaim_finished(settings.finished_cleanup_hours);
+        reclaimed
+            + evict_to_storage_limit(
+                &self.library_dir,
+                &self.index_guard,
+                settings.storage_size_limit.bytes(),
+            )
+    }
+
+    /// Delete chapters finished longer ago than `hours`, returning the bytes
+    /// freed. `0` disables it.
+    ///
+    /// Best-effort by design: this is housekeeping, and a failure here must
+    /// never surface as an error in front of someone who was reading. The
+    /// engine's own refusals (never an unfinished chapter, never the one you
+    /// have open, never a series' last chapter) are what make that safe.
+    fn reclaim_finished(&self, hours: u32) -> u64 {
+        if hours == 0 {
+            return 0;
+        }
+        let _g = self.index_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let store =
+            gideon_core::ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default();
+        match gideon_sources::run_finished_cleanup(&self.library_dir, &store, &mut index, hours) {
+            Ok(summary) => {
+                if !summary.is_empty() {
+                    eprintln!(
+                        "gideon: cleaned up {} finished chapter(s), {} bytes",
+                        summary.files(),
+                        summary.bytes()
+                    );
+                }
+                summary.bytes()
+            }
+            Err(e) => {
+                eprintln!("gideon: finished-chapter cleanup failed: {e}");
+                0
+            }
+        }
     }
 
     /// Open the storage-usage screen from Settings.
@@ -4406,9 +4503,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Stats)) {
             return Ok(Some(self.compose_stats()));
         }
+        if matches!(self.stack.last(), Some(Screen::Home)) {
+            let rows = HOME_ROWS.len() + usize::from(self.home_offline);
+            let mut canvas = RgbPage::from_gray(&self.compose_current()?);
+            // No band (nothing read yet, or no room) means the plain menu is
+            // all there is — fall back to the grayscale path so Home does not
+            // pay for a colour refresh it makes no use of.
+            if self.compose_home_band(&mut canvas, rows).is_none() {
+                return Ok(None);
+            }
+            return Ok(Some(canvas));
+        }
         let Some(Screen::Library { items, page }) = self.stack.last() else {
             return Ok(None);
         };
+        if self.load_settings().library_view == "list" {
+            return Ok(Some(self.compose_library_list(items, *page)));
+        }
         let l = &self.layout;
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
@@ -4500,6 +4611,259 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &palette,
         );
         canvas
+    }
+
+    /// Home's data band: the reading totals and the activity heatmap, drawn
+    /// in the space below the menu rows.
+    ///
+    /// The menu keeps every row index it has always had — the band lives
+    /// strictly *below* the last row, so taps, row geometry and the tests
+    /// that depend on them are untouched. On a 1264x1680 Libra Colour the
+    /// seven rows fill 816px of 1680, so this is otherwise dead panel.
+    ///
+    /// Returns `None` when there is nothing to say (no reading recorded yet)
+    /// or no room to say it, so a fresh device shows the plain menu rather
+    /// than a band of zeroes.
+    fn compose_home_band(&self, canvas: &mut RgbPage, first_free_row: usize) -> Option<()> {
+        let l = &self.layout;
+        let top = l.row_top(first_free_row) + l.pad;
+        let bottom = l.height.saturating_sub(l.nav_h);
+        if bottom.saturating_sub(top) < l.row_h * 2 {
+            return None;
+        }
+        let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
+        if stats.chapters_tracked == 0 {
+            return None;
+        }
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let inner = l.width.saturating_sub(l.pad * 2);
+
+        // A separator sets the band apart from the tappable rows above it, so
+        // nothing here reads as another menu entry.
+        fill_rect_rgb(canvas, l.pad, top, inner, 1, [0x55, 0x55, 0x55]);
+
+        let tiles_y = top + l.pad;
+        let tile_h = l.row_h;
+        widgets::draw_stat_tiles(
+            canvas,
+            l.pad,
+            tiles_y,
+            inner,
+            tile_h,
+            &[
+                widgets::StatTile {
+                    value: &stats.current_streak.to_string(),
+                    label: "day streak",
+                    sub: &format!("best {}", stats.longest_streak),
+                },
+                widgets::StatTile {
+                    value: &stats.chapters_finished.to_string(),
+                    label: "chapters",
+                    sub: &format!("{} series", stats.series_count),
+                },
+                widgets::StatTile {
+                    value: &stats.pages_read.to_string(),
+                    label: "pages",
+                    sub: &format!("{} days", stats.active_days),
+                },
+            ],
+            l.text_px,
+            &theme,
+        );
+
+        // Fit the heatmap to whatever is left rather than a fixed cell size,
+        // so this is right on a 1072-wide Clara as well as a Libra Colour.
+        let grid_y = tiles_y + tile_h + l.pad;
+        if bottom.saturating_sub(grid_y) < l.row_h {
+            return Some(());
+        }
+        let weeks = STATS_HEATMAP_WEEKS;
+        let layout = heatmap::HeatmapLayout::fit(l.pad, grid_y, weeks, inner, 6);
+        if grid_y + layout.height() <= bottom {
+            heatmap::draw_heatmap(
+                canvas,
+                &layout,
+                &stats.heatmap(weeks as usize),
+                &heatmap::Palette::from_setting(&self.load_settings().color_profile),
+            );
+        }
+        Some(())
+    }
+
+    /// How many dense library rows fit on a page. Each row carries a cover
+    /// thumbnail, the title, the MyAnimeList line and the progress column,
+    /// so it needs about twice a menu row.
+    fn list_row_height(&self) -> u32 {
+        self.layout.row_h * 2
+    }
+
+    fn list_rows_per_page(&self) -> usize {
+        ((self.layout.content_height() / self.list_row_height()).max(1)) as usize
+    }
+
+    /// The Library as a dense list: one row per series carrying everything
+    /// the device knows about it — score, publication status, genres, how
+    /// much is downloaded, how far in you are and what is next.
+    ///
+    /// This is the view the metadata exists for. The cover shelf stays the
+    /// default for people who browse by art; `library_view` picks between
+    /// them and the title bar toggles it.
+    fn compose_library_list(&self, items: &[SeriesCard], page: usize) -> RgbPage {
+        let l = &self.layout;
+        let per_page = self.list_rows_per_page();
+        let page_count = items.len().div_ceil(per_page).max(1);
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+
+        let mut canvas = RgbPage::from_gray(&compose_chrome(l, "Library", page, page_count));
+        let row_h = self.list_row_height();
+
+        self.with_progress(|app, store| {
+            for (i, card) in items
+                .iter()
+                .skip(page * per_page)
+                .take(per_page)
+                .enumerate()
+            {
+                let y = l.content_top() + i as u32 * row_h;
+                let meta = card
+                    .series
+                    .as_deref()
+                    .and_then(|dir| index.get(dir))
+                    .and_then(|r| r.meta.as_ref());
+
+                let finished = card
+                    .chapters
+                    .iter()
+                    .filter(|c| store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
+                    .count();
+                // Total prefers MyAnimeList's chapter count — what the series
+                // actually has — and falls back to what is on disk, so an
+                // un-looked-up series still reads honestly instead of
+                // claiming to be complete.
+                let total = meta
+                    .and_then(|m| m.total_chapters)
+                    .map(|t| t as usize)
+                    .unwrap_or(card.chapters.len())
+                    .max(finished);
+                let downloaded = card.chapters.len();
+                // "18 downloaded" alone does not answer the question you
+                // actually have in front of a library — how much of what is
+                // on the device is still waiting for you. Unread is the
+                // number that decides whether to open this series or another.
+                let unread = card
+                    .chapters
+                    .iter()
+                    .filter(|c| !store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
+                    .count();
+                let genres = meta.map(|m| m.genres.join(" · ")).unwrap_or_default();
+                let when = card.latest_read_at(store);
+
+                let row = widgets::LibraryRow {
+                    title: &card.title(),
+                    score: meta.and_then(|m| m.score),
+                    status: meta.and_then(|m| m.status.as_deref()),
+                    genres: &genres,
+                    downloads: &if unread == 0 {
+                        format!("{downloaded} downloaded · all read")
+                    } else {
+                        format!("{downloaded} downloaded · {unread} unread")
+                    },
+                    when: &app.ago(when),
+                    read: &format!("{finished} / {total}"),
+                    pct: if total == 0 {
+                        0.0
+                    } else {
+                        finished as f32 / total as f32
+                    },
+                    // Three distinct states, which an Option chain quietly
+                    // collapsed into one: nothing read yet, a next chapter
+                    // waiting on disk, and read as far as what is downloaded.
+                    // The last is the common case mid-series and must not
+                    // read as "start reading".
+                    next: &match card.furthest_read(store) {
+                        None => "start reading".to_string(),
+                        Some(current) => match card.next_after(current) {
+                            // Just the chapter, not "Series — Chapter":
+                            // the row is already titled with the series, and
+                            // repeating it crowds out the part that matters.
+                            Some(next) => format!("next: {}", chapter_label(&next.relative_path)),
+                            None if finished >= total => "finished".to_string(),
+                            None => "caught up".to_string(),
+                        },
+                    },
+                    finished: finished > 0 && finished >= total,
+                };
+                // Cover art first, then hand the row widget the space that
+                // is left. Decoding and caching stay here so the widget
+                // remains a pure drawing routine.
+                let inset = l.pad;
+                let cover_h = row_h.saturating_sub(inset * 2);
+                let cover_w = cover_h * 2 / 3;
+                let thumb = app.shelf_cover(card.cover_entry(), (cover_w, cover_h), per_page);
+                blit_thumb(&mut canvas, &thumb, inset, y + inset, cover_w, cover_h);
+
+                let text_x = inset + cover_w + inset;
+                widgets::draw_library_row(
+                    &mut canvas,
+                    text_x,
+                    y,
+                    l.width.saturating_sub(text_x),
+                    row_h,
+                    &row,
+                    l.text_px,
+                    &theme,
+                );
+                // A hairline between rows, not around them: the list should
+                // read as one continuous column, not a stack of cards.
+                if i + 1 < per_page {
+                    fill_rect_rgb(
+                        &mut canvas,
+                        inset,
+                        y + row_h - 1,
+                        l.width.saturating_sub(inset * 2),
+                        1,
+                        [0xDD, 0xDD, 0xDD],
+                    );
+                }
+            }
+        });
+        canvas
+    }
+
+    /// "3 days ago" for a unix timestamp, or an empty string when nothing
+    /// has been read — the row then simply omits the age rather than
+    /// claiming the epoch.
+    fn ago(&self, at: u64) -> String {
+        if at == 0 {
+            return String::new();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(at);
+        let secs = now.saturating_sub(at);
+        match secs {
+            s if s < 3600 => "just now".to_string(),
+            s if s < 86_400 => format!("{}h ago", s / 3600),
+            s if s < 2_592_000 => format!("{}d ago", s / 86_400),
+            s => format!("{}mo ago", s / 2_592_000),
+        }
+    }
+
+    /// Swap the Library between the cover shelf and the dense metadata list,
+    /// persisting the choice so it survives a restart.
+    fn toggle_library_view(&mut self) -> Result<()> {
+        let mut settings = self.load_settings();
+        settings.library_view = if settings.library_view == "list" {
+            "shelf".to_string()
+        } else {
+            "list".to_string()
+        };
+        self.save_settings(&settings);
+        // Full refresh: the whole content area is being replaced, and a
+        // partial would leave the previous view ghosting under the new one.
+        self.render_current(RefreshMode::Full)
     }
 
     fn compose_current(&self) -> Result<GrayPage> {
@@ -6299,6 +6663,46 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
 /// Overlay a full-size grayscale layer onto an RGB canvas, keeping only its
 /// ink: white stays transparent so text can be drawn over colour without
 /// punching a white box through it.
+/// Draw a decoded cover into an RGB canvas, scaled to fit its box and centred
+/// in it, clipped to the canvas. Covers keep their colour — this is the one
+/// place on the panel where Kaleido earns its keep.
+fn blit_thumb(dst: &mut RgbPage, img: &image::DynamicImage, x: u32, y: u32, w: u32, h: u32) {
+    if w == 0 || h == 0 || x >= dst.width || y >= dst.height {
+        return;
+    }
+    let scaled = img.resize(w, h, image::imageops::FilterType::Triangle);
+    let rgb = scaled.to_rgb8();
+    let (iw, ih) = (rgb.width(), rgb.height());
+    // Centre whatever the aspect-preserving resize produced, so a square page
+    // and a tall cover both sit in the middle of their box.
+    let off_x = x + w.saturating_sub(iw) / 2;
+    let off_y = y + h.saturating_sub(ih) / 2;
+    for row in 0..ih.min(dst.height.saturating_sub(off_y)) {
+        for col in 0..iw.min(dst.width.saturating_sub(off_x)) {
+            let px = rgb.get_pixel(col, row).0;
+            let idx = (((off_y + row) * dst.width + off_x + col) * 3) as usize;
+            dst.pixels[idx..idx + 3].copy_from_slice(&px);
+        }
+    }
+}
+
+/// Fill a rectangle on an RGB canvas, clipped to it. Anything outside is
+/// dropped rather than wrapping onto the next row.
+fn fill_rect_rgb(dst: &mut RgbPage, x: u32, y: u32, w: u32, h: u32, color: [u8; 3]) {
+    if x >= dst.width || y >= dst.height {
+        return;
+    }
+    let w = w.min(dst.width - x);
+    let h = h.min(dst.height - y);
+    for row in 0..h {
+        let start = (((y + row) * dst.width + x) * 3) as usize;
+        for col in 0..w {
+            let idx = start + (col * 3) as usize;
+            dst.pixels[idx..idx + 3].copy_from_slice(&color);
+        }
+    }
+}
+
 fn copy_gray_into_rgb(dst: &mut RgbPage, src: &GrayPage) {
     for y in 0..src.height.min(dst.height) {
         for x in 0..src.width.min(dst.width) {
@@ -6725,6 +7129,14 @@ fn record_chapter_in_index(
     if let Err(e) = index.save(library_dir) {
         eprintln!("gideon: couldn't save the series index: {e}");
     }
+    // Drop the index guard before the metadata lookup: it reloads and saves
+    // the index itself, and it may touch the network. Holding the lock across
+    // a request would stall every other download's bookkeeping behind it.
+    drop(_g);
+    // Best-effort, and deliberately after the chapter is safely on disk: this
+    // can't fail the download, and it no-ops when offline, when the series
+    // already has metadata, or when MyAnimeList has never heard of it.
+    crate::manga::cache_series_metadata(library_dir, &dir);
 }
 
 /// Card name for a library entry: "Series — Chapter" when it lives in a
@@ -6883,8 +7295,32 @@ fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
             ),
             true,
         ),
+        (format!("Colour profile: {}", s.color_profile), true),
+        (
+            format!(
+                "Delete finished chapters: {}",
+                cleanup_label(s.finished_cleanup_hours)
+            ),
+            true,
+        ),
     ]
 }
+
+/// How the finished-chapter cleanup delay reads on the settings row.
+/// "never" rather than "0 hours", because zero is a decision, not a duration.
+fn cleanup_label(hours: u32) -> String {
+    match hours {
+        0 => "never".to_string(),
+        24 => "after 1 day".to_string(),
+        168 => "after 1 week".to_string(),
+        h if h % 24 == 0 => format!("after {} days", h / 24),
+        h => format!("after {h} hours"),
+    }
+}
+
+/// The colour profiles the settings row cycles through, in the order the
+/// palette reference presents them.
+const COLOR_PROFILE_STEPS: [&str; 5] = ["ink-rust", "indigo", "sumi", "botanical", "mono"];
 
 /// Next value in a cycle: the entry after `current`, wrapping around; the
 /// first entry when `current` isn't in the list (hand-edited settings).

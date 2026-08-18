@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use gideon_aidoku::source::Source;
-use gideon_core::Settings;
+use gideon_core::{SeriesIndex, SeriesRef, Settings};
 use gideon_sources::storage::sanitize;
 use gideon_sources::{pages_to_cbz, Fetcher, SourceLists, UreqFetcher};
 
@@ -376,11 +376,139 @@ pub fn cmd_manga_download(
         library,
         &mut progress,
     ))?;
+    // The download is done and the file is on disk from here on: indexing it
+    // and looking up its metadata can only add, never take the chapter away.
+    record_downloaded_series(library, &source, manga_id, chapter_id, &out_path);
     println!(
         "\nSaved to {} — `gideon read` it or open the library.",
         out_path.display()
     );
     Ok(())
+}
+
+/// Series titles whose MyAnimeList lookup has already been attempted in this
+/// run of gideon, matched or not.
+///
+/// The persisted `meta` is the real "already done" marker, but it can only
+/// record a *success*: a series MyAnimeList has never heard of (a doujin, a
+/// scanlation-only title) would otherwise be looked up again after every
+/// chapter. This bounds that to one attempt per title per session, which is
+/// what keeps the feature to "one request per series, ever" in practice.
+static METADATA_TRIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Whether `title` still deserves a lookup, claiming it if so.
+fn claim_metadata_lookup(title: &str) -> bool {
+    let tried = METADATA_TRIED.get_or_init(Default::default);
+    let mut tried = tried.lock().unwrap_or_else(|e| e.into_inner());
+    tried.insert(title.to_string())
+}
+
+/// Fill in `series_dir`'s cached MyAnimeList metadata, if it hasn't got any.
+///
+/// Metadata is a nicety on top of a download that has already succeeded, so
+/// this is written to be impossible to fail *outward*: it returns nothing, it
+/// never propagates an error, and every failure mode — offline, MyAnimeList
+/// down (its API answers 504 for every request while it is), an unknown
+/// title, an unwritable index — leaves the library exactly as it was. Call it
+/// **after** the work the user asked for is finished, never in front of it.
+///
+/// The lookup is skipped entirely unless the series is in the index and has
+/// no metadata yet, so re-recording a series on every chapter download costs
+/// nothing.
+pub fn cache_series_metadata(library: &Path, series_dir: &str) {
+    // A local sysfs read, not a probe: if the radio is down there is nothing
+    // to report — the user is reading offline on purpose.
+    if !gideon_device::network::is_online() {
+        return;
+    }
+    cache_series_metadata_with(library, series_dir, &UreqFetcher::new());
+}
+
+/// [`cache_series_metadata`] with the fetcher injected, so the gating and the
+/// failure handling are testable without a network.
+fn cache_series_metadata_with(library: &Path, series_dir: &str, fetcher: &dyn Fetcher) {
+    let mut index = SeriesIndex::load(library);
+    let Some(series) = index.get(series_dir) else {
+        return; // sideloaded, or not recorded (yet) — nothing to attach to
+    };
+    if series.meta.as_ref().is_some_and(|meta| !meta.is_empty()) {
+        return; // already cached: never pay for it twice
+    }
+    let origin = series.clone();
+    if !claim_metadata_lookup(&origin.manga_title) {
+        return;
+    }
+
+    let meta = match crate::mal::metadata_for_title(fetcher, &origin.manga_title) {
+        Ok(Some(meta)) => meta,
+        // No confident match is the expected answer for plenty of series and
+        // is not worth a line of log; a failed lookup is MyAnimeList or the
+        // link, and is reported once, quietly.
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!(
+                "gideon: no MyAnimeList metadata for {}: {e:#}",
+                origin.manga_title
+            );
+            return;
+        }
+    };
+
+    index.record(
+        series_dir,
+        SeriesRef {
+            meta: Some(meta),
+            ..origin
+        },
+    );
+    if let Err(e) = index.save(library) {
+        eprintln!("gideon: couldn't save the series index: {e}");
+    }
+}
+
+/// Record a CLI-downloaded chapter's series in the index the way the device
+/// UI does, then top it up with MyAnimeList metadata. Best-effort throughout:
+/// the chapter is already on disk and readable, so nothing here may fail the
+/// download.
+fn record_downloaded_series(
+    library: &Path,
+    source: &Source,
+    manga_id: &str,
+    chapter_id: &str,
+    cbz_path: &Path,
+) {
+    let Some(series_dir) = cbz_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|d| d.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let info = source.manifest().info;
+    let mut index = SeriesIndex::load(library);
+    index.record(
+        &series_dir,
+        SeriesRef {
+            source_id: info.id,
+            source_name: info.name,
+            manga_id: manga_id.to_string(),
+            // The directory name is the sanitized title, which is as close to
+            // the source's title as the CBZ path preserves — and re-asking
+            // the source for details would be another network round-trip for
+            // a value that only feeds a metadata query.
+            manga_title: series_dir.clone(),
+            ..SeriesRef::default()
+        },
+    );
+    if let Some(file) = cbz_path.file_name() {
+        index.record_download(&series_dir, chapter_id, &file.to_string_lossy());
+    }
+    if let Err(e) = index.save(library) {
+        eprintln!("gideon: couldn't save the series index: {e}");
+        return;
+    }
+    cache_series_metadata(library, &series_dir);
 }
 
 /// The shared HTTP client for chapter pages and cover art. Its
@@ -972,6 +1100,166 @@ mod download_tests {
                 .contains("referer: https://manga.example.com/reader"),
             "redirected request lost the Referer:\n{second}"
         );
+    }
+}
+
+#[cfg(test)]
+mod series_metadata_tests {
+    use super::*;
+    use gideon_sources::fetch::FakeFetcher;
+    use std::cell::Cell;
+
+    /// A [`FakeFetcher`] that counts requests, so a test can assert the
+    /// device stayed *off* the network as well as what it got from it.
+    struct CountingFetcher {
+        inner: FakeFetcher,
+        calls: Cell<usize>,
+    }
+
+    impl CountingFetcher {
+        fn new(inner: FakeFetcher) -> Self {
+            Self {
+                inner,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl Fetcher for CountingFetcher {
+        fn get(&self, url: &Url) -> gideon_sources::Result<Vec<u8>> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.get(url)
+        }
+    }
+
+    fn jikan(title: &str) -> String {
+        format!("https://api.jikan.moe/v4/manga?q={title}&limit=5")
+    }
+
+    /// Titles are unique per test: the "already tried" set is process-wide
+    /// (as it is on the device, for one run of gideon).
+    fn library_with(dir: &Path, series_dir: &str, meta: Option<gideon_core::SeriesMeta>) {
+        let mut index = SeriesIndex::load(dir);
+        index.record(
+            series_dir,
+            SeriesRef {
+                source_id: "multi.mangadex".into(),
+                source_name: "MangaDex".into(),
+                manga_id: "m1".into(),
+                manga_title: series_dir.to_string(),
+                meta,
+                ..SeriesRef::default()
+            },
+        );
+        index.record_download(series_dir, "c1", "Chapter 1.cbz");
+        index.save(dir).unwrap();
+    }
+
+    #[test]
+    fn a_confident_match_is_cached_on_the_series() {
+        let dir = tempfile::tempdir().unwrap();
+        library_with(dir.path(), "Berserk", None);
+        let fetcher = FakeFetcher::new().with(
+            &jikan("Berserk"),
+            r#"{"data":[{"title":"Berserk","type":"manga","score":9.47,
+                        "status":"Publishing","rank":1,
+                        "genres":[{"name":"Action"}]}]}"#,
+        );
+
+        cache_series_metadata_with(dir.path(), "Berserk", &fetcher);
+
+        let series = SeriesIndex::load(dir.path())
+            .get("Berserk")
+            .unwrap()
+            .clone();
+        let meta = series.meta.expect("metadata must be cached");
+        assert_eq!(meta.score, Some(9.47));
+        assert_eq!(meta.status.as_deref(), Some("Publishing"));
+        assert_eq!(meta.rank, Some(1));
+        assert_eq!(meta.genres, vec!["Action".to_string()]);
+        // The download history the entry already had is untouched.
+        assert_eq!(series.downloaded.get("c1"), Some(&"Chapter 1.cbz".into()));
+    }
+
+    #[test]
+    fn an_ambiguous_match_leaves_the_series_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        library_with(dir.path(), "Kagerou", None);
+        // Fuzzy neighbours only — nothing whose title *is* the query.
+        let fetcher = FakeFetcher::new().with(
+            &jikan("Kagerou"),
+            r#"{"data":[{"title":"Kagerou Days","type":"manga","score":7.0},
+                       {"title":"Kagerou Project","type":"manga","score":6.5}]}"#,
+        );
+
+        cache_series_metadata_with(dir.path(), "Kagerou", &fetcher);
+
+        // A wrong series' score would be worse than none at all.
+        assert_eq!(
+            SeriesIndex::load(dir.path()).get("Kagerou").unwrap().meta,
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_lookup_leaves_the_download_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        library_with(dir.path(), "Vinland Saga", None);
+        // Nothing canned: every request fails, as it does offline.
+        cache_series_metadata_with(dir.path(), "Vinland Saga", &FakeFetcher::new());
+
+        let series = SeriesIndex::load(dir.path())
+            .get("Vinland Saga")
+            .unwrap()
+            .clone();
+        assert_eq!(series.meta, None);
+        assert_eq!(series.source_name, "MangaDex");
+        assert_eq!(series.downloaded.get("c1"), Some(&"Chapter 1.cbz".into()));
+    }
+
+    #[test]
+    fn a_series_that_has_metadata_is_never_looked_up_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = gideon_core::SeriesMeta {
+            score: Some(8.5),
+            ..gideon_core::SeriesMeta::default()
+        };
+        library_with(dir.path(), "Vagabond", Some(cached.clone()));
+        let fetcher = CountingFetcher::new(FakeFetcher::new().with(
+            &jikan("Vagabond"),
+            r#"{"data":[{"title":"Vagabond","type":"manga","score":9.2}]}"#,
+        ));
+
+        cache_series_metadata_with(dir.path(), "Vagabond", &fetcher);
+
+        assert_eq!(fetcher.calls.get(), 0, "cached metadata must not hit MAL");
+        assert_eq!(
+            SeriesIndex::load(dir.path()).get("Vagabond").unwrap().meta,
+            Some(cached)
+        );
+    }
+
+    #[test]
+    fn an_unmatched_series_is_not_retried_for_the_rest_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        library_with(dir.path(), "Doujin Only", None);
+        let fetcher =
+            CountingFetcher::new(FakeFetcher::new().with(&jikan("Doujin+Only"), r#"{"data":[]}"#));
+
+        cache_series_metadata_with(dir.path(), "Doujin Only", &fetcher);
+        assert_eq!(fetcher.calls.get(), 1);
+
+        // A second chapter download must not pay for the same miss again.
+        cache_series_metadata_with(dir.path(), "Doujin Only", &fetcher);
+        assert_eq!(fetcher.calls.get(), 1);
+    }
+
+    #[test]
+    fn an_unrecorded_series_is_a_quiet_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = CountingFetcher::new(FakeFetcher::new());
+        cache_series_metadata_with(dir.path(), "Sideloaded", &fetcher);
+        assert_eq!(fetcher.calls.get(), 0);
     }
 }
 

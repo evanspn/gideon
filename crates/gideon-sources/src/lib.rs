@@ -7,12 +7,14 @@
 //! or GitHub Pages) — describing installable manga sources. gideon ships
 //! with a default list preinstalled and lets users add their own.
 
+pub mod cleanup;
 pub mod download;
 pub mod fetch;
 pub mod list;
 pub mod storage;
 pub mod update;
 
+pub use cleanup::{plan_finished_cleanup, run_finished_cleanup, CleanupCandidate, CleanupSummary};
 pub use download::pages_to_cbz;
 pub use fetch::{Fetcher, UreqFetcher};
 pub use list::{
@@ -44,6 +46,12 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A gideon-core operation failed — in practice persisting the series
+    /// index after a cleanup pass. Kept as its own variant so the cause isn't
+    /// flattened into a bare io error and loses which file it was about.
+    #[error("{0}")]
+    Core(#[from] gideon_core::Error),
 
     #[error("zip error: {0}")]
     Zip(#[from] zip::result::ZipError),

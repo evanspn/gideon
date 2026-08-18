@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use gideon_core::SeriesMeta;
 use gideon_sources::Fetcher;
 
 /// One popular manga title from MyAnimeList. Serialisable so the last
@@ -74,13 +75,7 @@ const MAX_TITLE_VARIANTS: usize = 6;
 /// Returns the variants (deduplicated, without the query itself), best
 /// matches first. An empty list just means "nothing to retry with".
 pub fn search_title_variants(fetcher: &dyn Fetcher, query: &str) -> Result<Vec<String>> {
-    let mut url = Url::parse(JIKAN_SEARCH_MANGA).expect("valid static URL");
-    url.query_pairs_mut()
-        .append_pair("q", query)
-        .append_pair("limit", "5");
-    let body = fetcher
-        .get(&url)
-        .context("fetching MyAnimeList title variants")?;
+    let body = search_manga(fetcher, query)?;
     parse_title_variants(&body, query)
 }
 
@@ -132,6 +127,198 @@ pub fn parse_title_variants(body: &[u8], query: &str) -> Result<Vec<String>> {
     }
     variants.truncate(MAX_TITLE_VARIANTS);
     Ok(variants)
+}
+
+/// Longest query Jikan is asked for. A library folder name can be a whole
+/// sentence ("… Vol. 3 Official Colored"); MyAnimeList rejects very long
+/// queries outright, so the query is clipped rather than wasted (the web
+/// dashboard's MAL sync clips at the same 64).
+const MAX_QUERY_CHARS: usize = 64;
+
+/// One Jikan `/manga?q=` search. The single place the search endpoint is
+/// spelled out, so the title-variant lookup and the metadata lookup can't
+/// drift apart (and a metadata lookup can reuse a body it already fetched
+/// instead of paying for a second round-trip on the device).
+fn search_manga(fetcher: &dyn Fetcher, query: &str) -> Result<Vec<u8>> {
+    let clipped: String = query.trim().chars().take(MAX_QUERY_CHARS).collect();
+    let mut url = Url::parse(JIKAN_SEARCH_MANGA).expect("valid static URL");
+    url.query_pairs_mut()
+        .append_pair("q", &clipped)
+        .append_pair("limit", "5");
+    fetcher.get(&url).context("searching MyAnimeList")
+}
+
+/// Look up MyAnimeList metadata (score, status, genres, rank, chapter count)
+/// for a single series by title.
+///
+/// `Ok(None)` is the normal "no confident match" answer and is not a problem
+/// worth reporting: a *wrong* match is far worse than no metadata (it would
+/// put another series' score and genres on the user's book), so a hit only
+/// counts when a MyAnimeList title matches exactly once normalised — the same
+/// rule `syncKoboToMal` uses in the web dashboard before it writes to a real
+/// MAL list.
+///
+/// Romanised-vs-English naming is the one case where an exact rule needs
+/// help, so a miss retries with the names MyAnimeList itself knows the series
+/// by ([`parse_title_variants`], capped at [`MAX_TITLE_VARIANTS`]) — the same
+/// retry the source search uses. That costs extra round-trips, so callers
+/// must only ever run this once per series, never per chapter.
+pub fn metadata_for_title(fetcher: &dyn Fetcher, title: &str) -> Result<Option<SeriesMeta>> {
+    let query = series_query(title);
+    let body = search_manga(fetcher, &query)?;
+    if let Some(meta) = parse_metadata_match(&body, &query)? {
+        return Ok(Some(meta));
+    }
+    // The first page of results was fetched with the user's spelling; the
+    // variants are what that page says the series is *also* called, so a
+    // retry can find an entry the first query ranked off the page.
+    for variant in parse_title_variants(&body, &query)? {
+        let body = search_manga(fetcher, &variant)?;
+        if let Some(meta) = parse_metadata_match(&body, &variant)? {
+            return Ok(Some(meta));
+        }
+    }
+    Ok(None)
+}
+
+/// The query a library title is searched with: mirrors the web dashboard's
+/// `seriesQuery`. Folder names pick up qualifiers MyAnimeList doesn't carry
+/// ("Berserk (Deluxe Edition)", "Manga - Berserk"); dropping them is what
+/// lets an *exact* match rule still hit.
+fn series_query(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut depth = 0usize;
+    for c in title.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out.trim();
+    let out = out
+        .strip_prefix("Manga ")
+        .or_else(|| out.strip_prefix("manga "))
+        .or_else(|| out.strip_prefix("Manga-"))
+        .or_else(|| out.strip_prefix("manga-"))
+        .unwrap_or(out)
+        .trim();
+    if out.is_empty() {
+        title.trim().to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+/// Normalised form used for match comparison: case and punctuation carry no
+/// meaning across catalogues ("Hunter x Hunter" / "HUNTER×HUNTER"), so they
+/// are flattened away — but nothing else is, so the comparison stays exact.
+/// Unlike the web dashboard's JS version this keeps non-Latin scripts, which
+/// there collapse to the empty string and would make every Japanese title
+/// "equal" to every other.
+fn norm_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut pending_space = false;
+    for c in title.chars() {
+        if c.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.extend(c.to_lowercase());
+        } else {
+            pending_space = true;
+        }
+    }
+    out
+}
+
+/// Pick the entry of a Jikan `/manga?q=` response whose title *is* `query`
+/// (normalised) and return its metadata, or `None` when nothing matches that
+/// strictly.
+///
+/// Novels are dropped the way the web sync drops them: MyAnimeList lists a
+/// manga and its light-novel original under near-identical titles, and the
+/// novel's chapter count and score describe a different work.
+pub fn parse_metadata_match(body: &[u8], query: &str) -> Result<Option<SeriesMeta>> {
+    #[derive(Deserialize)]
+    struct Response {
+        data: Vec<Entry>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        title: Option<String>,
+        title_english: Option<String>,
+        title_japanese: Option<String>,
+        #[serde(default, deserialize_with = "lenient")]
+        r#type: Option<String>,
+        // Leniently parsed for the same reason the ranking is: MyAnimeList
+        // leaves most of this null across its catalogue, and an odd value
+        // must cost that field only.
+        #[serde(default, deserialize_with = "lenient")]
+        score: Option<f32>,
+        #[serde(default, deserialize_with = "lenient")]
+        status: Option<String>,
+        #[serde(default, deserialize_with = "lenient")]
+        genres: Option<Vec<Genre>>,
+        #[serde(default, deserialize_with = "lenient")]
+        rank: Option<u32>,
+        #[serde(default, deserialize_with = "lenient")]
+        chapters: Option<u32>,
+    }
+    #[derive(Deserialize)]
+    struct Genre {
+        name: Option<String>,
+    }
+
+    let response: Response =
+        serde_json::from_slice(body).context("parsing MyAnimeList search response")?;
+    let needle = norm_title(query);
+    if needle.is_empty() {
+        return Ok(None); // nothing to match on — never guess
+    }
+
+    for entry in response.data {
+        if entry.r#type.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case("novel") || t.eq_ignore_ascii_case("Light Novel")
+        }) {
+            continue;
+        }
+        let matched = [
+            entry.title.as_deref(),
+            entry.title_english.as_deref(),
+            entry.title_japanese.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|t| norm_title(t) == needle);
+        if !matched {
+            continue;
+        }
+        let meta = SeriesMeta {
+            score: entry.score.filter(|s| s.is_finite()),
+            status: entry
+                .status
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            genres: entry
+                .genres
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|g| g.name)
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect(),
+            rank: entry.rank.filter(|r| *r > 0),
+            // MyAnimeList reports 0 chapters for a series that hasn't
+            // finished; that's "unknown", not "zero chapters".
+            total_chapters: entry.chapters.filter(|c| *c > 0),
+        };
+        // An entry that matched but knows nothing is still no metadata.
+        return Ok((!meta.is_empty()).then_some(meta));
+    }
+    Ok(None)
 }
 
 /// Run `fetch` and cache a non-empty result at `cache`; on a failed (or
@@ -505,6 +692,117 @@ mod tests {
     fn no_matching_entry_means_no_variants() {
         let out = parse_title_variants(SEARCH_SAMPLE.as_bytes(), "one piece").unwrap();
         assert!(out.is_empty());
+    }
+
+    /// A `/manga?q=berserk` page: the exact match, a novel adaptation whose
+    /// title normalises the same (must never win), and a fuzzy neighbour.
+    const META_SAMPLE: &str = r#"{
+        "data": [
+            {
+                "mal_id": 99,
+                "title": "Berserk: The Prototype",
+                "type": "manga",
+                "score": 7.1,
+                "status": "Finished",
+                "chapters": 1
+            },
+            {
+                "mal_id": 98,
+                "title": "BERSERK!",
+                "type": "Light Novel",
+                "score": 5.0,
+                "status": "Finished",
+                "chapters": 3
+            },
+            {
+                "mal_id": 2,
+                "title": "Berserk",
+                "title_english": "Berserk",
+                "title_japanese": "ベルセルク",
+                "type": "manga",
+                "score": 9.47,
+                "status": "Publishing",
+                "rank": 1,
+                "chapters": 0,
+                "genres": [{ "name": "Action" }, { "name": "Drama" }]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn metadata_needs_an_exact_title_match() {
+        let meta = parse_metadata_match(META_SAMPLE.as_bytes(), "berserk")
+            .unwrap()
+            .expect("the exactly-titled entry matches");
+        assert_eq!(meta.score, Some(9.47));
+        assert_eq!(meta.status.as_deref(), Some("Publishing"));
+        assert_eq!(meta.genres, vec!["Action".to_string(), "Drama".into()]);
+        assert_eq!(meta.rank, Some(1));
+        // 0 chapters means "still running", not zero.
+        assert_eq!(meta.total_chapters, None);
+
+        // A near-miss title is not a match: no metadata beats wrong metadata.
+        assert_eq!(
+            parse_metadata_match(META_SAMPLE.as_bytes(), "berserk prototype").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_metadata_match(META_SAMPLE.as_bytes(), "").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_matches_through_punctuation_and_qualifiers() {
+        // Folder-name noise the exact rule must survive (`series_query` drops
+        // the parenthetical, `norm_title` the case and punctuation).
+        let fetcher = FakeFetcher::new().with(
+            "https://api.jikan.moe/v4/manga?q=Berserk&limit=5",
+            META_SAMPLE,
+        );
+        let meta = metadata_for_title(&fetcher, "Berserk (Deluxe Edition)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.rank, Some(1));
+    }
+
+    #[test]
+    fn lookup_retries_with_the_titles_mal_knows() {
+        // The user's spelling finds the right series only as a *synonym*;
+        // the retry with MyAnimeList's own title is what lands the metadata.
+        const BY_SYNONYM: &str = r#"{
+            "data": [
+                {
+                    "title": "Judge",
+                    "title_synonyms": ["Jajji"],
+                    "type": "manga",
+                    "score": 7.2
+                }
+            ]
+        }"#;
+        let fetcher = FakeFetcher::new()
+            .with("https://api.jikan.moe/v4/manga?q=Jajji&limit=5", BY_SYNONYM)
+            .with("https://api.jikan.moe/v4/manga?q=Judge&limit=5", BY_SYNONYM);
+        let meta = metadata_for_title(&fetcher, "Jajji").unwrap().unwrap();
+        assert_eq!(meta.score, Some(7.2));
+    }
+
+    #[test]
+    fn an_unknown_title_is_none_not_an_error() {
+        let fetcher = FakeFetcher::new().with(
+            "https://api.jikan.moe/v4/manga?q=Nothing+Like+It&limit=5",
+            r#"{ "data": [] }"#,
+        );
+        assert_eq!(
+            metadata_for_title(&fetcher, "Nothing Like It").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_search_failure_is_an_error_the_caller_can_swallow() {
+        // Nothing canned: the fetch fails, exactly as it does offline.
+        assert!(metadata_for_title(&FakeFetcher::new(), "Berserk").is_err());
     }
 
     #[test]
