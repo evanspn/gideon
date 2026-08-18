@@ -66,8 +66,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # No apt install for shellcheck: the ubuntu-latest image ships it, and
+      # fetching it anyway made this job the flakiest thing in CI — three runs
+      # in a row hung for tens of minutes on `apt-get update` when the mirror
+      # was unreachable, on three different runners, blocking merges on a step
+      # that installed a tool already present. If a future image drops it, the
+      # lint below fails with command-not-found, which is loud and obvious.
       - name: Lint shell scripts
         run: shellcheck installer/install.sh installer/gideon-launch.sh ci/installer_test.sh ci/qemu_integration.sh
       - name: Run installer test suite

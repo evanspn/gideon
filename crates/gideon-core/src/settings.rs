@@ -74,6 +74,17 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_color_post_process")]
     pub color_post_process: String,
 
+    /// Which colour profile the UI draws in: "ink-rust" (the default),
+    /// "indigo", "sumi", "botanical", or "mono".
+    ///
+    /// This is a palette choice, not a capability switch — "mono" is a real
+    /// target (a panel with no colour filter), not a degraded fallback, and
+    /// every profile's ramps are monotonic in luma so the UI stays legible
+    /// either way. Parsed leniently: an unknown value means the default.
+    #[serde(default = "default_color_profile")]
+    #[serde(deserialize_with = "lenient_color_profile")]
+    pub color_profile: String,
+
     /// Page turns between full (flashing) e-ink refreshes. Higher flashes
     /// less often (smoother reading) but lets ghosting build up longer.
     /// Parsed leniently — out-of-range or wrong-typed values fall back to the
@@ -126,6 +137,7 @@ impl Default for Settings {
             reader_rotation: 0,
             reader_rotation_locked: true,
             color_post_process: "vivid".to_string(),
+            color_profile: default_color_profile(),
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
@@ -241,6 +253,26 @@ fn lenient_color_post_process<'de, D: serde::Deserializer<'de>>(
         match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
             Some(s) if s == "standard" || s == "off" => s,
             _ => "vivid".to_string(),
+        },
+    )
+}
+
+/// The colour profile a fresh install draws in.
+fn default_color_profile() -> String {
+    "ink-rust".to_string()
+}
+
+/// Lenient `color_profile` parsing: known profiles pass through lowercased,
+/// anything else means the default. A settings file written by a newer
+/// gideon naming a profile this build doesn't have must not be fatal.
+fn lenient_color_profile<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "indigo" || s == "sumi" || s == "botanical" || s == "mono" => s,
+            _ => default_color_profile(),
         },
     )
 }
@@ -484,6 +516,7 @@ mod tests {
             predownload_unread_chapters: 5,
             auto_check_updates: false,
             reader_fit: "fit-width".into(),
+            color_profile: "indigo".into(),
             reader_rotation: 90,
             reader_rotation_locked: false,
             color_post_process: "standard".into(),

@@ -12,13 +12,15 @@ pub mod natsort;
 pub mod profile;
 pub mod series;
 pub mod settings;
+pub mod stats;
 
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
 pub use error::Error;
 pub use library::{Library, LibraryEntry, ProgressStore, ReadingProgress};
 pub use profile::DEFAULT_PROFILE;
-pub use series::{SeriesIndex, SeriesRef};
+pub use series::{SeriesIndex, SeriesMeta, SeriesRef};
 pub use settings::{Settings, StorageSize};
+pub use stats::ReadingStats;
 
 pub type Result<T> = std::result::Result<T, Error>;
