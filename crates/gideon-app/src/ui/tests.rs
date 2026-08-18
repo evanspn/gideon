@@ -8424,3 +8424,42 @@ fn discover_cards_are_a_grid_and_each_one_opens_its_own_destination() {
         assert_eq!(landed, want, "card {i}");
     }
 }
+
+#[test]
+fn discovers_installed_sources_open_their_listings() {
+    // The strip under the cards is the one part of Discover that still says
+    // something with the radio off. Listing what you have installed and then
+    // ignoring a tap on it is the kind of dead text that teaches people not
+    // to try, so each line opens that source.
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), source_gateway(), vec![]);
+    app.run().unwrap();
+    app.goto_root(Screen::Home).unwrap();
+
+    let sources = app.gateway().installed_sources().unwrap();
+    assert!(!sources.is_empty(), "the fixture installs a source");
+
+    let l = layout();
+    let head_h = l.row_h * 2 / 3;
+    let top = app.discover_sources_top() + head_h + l.pad / 2;
+    let line_h = app.discover_source_line_h();
+
+    // The header above the strip is not a row.
+    assert!(app.discover_source_at(top.saturating_sub(1)).is_none());
+    for (i, source) in sources.iter().enumerate() {
+        let y = top + i as u32 * line_h + line_h / 2;
+        assert_eq!(
+            app.discover_source_at(y).map(|s| s.id.clone()),
+            Some(source.id.clone()),
+            "line {i} must hit the source drawn there"
+        );
+    }
+
+    // And a tap actually goes there, without disturbing the cards above it.
+    let y = top + line_h / 2;
+    app.handle_tap(l.width / 2, y).unwrap();
+    assert!(
+        matches!(app.screen(), Screen::Listings { source } if source.id == sources[0].id),
+        "the tap opened the source's listings"
+    );
+}

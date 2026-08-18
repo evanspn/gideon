@@ -2330,6 +2330,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // every one of them.
                 let cards = self.discover_cards();
                 let Some(mut index) = self.discover_grid(cards.len()).hit(x, y, cards.len()) else {
+                    // Below the cards: the installed-source strip, where a
+                    // tap opens that source's listings.
+                    if let Some(source) = self.discover_source_at(y) {
+                        self.push(Screen::Listings { source })?;
+                    }
                     return Ok(Flow::Continue);
                 };
                 if self.home_offline {
@@ -5870,7 +5875,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // the radio off — and it answers "why is search finding nothing?"
         // without making you open another screen to find out.
         let head_h = l.row_h * 2 / 3;
-        let mut y = grid.y + grid.height(cards.len()) + l.pad;
+        let mut y = self.discover_sources_top();
         let inner = l.width.saturating_sub(l.pad * 2);
         if y + head_h + l.row_h / 2 <= l.nav_top() {
             let sources = self.gateway.installed_sources().unwrap_or_default();
@@ -5885,7 +5890,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 &theme,
             );
             y += head_h + l.pad / 2;
-            let line_h = l.row_h * 3 / 4;
+            let line_h = self.discover_source_line_h();
             let mut layer = GrayPage::new_white(l.width, l.height);
             if sources.is_empty() {
                 draw_text(
@@ -5928,6 +5933,37 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             &theme,
         );
         canvas
+    }
+
+    /// Top of Discover's installed-source strip: directly under the cards.
+    fn discover_sources_top(&self) -> u32 {
+        let cards = self.discover_cards();
+        let grid = self.discover_grid(cards.len());
+        grid.y + grid.height(cards.len()) + self.layout.pad
+    }
+
+    /// One line per source in the strip. Small, because the strip is a
+    /// reference, not the main event — but a finger still has to hit it.
+    fn discover_source_line_h(&self) -> u32 {
+        self.layout.row_h * 3 / 4
+    }
+
+    /// The installed source a tap at `y` lands on in Discover's strip.
+    /// Listing what you have installed and then ignoring a tap on it is the
+    /// kind of dead text that teaches people not to try.
+    fn discover_source_at(&self, y: u32) -> Option<SourceEntry> {
+        let l = &self.layout;
+        let head_h = l.row_h * 2 / 3;
+        let top = self.discover_sources_top() + head_h + l.pad / 2;
+        if y < top {
+            return None;
+        }
+        let index = ((y - top) / self.discover_source_line_h().max(1)) as usize;
+        self.gateway
+            .installed_sources()
+            .ok()?
+            .into_iter()
+            .nth(index)
     }
 
     /// Discover's cards: the offline reconnect card first when it applies,
