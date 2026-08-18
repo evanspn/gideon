@@ -71,9 +71,6 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
     2 * 1024 * 1024 * 1024,
     5 * 1024 * 1024 * 1024,
 ];
-/// Row of the "Free up space now" action on the Storage screen (after three
-/// read-only info rows). Shared by the renderer and the tap handler.
-const STORAGE_FREE_ROW: usize = 3;
 
 /// One row on the Sources screen.
 #[derive(Debug, Clone)]
@@ -2445,7 +2442,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Screen::Storage => {
-                if row == STORAGE_FREE_ROW {
+                // The action sits on the last row, above the Back bar, so it
+                // never moves as the series list grows or shrinks.
+                if y >= self.layout.nav_top().saturating_sub(self.layout.row_h) {
                     let freed = self.enforce_storage_limit();
                     let msg = if freed > 0 {
                         format!("Freed {}.", gideon_core::StorageSize(freed))
@@ -5015,6 +5014,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Settings)) {
             return Ok(Some(self.compose_settings()));
         }
+        if matches!(self.stack.last(), Some(Screen::Storage)) {
+            return Ok(Some(self.compose_storage()));
+        }
         if matches!(self.stack.last(), Some(Screen::Home)) {
             // Discover is a top-level destination, so it takes the colour
             // path unconditionally: the nav bar is drawn in RGB, and without
@@ -5869,7 +5871,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // live here is what let the screen drift out of step with its own
             // tap map.
             Screen::Settings => self.compose_settings().to_gray(),
-            Screen::Storage => self.compose_storage()?,
+            Screen::Storage => self.compose_storage().to_gray(),
             Screen::AccountMenu => {
                 let rows = match self.account_email() {
                     Some(email) => vec![
@@ -6105,30 +6107,157 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// The storage detail screen: how much downloaded content is on disk
     /// against the budget, plus the manual "free up space now" action.
-    fn compose_storage(&self) -> Result<GrayPage> {
+    fn compose_storage(&self) -> RgbPage {
         let l = &self.layout;
         let settings = self.load_settings();
         let stats = self.storage_stats();
+        let theme = widgets::Theme::from_setting(&settings.color_profile);
+        let inner = l.width.saturating_sub(l.pad * 2);
         let limit = settings.storage_size_limit;
-        let used = gideon_core::StorageSize(stats.used);
         let pct = if limit.bytes() > 0 {
             (stats.used.saturating_mul(100) / limit.bytes()).min(100)
         } else {
             0
         };
-        let rows = vec![
-            (format!("Used: {used} of {limit} ({pct}%)"), false),
-            (
-                format!("{} chapters · {} series", stats.chapters, stats.series),
-                false,
+
+        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(l, "Storage", 0, 1, true));
+        let mut y = l.content_top() + l.pad;
+
+        // How full the device is, as a bar rather than a sentence: this is
+        // the one number the screen exists for, and "1.7 GB of 2 GB" reads
+        // as trivia until you can see the bar nearly touching its end.
+        let meter_h = l.row_h * 3 / 2;
+        widgets::draw_meter(
+            &mut canvas,
+            l.pad,
+            y,
+            inner,
+            meter_h,
+            if limit.bytes() > 0 {
+                stats.used as f32 / limit.bytes() as f32
+            } else {
+                0.0
+            },
+            &format!("{} of {limit}", human_size(stats.used)),
+            &format!(
+                "{pct}% · {} chapters · {} series",
+                stats.chapters, stats.series
             ),
-            (
-                "Auto-cleanup removes least-recently-read first".to_string(),
-                false,
-            ),
-            ("Free up space now".to_string(), true),
-        ];
-        Ok(compose_list(l, "Storage", &rows, 0, 1))
+            l.text_px,
+            &theme,
+        );
+        y += meter_h + l.pad;
+
+        // Where the space actually went. Auto-cleanup takes the
+        // least-recently-read first, which is only reassuring if you can see
+        // what is big and what you have not touched.
+        let head_h = l.row_h * 2 / 3;
+        let by_series = self.storage_by_series();
+        let free_top = l.nav_top().saturating_sub(l.row_h);
+        if !by_series.is_empty() && y + head_h + l.row_h <= free_top {
+            widgets::draw_section_header(
+                &mut canvas,
+                l.pad,
+                y,
+                inner,
+                head_h,
+                "Biggest on disk",
+                l.text_px,
+                &theme,
+            );
+            y += head_h + l.pad / 2;
+            let mut layer = GrayPage::new_white(l.width, l.height);
+            let biggest = by_series.first().map_or(1, |(_, bytes, _)| *bytes).max(1);
+            for (title, bytes, chapters) in &by_series {
+                if y + l.row_h > free_top {
+                    break;
+                }
+                let size = human_size(*bytes);
+                let sw = measure_text(l.text_px * 0.72, &size, false);
+                let ty = y + l.row_h / 2 - (l.text_px * 0.85) as u32;
+                draw_text(
+                    &mut layer,
+                    l.pad,
+                    ty,
+                    l.text_px * 0.85,
+                    title,
+                    inner.saturating_sub(sw + l.pad),
+                    true,
+                );
+                draw_text(
+                    &mut layer,
+                    l.width.saturating_sub(l.pad + sw),
+                    ty,
+                    l.text_px * 0.72,
+                    &size,
+                    sw,
+                    false,
+                );
+                draw_text(
+                    &mut layer,
+                    l.pad,
+                    ty + (l.text_px * 0.95) as u32,
+                    l.text_px * 0.62,
+                    &format!("{chapters} chapters"),
+                    inner,
+                    false,
+                );
+                // A bar proportional to the biggest series, so the list reads
+                // as a chart and not as a column of numbers to compare by eye.
+                let bar_y = y + l.row_h.saturating_sub(6);
+                let filled = (inner as u64 * bytes / biggest) as u32;
+                fill_rect_rgb(&mut canvas, l.pad, bar_y, inner, 4, [0xE4, 0xE4, 0xE4]);
+                fill_rect_rgb(&mut canvas, l.pad, bar_y, filled.max(2), 4, theme.bar);
+                y += l.row_h;
+            }
+            copy_gray_into_rgb(&mut canvas, &layer);
+        }
+
+        // The action, parked on the last row so it never moves.
+        let mut layer = GrayPage::new_white(l.width, l.height);
+        fill_rect_rgb(&mut canvas, l.pad, free_top, inner, 1, [0xDD, 0xDD, 0xDD]);
+        draw_text(
+            &mut layer,
+            l.pad,
+            free_top + l.row_h / 2 - (l.text_px * 0.6) as u32,
+            l.text_px * 0.85,
+            "Free up space now",
+            inner,
+            true,
+        );
+        draw_text(
+            &mut layer,
+            l.pad,
+            free_top + l.row_h / 2 + (l.text_px * 0.15) as u32,
+            l.text_px * 0.62,
+            "removes the least recently read until you are under the limit",
+            inner,
+            false,
+        );
+        copy_gray_into_rgb(&mut canvas, &layer);
+        canvas
+    }
+
+    /// Downloaded bytes and chapter count per series, biggest first.
+    fn storage_by_series(&self) -> Vec<(String, u64, usize)> {
+        let _g = self.index_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let index = gideon_core::SeriesIndex::load(&self.library_dir);
+        let mut rows: Vec<(String, u64, usize)> = index
+            .iter()
+            .filter_map(|(dir, series)| {
+                let mut bytes = 0;
+                let mut chapters = 0;
+                for file in series.downloaded.values() {
+                    if let Ok(meta) = std::fs::metadata(self.library_dir.join(dir).join(file)) {
+                        bytes += meta.len();
+                        chapters += 1;
+                    }
+                }
+                (chapters > 0).then(|| (tidy_title(dir), bytes, chapters))
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows
     }
 
     fn compose_library(&self, items: &[SeriesCard], page: usize) -> Result<GrayPage> {
@@ -8306,6 +8435,24 @@ fn settings_groups(s: &gideon_core::Settings) -> Vec<SettingsGroup> {
             ],
         ),
     ]
+}
+
+/// A byte count for a person to read: KB under a megabyte, one decimal up to
+/// a gigabyte, two beyond. `StorageSize`'s own Display is the settings-file
+/// format and has to round-trip through the parser, so it floors everything
+/// to whole MB — which renders a 700 KB chapter as "0 MB".
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{} KB", (b / KB).round() as u64)
+    }
 }
 
 /// Next value in a cycle: the entry after `current`, wrapping around; the

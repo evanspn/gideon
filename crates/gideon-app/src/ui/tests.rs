@@ -3414,10 +3414,11 @@ fn storage_screen_reports_usage_and_frees_space() {
     s.storage_size_limit = gideon_core::StorageSize(1024 * 1024);
     app.save_settings(&s);
 
-    // Open the storage screen and tap "Free up space now".
+    // Open the storage screen and tap "Free up space now" — the last row of
+    // content, sitting on the Back bar, wherever the series list ends.
     app.push(Screen::Storage).unwrap();
     let l = layout();
-    app.handle_tap(l.width / 2, l.row_top(STORAGE_FREE_ROW) + l.row_h / 2)
+    app.handle_tap(l.width / 2, l.nav_top() - l.row_h / 2)
         .unwrap();
     assert_eq!(
         app.storage_stats().chapters,
@@ -7659,6 +7660,11 @@ fn dump_demo() {
         for c in 0..*read {
             progress.push((format!("{title}/ch{c}.cbz"), 19, 20, now - days * 86_400));
         }
+        // Record the files as downloads too, so the storage screen has a
+        // breakdown to draw.
+        for i in 0..*downloaded {
+            index.record_download(title, &format!("c{i}"), &format!("ch{i}.cbz"));
+        }
     }
     // A partly-read chapter so Continue has somewhere to point.
     progress.push((
@@ -8188,4 +8194,52 @@ fn todays_waiting_list_shows_unread_series_and_opens_them() {
         1,
         "tapping the Frieren row resumed and turned a page in Frieren"
     );
+}
+
+#[test]
+fn storage_breaks_down_by_series_and_reads_sizes_in_human_units() {
+    // The screen used to be four sentences: "Used: 0 MB of 2048 MB" and a
+    // promise that auto-cleanup takes the least-recently-read first. Neither
+    // told you what was actually taking the space.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let mut index = gideon_core::SeriesIndex::default();
+    for (series, chapters, pages) in [("Big Series", 3, 12), ("Small Series", 1, 2)] {
+        index.record(
+            series,
+            gideon_core::SeriesRef {
+                source_id: "s".into(),
+                source_name: "src".into(),
+                manga_id: series.into(),
+                manga_title: series.into(),
+                ..Default::default()
+            },
+        );
+        for c in 0..chapters {
+            let file = format!("ch{c}.cbz");
+            make_cbz(&lib.join(series).join(&file), pages);
+            index.record_download(series, &format!("c{c}"), &file);
+        }
+    }
+    index.save(&lib).unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+
+    let rows = app.storage_by_series();
+    let names: Vec<&str> = rows.iter().map(|(t, ..)| t.as_str()).collect();
+    assert_eq!(names, vec!["Big Series", "Small Series"], "biggest first");
+    assert_eq!(rows[0].2, 3, "chapter counts come from the download index");
+    assert!(rows[0].1 > rows[1].1);
+    assert_eq!(
+        rows.iter().map(|(_, b, _)| b).sum::<u64>(),
+        app.storage_stats().used,
+        "the breakdown accounts for every byte the total claims"
+    );
+
+    // `StorageSize`'s Display floors to whole MB because it has to round-trip
+    // through the settings parser, which renders a 700 KB chapter as "0 MB".
+    assert_eq!(super::human_size(700 * 1024), "700 KB");
+    assert_eq!(super::human_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    assert_eq!(super::human_size(2 * 1024 * 1024 * 1024), "2.00 GB");
 }
