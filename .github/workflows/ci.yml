@@ -50,6 +50,7 @@ jobs:
             shell:
               - 'installer/**'
               - 'ci/**'
+              - 'scripts/**'
               - '.github/workflows/**'
 
   lint:
@@ -141,7 +142,7 @@ jobs:
       # lint below fails with command-not-found, which is loud and obvious.
       - name: Lint shell scripts
         if: needs.changes.outputs.shell == 'true'
-        run: shellcheck installer/install.sh installer/gideon-launch.sh ci/installer_test.sh ci/qemu_integration.sh
+        run: shellcheck installer/install.sh installer/gideon-launch.sh ci/installer_test.sh ci/qemu_integration.sh scripts/gideon-library-report.sh
       - name: Run installer test suite
         if: needs.changes.outputs.shell == 'true'
         run: ./ci/installer_test.sh
