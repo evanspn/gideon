@@ -7230,3 +7230,65 @@ fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
         "one disk, one limit: both profiles must see the same value"
     );
 }
+
+#[test]
+#[ignore]
+fn dump_today_png() {
+    // Not part of CI: renders Home at real Libra Colour size for eyeballing.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Vinland Saga/vol1.cbz"), 40);
+    let now = now_unix();
+    let pattern = [
+        0usize, 14, 3, 0, 41, 22, 0, 0, 7, 33, 18, 0, 9, 27, 0, 44, 2, 0, 11, 36,
+    ];
+    let mut entries: Vec<(String, usize, usize, u64)> = Vec::new();
+    for d in 0..126u64 {
+        let pages = pattern[(d as usize * 7 + d as usize / 5) % pattern.len()];
+        if pages == 0 {
+            continue;
+        }
+        entries.push((
+            format!("Vinland Saga/ch{d}.cbz"),
+            pages - 1,
+            pages,
+            now - d * 86_400,
+        ));
+    }
+    let refs: Vec<(&str, usize, usize, u64)> = entries
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        color_profile: std::env::var("GIDEON_PROFILE").unwrap_or_else(|_| "ink-rust".into()),
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let mut app = UiApp::new(
+        MemoryDisplay::new(1264, 1680),
+        FakeInput::new(vec![]),
+        FakeGateway::default(),
+        lib.clone(),
+    )
+    .with_settings_dir(settings_dir);
+    app.push(Screen::Stats).unwrap();
+
+    let page = app
+        .compose_color_current()
+        .unwrap()
+        .expect("Home draws its band in colour");
+    let mut img = image::RgbImage::new(page.width, page.height);
+    for y in 0..page.height {
+        for x in 0..page.width {
+            img.put_pixel(x, y, image::Rgb(page.pixel(x, y)));
+        }
+    }
+    let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| "home.png".into());
+    img.save(&out).unwrap();
+    eprintln!("wrote {out}");
+}

@@ -4544,75 +4544,160 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     ///
     /// The stats are derived from THIS profile's progress store, so switching
     /// profiles shows that reader's numbers rather than the device's.
+    /// The Today screen: what you have read, and what you were reading.
+    ///
+    /// This is the design's landing screen — stat tiles across the top, the
+    /// activity heatmap under them, the chapter you were on, and the nav bar
+    /// along the bottom. Composed in RGB because the heatmap is a colour ramp
+    /// and the nav indicator a colour block; on a panel with no colour filter
+    /// both collapse to their own greys, which is why every ramp is monotonic
+    /// in luma.
     fn compose_stats(&self) -> RgbPage {
         let l = &self.layout;
+        let settings = self.load_settings();
         let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
-        let palette = heatmap::Palette::from_setting(&self.load_settings().color_profile);
+        let theme = widgets::Theme::from_setting(&settings.color_profile);
+        let palette = heatmap::Palette::from_setting(&settings.color_profile);
+        let inner = l.width.saturating_sub(l.pad * 2);
 
-        let mut canvas = RgbPage::from_gray(&compose_chrome(l, "Reading stats", 0, 1));
-        let mut gray = GrayPage::new_white(l.width, l.height);
-
-        // Four totals, two per row, so the labels have room at any panel width
-        // rather than being ellipsised into uselessness on the narrow ones.
-        let tiles = [
-            (
-                stats.current_streak.to_string(),
-                format!("day streak - best {}", stats.longest_streak),
-            ),
-            (
-                stats.chapters_finished.to_string(),
-                format!("chapters - {} series", stats.series_count),
-            ),
-            (stats.pages_read.to_string(), "pages read".to_string()),
-            (stats.active_days.to_string(), "days read".to_string()),
-        ];
-        let col_w = (l.width - l.pad * 2) / 2;
-        let tile_h = l.row_h;
+        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(l, "Today", 0, 1, false));
         let mut y = l.content_top() + l.pad;
-        for (i, (value, label)) in tiles.iter().enumerate() {
-            let x = l.pad + (i as u32 % 2) * col_w;
-            if i % 2 == 0 && i > 0 {
-                y += tile_h;
-            }
-            draw_text(&mut gray, x, y, l.text_px * 1.15, value, col_w, true);
-            draw_text(
-                &mut gray,
-                x,
-                y + (l.text_px * 1.3) as u32,
-                l.text_px * 0.62,
-                label,
-                col_w,
-                false,
-            );
-        }
-        y += tile_h + l.pad;
 
-        draw_text(
-            &mut gray,
+        // The totals the web dashboard derives from Supabase — here they come
+        // off the device's own progress store, so they are right offline.
+        // Two rows tall: a tile stacks a value, a label and a qualifier,
+        // and a single row height clips the bottom two away.
+        let tile_h = l.row_h * 2;
+        widgets::draw_stat_tiles(
+            &mut canvas,
             l.pad,
             y,
-            l.text_px * 0.62,
-            "READING ACTIVITY",
-            l.width - l.pad * 2,
-            true,
+            inner,
+            tile_h,
+            &[
+                widgets::StatTile {
+                    value: &stats.current_streak.to_string(),
+                    label: "day streak",
+                    sub: &format!("best {}", stats.longest_streak),
+                },
+                widgets::StatTile {
+                    value: &stats.chapters_finished.to_string(),
+                    label: "chapters",
+                    sub: &format!("{} series", stats.series_count),
+                },
+                widgets::StatTile {
+                    value: &stats.pages_read.to_string(),
+                    label: "pages read",
+                    sub: &format!("{} days", stats.active_days),
+                },
+            ],
+            l.text_px,
+            &theme,
         );
-        y += (l.text_px * 0.95) as u32;
+        y += tile_h + l.pad;
 
-        copy_gray_into_rgb(&mut canvas, &gray);
-
-        // Size the grid to the panel instead of hardcoding a cell, so this is
-        // right on a 1072-wide Clara as well as a 1264-wide Libra Colour.
         let weeks = STATS_HEATMAP_WEEKS;
-        let layout = heatmap::HeatmapLayout::fit(l.pad, y, weeks, l.width - l.pad * 2, 6);
-        heatmap::draw_heatmap(
+        let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
+        heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
+        y += grid.height() + l.pad * 2;
+
+        // Continue: the chapter a tap resumes. Omitted on a fresh device
+        // rather than drawn as an empty card.
+        let nav_top = l.height.saturating_sub(l.nav_h);
+        if let Some((title, chapter, pct)) = self.continue_card() {
+            if nav_top.saturating_sub(y) >= l.row_h * 2 {
+                let mut gray = GrayPage::new_white(l.width, l.height);
+                draw_text(
+                    &mut gray,
+                    l.pad,
+                    y,
+                    l.text_px * 0.6,
+                    "CONTINUE",
+                    inner,
+                    true,
+                );
+                draw_text(
+                    &mut gray,
+                    l.pad,
+                    y + (l.text_px * 0.9) as u32,
+                    l.text_px * 1.1,
+                    &title,
+                    inner,
+                    true,
+                );
+                draw_text(
+                    &mut gray,
+                    l.pad,
+                    y + (l.text_px * 2.4) as u32,
+                    l.text_px * 0.75,
+                    &chapter,
+                    inner,
+                    false,
+                );
+                copy_gray_into_rgb(&mut canvas, &gray);
+                let bar_y = y + (l.text_px * 3.4) as u32;
+                fill_rect_rgb(&mut canvas, l.pad, bar_y, inner, 8, [0xCC, 0xCC, 0xCC]);
+                let filled = (inner as f32 * pct.clamp(0.0, 1.0)) as u32;
+                fill_rect_rgb(&mut canvas, l.pad, bar_y, filled, 8, theme.bar);
+            }
+        }
+
+        // The nav bar the whole design is built around.
+        widgets::draw_nav_bar(
             &mut canvas,
-            &layout,
-            &stats.heatmap(weeks as usize),
-            &palette,
+            0,
+            nav_top,
+            l.width,
+            l.nav_h,
+            &[
+                widgets::NavItem {
+                    label: "Today",
+                    active: true,
+                },
+                widgets::NavItem {
+                    label: "Library",
+                    active: false,
+                },
+                widgets::NavItem {
+                    label: "Discover",
+                    active: false,
+                },
+                widgets::NavItem {
+                    label: "Settings",
+                    active: false,
+                },
+            ],
+            l.text_px,
+            &theme,
         );
         canvas
     }
 
+    /// The series and chapter a Continue tap resumes, with its progress: the
+    /// most recently read chapter anywhere in the library.
+    fn continue_card(&self) -> Option<(String, String, f32)> {
+        let cards = group_library(Library::new(&self.library_dir).scan().ok()?);
+        self.with_progress(|_, store| {
+            let card = cards
+                .iter()
+                .filter(|c| c.latest_read_at(store) > 0)
+                .max_by_key(|c| c.latest_read_at(store))?;
+            let entry = card.resume_chapter(store);
+            let progress = store.get(&entry.relative_path);
+            let pct = progress
+                .filter(|p| p.total_pages > 0)
+                .map(|p| (p.current_page + 1) as f32 / p.total_pages as f32)
+                .unwrap_or(0.0);
+            let label = chapter_label(&entry.relative_path);
+            let where_at = match progress {
+                Some(p) if p.total_pages > 0 => {
+                    format!("{label} — page {} of {}", p.current_page + 1, p.total_pages)
+                }
+                _ => label,
+            };
+            Some((card.title(), where_at, pct))
+        })
+    }
     /// Home's data band: the reading totals and the activity heatmap, drawn
     /// in the space below the menu rows.
     ///
@@ -4643,7 +4728,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         fill_rect_rgb(canvas, l.pad, top, inner, 1, [0x55, 0x55, 0x55]);
 
         let tiles_y = top + l.pad;
-        let tile_h = l.row_h;
+        // Two rows tall: a tile stacks a value, a label and a qualifier,
+        // and a single row height clips the bottom two away.
+        let tile_h = l.row_h * 2;
         widgets::draw_stat_tiles(
             canvas,
             l.pad,
