@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-aidoku"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aidoku",
  "anyhow",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-aidoku-wasm-macros"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-aidoku-wasm-shared"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "image",
  "quick-xml",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-device"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gideon-render",
  "libc",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-render"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ab_glyph",
  "image",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-sources"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "filetime",
  "gideon-core",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "gideon-sync"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gideon-core",
  "serde",
