@@ -8556,61 +8556,87 @@ fn discovers_installed_sources_open_their_listings() {
 }
 
 #[test]
-fn a_paginated_library_does_not_draw_paging_buttons_under_the_nav_bar() {
-    // Shipped in 1.0 and caught on hardware: with more than one page of
-    // series, the Library drew First/Prev/Next/Last into the bottom strip
-    // AND the four nav tabs on top of them, so the bar read
-    // "Library First TodayPrev DisCoveNr Sesttings".
+fn every_top_level_destination_owns_its_nav_strip() {
+    // The invariant three separate bugs violated, each found on hardware or
+    // in a screenshot rather than here:
+    //
+    //   * a paginated Library drew First/Prev/Next/Last INTO the nav strip,
+    //     under the tabs, so the bar read "Library First TodayPrev
+    //     DisCoveNr Sesttings";
+    //   * the Library tab pushed instead of replacing the root, so it came
+    //     up with a Back button and no nav bar at all;
+    //   * Discover composed in grayscale, so its nav bar was not drawn.
+    //
+    // All three are the same statement: on a top-level destination, the
+    // bottom strip belongs to the nav bar and to nothing else. Checked by
+    // rendering the bar on its own and requiring the screen's strip to match
+    // it pixel for pixel — which no amount of "looks fine" can fake.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
+    // Enough series to paginate in either view, so the paging chrome is in
+    // play on every pass.
+    for i in 0..12 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 2);
+        make_red_cover(&lib.join(format!("Series {i:02}")));
+    }
+    write_progress(&lib, &[("Series 00/vol1.cbz", 0, 2, now_unix())]);
+    let settings_dir = dir.path().join("data");
+
     for view in ["list", "shelf"] {
-        let profile_lib = lib.join(view);
-        for i in 0..12 {
-            make_cbz(&profile_lib.join(format!("Series {i:02}/vol1.cbz")), 1);
-        }
         gideon_core::ProfileSettings {
             library_view: Some(view.into()),
             ..Default::default()
         }
-        .save(&profile_lib)
+        .save(&lib)
         .unwrap();
 
-        let mut paged = app(&profile_lib, FakeGateway::default(), vec![]);
-        paged.run().unwrap();
-        // Today is the landing screen; this test is about the library.
-        paged.open_library().unwrap();
-        assert!(paged.current_page_count() > 1, "{view}: needs to paginate");
+        for zone in 0..4u32 {
+            let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(zone)])
+                .with_settings_dir(settings_dir.clone());
+            app.run().unwrap();
+            // The Settings tab raises the quick sheet; this is about the
+            // screen under it, so dismiss it the way a tap outside would.
+            if app.sheet().is_some() {
+                app.tap_sheet(1, 1).unwrap();
+            }
+            let what = format!("{view} view, tab {zone}, {:?}", app.screen());
 
-        let page = paged.compose_final().unwrap();
-        let l = layout();
-        let strip = l.nav_top() + l.nav_h / 2;
-        // The nav bar draws four labels; the paging buttons would add ink in
-        // the gaps between them. Compare against the same screen on a
-        // single page, where only the tabs are drawn.
-        let one = dir.path().join(format!("{view}-one"));
-        make_cbz(&one.join("Only/vol1.cbz"), 1);
-        gideon_core::ProfileSettings {
-            library_view: Some(view.into()),
-            ..Default::default()
+            // A destination replaces the root rather than stacking on it.
+            assert_eq!(app.stack_depth(), 1, "{what}: not a root screen");
+
+            let page = app.compose_final().unwrap();
+            let l = layout();
+
+            // The strip, rendered from nothing but the nav bar.
+            let mut reference = gideon_render::RgbPage::new_white(l.width, l.height);
+            gideon_render::widgets::draw_nav_bar(
+                &mut reference,
+                0,
+                l.nav_top(),
+                l.width,
+                l.nav_h,
+                &app.nav_items(),
+                l.text_px,
+                &gideon_render::widgets::Theme::from_setting(
+                    &effective_settings(&settings_dir, &lib).color_profile,
+                ),
+            );
+
+            let mut drawn = 0usize;
+            for y in l.nav_top()..l.height {
+                for x in 0..l.width {
+                    assert_eq!(
+                        page.pixel(x, y),
+                        reference.pixel(x, y),
+                        "{what}: the nav strip has something else in it at {x},{y}"
+                    );
+                    if reference.pixel(x, y) != [0xFF; 3] {
+                        drawn += 1;
+                    }
+                }
+            }
+            assert!(drawn > 0, "{what}: the nav bar was never drawn");
         }
-        .save(&one)
-        .unwrap();
-        let mut single = app(&one, FakeGateway::default(), vec![]);
-        single.run().unwrap();
-        single.open_library().unwrap();
-        assert_eq!(single.current_page_count(), 1);
-        let plain = single.compose_final().unwrap();
-
-        let ink = |p: &gideon_render::RgbPage| -> usize {
-            (0..l.width)
-                .filter(|&x| p.pixel(x, strip) != [0xFF; 3])
-                .count()
-        };
-        assert_eq!(
-            ink(&page),
-            ink(&plain),
-            "{view}: the paged nav strip must hold the tabs and nothing else"
-        );
     }
 }
 

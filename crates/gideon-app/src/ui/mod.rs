@@ -1048,6 +1048,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.stack.last().expect("screen stack is never empty")
     }
 
+    /// How deep the screen stack is. A top-level destination is depth 1; a
+    /// pushed screen is deeper and carries Back instead of the nav bar.
+    #[cfg(test)]
+    fn stack_depth(&self) -> usize {
+        self.stack.len()
+    }
+
     /// The open modal sheet, if any. Long-press menus and confirmations are
     /// sheets over the screen you were on, not screens of their own, so tests
     /// assert on this rather than on the stack.
@@ -1850,6 +1857,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// stacking onto it — what the nav bar does, exposed so tests and the
     /// demo dumps land on the same screen a real tap would.
     fn goto_root(&mut self, screen: Screen) -> Result<()> {
+        // A sheet belongs to the screen it was raised over. Going somewhere
+        // else without dismissing it left it floating above a screen it says
+        // nothing about — and covering that screen's nav bar.
+        self.sheet = None;
         // Settings always opens at the top: arriving on page 2 because that
         // is where you left it a session ago reads as a bug, not a memory.
         if matches!(screen, Screen::Settings) {
