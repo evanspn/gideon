@@ -71,13 +71,6 @@ const STORAGE_LIMIT_STEPS: [u64; 4] = [
     2 * 1024 * 1024 * 1024,
     5 * 1024 * 1024 * 1024,
 ];
-/// Index of the trailing "Storage" row on the Settings screen — appended after
-/// the ten cycling rows ([`settings_rows`]), it opens the storage detail
-/// screen instead of cycling a value.
-const SETTINGS_STORAGE_ROW: usize = 12;
-/// Index of the trailing "Account" row on the Settings screen — appended after
-/// the storage row, it opens the sync account menu (sign in / sync / sign out).
-const SETTINGS_ACCOUNT_ROW: usize = 13;
 /// Row of the "Free up space now" action on the Storage screen (after three
 /// read-only info rows). Shared by the renderer and the tap handler.
 const STORAGE_FREE_ROW: usize = 3;
@@ -111,6 +104,29 @@ enum Sheet {
     /// The settings you change often, over whatever you were doing. Anything
     /// device-wide lives behind the "All settings" row rather than here.
     QuickSettings,
+}
+
+/// What a settings row does when tapped. The grouped list is built once and
+/// used for BOTH drawing and hit-testing: the screen previously drew from
+/// `settings_groups` while `tap_setting` indexed a different, flat list, so
+/// every row on it fired the wrong setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingAction {
+    ReaderFit,
+    FullRefresh,
+    RotateSpreads,
+    ColorProfile,
+    LibraryView,
+    Predownload,
+    CleanupHours,
+    StorageLimit,
+    IdleSuspend,
+    WifiAutoConnect,
+    ColorBoost,
+    AutoUpdate,
+    OpenWifi,
+    OpenStorage,
+    OpenAccount,
 }
 
 /// One library shelf card: a series directory grouping every downloaded
@@ -762,6 +778,10 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// The open modal sheet, if any. A sheet layers over whatever screen is
     /// underneath instead of replacing it, so dismissing one never navigates.
     sheet: Option<Sheet>,
+    /// Which page of the grouped Settings screen is showing. Settings is
+    /// taller than any panel gideon runs on, so it pages like every other
+    /// list; reset whenever Settings is entered afresh.
+    settings_page: usize,
     /// The shelf's ProgressStore, loaded once and reused across repaints
     /// (a disk read + JSON parse per shelf page flip was measurable).
     /// Invalidated whenever the UI writes progress or switches profile.
@@ -842,6 +862,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             charger: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
             sheet: None,
+            settings_page: 0,
             progress_cache: std::cell::RefCell::new(None),
             index_guard: Arc::new(Mutex::new(())),
             predownloader: None,
@@ -1284,7 +1305,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(());
         }
         let items = self.scan_library_items()?;
-        let capacity = self.shelf_layout().capacity().max(1);
+        let capacity = self.library_page_capacity();
         let max_page = items.len().div_ceil(capacity).saturating_sub(1);
         if let Some(Screen::Library { items: slot, page }) = self.stack.last_mut() {
             *page = (*page).min(max_page);
@@ -1629,7 +1650,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// — note the Library paginates by shelf capacity, not list rows.
     fn current_page_count(&self) -> usize {
         let per_page = self.layout.rows_per_page();
-        let shelf_capacity = self.shelf_layout().capacity().max(1);
+        let shelf_capacity = self.library_page_capacity();
         match self.stack.last() {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
@@ -1652,7 +1673,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// end — so a long chapter list is one tap from the start instead of many.
     fn move_page(&mut self, mv: PageMove) -> Result<()> {
         let per_page = self.layout.rows_per_page();
-        let shelf_capacity = self.shelf_layout().capacity().max(1);
+        let shelf_capacity = self.library_page_capacity();
         let Some(screen) = self.stack.last_mut() else {
             return Ok(());
         };
@@ -1711,10 +1732,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // full screen: the handful of things you change often should not
             // cost you your place. Device-wide settings are behind its
             // "All settings" row.
-            3 => {
-                self.sheet = Some(Sheet::QuickSettings);
-                self.render_current(RefreshMode::Partial)?;
-            }
+            3 => self.open_quick_settings()?,
             _ => {}
         }
         Ok(Flow::Continue)
@@ -1724,6 +1742,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// stacking onto it — what the nav bar does, exposed so tests and the
     /// demo dumps land on the same screen a real tap would.
     fn goto_root(&mut self, screen: Screen) -> Result<()> {
+        // Settings always opens at the top: arriving on page 2 because that
+        // is where you left it a session ago reads as a bug, not a memory.
+        if matches!(screen, Screen::Settings) {
+            self.settings_page = 0;
+        }
         self.stack.truncate(1);
         self.stack[0] = screen;
         self.render_current(RefreshMode::Full)
@@ -1801,6 +1824,67 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         );
     }
 
+    /// Where each settings row was drawn, and what it does. Built by walking
+    /// exactly the list the screen draws, so a tap can be resolved by the y it
+    /// landed on rather than by an index into a second, different list.
+    fn settings_hit_map(&self) -> Vec<(u32, u32, SettingAction)> {
+        let l = &self.layout;
+        let (page, pages) = self.settings_layout();
+        let head_h = l.row_h * 2 / 3;
+        let mut y = l.content_top();
+        let mut map = Vec::new();
+        for (_, rows) in page {
+            y += head_h;
+            for (_, _, _, action) in rows {
+                map.push((y, y + l.row_h, action));
+                y += l.row_h;
+            }
+        }
+        let _ = pages;
+        map
+    }
+
+    /// Top edge of the settings pager strip: the last row of content height,
+    /// sitting directly on the nav bar.
+    #[cfg(test)]
+    fn settings_page_count(&self) -> usize {
+        self.settings_layout().1
+    }
+
+    #[cfg(test)]
+    fn settings_page(&self) -> usize {
+        self.settings_page
+    }
+
+    #[cfg(test)]
+    fn set_settings_page(&mut self, page: usize) {
+        self.settings_page = page;
+    }
+
+    fn settings_pager_top(&self) -> u32 {
+        self.layout.nav_top().saturating_sub(self.layout.row_h)
+    }
+
+    /// The settings rows on the current page, and how many pages there are.
+    /// One source of truth: the compositor draws exactly what this returns
+    /// and the hit map walks exactly what this returns, so a row can never
+    /// be drawn in one place and tapped in another.
+    fn settings_layout(&self) -> (Vec<SettingsGroup>, usize) {
+        let l = &self.layout;
+        let head_h = l.row_h * 2 / 3;
+        let avail = l.nav_top().saturating_sub(l.content_top());
+        let groups = settings_groups(&self.load_settings());
+        let mut pages = paginate_settings(groups.clone(), head_h, l.row_h, avail);
+        if pages.len() > 1 {
+            // Paging needs a pager row, which costs a row of content — so
+            // re-paginate against the smaller budget.
+            pages = paginate_settings(groups, head_h, l.row_h, avail.saturating_sub(l.row_h));
+        }
+        let count = pages.len();
+        let at = self.settings_page.min(count - 1);
+        (pages.swap_remove(at), count)
+    }
+
     /// The finished frame: the current screen, with any open sheet layered
     /// over it. One place, so what a dump renders is what the panel gets.
     fn compose_final(&self) -> Result<RgbPage> {
@@ -1860,6 +1944,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     FitMode::FitWidth => "contain".into(),
                     _ => "fit-width".into(),
                 };
+                // The next book opens with the new fit, without a restart:
+                // the reader is built from this field, not from the file.
+                self.reader_fit = FitMode::from_setting(&settings.reader_fit);
                 self.save_settings(&settings);
             }
             "Colour profile" => {
@@ -1894,6 +1981,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // A value cycle repaints one line. Partial, and no flash.
         self.render_current(RefreshMode::Partial)?;
         Ok(Flow::Continue)
+    }
+
+    /// How many series fit on one Library page, in whichever view is active.
+    ///
+    /// The two views hold very different counts — the shelf packs a grid of
+    /// covers, the list gives each series a double-height row — so paging has
+    /// to ask the active view. Using the shelf's capacity while the list is on
+    /// screen makes the page count too small and strands everything past the
+    /// last reachable page.
+    fn library_page_capacity(&self) -> usize {
+        if self.load_settings().library_view == "list" {
+            self.list_rows_per_page()
+        } else {
+            self.shelf_layout().capacity()
+        }
+        .max(1)
     }
 
     /// Whether the current screen is a top-level destination, and so draws
@@ -2247,8 +2350,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            // Settings resolves by the y the tap landed on, not by a row
+            // index: its rows are interleaved with shorter section headers, so
+            // a uniform row grid does not describe them.
             Screen::Settings => {
-                self.tap_setting(row)?;
+                self.tap_setting_at(x, y)?;
                 Ok(Flow::Continue)
             }
             Screen::Storage => {
@@ -2679,109 +2785,114 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Cycle the setting on row `row` to its next value, persist
     /// settings.json immediately (atomic save) and repaint in place.
-    fn tap_setting(&mut self, row: usize) -> Result<()> {
-        // Row 6 opens the Wi-Fi screen (scan + connect) — an action, not a
-        // stored field.
-        if row == 6 {
-            return self.open_wifi();
+    /// Act on a tap at `y` on the settings screen.
+    ///
+    /// Resolved against [`Self::settings_hit_map`] — the same walk the screen
+    /// draws — rather than an index into a parallel list. Two lists is exactly
+    /// how every row here ended up firing a different setting than its label.
+    fn tap_setting_at(&mut self, x: u32, y: u32) -> Result<()> {
+        // The pager strip, when settings runs to more than one page: left
+        // half back, right half forward, both wrapping.
+        let (_, pages) = self.settings_layout();
+        if pages > 1 && y >= self.settings_pager_top() && y < self.layout.nav_top() {
+            let back = x < self.layout.width / 2;
+            self.settings_page = if back {
+                (self.settings_page + pages - 1) % pages
+            } else {
+                (self.settings_page + 1) % pages
+            };
+            // A page flip replaces the whole content area, so it flashes —
+            // this is the one settings interaction that legitimately does.
+            return self.render_current(RefreshMode::Full);
         }
-        // The trailing storage row opens the usage detail screen.
-        if row == SETTINGS_STORAGE_ROW {
-            return self.open_storage();
-        }
-        // The trailing account row opens the sync account menu.
-        if row == SETTINGS_ACCOUNT_ROW {
-            return self.push(Screen::AccountMenu);
-        }
+        let Some((_, _, action)) = self
+            .settings_hit_map()
+            .into_iter()
+            .find(|(top, bottom, _)| y >= *top && y < *bottom)
+        else {
+            return Ok(());
+        };
         let mut settings = self.load_settings();
-        match row {
-            10 => {
-                let current = settings.color_profile.as_str();
-                let next = COLOR_PROFILE_STEPS
-                    .iter()
-                    .position(|p| *p == current)
-                    .map_or(0, |i| (i + 1) % COLOR_PROFILE_STEPS.len());
-                settings.color_profile = COLOR_PROFILE_STEPS[next].to_string();
+        match action {
+            SettingAction::OpenWifi => return self.open_wifi(),
+            SettingAction::OpenStorage => return self.open_storage(),
+            SettingAction::OpenAccount => return self.push(Screen::AccountMenu),
+            SettingAction::ReaderFit => {
+                settings.reader_fit = match FitMode::from_setting(&settings.reader_fit) {
+                    FitMode::FitWidth => "contain".into(),
+                    _ => "fit-width".into(),
+                };
+                // Live, so the next book opens with it (see the sheet's twin).
+                self.reader_fit = FitMode::from_setting(&settings.reader_fit);
             }
-            11 => {
+            SettingAction::FullRefresh => {
+                settings.reader_full_refresh_interval =
+                    cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
+            }
+            SettingAction::RotateSpreads => {
+                settings.auto_rotate_spreads = !settings.auto_rotate_spreads;
+            }
+            SettingAction::ColorProfile => {
+                let at = COLOR_PROFILE_STEPS
+                    .iter()
+                    .position(|p| *p == settings.color_profile)
+                    .map_or(0, |i| (i + 1) % COLOR_PROFILE_STEPS.len());
+                settings.color_profile = COLOR_PROFILE_STEPS[at].to_string();
+            }
+            SettingAction::LibraryView => {
+                settings.library_view = if settings.library_view == "list" {
+                    "shelf".into()
+                } else {
+                    "list".into()
+                };
+            }
+            SettingAction::Predownload => {
+                settings.predownload_unread_chapters =
+                    cycle(&PREDOWNLOAD_STEPS, settings.predownload_unread_chapters);
+            }
+            SettingAction::CleanupHours => {
                 settings.finished_cleanup_hours = cycle(
                     &gideon_core::FINISHED_CLEANUP_STEPS,
                     settings.finished_cleanup_hours,
                 );
             }
-            0 => {
-                settings.predownload_unread_chapters =
-                    cycle(&PREDOWNLOAD_STEPS, settings.predownload_unread_chapters);
-            }
-            1 => {
+            SettingAction::StorageLimit => {
                 settings.storage_size_limit = gideon_core::StorageSize(cycle(
                     &STORAGE_LIMIT_STEPS,
                     settings.storage_size_limit.bytes(),
                 ));
             }
-            2 => {
-                settings.reader_fit = match FitMode::from_setting(&settings.reader_fit) {
-                    FitMode::FitWidth => "contain",
-                    _ => "fit-width",
-                }
-                .to_string();
-                // The next opened book must use the new fit immediately.
-                self.reader_fit = FitMode::from_setting(&settings.reader_fit);
-            }
-            // TODO: this toggle only persists the preference today —
-            // nothing reads auto_check_updates yet (see cmd_browse). Wire
-            // it to an idle-time update check, not startup.
-            3 => settings.auto_check_updates = !settings.auto_check_updates,
-            4 => {
-                // Cycle the Kaleido color boost: vivid → standard → off.
-                // Dialing it down clears rainbow banding on color gradients.
-                use gideon_device::ColorPostProcess as Cpp;
-                let next = match Cpp::from_setting(&settings.color_post_process) {
-                    Cpp::Vivid => Cpp::Standard,
-                    Cpp::Standard => Cpp::Off,
-                    Cpp::Off => Cpp::Vivid,
-                };
-                settings.color_post_process = next.as_setting().to_string();
-                // Apply to the live panel so the next color refresh shows it.
-                self.display.set_color_post_process(next);
-            }
-            5 => {
-                // Cycle the full-refresh interval: fewer flashes = smoother,
-                // more ghosting. Takes effect on the next opened book.
-                settings.reader_full_refresh_interval =
-                    cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
-                self.full_refresh_interval = settings.reader_full_refresh_interval;
-            }
-            7 => {
-                // Auto-connect Wi-Fi on/off: whether gideon brings the radio
-                // up on its own before actions and on wake.
-                settings.wifi_auto_connect = !settings.wifi_auto_connect;
-                self.wifi_auto_connect = settings.wifi_auto_connect;
-            }
-            8 => {
-                // Rotate wide spreads on/off — applies to the next opened book.
-                settings.auto_rotate_spreads = !settings.auto_rotate_spreads;
-                self.auto_rotate_spreads = settings.auto_rotate_spreads;
-            }
-            9 => {
-                // Cycle the idle auto-suspend timeout (5/10/15/30/60 min,
-                // never) and apply it to the live event loops immediately.
+            SettingAction::IdleSuspend => {
                 settings.idle_suspend_minutes =
                     cycle(&IDLE_SUSPEND_STEPS, settings.idle_suspend_minutes);
+                // The live event loops read this field, not the file: without
+                // it the new timeout only takes effect after a restart.
                 self.idle_suspend = idle_suspend_duration(settings.idle_suspend_minutes);
             }
-            _ => return Ok(()),
+            SettingAction::WifiAutoConnect => {
+                settings.wifi_auto_connect = !settings.wifi_auto_connect;
+            }
+            SettingAction::ColorBoost => {
+                // Cycle the Kaleido colour boost: vivid → standard → off.
+                // Dialing it down clears rainbow banding on colour gradients.
+                use gideon_device::ColorPostProcess as C;
+                let next = match C::from_setting(&settings.color_post_process) {
+                    C::Vivid => C::Standard,
+                    C::Standard => C::Off,
+                    C::Off => C::Vivid,
+                };
+                settings.color_post_process = next.as_setting().to_string();
+                // Apply to the live panel so the next colour refresh shows it.
+                self.display.set_color_post_process(next);
+            }
+            SettingAction::AutoUpdate => {
+                settings.auto_check_updates = !settings.auto_check_updates;
+            }
         }
         self.save_settings(&settings);
-        // Lowering the storage limit should take effect now, not just on the
-        // next download — evict down to the new budget immediately.
-        if row == 1 {
-            self.enforce_storage_limit();
-        }
+        // One row's value changed: partial, no flash. See docs/REFRESH.md.
         self.render_current(RefreshMode::Partial)
     }
-
-    // --- profiles ---
 
     /// Current settings; defaults when no settings dir is configured
     /// (tests, headless) or the file is unreadable.
@@ -4829,14 +4940,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let shelf = self.shelf_layout();
         let capacity = shelf.capacity().max(1);
         let visible = || items.iter().skip(page * capacity).take(capacity);
-        if !visible().any(|c| self.cover_path(c.cover_entry()).exists()) {
+        // The shelf takes the colour path when a cover would show it, and also
+        // whenever it is a top-level destination — the nav bar is drawn in RGB,
+        // and without it the shelf loses every route off the screen.
+        let nav = self.screen_has_nav();
+        if !nav && !visible().any(|c| self.cover_path(c.cover_entry()).exists()) {
             return Ok(None);
         }
         let page_count = items.len().div_ceil(capacity).max(1);
-        let chrome = compose_chrome(l, "Library", *page, page_count);
+        let chrome = compose_chrome_opts(l, "Library", *page, page_count, !nav);
         let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, &shelf), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
+        if nav {
+            let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+            widgets::draw_nav_bar(
+                &mut canvas,
+                0,
+                l.height.saturating_sub(l.nav_h),
+                l.width,
+                l.nav_h,
+                &self.nav_items(),
+                l.text_px,
+                &theme,
+            );
+        }
         Ok(Some(canvas))
     }
 
@@ -4973,24 +5101,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             nav_top,
             l.width,
             l.nav_h,
-            &[
-                widgets::NavItem {
-                    label: "Today",
-                    active: true,
-                },
-                widgets::NavItem {
-                    label: "Library",
-                    active: false,
-                },
-                widgets::NavItem {
-                    label: "Discover",
-                    active: false,
-                },
-                widgets::NavItem {
-                    label: "Settings",
-                    active: false,
-                },
-            ],
+            &self.nav_items(),
             l.text_px,
             &theme,
         );
@@ -5310,17 +5421,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let settings = self.load_settings();
         let theme = widgets::Theme::from_setting(&settings.color_profile);
         let inner = l.width.saturating_sub(l.pad * 2);
-        let mut canvas = RgbPage::from_gray(&compose_chrome_opts(l, "Settings", 0, 1, false));
+        let (page, pages) = self.settings_layout();
+        let at = self.settings_page.min(pages - 1);
+        let mut canvas = RgbPage::from_gray(&compose_chrome_paged(
+            l, "Settings", at, pages, false, 0, false,
+        ));
 
-        let head_h = (l.row_h * 2) / 3;
+        let head_h = l.row_h * 2 / 3;
         let row_h = l.row_h;
         let mut y = l.content_top();
-        let nav_top = l.height.saturating_sub(l.nav_h);
+        let nav_top = l.nav_top();
 
-        for (heading, rows) in settings_groups(&settings) {
-            if y + head_h > nav_top {
-                break;
-            }
+        for (heading, rows) in page {
             widgets::draw_section_header(
                 &mut canvas,
                 l.pad,
@@ -5332,10 +5444,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 &theme,
             );
             y += head_h;
-            for (label, value, detail) in rows {
-                if y + row_h > nav_top {
-                    break;
-                }
+            for (label, value, detail, _) in rows {
                 widgets::draw_setting_row(
                     &mut canvas,
                     l.pad,
@@ -5353,6 +5462,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 );
                 y += row_h;
             }
+        }
+
+        if pages > 1 {
+            widgets::draw_setting_row(
+                &mut canvas,
+                l.pad,
+                self.settings_pager_top(),
+                inner,
+                row_h,
+                &widgets::SettingRow {
+                    label: "‹  Previous",
+                    value: "Next  ›",
+                    detail: &format!("page {} of {}", at + 1, pages),
+                    selected: false,
+                },
+                l.text_px,
+                &theme,
+            );
         }
 
         if self.screen_has_nav() {
@@ -5512,31 +5639,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.keyboard_shift,
             ),
             Screen::Stats => self.compose_stats().to_gray(),
-            Screen::Settings => {
-                let settings = self.load_settings();
-                let mut rows = settings_rows(&settings);
-                // A trailing tappable row summarizing storage use; opens the
-                // storage detail screen (SETTINGS_STORAGE_ROW).
-                let stats = self.storage_stats();
-                rows.push((
-                    format!(
-                        "Storage: {} of {} ›",
-                        gideon_core::StorageSize(stats.used),
-                        settings.storage_size_limit
-                    ),
-                    true,
-                ));
-                // Trailing sync-account row (SETTINGS_ACCOUNT_ROW): shows the
-                // signed-in email, or an invitation to sign in.
-                rows.push((
-                    match self.account_email() {
-                        Some(email) => format!("Account: {email} ›"),
-                        None => "Account: sign in to sync ›".to_string(),
-                    },
-                    true,
-                ));
-                compose_list(l, "Settings", &rows, 0, 1)
-            }
+            // Settings is composed in RGB unconditionally (see
+            // `compose_color_current`): its section headers and value column
+            // are the palette's work, and the grayscale twin that used to
+            // live here is what let the screen drift out of step with its own
+            // tap map.
+            Screen::Settings => self.compose_settings().to_gray(),
             Screen::Storage => self.compose_storage()?,
             Screen::AccountMenu => {
                 let rows = match self.account_email() {
@@ -5805,7 +5913,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let capacity = shelf.capacity().max(1);
         let page_count = items.len().div_ceil(capacity).max(1);
 
-        let mut canvas = compose_chrome(l, "Library", page, page_count);
+        let mut canvas =
+            compose_chrome_opts(l, "Library", page, page_count, !self.screen_has_nav());
         if items.is_empty() {
             draw_text(
                 &mut canvas,
@@ -6238,6 +6347,32 @@ fn compose_chrome_reserved(
     show_back: bool,
     right_reserved: u32,
 ) -> GrayPage {
+    compose_chrome_paged(
+        l,
+        title,
+        page,
+        page_count,
+        show_back,
+        right_reserved,
+        page_count > 1,
+    )
+}
+
+/// The chrome, with the bottom paging buttons under separate control from the
+/// "n/m" indicator. A screen that carries the four-tab nav bar in the bottom
+/// strip wants the indicator without the buttons — drawing both puts
+/// First/Prev/Next/Last on top of Library/Today/Discover/Settings, which is
+/// how the cover shelf once stranded the user with no way back.
+#[allow(clippy::too_many_arguments)]
+fn compose_chrome_paged(
+    l: &UiLayout,
+    title: &str,
+    page: usize,
+    page_count: usize,
+    show_back: bool,
+    right_reserved: u32,
+    paged_nav: bool,
+) -> GrayPage {
     let mut canvas = GrayPage::new_white(l.width, l.height);
     let text_y = |top: u32, h: u32| top + h.saturating_sub(l.text_px as u32 + 4) / 2;
 
@@ -6271,7 +6406,7 @@ fn compose_chrome_reserved(
     // [`UiLayout::nav_buttons`]).
     hline(&mut canvas, l.nav_top(), 0x55);
     let nav_y = text_y(l.nav_top(), l.nav_h);
-    for (target, bx, bw) in l.nav_buttons(page_count > 1) {
+    for (target, bx, bw) in l.nav_buttons(paged_nav) {
         let label = match target {
             TapTarget::Back if show_back => "< Back",
             TapTarget::Back => continue,
@@ -7751,65 +7886,6 @@ fn home_title(version: &str, profile: &str, battery: Option<u8>) -> String {
     title
 }
 
-/// The Settings screen's rows, showing current values.
-fn settings_rows(s: &gideon_core::Settings) -> Vec<(String, bool)> {
-    let fit = match gideon_render::FitMode::from_setting(&s.reader_fit) {
-        gideon_render::FitMode::FitWidth => "fit-width",
-        _ => "contain",
-    };
-    let auto = if s.auto_check_updates { "on" } else { "off" };
-    let color = gideon_device::ColorPostProcess::from_setting(&s.color_post_process).as_setting();
-    // Live Wi-Fi status (one probe per Settings paint); off-device this reads
-    // "connected" and the controls no-op.
-    let wifi = if gideon_device::network::is_online() {
-        "Wi-Fi: connected (tap to manage)".to_string()
-    } else {
-        "Wi-Fi: off (tap to scan)".to_string()
-    };
-    let auto_connect = if s.wifi_auto_connect { "on" } else { "off" };
-    vec![
-        (
-            format!("Pre-download ahead: {}", s.predownload_unread_chapters),
-            true,
-        ),
-        (format!("Storage limit: {}", s.storage_size_limit), true),
-        (format!("Reader fit: {fit}"), true),
-        (format!("Check updates automatically: {auto}"), true),
-        (format!("Color boost: {color}"), true),
-        (
-            format!(
-                "Full refresh: every {} pages",
-                s.reader_full_refresh_interval
-            ),
-            true,
-        ),
-        (wifi, true),
-        (format!("Auto-connect Wi-Fi: {auto_connect}"), true),
-        (
-            format!(
-                "Rotate wide spreads: {}",
-                if s.auto_rotate_spreads { "on" } else { "off" }
-            ),
-            true,
-        ),
-        (
-            format!(
-                "Sleep when idle: {}",
-                idle_suspend_label(s.idle_suspend_minutes)
-            ),
-            true,
-        ),
-        (format!("Colour profile: {}", s.color_profile), true),
-        (
-            format!(
-                "Delete finished chapters: {}",
-                cleanup_label(s.finished_cleanup_hours)
-            ),
-            true,
-        ),
-    ]
-}
-
 /// How the finished-chapter cleanup delay reads on the settings row.
 /// "never" rather than "0 hours", because zero is a decision, not a duration.
 fn cleanup_label(hours: u32) -> String {
@@ -7826,6 +7902,62 @@ fn cleanup_label(hours: u32) -> String {
 /// palette reference presents them.
 const COLOR_PROFILE_STEPS: [&str; 5] = ["ink-rust", "indigo", "sumi", "botanical", "mono"];
 
+/// One drawn settings row: label, current value, the one-line detail under
+/// it, and what a tap on it does.
+type SettingsRow = (String, String, String, SettingAction);
+/// A heading and the rows under it.
+type SettingsGroup = (&'static str, Vec<SettingsRow>);
+
+/// Split the settings groups into pages that actually fit `avail` pixels of
+/// content. Without this the screen silently drops every row past the fold —
+/// fifteen rows and three headings need ~1734px of a 1680px panel, so the
+/// last group simply never rendered and could never be tapped.
+///
+/// A group too tall for one page is split, and its heading repeats on the
+/// continuation, so a page never opens with orphan rows under no heading and
+/// a heading never sits alone at the bottom of a page.
+fn paginate_settings(
+    groups: Vec<SettingsGroup>,
+    head_h: u32,
+    row_h: u32,
+    avail: u32,
+) -> Vec<Vec<SettingsGroup>> {
+    let mut pages: Vec<Vec<SettingsGroup>> = Vec::new();
+    let mut page: Vec<SettingsGroup> = Vec::new();
+    let mut used = 0;
+    for (heading, rows) in groups {
+        let mut pending: Vec<SettingsRow> = Vec::new();
+        // A heading is only worth placing if at least one of its rows fits
+        // beneath it on the same page.
+        if used + head_h + row_h > avail && !page.is_empty() {
+            pages.push(std::mem::take(&mut page));
+            used = 0;
+        }
+        used += head_h;
+        for r in rows {
+            if used + row_h > avail && !(page.is_empty() && pending.is_empty()) {
+                if !pending.is_empty() {
+                    page.push((heading, std::mem::take(&mut pending)));
+                }
+                pages.push(std::mem::take(&mut page));
+                used = head_h;
+            }
+            pending.push(r);
+            used += row_h;
+        }
+        if !pending.is_empty() {
+            page.push((heading, pending));
+        }
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    if pages.is_empty() {
+        pages.push(Vec::new());
+    }
+    pages
+}
+
 /// Settings, grouped by what each one is about. The order is deliberate:
 /// the things you change often come first, the hardware you set once comes
 /// last, and the split also marks scope — Reading and Library are per
@@ -7833,16 +7965,13 @@ const COLOR_PROFILE_STEPS: [&str; 5] = ["ink-rust", "indigo", "sumi", "botanical
 ///
 /// Returns `(heading, [(label, value, detail)])` so the compositor stays a
 /// drawing routine and the copy lives in one place.
-#[allow(clippy::type_complexity)]
-fn settings_groups(
-    s: &gideon_core::Settings,
-) -> Vec<(&'static str, Vec<(String, String, String)>)> {
+fn settings_groups(s: &gideon_core::Settings) -> Vec<SettingsGroup> {
     let fit = match gideon_render::FitMode::from_setting(&s.reader_fit) {
         gideon_render::FitMode::FitWidth => "fit-width",
         _ => "contain",
     };
     let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
-    let row = |l: &str, v: String, d: &str| (l.to_string(), v, d.to_string());
+    let row = |l: &str, v: String, d: &str, a: SettingAction| (l.to_string(), v, d.to_string(), a);
 
     vec![
         (
@@ -7852,21 +7981,25 @@ fn settings_groups(
                     "Reader fit",
                     fit.to_string(),
                     "how a page is scaled to the panel",
+                    SettingAction::ReaderFit,
                 ),
                 row(
                     "Full refresh",
                     format!("every {} pages", s.reader_full_refresh_interval),
                     "flashes the panel clean to clear ghosting",
+                    SettingAction::FullRefresh,
                 ),
                 row(
                     "Rotate wide spreads",
                     on_off(s.auto_rotate_spreads),
                     "turn double pages to landscape",
+                    SettingAction::RotateSpreads,
                 ),
                 row(
                     "Colour profile",
                     s.color_profile.clone(),
                     "the palette the interface draws in",
+                    SettingAction::ColorProfile,
                 ),
             ],
         ),
@@ -7877,21 +8010,31 @@ fn settings_groups(
                     "Library view",
                     s.library_view.clone(),
                     "dense list, or the cover shelf",
+                    SettingAction::LibraryView,
                 ),
                 row(
                     "Pre-download ahead",
                     s.predownload_unread_chapters.to_string(),
                     "chapters fetched past the one you are on",
+                    SettingAction::Predownload,
                 ),
                 row(
                     "Delete finished chapters",
                     cleanup_label(s.finished_cleanup_hours),
                     "reclaims space once you are done with them",
+                    SettingAction::CleanupHours,
                 ),
                 row(
                     "Storage limit",
                     s.storage_size_limit.to_string(),
                     "downloads are evicted past this",
+                    SettingAction::StorageLimit,
+                ),
+                row(
+                    "Storage",
+                    "›".to_string(),
+                    "what is using space, and free it up",
+                    SettingAction::OpenStorage,
                 ),
             ],
         ),
@@ -7902,11 +8045,19 @@ fn settings_groups(
                     "Sleep when idle",
                     idle_suspend_label(s.idle_suspend_minutes),
                     "shared by every profile",
+                    SettingAction::IdleSuspend,
                 ),
                 row(
                     "Auto-connect Wi-Fi",
                     on_off(s.wifi_auto_connect),
                     "reconnect without asking",
+                    SettingAction::WifiAutoConnect,
+                ),
+                row(
+                    "Wi-Fi",
+                    "›".to_string(),
+                    "scan for and join a network",
+                    SettingAction::OpenWifi,
                 ),
                 row(
                     "Colour boost",
@@ -7914,11 +8065,19 @@ fn settings_groups(
                         .as_setting()
                         .to_string(),
                     "Kaleido saturation; vivid can band gradients",
+                    SettingAction::ColorBoost,
                 ),
                 row(
                     "Check updates automatically",
                     on_off(s.auto_check_updates),
                     "look for new releases on start",
+                    SettingAction::AutoUpdate,
+                ),
+                row(
+                    "Account",
+                    "›".to_string(),
+                    "sign in to sync progress across devices",
+                    SettingAction::OpenAccount,
                 ),
             ],
         ),

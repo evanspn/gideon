@@ -236,6 +236,87 @@ fn tap_today() -> UiEvent {
     tap_nav(1)
 }
 
+/// Tap row `i` of the quick-settings sheet the Settings tab opens.
+fn tap_quick_row(i: usize) -> UiEvent {
+    let l = layout();
+    // `sheet_height` = title (one row) + one row each.
+    let rows = QUICK_SETTINGS_ROWS;
+    let h = (rows + 1) * l.row_h;
+    let top = H - h;
+    UiEvent::Tap {
+        x: W / 2,
+        y: top + l.row_h + i as u32 * l.row_h + l.row_h / 2,
+    }
+}
+
+/// Number of rows in the quick-settings sheet, and the index of the row that
+/// opens the full device-wide settings screen.
+const QUICK_SETTINGS_ROWS: u32 = 6;
+const QUICK_ALL_SETTINGS: usize = 4;
+
+/// Open the full Settings screen the way a user does: the Settings tab raises
+/// the quick sheet, and "All settings" goes through to the whole list.
+fn open_settings() -> Vec<UiEvent> {
+    vec![tap_nav(3), tap_quick_row(QUICK_ALL_SETTINGS)]
+}
+
+/// The page a settings row is drawn on, and a tap at the centre of it.
+/// Computed from the same pagination the screen uses, so a test never has to
+/// know which page a row landed on — and a row that moves takes its tap with
+/// it instead of quietly firing its neighbour.
+fn settings_row_at(label: &str) -> (usize, UiEvent) {
+    let l = layout();
+    let head_h = l.row_h * 2 / 3;
+    let avail = l.nav_top().saturating_sub(l.content_top());
+    let groups = super::settings_groups(&gideon_core::Settings::default());
+    let mut pages = super::paginate_settings(groups.clone(), head_h, l.row_h, avail);
+    if pages.len() > 1 {
+        pages = super::paginate_settings(groups, head_h, l.row_h, avail.saturating_sub(l.row_h));
+    }
+    for (p, page) in pages.iter().enumerate() {
+        let mut y = l.content_top();
+        for (_, rows) in page {
+            y += head_h;
+            for (name, ..) in rows {
+                if name == label {
+                    return (
+                        p,
+                        UiEvent::Tap {
+                            x: l.width / 2,
+                            y: y + l.row_h / 2,
+                        },
+                    );
+                }
+                y += l.row_h;
+            }
+        }
+    }
+    panic!("no settings row labelled {label:?}");
+}
+
+/// A tap on the settings pager strip: left half back, right half forward.
+fn settings_pager(forward: bool) -> UiEvent {
+    let l = layout();
+    UiEvent::Tap {
+        x: if forward {
+            l.width * 3 / 4
+        } else {
+            l.width / 4
+        },
+        y: l.nav_top() - l.row_h / 2,
+    }
+}
+
+/// Everything needed to tap the settings row labelled `label` from page 0 of
+/// the Settings screen, ending back on page 0 so calls compose.
+fn tap_setting(label: &str) -> Vec<UiEvent> {
+    let (page, tap) = settings_row_at(label);
+    let mut events: Vec<UiEvent> = (0..page).map(|_| settings_pager(true)).collect();
+    events.push(tap);
+    events.extend((0..page).map(|_| settings_pager(false)));
+    events
+}
+
 fn tap_row(i: usize) -> UiEvent {
     let l = layout();
     UiEvent::Tap {
@@ -1677,6 +1758,15 @@ fn color_library_page_flips_stay_partial() {
         make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
         make_red_cover(&lib.join(format!("Series {i:02}")));
     }
+
+    // Pin this profile to the cover shelf: the flip under test is the
+    // colour one, and the dense list is the default view now.
+    gideon_core::ProfileSettings {
+        library_view: Some("shelf".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
 
     let events = vec![nav_discover(), tap_row(0), tap_nav_next()];
     let mut app = app(&lib, FakeGateway::default(), events);
@@ -4004,20 +4094,17 @@ fn settings_rows_cycle_and_persist_to_disk() {
         .save(&settings_dir)
         .unwrap();
 
-    let events = vec![
-        nav_discover(),
-        tap_row(3), // Home -> Settings
-        tap_row(0), // pre-download 2 -> 3
-        tap_row(0), // 3 -> 5
-        tap_row(1), // storage 2 GB -> 5 GB
-        tap_row(3), // auto-check on -> off
-        tap_back(),
-    ];
+    let mut events = open_settings();
+    events.extend(tap_setting("Pre-download ahead")); // 2 -> 3
+    events.extend(tap_setting("Pre-download ahead")); // 3 -> 5
+    events.extend(tap_setting("Storage limit")); // 2 GB -> 5 GB
+    events.extend(tap_setting("Check updates automatically")); // on -> off
+    events.push(tap_nav(0));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
-    assert!(matches!(app.screen(), Screen::Home));
+    assert!(matches!(app.screen(), Screen::Library { .. }));
     let settings = effective_settings(&settings_dir, dir.path());
     assert_eq!(settings.predownload_unread_chapters, 5);
     assert_eq!(
@@ -4039,7 +4126,8 @@ fn idle_suspend_setting_cycles_and_persists() {
         .unwrap();
 
     // Default 15 min -> 30 min (the Nickel/KOReader increments).
-    let events = vec![nav_discover(), tap_row(3), tap_row(9)];
+    let mut events = open_settings();
+    events.extend(tap_setting("Sleep when idle"));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -4064,7 +4152,8 @@ fn idle_suspend_cycles_past_an_hour_to_never() {
     .save(&settings_dir)
     .unwrap();
 
-    let events = vec![nav_discover(), tap_row(3), tap_row(9)];
+    let mut events = open_settings();
+    events.extend(tap_setting("Sleep when idle"));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
@@ -4098,12 +4187,13 @@ fn storage_limit_cycle_wraps_around() {
     .save(&settings_dir)
     .unwrap();
 
-    let events = vec![nav_discover(), tap_row(3), tap_row(1)];
+    let mut events = open_settings();
+    events.extend(tap_setting("Storage limit"));
     let mut app =
         app(dir.path(), FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
-    let settings = gideon_core::Settings::load(&settings_dir).unwrap();
+    let settings = effective_settings(&settings_dir, dir.path());
     assert_eq!(
         settings.storage_size_limit.bytes(),
         500 * 1024 * 1024,
@@ -4123,16 +4213,21 @@ fn reader_fit_toggle_applies_to_the_next_book_immediately() {
 
     // Toggle contain -> fit-width, then open a tall page: a "next" tap
     // must scroll within the page (no page turn), without a restart.
-    let events = vec![
-        nav_discover(),
-        tap_row(3), // Settings
-        tap_row(2), // Reader fit: contain -> fit-width
-        tap_back(), // Home
-        tap_row(0), // Library
+    // The cover shelf, so opening the book is one tap on a known cell.
+    gideon_core::ProfileSettings {
+        library_view: Some("shelf".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
+    let mut events = open_settings();
+    events.extend(tap_setting("Reader fit")); // contain -> fit-width
+    events.extend([
+        tap_nav(0), // Library
         tap_shelf_cell0(),
         reader_tap_next(),
         reader_tap_back(),
-    ];
+    ]);
     let mut app = app(&lib, FakeGateway::default(), events).with_settings_dir(settings_dir.clone());
     app.run().unwrap();
 
@@ -7489,12 +7584,10 @@ fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
     // Device-global settings stay shared: a storage-limit change made by one
     // profile is the same limit the other sees, because there is one disk.
     let before = effective_settings(&settings_dir, &alex_lib).storage_size_limit;
-    let mut b = app(
-        &root,
-        FakeGateway::default(),
-        vec![nav_discover(), tap_row(3), tap_row(1)],
-    )
-    .with_settings_dir(settings_dir.clone());
+    let mut storage_events = open_settings();
+    storage_events.extend(tap_setting("Storage limit"));
+    let mut b =
+        app(&root, FakeGateway::default(), storage_events).with_settings_dir(settings_dir.clone());
     b.run().unwrap();
     let after_self = effective_settings(&settings_dir, &root).storage_size_limit;
     let after_other = effective_settings(&settings_dir, &alex_lib).storage_size_limit;
@@ -7807,4 +7900,185 @@ fn quick_settings_opens_and_cycles_without_flashing() {
         Some(&RefreshMode::Full),
         "closing restores what the sheet covered, so it flashes"
     );
+}
+
+#[test]
+fn every_series_is_reachable_by_paging_in_either_library_view() {
+    // The two views hold different counts per page — the shelf packs a cover
+    // grid, the list gives each series a double-height row. Paging that asks
+    // the wrong one strands everything past the last reachable page, which
+    // with the list as the default meant half a library was simply gone.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..14 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 2);
+    }
+    let settings_dir = dir.path().join("data");
+
+    for view in ["list", "shelf"] {
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&lib)
+        .unwrap();
+        let mut app =
+            app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+        app.run().unwrap();
+
+        let per_page = app.library_page_capacity();
+        let Screen::Library { items, .. } = app.screen() else {
+            panic!("the landing screen is the library");
+        };
+        let total = items.len();
+        assert_eq!(total, 14, "{view}: every series should be listed");
+
+        // Jump to the last page and confirm it really covers the tail.
+        let pages = total.div_ceil(per_page);
+        app.move_page(PageMove::Last).unwrap();
+        let Screen::Library { page, .. } = app.screen() else {
+            unreachable!()
+        };
+        let page = *page;
+        assert_eq!(
+            page,
+            pages - 1,
+            "{view}: Last should reach the final page, not stop short"
+        );
+        assert!(
+            (page + 1) * per_page >= total,
+            "{view}: the last page must cover the final series ({} of {total} covered)",
+            (page + 1) * per_page
+        );
+    }
+}
+
+#[test]
+fn every_settings_row_changes_the_setting_its_label_names() {
+    // The screen drew from a grouped list while the tap dispatch indexed a
+    // different flat one, so every row fired someone else's setting — "Library
+    // view" opened the Wi-Fi scanner. Nothing caught it, because the only test
+    // exercised the model rather than a tap at the y a row is drawn at.
+    // This taps the drawn centre of each row and asserts THAT row's field moved.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+    app.goto_root(Screen::Settings).unwrap();
+
+    let mut seen = Vec::new();
+    let pages = app.settings_page_count();
+    assert!(pages >= 1);
+    for page in 0..pages {
+        app.set_settings_page(page);
+        let map = app.settings_hit_map();
+        assert!(!map.is_empty(), "page {page} laid out no rows");
+        for (top, bottom, action) in map {
+            seen.push(action);
+            let before = effective_settings(&settings_dir, &lib);
+            app.tap_setting_at(W / 2, (top + bottom) / 2).unwrap();
+            let after = effective_settings(&settings_dir, &lib);
+
+            // The three navigation rows move the screen instead of a value.
+            let changed = match action {
+                SettingAction::ReaderFit => before.reader_fit != after.reader_fit,
+                SettingAction::FullRefresh => {
+                    before.reader_full_refresh_interval != after.reader_full_refresh_interval
+                }
+                SettingAction::RotateSpreads => {
+                    before.auto_rotate_spreads != after.auto_rotate_spreads
+                }
+                SettingAction::ColorProfile => before.color_profile != after.color_profile,
+                SettingAction::LibraryView => before.library_view != after.library_view,
+                SettingAction::Predownload => {
+                    before.predownload_unread_chapters != after.predownload_unread_chapters
+                }
+                SettingAction::CleanupHours => {
+                    before.finished_cleanup_hours != after.finished_cleanup_hours
+                }
+                SettingAction::StorageLimit => {
+                    before.storage_size_limit != after.storage_size_limit
+                }
+                SettingAction::IdleSuspend => {
+                    before.idle_suspend_minutes != after.idle_suspend_minutes
+                }
+                SettingAction::WifiAutoConnect => {
+                    before.wifi_auto_connect != after.wifi_auto_connect
+                }
+                SettingAction::ColorBoost => before.color_post_process != after.color_post_process,
+                SettingAction::AutoUpdate => before.auto_check_updates != after.auto_check_updates,
+                SettingAction::OpenWifi
+                | SettingAction::OpenStorage
+                | SettingAction::OpenAccount => {
+                    // A navigation row leaves every value alone.
+                    assert_eq!(before, after, "{action:?} must not change a setting");
+                    app.goto_root(Screen::Settings).unwrap();
+                    app.set_settings_page(page);
+                    continue;
+                }
+            };
+            assert!(changed, "tapping the {action:?} row changed nothing");
+        }
+    }
+
+    // Paging must not lose a row: every setting the model defines has to be
+    // reachable on some page. Dropping the tail off the fold is exactly the
+    // bug this screen shipped with.
+    for (_, rows) in super::settings_groups(&effective_settings(&settings_dir, &lib)) {
+        for (label, _, _, action) in rows {
+            assert!(
+                seen.contains(&action),
+                "{label:?} is defined but on no page"
+            );
+        }
+    }
+}
+
+#[test]
+fn settings_pages_reach_every_row_and_open_at_the_top() {
+    // Fifteen rows and three headings need more height than any panel gideon
+    // runs on, so the screen pages. Before it did, the whole Device group was
+    // drawn off the bottom: visible nowhere, tappable nowhere.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings::default()
+        .save(&settings_dir)
+        .unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    app.run().unwrap();
+    app.goto_root(Screen::Settings).unwrap();
+
+    let pages = app.settings_page_count();
+    assert!(pages > 1, "the settings list is taller than the panel");
+
+    // The pager strip: forward wraps back to the first page, and the left
+    // half walks backwards.
+    let l = layout();
+    let pager_y = l.nav_top() - l.row_h / 2;
+    for expected in 1..pages {
+        app.tap_setting_at(W * 3 / 4, pager_y).unwrap();
+        assert_eq!(app.settings_page(), expected, "forward advances one page");
+    }
+    app.tap_setting_at(W * 3 / 4, pager_y).unwrap();
+    assert_eq!(app.settings_page(), 0, "forward wraps at the last page");
+    app.tap_setting_at(W / 4, pager_y).unwrap();
+    assert_eq!(app.settings_page(), pages - 1, "back wraps at the first");
+
+    // Leaving and coming back starts at the top again.
+    app.goto_root(Screen::Library {
+        items: Vec::new(),
+        page: 0,
+    })
+    .unwrap();
+    app.goto_root(Screen::Settings).unwrap();
+    assert_eq!(app.settings_page(), 0);
 }
