@@ -102,6 +102,17 @@ impl SourceRow {
     }
 }
 
+/// An open modal sheet: what it is titled, and what it offers.
+///
+/// Kinds rather than free-form callbacks so the tap routing stays a match on
+/// data — the same reason [`Screen`] is an enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sheet {
+    /// The settings you change often, over whatever you were doing. Anything
+    /// device-wide lives behind the "All settings" row rather than here.
+    QuickSettings,
+}
+
 /// One library shelf card: a series directory grouping every downloaded
 /// chapter inside it, or a single loose CBZ at the library root. Grouping
 /// happens here in the UI layer — `Library::scan` still returns one entry
@@ -748,6 +759,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// recently used — never wholesale, so flipping a shelf page back
     /// stays warm.
     cover_cache: std::cell::RefCell<CoverCache>,
+    /// The open modal sheet, if any. A sheet layers over whatever screen is
+    /// underneath instead of replacing it, so dismissing one never navigates.
+    sheet: Option<Sheet>,
     /// The shelf's ProgressStore, loaded once and reused across repaints
     /// (a disk read + JSON parse per shelf page flip was measurable).
     /// Invalidated whenever the UI writes progress or switches profile.
@@ -827,6 +841,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             idle_suspend: IDLE_SUSPEND,
             charger: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
+            sheet: None,
             progress_cache: std::cell::RefCell::new(None),
             index_guard: Arc::new(Mutex::new(())),
             predownloader: None,
@@ -1307,6 +1322,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // Today draws a four-item nav bar where other screens draw Back,
             // so its bottom strip is routed here instead of falling through
             // to the generic targets.
+            _ if self.sheet.is_some() => self.tap_sheet(x, y),
             _ if self.screen_has_nav() && y >= self.layout.nav_top() => self.tap_main_nav(x),
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
@@ -1683,8 +1699,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.stack[0] = Screen::Home;
                 self.render_current(RefreshMode::Full)?;
             }
+            // Settings opens the quick sheet over where you were, not a
+            // full screen: the handful of things you change often should not
+            // cost you your place. Device-wide settings are behind its
+            // "All settings" row.
             3 => {
-                self.stack[0] = Screen::Settings;
+                self.sheet = Some(Sheet::QuickSettings);
                 self.render_current(RefreshMode::Full)?;
             }
             _ => {}
@@ -1699,6 +1719,160 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.stack.truncate(1);
         self.stack[0] = screen;
         self.render_current(RefreshMode::Full)
+    }
+
+    /// The rows an open sheet shows. Kept beside the tap routing so drawing
+    /// and hit-testing read the same list and cannot fall out of step.
+    fn sheet_rows(&self) -> (String, Vec<(String, String, bool)>) {
+        match self.sheet {
+            Some(Sheet::QuickSettings) => {
+                let s = self.load_settings();
+                (
+                    "Quick settings".to_string(),
+                    vec![
+                        ("Library view".into(), s.library_view.clone(), false),
+                        (
+                            "Reader fit".into(),
+                            match FitMode::from_setting(&s.reader_fit) {
+                                FitMode::FitWidth => "fit-width".into(),
+                                _ => "contain".into(),
+                            },
+                            false,
+                        ),
+                        ("Colour profile".into(), s.color_profile.clone(), false),
+                        (
+                            "Delete finished".into(),
+                            cleanup_label(s.finished_cleanup_hours),
+                            false,
+                        ),
+                        ("All settings".into(), String::new(), false),
+                        ("Close".into(), String::new(), true),
+                    ],
+                )
+            }
+            None => (String::new(), Vec::new()),
+        }
+    }
+
+    /// Where an open sheet sits: anchored to the bottom, as tall as its rows
+    /// need. Everything above it stays on screen and unrepainted.
+    fn sheet_bounds(&self) -> Option<(u32, u32)> {
+        let (_, rows) = self.sheet_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let h = widgets::sheet_height(rows.len(), self.layout.row_h).min(self.layout.height);
+        Some((self.layout.height - h, h))
+    }
+
+    /// Draw the open sheet over an already-composed screen.
+    fn overlay_sheet(&self, canvas: &mut RgbPage) {
+        let Some((y, h)) = self.sheet_bounds() else {
+            return;
+        };
+        let (title, rows) = self.sheet_rows();
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let rows: Vec<widgets::SheetRow> = rows
+            .iter()
+            .map(|(l, v, d)| widgets::SheetRow {
+                label: l,
+                value: v,
+                dismiss: *d,
+            })
+            .collect();
+        widgets::draw_sheet(
+            canvas,
+            0,
+            y,
+            self.layout.width,
+            h,
+            &title,
+            &rows,
+            self.layout.text_px,
+            &theme,
+        );
+    }
+
+    /// The finished frame: the current screen, with any open sheet layered
+    /// over it. One place, so what a dump renders is what the panel gets.
+    fn compose_final(&self) -> Result<RgbPage> {
+        let mut canvas = match self.compose_color_current()? {
+            Some(rgb) => rgb,
+            None => RgbPage::from_gray(&self.compose_current()?),
+        };
+        self.overlay_sheet(&mut canvas);
+        Ok(canvas)
+    }
+
+    /// Open the quick-settings sheet over the current screen.
+    fn open_quick_settings(&mut self) -> Result<()> {
+        self.sheet = Some(Sheet::QuickSettings);
+        self.render_current(RefreshMode::Full)
+    }
+
+    /// Route a tap while a sheet is open. A tap outside it dismisses, which is
+    /// what every modal on every platform does and what a reader will try
+    /// first; the sheet's own rows act.
+    fn tap_sheet(&mut self, _x: u32, y: u32) -> Result<Flow> {
+        let Some((top, h)) = self.sheet_bounds() else {
+            return Ok(Flow::Continue);
+        };
+        if y < top {
+            self.sheet = None;
+            return self
+                .render_current(RefreshMode::Full)
+                .map(|_| Flow::Continue);
+        }
+        let (_, rows) = self.sheet_rows();
+        let row_h = self.layout.row_h;
+        let title_h = h.saturating_sub(row_h * rows.len() as u32);
+        if y < top + title_h {
+            return Ok(Flow::Continue);
+        }
+        let index = ((y - top - title_h) / row_h.max(1)) as usize;
+        let Some((label, _, _)) = rows.get(index) else {
+            return Ok(Flow::Continue);
+        };
+        let mut settings = self.load_settings();
+        match label.as_str() {
+            "Library view" => {
+                settings.library_view = if settings.library_view == "list" {
+                    "shelf".into()
+                } else {
+                    "list".into()
+                };
+                self.save_settings(&settings);
+            }
+            "Reader fit" => {
+                settings.reader_fit = match FitMode::from_setting(&settings.reader_fit) {
+                    FitMode::FitWidth => "contain".into(),
+                    _ => "fit-width".into(),
+                };
+                self.save_settings(&settings);
+            }
+            "Colour profile" => {
+                let at = COLOR_PROFILE_STEPS
+                    .iter()
+                    .position(|p| *p == settings.color_profile)
+                    .map_or(0, |i| (i + 1) % COLOR_PROFILE_STEPS.len());
+                settings.color_profile = COLOR_PROFILE_STEPS[at].to_string();
+                self.save_settings(&settings);
+            }
+            "Delete finished" => {
+                settings.finished_cleanup_hours = cycle(
+                    &gideon_core::FINISHED_CLEANUP_STEPS,
+                    settings.finished_cleanup_hours,
+                );
+                self.save_settings(&settings);
+            }
+            "All settings" => {
+                self.sheet = None;
+                return self.goto_root(Screen::Settings).map(|_| Flow::Continue);
+            }
+            _ => self.sheet = None,
+        }
+        self.render_current(RefreshMode::Full)?;
+        Ok(Flow::Continue)
     }
 
     /// Whether the current screen is a top-level destination, and so draws
@@ -4559,6 +4733,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // refresh mode passes through: the MTK driver has a non-flashing
         // color waveform (GLRC16) for partials, so shelf page flips don't
         // have to flash.
+        if self.sheet.is_some() {
+            // Compose the screen underneath, then layer the sheet on it. The
+            // sheet is opaque, so nothing below needs its own repaint.
+            let canvas = self.compose_final()?;
+            let canvas = if rotation == 0 {
+                canvas
+            } else {
+                rotate_page_rgb(&canvas, rotation)
+            };
+            self.display.blit_rgb(&canvas, 0)?;
+            self.display.flush(mode)?;
+            return Ok(());
+        }
         if let Some(page) = self.compose_color_current()? {
             let page = if rotation == 0 {
                 page

@@ -1258,6 +1258,11 @@ fn library_paginates_with_prev_next() {
     let Screen::Library { page, items } = app.screen() else {
         panic!("expected library screen");
     };
+    eprintln!(
+        "DBG capacity={capacity} items={} page={page} flushes={:?}",
+        items.len(),
+        app.display().flushes
+    );
     assert_eq!(items.len(), capacity + 2);
     assert_eq!(*page, 0);
     // Page flips within a screen are partial refreshes.
@@ -7699,13 +7704,15 @@ fn dump_demo() {
         "discover" => app.goto_root(Screen::Home).unwrap(),
         "settings" => app.goto_root(Screen::Settings).unwrap(),
         "storage" => app.push(Screen::Storage).unwrap(),
+        // The quick-settings sheet, layered over the library the way a real
+        // nav tap produces it.
+        "quick" => {
+            app.open_quick_settings().unwrap();
+        }
         other => panic!("unknown screen {other}"),
     }
 
-    let page = match app.compose_color_current().unwrap() {
-        Some(rgb) => rgb,
-        None => RgbPage::from_gray(&app.compose_current().unwrap()),
-    };
+    let page = app.compose_final().unwrap();
     let mut img = image::RgbImage::new(page.width, page.height);
     for y in 0..page.height {
         for x in 0..page.width {

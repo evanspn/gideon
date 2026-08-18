@@ -2056,3 +2056,122 @@ mod tests {
         }
     }
 }
+
+/// One row in a [`draw_sheet`] modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheetRow<'a> {
+    pub label: &'a str,
+    /// The current value, right-aligned — empty for a plain action row.
+    pub value: &'a str,
+    /// Draws the row as the way out of the sheet rather than a choice in it.
+    pub dismiss: bool,
+}
+
+/// Height a sheet needs for `rows` at `row_h`, including its title bar.
+pub fn sheet_height(rows: usize, row_h: u32) -> u32 {
+    row_h + row_h * rows as u32
+}
+
+/// A bottom-sheet modal: a solid panel anchored to the bottom of the screen,
+/// carrying a title and a short list of choices.
+///
+/// Deliberately NOT a dimmed backdrop. E-ink has no cheap translucency, and
+/// tinting the whole screen behind the sheet would force a full flashing
+/// refresh of everything the sheet is supposed to be layered over. Instead
+/// the panel is opaque and its top edge is a heavy 3px rule — the same trick
+/// the reader's controls sheet uses — so it reads as *in front of* the screen
+/// without repainting it.
+///
+/// The caller places it; `sheet_height` says how tall it wants to be. Rows are
+/// `row_h` tall so they clear the 88px touch floor at any panel size the
+/// layout produces.
+#[allow(clippy::too_many_arguments)] // the caller's contract; see draw_stat_tiles
+pub fn draw_sheet(
+    canvas: &mut RgbPage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    title: &str,
+    rows: &[SheetRow],
+    text_px: f32,
+    t: &Theme,
+) {
+    let clip = Clip::new(canvas, x, y, w, h);
+    if clip.is_empty() {
+        return;
+    }
+    // Opaque panel, so whatever it covers needs no repaint.
+    fill_rect(canvas, &clip, x, y, w, h, [0xFF, 0xFF, 0xFF]);
+    // The heavy top edge is what makes it read as layered.
+    fill_rect(canvas, &clip, x, y, w, 3, [0x00, 0x00, 0x00]);
+
+    let row_h = if rows.is_empty() {
+        h
+    } else {
+        (h.saturating_sub(h / (rows.len() as u32 + 1))) / rows.len().max(1) as u32
+    };
+    let title_h = h.saturating_sub(row_h * rows.len() as u32);
+    let pad = (text_px * 0.5) as u32;
+
+    let mut layer = GrayPage::new_white(w.max(1), h.max(1));
+    draw_text(
+        &mut layer,
+        pad,
+        (title_h.saturating_sub(text_px as u32)) / 2,
+        text_px * 0.62,
+        title,
+        w.saturating_sub(pad * 2),
+        true,
+    );
+
+    for (i, row) in rows.iter().enumerate() {
+        let ry = title_h + i as u32 * row_h;
+        // A hairline between choices, never around them.
+        if i > 0 {
+            fill_rect(
+                canvas,
+                &clip,
+                x + pad,
+                y + ry,
+                w.saturating_sub(pad * 2),
+                1,
+                RULE,
+            );
+        }
+        let text_y = ry + (row_h.saturating_sub(text_px as u32)) / 2;
+        draw_text(
+            &mut layer,
+            pad,
+            text_y,
+            text_px * 0.85,
+            row.label,
+            w.saturating_sub(pad * 2),
+            !row.dismiss,
+        );
+        if !row.value.is_empty() {
+            let vw = measure_text(text_px * 0.85, row.value, false);
+            draw_text(
+                &mut layer,
+                w.saturating_sub(pad + vw),
+                text_y,
+                text_px * 0.85,
+                row.value,
+                vw + pad,
+                false,
+            );
+        }
+    }
+    // An accent stripe down the title, the same mark section headers carry, so
+    // the sheet belongs to the same family rather than looking like an alert.
+    fill_rect(
+        canvas,
+        &clip,
+        x + pad / 2,
+        y + pad,
+        6,
+        title_h.saturating_sub(pad * 2),
+        t.accent,
+    );
+    overlay_ink_at(canvas, &layer, x, y);
+}
