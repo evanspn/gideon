@@ -481,6 +481,18 @@ fn tap_nav_last() -> UiEvent {
     nav_tap(TapTarget::Last)
 }
 
+/// Tap the title bar's pager: "‹ n/m ›" at its right end. `pages` sizes the
+/// label, which is what the zones are measured from.
+fn tap_page(forward: bool, pages: usize) -> UiEvent {
+    let l = layout();
+    let (prev, next, _) = super::title_pager_zones(&l, 0, pages, 0);
+    let zone = if forward { next } else { prev };
+    UiEvent::Tap {
+        x: (zone.0 + zone.1) / 2,
+        y: l.title_h / 2,
+    }
+}
+
 /// Tap the sort button parked at the right edge of a chapter list's title bar.
 fn tap_sort() -> UiEvent {
     let l = layout();
@@ -1472,7 +1484,12 @@ fn library_paginates_with_prev_next() {
         make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
     }
 
-    let events = vec![tap_nav(0), tap_nav_next(), tap_nav_next(), tap_nav_prev()];
+    let events = vec![
+        tap_nav(0),
+        tap_page(true, 2),
+        tap_page(true, 2), // clamped at the last page
+        tap_page(false, 2),
+    ];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -1874,7 +1891,7 @@ fn color_library_page_flips_stay_partial() {
     .save(&lib)
     .unwrap();
 
-    let events = vec![tap_nav(0), tap_nav_next()];
+    let events = vec![tap_nav(0), tap_page(true, 2)];
     let mut app = app(&lib, FakeGateway::default(), events);
     app.run().unwrap();
 
@@ -2239,19 +2256,39 @@ fn check_updates_shows_message_screen() {
 }
 
 #[test]
-fn back_on_home_does_nothing() {
+fn a_root_screen_has_no_back_and_cannot_be_popped_out_of() {
+    // The bottom strip of a top-level destination is the nav bar, so the
+    // place Back used to be is now the Library tab. Nothing can pop the root
+    // out from under the app — quitting goes through the power menu — and
+    // the taps after it still work.
     let dir = tempfile::tempdir().unwrap();
-    // Back taps on Home are ignored — quitting goes through the power
-    // menu. The tap after them still works.
-    let mut app = app(
+    let mut rooted = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_back(), tap_back(), tap_card(0)],
+        vec![nav_discover(), tap_back(), tap_back()],
     );
-    app.run().unwrap();
+    rooted.run().unwrap();
     assert!(
-        matches!(app.screen(), Screen::Message { title, .. } if title == "Search"),
-        "the row tap after two ignored Back taps still works"
+        matches!(rooted.screen(), Screen::Library { .. }),
+        "the bottom-left of a root screen is the Library tab"
+    );
+
+    // And the tap after them still works: Discover, then its first card.
+    let mut again = app(
+        dir.path(),
+        FakeGateway::default(),
+        vec![
+            nav_discover(),
+            tap_back(),
+            tap_back(),
+            nav_discover(),
+            tap_card(0),
+        ],
+    );
+    again.run().unwrap();
+    assert!(
+        matches!(again.screen(), Screen::Message { title, .. } if title == "Search"),
+        "the tap after them still works"
     );
 }
 
@@ -7359,15 +7396,17 @@ fn the_library_title_bar_toggles_between_shelf_and_list() {
 }
 
 #[test]
-fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
-    // The list carries score chips and a progress bar in the theme colour,
-    // so it must take the RGB path; a coverless shelf has no colour to show.
+fn both_library_views_take_the_colour_path_as_a_destination() {
+    // The list carries score chips and a progress bar in the theme colour;
+    // the shelf carries covers. Either way, as a top-level destination the
+    // Library draws the nav bar, which is RGB — a screen that fell back to
+    // the grayscale path would lose every route off itself.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
     let settings_dir = dir.path().join("data");
 
-    for (view, want_colour) in [("shelf", false), ("list", true)] {
+    for view in ["shelf", "list"] {
         // The view is a per-profile setting, so it has to be written to the
         // profile's own file — a device-file value would be overlaid away.
         gideon_core::ProfileSettings {
@@ -7379,10 +7418,9 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
         let mut app = app(&lib, FakeGateway::default(), vec![tap_nav(0)])
             .with_settings_dir(settings_dir.clone());
         app.run().unwrap();
-        assert_eq!(
+        assert!(
             app.compose_color_current().unwrap().is_some(),
-            want_colour,
-            "{view} view colour path"
+            "{view} view must compose in colour so it can draw the nav bar"
         );
     }
 }
@@ -7872,7 +7910,9 @@ fn dump_demo() {
     // instead of the nav bar) and misrepresent the design.
     app.run().unwrap();
     match screen.as_str() {
-        "library" | "shelf" => {}
+        // Today is the landing screen now, so a library dump has to walk
+        // there the way a person does.
+        "library" | "shelf" => app.open_library().unwrap(),
         "today" => app.goto_root(Screen::Stats).unwrap(),
         "discover" => app.goto_root(Screen::Home).unwrap(),
         "settings" => app.goto_root(Screen::Settings).unwrap(),
@@ -8637,4 +8677,48 @@ fn a_device_without_a_lamp_gets_no_sliders() {
     app.run().unwrap();
     app.open_quick_settings().unwrap();
     assert!(app.quick_sliders().is_empty());
+}
+
+#[test]
+fn the_title_bar_pages_and_does_not_swallow_the_view_toggle() {
+    // The page indicator is the pager: "‹ 2/3 ›" at the right end of the
+    // title bar. A separate Previous/Next row above the nav bar said the
+    // same thing twice and cost a row of content to say it.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..12 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
+    }
+
+    let mut app = app(&lib, FakeGateway::default(), vec![]);
+    app.run().unwrap();
+    app.open_library().unwrap();
+    let pages = app.current_page_count();
+    assert!(pages > 1, "needs to paginate");
+
+    let l = layout();
+    let (prev, next, _) = super::title_pager_zones(&l, 0, pages, 0);
+    let title_y = l.title_h / 2;
+    let page_of = |app: &UiApp<MemoryDisplay, FakeInput, FakeGateway>| match app.screen() {
+        Screen::Library { page, .. } => *page,
+        other => panic!("expected the library, got {other:?}"),
+    };
+
+    // Forward, then back, from the title bar.
+    app.handle_tap((next.0 + next.1) / 2, title_y).unwrap();
+    assert_eq!(page_of(&app), 1, "the › chevron pages forward");
+    app.handle_tap((prev.0 + prev.1) / 2, title_y).unwrap();
+    assert_eq!(page_of(&app), 0, "the ‹ chevron pages back");
+
+    // The rest of the title bar still toggles the library view — the two
+    // must not fight over the same strip.
+    let before = effective_settings(&dir.path().join("data"), &lib).library_view;
+    app.handle_tap(l.pad, title_y).unwrap();
+    let after = effective_settings(&dir.path().join("data"), &lib).library_view;
+    assert_ne!(before, after, "a tap on the title still toggles the view");
+    assert_eq!(page_of(&app), 0, "and does not page");
+
+    // The chevrons are finger-sized, not glyph-sized.
+    assert!(next.1 - next.0 >= l.title_h.min(88), "next zone too small");
+    assert!(prev.1 - prev.0 >= l.title_h.min(88), "prev zone too small");
 }

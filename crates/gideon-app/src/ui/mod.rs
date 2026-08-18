@@ -1378,11 +1378,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.sheet.is_none() && self.screen_has_nav() && y >= self.layout.nav_top() {
             return self.tap_main_nav(x);
         }
-        // The pager row sits directly on the nav bar, on screens whose paging
-        // buttons cannot live in the strip itself.
-        if self.sheet.is_none() && self.tap_pager_strip(x, y)? {
-            return Ok(Flow::Continue);
-        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -1406,6 +1401,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
+                // The pager lives in the title bar: "‹ 2/3 ›" at the right
+                // end, ahead of anything else the bar does, so a tap on a
+                // chevron never toggles the library view by accident.
+                let pages = self.current_page_count();
+                if pages > 1 {
+                    let reserved = if self.screen_has_sort() {
+                        sort_button_width(&self.layout) + self.layout.pad
+                    } else {
+                        0
+                    };
+                    let page = self.current_page();
+                    let (prev, next, _) = title_pager_zones(&self.layout, page, pages, reserved);
+                    if x >= next.0 && x < next.1 {
+                        self.move_page(PageMove::Delta(1))?;
+                        return Ok(Flow::Continue);
+                    }
+                    if x >= prev.0 && x < prev.1 {
+                        self.move_page(PageMove::Delta(-1))?;
+                        return Ok(Flow::Continue);
+                    }
+                }
                 // A chapter list's title bar carries the sort button on its
                 // right edge; tapping it cycles the order.
                 if self.screen_has_sort() && x >= sort_button_x(&self.layout) {
@@ -1724,6 +1740,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Move within the current paginated screen (partial refresh). `Delta`
     /// steps relative to the current page (clamped); `First`/`Last` jump to an
     /// end — so a long chapter list is one tap from the start instead of many.
+    /// The page the current screen is showing, or 0 for a screen that does
+    /// not paginate. Only used to size the title bar's page label, which is
+    /// wider at "10/12" than at "1/2".
+    fn current_page(&self) -> usize {
+        match self.stack.last() {
+            Some(
+                Screen::Library { page, .. }
+                | Screen::Sources { page, .. }
+                | Screen::SearchResults { page, .. }
+                | Screen::Popular { page, .. }
+                | Screen::MangaList { page, .. }
+                | Screen::ChapterList { page, .. }
+                | Screen::DownloadedChapters { page, .. },
+            ) => *page,
+            Some(Screen::Settings) => self.settings_page,
+            _ => 0,
+        }
+    }
+
     fn move_page(&mut self, mv: PageMove) -> Result<()> {
         let per_page = self.layout.rows_per_page();
         let shelf_capacity = self.library_page_capacity();
@@ -1742,6 +1777,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
             Screen::DownloadedChapters { entries, page, .. } => {
                 (page, entries.len().div_ceil(per_page))
+            }
+            // Settings paginates too, but its page lives on the app rather
+            // than in the screen (the screen carries no state at all), so it
+            // is stepped here and returns early.
+            Screen::Settings => {
+                let count = self.settings_page_count().max(1);
+                let new = match mv {
+                    PageMove::Delta(delta) => {
+                        (self.settings_page as i64 + delta).clamp(0, count as i64 - 1) as usize
+                    }
+                    PageMove::First => 0,
+                    PageMove::Last => count - 1,
+                };
+                if new != self.settings_page {
+                    self.settings_page = new;
+                    // A page flip replaces the whole content area, so it
+                    // flashes — the one settings interaction that does.
+                    self.render_current(RefreshMode::Full)?;
+                }
+                return Ok(());
             }
             _ => return Ok(()),
         };
@@ -2062,62 +2117,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Top edge of the settings pager strip: the last row of content height,
     /// sitting directly on the nav bar.
-    fn settings_pager_top(&self) -> u32 {
-        self.pager_strip_top()
-    }
-
-    /// Top edge of the pager strip: the last row of content, sitting on the
-    /// nav bar.
-    ///
-    /// Screens that carry the four-tab nav bar cannot page with the usual
-    /// First/Prev/Next/Last buttons — those live in the same bottom strip,
-    /// and drawing both put the paging labels *underneath* the tabs. On
-    /// hardware that read as "Library First TodayPrev DisCoveNr Sesttings".
-    /// So paging gets its own row above the bar.
-    fn pager_strip_top(&self) -> u32 {
-        self.layout.nav_top().saturating_sub(self.layout.row_h)
-    }
-
-    /// Draw the pager strip for a screen that has `pages` pages and is
-    /// showing `page`. No-op for a single page.
-    fn draw_pager_strip(&self, canvas: &mut RgbPage, page: usize, pages: usize) {
-        if pages <= 1 {
-            return;
-        }
-        let l = &self.layout;
-        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
-        widgets::draw_setting_row(
-            canvas,
-            l.pad,
-            self.pager_strip_top(),
-            l.width.saturating_sub(l.pad * 2),
-            l.row_h,
-            &widgets::SettingRow {
-                label: "‹  Previous",
-                value: "Next  ›",
-                detail: &format!("page {} of {}", page + 1, pages),
-                selected: false,
-            },
-            l.text_px,
-            &theme,
-        );
-    }
-
-    /// Act on a tap in the pager strip: left half back, right half forward,
-    /// both wrapping. `true` when the tap was the pager's.
-    fn tap_pager_strip(&mut self, x: u32, y: u32) -> Result<bool> {
-        if !self.screen_has_nav() || self.current_page_count() <= 1 {
-            return Ok(false);
-        }
-        if y < self.pager_strip_top() || y >= self.layout.nav_top() {
-            return Ok(false);
-        }
-        let back = x < self.layout.width / 2;
-        self.move_page(PageMove::Delta(if back { -1 } else { 1 }))?;
-        Ok(true)
-    }
-
-    #[cfg(test)]
     fn settings_page_count(&self) -> usize {
         self.settings_layout().1
     }
@@ -2496,34 +2495,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.shelf_layout().capacity()
         }
         .max(1)
-    }
-
-    /// Height the library's content may use: the whole content area, less the
-    /// pager row when the library runs to more than one page.
-    ///
-    /// Chicken-and-egg by nature — how many pages there are depends on how
-    /// much room each page has — so it is measured against the full height
-    /// first and re-measured once we know paging is needed.
-    fn library_content_height(&self, items: usize) -> u32 {
-        let l = &self.layout;
-        let full = l.content_height();
-        if !self.screen_has_nav() {
-            return full;
-        }
-        let fits = |h: u32| -> usize {
-            if self.load_settings().library_view == "list" {
-                (h / self.list_row_height()).max(1) as usize
-            } else {
-                ShelfLayout::new(l.width, h, SHELF_COLUMNS)
-                    .capacity()
-                    .max(1)
-            }
-        };
-        if items <= fits(full) {
-            full
-        } else {
-            full.saturating_sub(l.row_h)
-        }
     }
 
     /// Whether the current screen is a top-level destination, and so draws
@@ -2948,7 +2919,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.trigger_sync();
         let items = self.scan_library_items()?;
         self.trigger_metadata_backfill(&items);
-        self.push(Screen::Library { items, page: 0 })
+        // The Library is a nav DESTINATION, not a child screen: it replaces
+        // the root the way the other three tabs do. Pushing it instead put a
+        // Back button and the paging buttons in the bottom strip and took
+        // the nav bar away entirely, so the tab you just tapped vanished.
+        self.goto_root(Screen::Library { items, page: 0 })
     }
 
     /// Look up MyAnimeList metadata, in the background, for series in the
@@ -3296,20 +3271,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// draws — rather than an index into a parallel list. Two lists is exactly
     /// how every row here ended up firing a different setting than its label.
     fn tap_setting_at(&mut self, x: u32, y: u32) -> Result<()> {
-        // The pager strip, when settings runs to more than one page: left
-        // half back, right half forward, both wrapping.
-        let (_, pages) = self.settings_layout();
-        if pages > 1 && y >= self.settings_pager_top() && y < self.layout.nav_top() {
-            let back = x < self.layout.width / 2;
-            self.settings_page = if back {
-                (self.settings_page + pages - 1) % pages
-            } else {
-                (self.settings_page + 1) % pages
-            };
-            // A page flip replaces the whole content area, so it flashes —
-            // this is the one settings interaction that legitimately does.
-            return self.render_current(RefreshMode::Full);
-        }
         let Some((.., action)) = self
             .settings_hit_map()
             .into_iter()
@@ -4413,17 +4374,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn shelf_layout(&self) -> ShelfLayout {
         ShelfLayout::new(
             self.layout.width,
-            self.library_content_height(self.library_item_count()),
+            self.layout.content_height(),
             SHELF_COLUMNS,
         )
-    }
-
-    /// How many series the library screen is currently showing.
-    fn library_item_count(&self) -> usize {
-        match self.stack.last() {
-            Some(Screen::Library { items, .. }) => items.len(),
-            _ => 0,
-        }
     }
 
     /// The series card whose shelf cell contains the tap, if any.
@@ -5469,14 +5422,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         let page_count = items.len().div_ceil(capacity).max(1);
         // A screen with the nav bar must not also put paging buttons in the
-        // bottom strip — they land underneath the tabs. It gets a pager row
-        // above the bar instead (see `pager_strip_top`).
+        // bottom strip — they land underneath the tabs. Paging lives in the
+        // title bar's "‹ 2/3 ›" instead (see `title_pager_zones`).
         let chrome = compose_chrome_paged(l, "Library", *page, page_count, !nav, 0, !nav);
         let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, &shelf), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
         if nav {
-            self.draw_pager_strip(&mut canvas, *page, page_count);
             let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
             widgets::draw_nav_bar(
                 &mut canvas,
@@ -5897,8 +5849,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn list_rows_per_page(&self) -> usize {
-        ((self.library_content_height(self.library_item_count()) / self.list_row_height()).max(1))
-            as usize
+        ((self.layout.content_height() / self.list_row_height()).max(1)) as usize
     }
 
     /// The Library as a dense list: one row per series carrying everything
@@ -6034,7 +5985,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
         });
         if nav {
-            self.draw_pager_strip(&mut canvas, page, page_count);
             let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
             widgets::draw_nav_bar(
                 &mut canvas,
@@ -6315,24 +6265,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 );
             }
             y += grid.height(rows.len()) + SETTINGS_GAP;
-        }
-
-        if pages > 1 {
-            widgets::draw_setting_row(
-                &mut canvas,
-                l.pad,
-                self.settings_pager_top(),
-                inner,
-                l.row_h,
-                &widgets::SettingRow {
-                    label: "‹  Previous",
-                    value: "Next  ›",
-                    detail: &format!("page {} of {}", at + 1, pages),
-                    selected: false,
-                },
-                l.text_px,
-                &theme,
-            );
         }
 
         if self.screen_has_nav() {
@@ -7220,6 +7152,32 @@ fn compose_chrome(l: &UiLayout, title: &str, page: usize, page_count: usize) -> 
 
 /// Like [`compose_chrome`], but Home passes `show_back = false`: its
 /// bottom-left corner has no Back (quitting goes through the power menu).
+/// The page indicator's text: `"2/3"`.
+fn page_label(page: usize, page_count: usize) -> String {
+    format!("{}/{}", page + 1, page_count)
+}
+
+/// Where the title bar's pager sits: `(prev zone, next zone, label x)`, each
+/// zone an `(x0, x1)` pair.
+///
+/// One function for drawing and for hit-testing, because a chevron you can
+/// see but not hit is worse than no chevron. The zones are a full title-bar
+/// height wide so they are finger-sized rather than glyph-sized.
+fn title_pager_zones(
+    l: &UiLayout,
+    page: usize,
+    page_count: usize,
+    right_reserved: u32,
+) -> ((u32, u32), (u32, u32), u32) {
+    let label_w = measure_text(l.text_px, &page_label(page, page_count), false).min(l.width / 3);
+    let hit = l.title_h.max(l.pad * 2);
+    let right = l.width.saturating_sub(l.pad + right_reserved);
+    let next = (right.saturating_sub(hit), right);
+    let label_x = next.0.saturating_sub(label_w);
+    let prev = (label_x.saturating_sub(hit), label_x);
+    (prev, next, label_x)
+}
+
 fn compose_chrome_opts(
     l: &UiLayout,
     title: &str,
@@ -7281,17 +7239,27 @@ fn compose_chrome_paged(
         true,
     );
     if page_count > 1 {
-        let label = format!("{}/{}", page + 1, page_count);
+        // The page indicator IS the pager: "‹ 2/3 ›" in the title bar, with
+        // the chevrons as the tap targets. A separate row of Previous/Next
+        // above the nav bar said the same thing twice and cost a row of
+        // content to do it.
+        let (prev, next, label_x) = title_pager_zones(l, page, page_count, right_reserved);
+        let label = page_label(page, page_count);
         let w = measure_text(l.text_px, &label, false).min(l.width / 3);
-        draw_text(
-            &mut canvas,
-            l.width.saturating_sub(w + l.pad + right_reserved),
-            text_y(0, l.title_h),
-            l.text_px,
-            &label,
-            w,
-            false,
-        );
+        let y = text_y(0, l.title_h);
+        draw_text(&mut canvas, label_x, y, l.text_px, &label, w, false);
+        for (zone, glyph) in [(prev, "‹"), (next, "›")] {
+            let gw = measure_text(l.text_px, glyph, true);
+            draw_text(
+                &mut canvas,
+                zone.0 + (zone.1 - zone.0).saturating_sub(gw) / 2,
+                y,
+                l.text_px,
+                glyph,
+                gw,
+                true,
+            );
+        }
     }
     hline(&mut canvas, l.title_h - 1, 0x55);
 
