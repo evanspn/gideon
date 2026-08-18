@@ -2494,14 +2494,32 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
-    /// Open the profile picker from Home's title bar.
-    fn open_profile_menu(&mut self) -> Result<()> {
+    /// Every profile the device knows: the ones settings.json lists, plus every
+    /// profile that has a library directory on disk, plus the active one.
+    ///
+    /// The disk half is what makes a lost list survivable. settings.json can go
+    /// missing or come back unparseable (a yanked USB cable mid-write, a
+    /// hand-edit), and `load_settings` then answers with the defaults — a list
+    /// of just "default". Trusting that alone would drop a profile out of the
+    /// picker while all of its books sat untouched in `@name`, and the next save
+    /// would make the omission permanent. So the profile's own directory is
+    /// enough to keep it listed, whatever settings.json says.
+    fn known_profiles(&self) -> Vec<String> {
         let mut profiles = self.load_settings().profiles;
-        // Lenient: a hand-edited settings.json may activate a profile the
-        // list doesn't know — show it anyway.
+        for name in gideon_core::profile::discover(&self.base_library) {
+            if !profiles.contains(&name) {
+                profiles.push(name);
+            }
+        }
         if !profiles.contains(&self.active_profile) {
             profiles.push(self.active_profile.clone());
         }
+        profiles
+    }
+
+    /// Open the profile picker from Home's title bar.
+    fn open_profile_menu(&mut self) -> Result<()> {
+        let profiles = self.known_profiles();
         self.push(Screen::ProfileMenu { profiles })
     }
 
@@ -2527,6 +2545,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             )
         })?;
         let mut settings = self.load_settings();
+        // Same as the conversion path: start from every profile that exists on
+        // disk, so switching can't persist a list that read back short.
+        settings.profiles = self.known_profiles();
         if !settings.profiles.iter().any(|p| p == name) {
             settings.profiles.push(name.to_string());
         }
@@ -2560,6 +2581,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
         };
         let mut settings = self.load_settings();
+        // Rebuild the list from what's actually on disk, so a settings file that
+        // read back short can't make this save drop a profile permanently.
+        settings.profiles = self.known_profiles();
         settings
             .profiles
             .retain(|p| p != gideon_core::DEFAULT_PROFILE && p != name);
