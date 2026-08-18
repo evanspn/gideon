@@ -6921,6 +6921,17 @@ fn home_grows_a_data_band_only_once_there_is_something_to_show() {
     );
 }
 
+/// Cover tints for the dump fixtures — muted the way real cover art reads
+/// once Kaleido has taken its cut, so the screenshot is not misleading.
+const COVER_TINTS: [[u8; 3]; 6] = [
+    [0x6f, 0x7d, 0x86],
+    [0x7a, 0x5c, 0x52],
+    [0x5f, 0x6f, 0x78],
+    [0x5a, 0x5a, 0x5a],
+    [0x6d, 0x62, 0x55],
+    [0x6b, 0x64, 0x70],
+];
+
 #[test]
 #[ignore]
 fn dump_library_list_png() {
@@ -6997,6 +7008,14 @@ fn dump_library_list_png() {
         for i in 0..*downloaded {
             make_cbz(&lib.join(format!("{title}/ch{i}.cbz")), 20);
         }
+        // A 2:3 cover in a distinct tint, so the dump shows what the row
+        // actually looks like rather than the fixture's black 8x8 page.
+        let tint = COVER_TINTS
+            [series.iter().position(|(t, ..)| t == title).unwrap_or(0) % COVER_TINTS.len()];
+        let cover = image::RgbImage::from_pixel(200, 300, image::Rgb(tint));
+        image::DynamicImage::ImageRgb8(cover)
+            .save(lib.join(title).join(".cover.jpg"))
+            .unwrap();
         index.record(
             title,
             gideon_core::SeriesRef {

@@ -4678,16 +4678,38 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     },
                     finished: finished > 0 && finished >= total,
                 };
+                // Cover art first, then hand the row widget the space that
+                // is left. Decoding and caching stay here so the widget
+                // remains a pure drawing routine.
+                let inset = l.pad;
+                let cover_h = row_h.saturating_sub(inset * 2);
+                let cover_w = cover_h * 2 / 3;
+                let thumb = app.shelf_cover(card.cover_entry(), (cover_w, cover_h), per_page);
+                blit_thumb(&mut canvas, &thumb, inset, y + inset, cover_w, cover_h);
+
+                let text_x = inset + cover_w + inset;
                 widgets::draw_library_row(
                     &mut canvas,
-                    0,
+                    text_x,
                     y,
-                    l.width,
+                    l.width.saturating_sub(text_x),
                     row_h,
                     &row,
                     l.text_px,
                     &theme,
                 );
+                // A hairline between rows, not around them: the list should
+                // read as one continuous column, not a stack of cards.
+                if i + 1 < per_page {
+                    fill_rect_rgb(
+                        &mut canvas,
+                        inset,
+                        y + row_h - 1,
+                        l.width.saturating_sub(inset * 2),
+                        1,
+                        [0xDD, 0xDD, 0xDD],
+                    );
+                }
             }
         });
         canvas
@@ -6525,6 +6547,29 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
 /// Overlay a full-size grayscale layer onto an RGB canvas, keeping only its
 /// ink: white stays transparent so text can be drawn over colour without
 /// punching a white box through it.
+/// Draw a decoded cover into an RGB canvas, scaled to fit its box and centred
+/// in it, clipped to the canvas. Covers keep their colour — this is the one
+/// place on the panel where Kaleido earns its keep.
+fn blit_thumb(dst: &mut RgbPage, img: &image::DynamicImage, x: u32, y: u32, w: u32, h: u32) {
+    if w == 0 || h == 0 || x >= dst.width || y >= dst.height {
+        return;
+    }
+    let scaled = img.resize(w, h, image::imageops::FilterType::Triangle);
+    let rgb = scaled.to_rgb8();
+    let (iw, ih) = (rgb.width(), rgb.height());
+    // Centre whatever the aspect-preserving resize produced, so a square page
+    // and a tall cover both sit in the middle of their box.
+    let off_x = x + w.saturating_sub(iw) / 2;
+    let off_y = y + h.saturating_sub(ih) / 2;
+    for row in 0..ih.min(dst.height.saturating_sub(off_y)) {
+        for col in 0..iw.min(dst.width.saturating_sub(off_x)) {
+            let px = rgb.get_pixel(col, row).0;
+            let idx = (((off_y + row) * dst.width + off_x + col) * 3) as usize;
+            dst.pixels[idx..idx + 3].copy_from_slice(&px);
+        }
+    }
+}
+
 /// Fill a rectangle on an RGB canvas, clipped to it. Anything outside is
 /// dropped rather than wrapping onto the next row.
 fn fill_rect_rgb(dst: &mut RgbPage, x: u32, y: u32, w: u32, h: u32, color: [u8; 3]) {

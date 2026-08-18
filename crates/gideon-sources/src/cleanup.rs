@@ -179,7 +179,9 @@ pub fn plan_finished_cleanup_at(
                 .enumerate()
                 .max_by_key(|(i, c)| {
                     (
-                        progress.get(&c.progress_key()).map_or(0, |p| p.last_read_at),
+                        progress
+                            .get(&c.progress_key())
+                            .map_or(0, |p| p.last_read_at),
                         // Tie-break on the file name so the choice is stable
                         // across runs and platforms rather than arbitrary.
                         std::cmp::Reverse(*i),
@@ -282,7 +284,8 @@ fn chapter_path(library: &Path, series_dir: &str, file_name: &str) -> Option<Pat
 fn is_plain_component(raw: &str) -> bool {
     let path = Path::new(raw);
     let mut components = path.components();
-    matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// Current unix time in seconds, matching `ReadingProgress::last_read_at`.
@@ -293,3 +296,457 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gideon_core::series::SeriesRef;
+    use serde_json::json;
+
+    const HOUR: u64 = 3600;
+    /// A fixed "now" well past the epoch, so `now - N hours` never saturates.
+    const NOW: u64 = 1_700_000_000;
+
+    /// A library on disk plus the index and progress rows that describe it.
+    ///
+    /// Progress is built through serde (the same path `progress.json` takes)
+    /// rather than through `ProgressStore::update`, because `update` stamps the
+    /// wall clock and these tests need chapters read at a chosen time.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        index: SeriesIndex,
+        /// key → (current_page, total_pages, last_read_at)
+        rows: Vec<(String, usize, usize, u64)>,
+        last_opened: Vec<(String, String)>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                index: SeriesIndex::default(),
+                rows: Vec::new(),
+                last_opened: Vec::new(),
+            }
+        }
+
+        fn library(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// Create `chapters` (file name, size) on disk under `series_dir` and
+        /// record them all in the index.
+        fn series(&mut self, series_dir: &str, chapters: &[(&str, usize)]) {
+            self.index.record(
+                series_dir,
+                SeriesRef {
+                    source_id: "s".into(),
+                    source_name: "S".into(),
+                    manga_id: series_dir.into(),
+                    manga_title: series_dir.into(),
+                    ..SeriesRef::default()
+                },
+            );
+            std::fs::create_dir_all(self.library().join(series_dir)).unwrap();
+            for (i, (file_name, size)) in chapters.iter().enumerate() {
+                std::fs::write(
+                    self.library().join(series_dir).join(file_name),
+                    vec![7u8; *size],
+                )
+                .unwrap();
+                self.index
+                    .record_download(series_dir, &format!("c{i}"), file_name);
+            }
+        }
+
+        /// Record progress for `series_dir/file_name`, finished or not, read
+        /// `hours_ago` hours before NOW.
+        fn read(&mut self, series_dir: &str, file_name: &str, finished: bool, hours_ago: u64) {
+            let total = 10;
+            let current = if finished { total - 1 } else { 3 };
+            self.row(
+                &format!("{series_dir}/{file_name}"),
+                current,
+                total,
+                NOW - hours_ago * HOUR,
+            );
+        }
+
+        /// A raw progress row, for cases (unknown timestamp, odd keys) the
+        /// convenience helper can't express.
+        fn row(&mut self, key: &str, current: usize, total: usize, last_read_at: u64) {
+            self.rows.retain(|(k, ..)| k != key);
+            self.rows
+                .push((key.to_string(), current, total, last_read_at));
+        }
+
+        fn open(&mut self, series_dir: &str, file_name: &str) {
+            self.last_opened
+                .push((series_dir.to_string(), format!("{series_dir}/{file_name}")));
+        }
+
+        fn progress(&self) -> ProgressStore {
+            let progress: serde_json::Map<String, serde_json::Value> = self
+                .rows
+                .iter()
+                .map(|(key, current, total, last_read_at)| {
+                    (
+                        key.clone(),
+                        json!({
+                            "current_page": current,
+                            "total_pages": total,
+                            "last_read_at": last_read_at,
+                        }),
+                    )
+                })
+                .collect();
+            let last_opened: serde_json::Map<String, serde_json::Value> = self
+                .last_opened
+                .iter()
+                .map(|(series, key)| (series.clone(), json!(key)))
+                .collect();
+            serde_json::from_value(json!({
+                "progress": progress,
+                "last_opened": last_opened,
+            }))
+            .unwrap()
+        }
+
+        fn exists(&self, series_dir: &str, file_name: &str) -> bool {
+            self.library().join(series_dir).join(file_name).exists()
+        }
+
+        fn plan(&self, hours: u32) -> CleanupSummary {
+            plan_finished_cleanup_at(self.library(), &self.progress(), &self.index, hours, NOW)
+        }
+
+        fn run(&mut self, hours: u32) -> CleanupSummary {
+            let library = self.dir.path().to_path_buf();
+            let progress = self.progress();
+            run_finished_cleanup_at(&library, &progress, &mut self.index, hours, NOW).unwrap()
+        }
+
+        fn downloaded(&self, series_dir: &str) -> Vec<String> {
+            self.index
+                .get(series_dir)
+                .map(|s| s.downloaded.values().cloned().collect())
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn removes_a_finished_and_stale_chapter() {
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 200)]);
+        f.read("Manga", "c1.cbz", true, 72);
+        f.read("Manga", "c2.cbz", false, 1);
+
+        let summary = f.run(48);
+        assert_eq!(summary.files(), 1);
+        assert_eq!(summary.bytes(), 100);
+        assert_eq!(summary.chapters[0].file_name, "c1.cbz");
+        assert_eq!(summary.chapters[0].chapter_id, "c0");
+        assert!(!f.exists("Manga", "c1.cbz"));
+        assert!(f.exists("Manga", "c2.cbz"));
+    }
+
+    #[test]
+    fn keeps_a_finished_but_recent_chapter() {
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        // Finished 47 hours ago, cutoff is 48: still inside the grace period.
+        f.read("Manga", "c1.cbz", true, 47);
+        f.read("Manga", "c2.cbz", true, 47);
+
+        assert!(f.run(48).is_empty());
+        assert!(f.exists("Manga", "c1.cbz"));
+        assert!(f.exists("Manga", "c2.cbz"));
+    }
+
+    #[test]
+    fn keeps_unfinished_and_never_opened_chapters() {
+        let mut f = Fixture::new();
+        f.series(
+            "Manga",
+            &[("c1.cbz", 100), ("c2.cbz", 100), ("c3.cbz", 100)],
+        );
+        // Mid-read, and old enough to be stale — but unfinished.
+        f.read("Manga", "c1.cbz", false, 500);
+        // c2 has no progress row at all: never opened.
+        // c3 is finished and stale, and is present so the "last chapter" rule
+        // isn't what saves c1/c2.
+        f.read("Manga", "c3.cbz", true, 500);
+
+        let summary = f.run(48);
+        assert_eq!(summary.files(), 1);
+        assert_eq!(summary.chapters[0].file_name, "c3.cbz");
+        assert!(f.exists("Manga", "c1.cbz"), "unfinished chapter kept");
+        assert!(f.exists("Manga", "c2.cbz"), "never-opened chapter kept");
+    }
+
+    #[test]
+    fn keeps_a_chapter_with_an_unknown_read_time() {
+        // A progress row synced from another device without a timestamp:
+        // last_read_at 0 means unknown, and unknown must not read as 1970.
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        f.row("Manga/c1.cbz", 9, 10, 0);
+        f.read("Manga", "c2.cbz", true, 500);
+
+        let summary = f.run(48);
+        assert_eq!(summary.files(), 1);
+        assert!(f.exists("Manga", "c1.cbz"), "unknown timestamp is kept");
+    }
+
+    #[test]
+    fn keeps_the_chapter_the_user_is_currently_on() {
+        let mut f = Fixture::new();
+        f.series(
+            "Manga",
+            &[("c1.cbz", 100), ("c2.cbz", 100), ("c3.cbz", 100)],
+        );
+        // All three finished long ago, but the reader is sitting on c2 — the
+        // user finished it and hasn't moved on yet.
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", true, 500);
+        f.read("Manga", "c3.cbz", true, 500);
+        f.open("Manga", "c2.cbz");
+
+        let summary = f.run(48);
+        assert!(f.exists("Manga", "c2.cbz"), "the current chapter is kept");
+        assert_eq!(summary.files(), 2);
+        assert!(!f.exists("Manga", "c1.cbz"));
+        assert!(!f.exists("Manga", "c3.cbz"));
+    }
+
+    #[test]
+    fn never_empties_a_series() {
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        // Both finished and stale, and no last_opened record at all.
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", true, 200); // read more recently
+
+        let summary = f.run(48);
+        assert_eq!(summary.files(), 1, "one chapter always survives");
+        assert!(!f.exists("Manga", "c1.cbz"));
+        assert!(
+            f.exists("Manga", "c2.cbz"),
+            "the most recently read chapter is the survivor"
+        );
+
+        // And a second pass over the now-single-chapter series removes nothing.
+        assert!(f.run(48).is_empty());
+        assert!(f.exists("Manga", "c2.cbz"));
+    }
+
+    #[test]
+    fn a_single_chapter_series_is_never_touched() {
+        let mut f = Fixture::new();
+        f.series("Solo", &[("only.cbz", 100)]);
+        f.read("Solo", "only.cbz", true, 10_000);
+
+        assert!(f.run(48).is_empty());
+        assert!(f.exists("Solo", "only.cbz"));
+        assert_eq!(f.downloaded("Solo"), vec!["only.cbz".to_string()]);
+    }
+
+    #[test]
+    fn the_last_chapter_rule_is_per_series() {
+        let mut f = Fixture::new();
+        f.series("A", &[("a1.cbz", 100), ("a2.cbz", 100)]);
+        f.series("B", &[("b1.cbz", 100)]);
+        for (dir, file) in [("A", "a1.cbz"), ("A", "a2.cbz"), ("B", "b1.cbz")] {
+            f.read(dir, file, true, 500);
+        }
+
+        let summary = f.run(48);
+        assert_eq!(summary.files(), 1, "one from A, none from B");
+        assert_eq!(summary.chapters[0].series_dir, "A");
+        assert!(f.exists("B", "b1.cbz"));
+    }
+
+    #[test]
+    fn reading_progress_survives_deletion() {
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", false, 1);
+
+        f.run(48);
+        assert!(!f.exists("Manga", "c1.cbz"));
+
+        // The store the caller handed in is untouched (it is a shared
+        // reference — this pass has no way to modify it), and a store saved
+        // after the run still remembers the chapter was finished.
+        let progress = f.progress();
+        assert!(
+            progress.get("Manga/c1.cbz").unwrap().is_finished(),
+            "the finished record outlives the file"
+        );
+        let path = f.library().join("progress.json");
+        progress.save(&path).unwrap();
+        let reloaded = ProgressStore::load(&path).unwrap();
+        assert!(reloaded.get("Manga/c1.cbz").unwrap().is_finished());
+    }
+
+    #[test]
+    fn the_index_is_updated_and_persisted() {
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", false, 1);
+
+        f.run(48);
+        assert_eq!(f.downloaded("Manga"), vec!["c2.cbz".to_string()]);
+
+        let reloaded = SeriesIndex::load(f.library());
+        let downloaded: Vec<String> = reloaded
+            .get("Manga")
+            .expect("the series itself stays in the index")
+            .downloaded
+            .values()
+            .cloned()
+            .collect();
+        assert_eq!(
+            downloaded,
+            vec!["c2.cbz".to_string()],
+            "the saved index no longer claims the deleted file"
+        );
+    }
+
+    #[test]
+    fn zero_hours_disables_cleanup_entirely() {
+        let mut f = Fixture::new();
+        f.series(
+            "Manga",
+            &[("c1.cbz", 100), ("c2.cbz", 100), ("c3.cbz", 100)],
+        );
+        for file in ["c1.cbz", "c2.cbz", "c3.cbz"] {
+            f.read("Manga", file, true, 100_000);
+        }
+
+        assert!(f.plan(0).is_empty(), "dry run reports nothing");
+        assert!(f.run(0).is_empty());
+        for file in ["c1.cbz", "c2.cbz", "c3.cbz"] {
+            assert!(f.exists("Manga", file));
+        }
+        assert_eq!(f.downloaded("Manga").len(), 3);
+        assert!(
+            !f.library().join(".gideon").join("series.json").exists(),
+            "a disabled pass doesn't even rewrite the index"
+        );
+    }
+
+    #[test]
+    fn dry_run_touches_nothing_but_reports_the_same_set() {
+        let mut f = Fixture::new();
+        f.series(
+            "Manga",
+            &[("c1.cbz", 100), ("c2.cbz", 250), ("c3.cbz", 100)],
+        );
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", true, 500);
+        f.read("Manga", "c3.cbz", false, 1);
+
+        let planned = f.plan(48);
+        assert_eq!(planned.files(), 2);
+        assert_eq!(planned.bytes(), 350);
+        // Nothing moved.
+        for file in ["c1.cbz", "c2.cbz", "c3.cbz"] {
+            assert!(
+                f.exists("Manga", file),
+                "{file} still on disk after dry run"
+            );
+        }
+        assert_eq!(f.downloaded("Manga").len(), 3);
+        assert!(!f.library().join(".gideon").join("series.json").exists());
+
+        // Planning again gives the same answer, and the real run matches it.
+        assert_eq!(f.plan(48), planned);
+        assert_eq!(f.run(48), planned);
+    }
+
+    #[test]
+    fn repeated_runs_are_idempotent() {
+        let mut f = Fixture::new();
+        f.series(
+            "Manga",
+            &[("c1.cbz", 100), ("c2.cbz", 100), ("c3.cbz", 100)],
+        );
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", true, 500);
+        f.read("Manga", "c3.cbz", false, 1);
+
+        let first = f.run(48);
+        assert_eq!(first.files(), 2);
+        let second = f.run(48);
+        assert!(second.is_empty(), "nothing left to do: {second:?}");
+        assert_eq!(f.run(48), CleanupSummary::default());
+        assert!(f.exists("Manga", "c3.cbz"));
+        assert_eq!(f.downloaded("Manga"), vec!["c3.cbz".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_library_is_a_no_op() {
+        let mut f = Fixture::new();
+        assert!(f.plan(48).is_empty());
+        assert!(f.run(48).is_empty());
+    }
+
+    #[test]
+    fn a_series_with_no_files_on_disk_is_left_alone() {
+        // Every row stale, every file already gone (a card swap, a manual
+        // delete). Nothing to do, and nothing to panic about.
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        std::fs::remove_dir_all(f.library().join("Manga")).unwrap();
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", true, 500);
+
+        assert!(f.run(48).is_empty());
+        assert_eq!(f.downloaded("Manga").len(), 2, "the index is left as-is");
+    }
+
+    #[test]
+    fn index_entries_whose_files_are_gone_are_ignored_not_counted() {
+        // A stale index row must not act as the surviving chapter that
+        // licenses deleting the only real file.
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100)]);
+        f.index.record_download("Manga", "ghost", "ghost.cbz");
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "ghost.cbz", true, 500);
+
+        assert!(f.run(48).is_empty(), "the only real file is the last one");
+        assert!(f.exists("Manga", "c1.cbz"));
+    }
+
+    #[test]
+    fn traversal_style_index_entries_are_refused() {
+        // A mangled index must never make this pass delete outside a series
+        // directory.
+        let mut f = Fixture::new();
+        f.series("Manga", &[("c1.cbz", 100), ("c2.cbz", 100)]);
+        f.read("Manga", "c1.cbz", true, 500);
+        f.read("Manga", "c2.cbz", true, 500);
+
+        let outsider = f.library().join("precious.cbz");
+        std::fs::write(&outsider, b"do not touch").unwrap();
+        f.index.record_download("Manga", "evil", "../precious.cbz");
+        f.row("Manga/../precious.cbz", 9, 10, NOW - 500 * HOUR);
+
+        f.run(48);
+        assert!(outsider.exists(), "path traversal entry was refused");
+    }
+
+    #[test]
+    fn plain_component_check() {
+        assert!(is_plain_component("c1.cbz"));
+        assert!(is_plain_component("Manga One"));
+        assert!(!is_plain_component("../precious.cbz"));
+        assert!(!is_plain_component("a/b"));
+        assert!(!is_plain_component("."));
+        assert!(!is_plain_component(""));
+        assert!(!is_plain_component("/etc/passwd"));
+    }
+}

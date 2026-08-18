@@ -1277,6 +1277,7 @@ name = "gideon-sources"
 version = "0.1.0"
 dependencies = [
  "filetime",
+ "gideon-core",
  "rustls",
  "rustls-native-certs 0.7.3",
  "serde",
