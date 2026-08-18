@@ -1546,6 +1546,14 @@ fn library_with_cover_art_renders_in_color() {
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Series/vol1.cbz"), 2);
     make_red_cover(&lib.join("Series"));
+    // This test is about the cover SHELF specifically; the dense list is the
+    // default view now, so pin this profile to the shelf.
+    gideon_core::ProfileSettings {
+        library_view: Some("shelf".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
 
     let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)]);
     app.run().unwrap();
@@ -6953,8 +6961,8 @@ fn the_library_title_bar_toggles_between_shelf_and_list() {
 
     assert_eq!(
         effective_settings(&settings_dir, &lib).library_view,
-        "list",
-        "tapping the Library title bar should switch to the dense list"
+        "shelf",
+        "the list is the default, so a title-bar tap swaps to the cover shelf"
     );
     assert!(
         matches!(app.screen(), Screen::Library { .. }),
@@ -6972,11 +6980,13 @@ fn the_list_view_draws_in_colour_and_the_shelf_does_not() {
     let settings_dir = dir.path().join("data");
 
     for (view, want_colour) in [("shelf", false), ("list", true)] {
-        gideon_core::Settings {
-            library_view: view.into(),
-            ..gideon_core::Settings::default()
+        // The view is a per-profile setting, so it has to be written to the
+        // profile's own file — a device-file value would be overlaid away.
+        gideon_core::ProfileSettings {
+            library_view: Some(view.into()),
+            ..Default::default()
         }
-        .save(&settings_dir)
+        .save(&lib)
         .unwrap();
         let mut app = app(&lib, FakeGateway::default(), vec![tap_row(0)])
             .with_settings_dir(settings_dir.clone());
@@ -7197,13 +7207,13 @@ fn two_profiles_keep_their_own_view_and_share_the_device_settings() {
     let alex_lib = root.join("@alex");
     assert_eq!(
         effective_settings(&settings_dir, &root).library_view,
-        "list",
-        "the profile that toggled should be on the list"
+        "shelf",
+        "the profile that toggled should have left the default list view"
     );
     assert_eq!(
         effective_settings(&settings_dir, &alex_lib).library_view,
-        "shelf",
-        "the other profile must not inherit it"
+        "list",
+        "the other profile keeps the default, and must not inherit the toggle"
     );
 
     // Device-global settings stay shared: a storage-limit change made by one
