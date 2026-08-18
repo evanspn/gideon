@@ -52,10 +52,10 @@ REAGL is exactly where residue shows.
 | Screen push / pop | Full | the whole content area changes |
 | Switching top-level destination (nav bar) | Full | same reason — it is a screen change |
 | Opening a modal sheet | **Partial** | only the strip the sheet covers changes; nothing above it moves |
-| Cycling a value inside a sheet | **Partial** | repaints one line of text |
+| Cycling a value inside a sheet | **Partial** | repaints one tile, or one line |
 | Replacing one sheet with another (book → delete confirmation) | **Partial** | the same strip is redrawn; what is above it never moved |
 | Closing a modal sheet | Full | restores a region held stale behind an opaque panel |
-| Settings page flip | Full | the whole content area is replaced, like any other list page |
+| Settings page flip | Full | the whole content area is replaced, like any other list page (the grid fits on one page at the sizes gideon runs on, so this is the small-panel path) |
 | Keyboard keypress | Partial | one character; forced Full every `KEYBOARD_FULL_REFRESH_INTERVAL` = 8 repaints so typing does not accumulate ghosting |
 | Library view toggle (shelf ⇄ list) | Full | the entire content area is replaced |
 | Status overlay ("Downloading… page 3/20") | Partial | a transient line |

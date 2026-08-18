@@ -248,11 +248,6 @@ fn tap_modal_row(rows: u32, i: usize) -> UiEvent {
     }
 }
 
-/// Tap row `i` of the quick-settings sheet the Settings tab opens.
-fn tap_quick_row(i: usize) -> UiEvent {
-    tap_modal_row(QUICK_SETTINGS_ROWS, i)
-}
-
 /// Tap row `i` of the book sheet a long press on a library card opens:
 /// 0 all chapters, 1 mark as unread, 2 delete chapter, 3 delete series,
 /// 4 close.
@@ -265,49 +260,108 @@ fn tap_confirm_row(i: usize) -> UiEvent {
     tap_modal_row(2, i)
 }
 
-/// Number of rows in the quick-settings sheet, and the index of the row that
-/// opens the full device-wide settings screen.
-const QUICK_SETTINGS_ROWS: u32 = 7;
-const QUICK_ALL_SETTINGS: usize = 5;
-
-/// Open the full Settings screen the way a user does: the Settings tab raises
-/// the quick sheet, and "All settings" goes through to the whole list.
-fn open_settings() -> Vec<UiEvent> {
-    vec![tap_nav(3), tap_quick_row(QUICK_ALL_SETTINGS)]
+/// The quick-settings sheet's geometry, mirroring `quick_sheet_layout`:
+/// `(top, tile grid, first action row's y)`.
+fn quick_sheet() -> (u32, gideon_render::widgets::GridLayout, u32) {
+    let l = layout();
+    let gap = super::SETTINGS_GAP;
+    let title_h = (l.text_px * 1.6) as u32;
+    let cell_h = l.row_h * 5 / 4;
+    let rows = (QUICK_TILES as u32).div_ceil(super::SETTINGS_COLS);
+    let grid_h = rows * cell_h + gap * rows.saturating_sub(1);
+    let actions_h = l.row_h * QUICK_ACTIONS as u32;
+    let h = (title_h + gap + grid_h + gap + actions_h).min(l.height);
+    let top = l.height - h;
+    let grid = gideon_render::widgets::GridLayout::new(
+        l.pad,
+        top + title_h + gap,
+        l.width.saturating_sub(l.pad * 2),
+        super::SETTINGS_COLS,
+        cell_h,
+        gap,
+    );
+    (top, grid, top + title_h + gap + grid_h + gap)
 }
 
-/// The page a settings row is drawn on, and a tap at the centre of it.
-/// Computed from the same pagination the screen uses, so a test never has to
-/// know which page a row landed on — and a row that moves takes its tap with
-/// it instead of quietly firing its neighbour.
+/// How many value tiles the quick sheet shows, and how many action rows sit
+/// under them ("All settings", "Close").
+const QUICK_TILES: usize = 5;
+const QUICK_ACTIONS: usize = 2;
+
+/// Tap tile `i` of the quick-settings grid.
+fn tap_quick_tile(i: usize) -> UiEvent {
+    let (_, grid, _) = quick_sheet();
+    let (cx, cy, cw, ch) = grid.cell(i);
+    UiEvent::Tap {
+        x: cx + cw / 2,
+        y: cy + ch / 2,
+    }
+}
+
+/// Tap action row `i` of the quick-settings sheet: 0 "All settings", 1 "Close".
+fn tap_quick_action(i: usize) -> UiEvent {
+    let l = layout();
+    let (_, _, actions_top) = quick_sheet();
+    UiEvent::Tap {
+        x: W / 2,
+        y: actions_top + i as u32 * l.row_h + l.row_h / 2,
+    }
+}
+
+/// Open the full Settings screen the way a user does: the Settings tab raises
+/// the quick sheet, and "All settings" goes through to everything else.
+fn open_settings() -> Vec<UiEvent> {
+    vec![tap_nav(3), tap_quick_action(0)]
+}
+
+/// The page a setting's tile is drawn on, and a tap at the centre of it.
+/// Computed from the same grid the screen uses, so a test never has to know
+/// which page or column a setting landed in — and a tile that moves takes its
+/// tap with it instead of quietly firing its neighbour.
 fn settings_row_at(label: &str) -> (usize, UiEvent) {
     let l = layout();
     let head_h = l.row_h * 2 / 3;
-    let avail = l.nav_top().saturating_sub(l.content_top());
+    let cell_h = l.row_h * 5 / 4;
+    let cols = super::SETTINGS_COLS;
+    let gap = super::SETTINGS_GAP;
+    let avail = l
+        .nav_top()
+        .saturating_sub(l.content_top() + l.pad / 2 + l.pad);
     let groups = super::settings_groups(&gideon_core::Settings::default());
-    let mut pages = super::paginate_settings(groups.clone(), head_h, l.row_h, avail);
+    let paginate =
+        |groups, avail| super::paginate_settings(groups, head_h, cell_h, gap, cols as usize, avail);
+    let mut pages = paginate(groups.clone(), avail);
     if pages.len() > 1 {
-        pages = super::paginate_settings(groups, head_h, l.row_h, avail.saturating_sub(l.row_h));
+        pages = paginate(groups, avail.saturating_sub(l.row_h));
     }
     for (p, page) in pages.iter().enumerate() {
-        let mut y = l.content_top();
+        let mut y = l.content_top() + l.pad / 2;
         for (_, rows) in page {
             y += head_h;
-            for (name, ..) in rows {
+            let grid = gideon_render::widgets::GridLayout::new(
+                l.pad,
+                y,
+                l.width.saturating_sub(l.pad * 2),
+                cols,
+                cell_h,
+                gap,
+            );
+            for (i, (name, ..)) in rows.iter().enumerate() {
                 if name == label {
+                    let (cx, cy, cw, ch) = grid.cell(i);
                     return (
                         p,
                         UiEvent::Tap {
-                            x: l.width / 2,
-                            y: y + l.row_h / 2,
+                            x: cx + cw / 2,
+                            y: cy + ch / 2,
                         },
                     );
                 }
-                y += l.row_h;
             }
+            y += grid.height(rows.len()) + gap;
         }
     }
-    panic!("no settings row labelled {label:?}");
+    panic!("no setting labelled {label:?}");
 }
 
 /// A tap on the settings pager strip: left half back, right half forward.
@@ -331,6 +385,32 @@ fn tap_setting(label: &str) -> Vec<UiEvent> {
     events.push(tap);
     events.extend((0..page).map(|_| settings_pager(false)));
     events
+}
+
+/// Tap card `i` of Discover's grid. Discover is two columns of cards now, so
+/// a tap at the middle of the screen lands in the gutter between them.
+fn tap_card(i: usize) -> UiEvent {
+    let l = layout();
+    let gap = l.pad / 2;
+    let top = l.content_top() + gap;
+    let avail = l.nav_top().saturating_sub(top + gap);
+    // Mirrors `discover_grid`: cards are laid out for the count on screen,
+    // which is four, or five when the offline reconnect card is showing.
+    let rows = 2u32;
+    let cell_h = (avail.saturating_sub(gap * (rows - 1)) / rows).clamp(l.row_h, l.row_h * 5 / 2);
+    let grid = gideon_render::widgets::GridLayout::new(
+        l.pad,
+        top,
+        l.width.saturating_sub(l.pad * 2),
+        super::SETTINGS_COLS,
+        cell_h,
+        gap,
+    );
+    let (cx, cy, cw, ch) = grid.cell(i);
+    UiEvent::Tap {
+        x: cx + cw / 2,
+        y: cy + ch / 2,
+    }
 }
 
 fn tap_row(i: usize) -> UiEvent {
@@ -447,6 +527,27 @@ fn panel_point_for(rx: u32, ry: u32, rot: u32) -> (u32, u32) {
 }
 
 /// [`tap_row`] aimed at a menu rendered at rotation `rot`.
+/// [`tap_card`] at rotation `rot`: the card centre in reading orientation,
+/// mapped back into panel coordinates.
+fn tap_card_rot(i: usize, rot: u32) -> UiEvent {
+    let l = menu_layout(rot);
+    let gap = l.pad / 2;
+    let top = l.content_top() + gap;
+    let avail = l.nav_top().saturating_sub(top + gap);
+    let cell_h = (avail.saturating_sub(gap) / 2).clamp(l.row_h, l.row_h * 5 / 2);
+    let grid = gideon_render::widgets::GridLayout::new(
+        l.pad,
+        top,
+        l.width.saturating_sub(l.pad * 2),
+        super::SETTINGS_COLS,
+        cell_h,
+        gap,
+    );
+    let (cx, cy, cw, ch) = grid.cell(i);
+    let (x, y) = panel_point_for(cx + cw / 2, cy + ch / 2, rot);
+    UiEvent::Tap { x, y }
+}
+
 fn tap_row_rot(i: usize, rot: u32) -> UiEvent {
     let l = menu_layout(rot);
     let (x, y) = panel_point_for(l.width / 2, l.row_top(i) + l.row_h / 2, rot);
@@ -525,27 +626,33 @@ fn offline_home_shows_reconnect_row_and_offsets_taps() {
         "offline row 0 reconnects, stays on Home"
     );
 
-    // Offline: the standard entries are offset past the reconnect row, so
-    // "Browse sources" — the second entry — is row 2.
+    // Offline: the cards are offset past the reconnect card, so "Browse
+    // sources" — the second destination — is card 2.
     let mut b = app(&lib, FakeGateway::default(), vec![]);
     b.goto_root(Screen::Home).unwrap();
     b.home_offline = true;
-    b.activate(2, 10, 10).unwrap();
+    let UiEvent::Tap { x, y } = tap_card(2) else {
+        unreachable!()
+    };
+    b.handle_tap(x, y).unwrap();
     assert!(
         matches!(b.screen(), Screen::Sources { .. }),
-        "offline row 2 is Browse sources"
+        "offline card 2 is Browse sources"
     );
 
-    // Online (the default): no reconnect row, so Browse sources is row 1.
+    // Online (the default): no reconnect card, so Browse sources is card 1.
     let mut c = app(&lib, FakeGateway::default(), vec![]);
     c.goto_root(Screen::Home).unwrap();
-    // Painting Home probes connectivity; pin the online case so the row
+    // Painting Discover probes connectivity; pin the online case so the
     // offset under test is the one being asserted and not the probe's mood.
     c.home_offline = false;
-    c.activate(1, 10, 10).unwrap();
+    let UiEvent::Tap { x, y } = tap_card(1) else {
+        unreachable!()
+    };
+    c.handle_tap(x, y).unwrap();
     assert!(
         matches!(c.screen(), Screen::Sources { .. }),
-        "online row 1 is Browse sources"
+        "online card 1 is Browse sources"
     );
 }
 
@@ -708,7 +815,7 @@ fn menu_taps_land_the_right_row_at_each_rotation() {
         // Row 1 of the Discover menu opens Sources… (the row indices are
         // Discover's, so each app starts there rather than on the library
         // the device lands on.)
-        let mut sources_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(1, rot)])
+        let mut sources_app = app(&lib, FakeGateway::default(), vec![tap_card_rot(1, rot)])
             .with_reader_settings(FitMode::Contain, rot);
         sources_app.goto_root(Screen::Home).unwrap();
         sources_app.run().unwrap();
@@ -720,7 +827,7 @@ fn menu_taps_land_the_right_row_at_each_rotation() {
         // …and row 0 opens search, which with no sources installed says so
         // rather than opening a dead keyboard: per-row precision, not just
         // "hit something".
-        let mut search_app = app(&lib, FakeGateway::default(), vec![tap_row_rot(0, rot)])
+        let mut search_app = app(&lib, FakeGateway::default(), vec![tap_card_rot(0, rot)])
             .with_reader_settings(FitMode::Contain, rot);
         search_app.goto_root(Screen::Home).unwrap();
         search_app.run().unwrap();
@@ -1869,7 +1976,7 @@ fn sources_screen_lists_installed_then_available() {
         ]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(1)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1893,7 +2000,7 @@ fn source_list_fetch_error_shows_note_row_and_continues() {
         available: Err("network unreachable".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(1)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(1)]);
     app.run().unwrap();
 
     let Screen::Sources { rows, .. } = app.screen() else {
@@ -1920,7 +2027,7 @@ fn tapping_available_source_installs_and_refreshes() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_row(1), tap_row(1)],
+        vec![nav_discover(), tap_card(1), tap_row(1)],
     );
     app.run().unwrap();
 
@@ -1977,7 +2084,7 @@ fn full_browse_download_and_read_flow() {
 
     let events = vec![
         nav_discover(),
-        tap_row(1),        // Home -> Sources
+        tap_card(1),       // Home -> Sources
         tap_row(0),        // installed "Src" -> Listings
         tap_row(0),        // Popular -> MangaList
         tap_row(0),        // Manga One -> ChapterList
@@ -2026,7 +2133,7 @@ fn manga_list_paginates() {
 
     let events = vec![
         nav_discover(),
-        tap_row(1),     // Sources
+        tap_card(1),    // Sources
         tap_row(0),     // Listings
         tap_row(0),     // Popular
         tap_nav_next(), // page 2
@@ -2058,10 +2165,10 @@ fn listing_failure_shows_error_screen_with_back() {
 
     let events = vec![
         nav_discover(),
-        tap_row(1), // Sources
-        tap_row(0), // Listings
-        tap_row(0), // Popular -> fails
-        tap_row(0), // tap the error screen -> back
+        tap_card(1), // Sources
+        tap_row(0),  // Listings
+        tap_row(0),  // Popular -> fails
+        tap_row(0),  // tap the error screen -> back
     ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
@@ -2081,7 +2188,7 @@ fn error_screen_renders_the_message() {
         mangas: Err("server exploded".into()),
         ..FakeGateway::default()
     };
-    let events = vec![nav_discover(), tap_row(1), tap_row(0), tap_row(0)];
+    let events = vec![nav_discover(), tap_card(1), tap_row(0), tap_row(0)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -2099,7 +2206,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(3)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(3)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -2117,7 +2224,7 @@ fn back_on_home_does_nothing() {
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_back(), tap_back(), tap_row(0)],
+        vec![nav_discover(), tap_back(), tap_back(), tap_card(0)],
     );
     app.run().unwrap();
     assert!(
@@ -3613,7 +3720,7 @@ fn downloads_land_in_the_active_profiles_directory() {
         nav_discover(),
         tap_title_left(), // profile menu
         tap_row(1),       // switch to alex
-        tap_row(1),       // Sources
+        tap_card(1),      // Sources
         tap_row(0),       // Listings
         tap_row(0),       // Popular
         tap_row(0),       // Manga One
@@ -3949,7 +4056,7 @@ fn long_press_removes_an_installed_source_after_confirming() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),        // Home -> Sources
+        tap_card(1),       // Home -> Sources
         long_press_row(0), // installed "Src" -> confirmation
         tap_row(0),        // "Remove source"
     ];
@@ -3977,7 +4084,7 @@ fn cancelling_the_source_removal_keeps_it_installed() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),        // Home -> Sources
+        tap_card(1),       // Home -> Sources
         long_press_row(0), // installed "Src" -> confirmation
         tap_row(1),        // Cancel
     ];
@@ -4004,7 +4111,7 @@ fn long_press_on_an_available_source_is_just_a_tap() {
         ..FakeGateway::default()
     };
     // Row 0 is the "— available —" separator; the source sits on row 1.
-    let events = vec![nav_discover(), tap_row(1), long_press_row(1)];
+    let events = vec![nav_discover(), tap_card(1), long_press_row(1)];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
 
@@ -4551,7 +4658,7 @@ fn finishing_a_chapter_flows_into_the_next() {
 
     let events = vec![
         nav_discover(),
-        tap_row(1),        // Sources
+        tap_card(1),       // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -5216,11 +5323,11 @@ fn downloading_records_the_series_origin() {
 
     let events = vec![
         nav_discover(),
-        tap_row(1), // Sources
-        tap_row(0), // Listings
-        tap_row(0), // Popular
-        tap_row(0), // Manga One
-        tap_row(0), // download + Reader
+        tap_card(1), // Sources
+        tap_row(0),  // Listings
+        tap_row(0),  // Popular
+        tap_row(0),  // Manga One
+        tap_row(0),  // download + Reader
         reader_tap_back(),
     ];
     let mut app = app(&lib, gateway, events);
@@ -5275,7 +5382,7 @@ fn downloaded_chapters_open_instantly_without_redownloading() {
 
     let events = vec![
         nav_discover(),
-        tap_row(1),        // Sources
+        tap_card(1),       // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -5329,7 +5436,7 @@ fn long_press_a_chapter_downloads_without_opening_the_reader() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(0),
         tap_row(0),                  // ChapterList
@@ -5384,7 +5491,7 @@ fn update_prompt_installs_on_tap() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_row(3), tap_row(0)],
+        vec![nav_discover(), tap_card(3), tap_row(0)],
     );
     assert_eq!(app.run().unwrap(), Exit::Restart);
     assert_eq!(
@@ -5425,8 +5532,8 @@ fn home_popular_lists_titles_and_tap_searches_installed_sources() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(2), // Home -> Popular manga
-        tap_row(0), // first popular title -> global search for it
+        tap_card(2), // Home -> Popular manga
+        tap_row(0),  // first popular title -> global search for it
     ];
     let mut app = app(dir.path(), gateway, events);
     app.run().unwrap();
@@ -5456,7 +5563,7 @@ fn home_popular_renders_the_titles() {
         }]),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(2)]);
     app.run().unwrap();
 
     let Screen::Popular { mangas, .. } = app.screen() else {
@@ -5477,7 +5584,7 @@ fn home_popular_empty_explains_instead_of_a_blank_tab() {
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_row(2)],
+        vec![nav_discover(), tap_card(2)],
     );
     app.run().unwrap();
 
@@ -5496,7 +5603,7 @@ fn home_popular_outage_explains_instead_of_an_error_screen() {
         popular: Err("Jikan 504".into()),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_row(2)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(2)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -5544,7 +5651,7 @@ fn home_search_goes_straight_to_the_keyboard() {
     let mut app = app(
         dir.path(),
         search_gateway(),
-        vec![nav_discover(), tap_row(0)],
+        vec![nav_discover(), tap_card(0)],
     );
     app.run().unwrap();
 
@@ -5561,7 +5668,7 @@ fn home_search_without_sources_explains_instead_of_a_dead_keyboard() {
     let mut app = app(
         dir.path(),
         FakeGateway::default(),
-        vec![nav_discover(), tap_row(0)],
+        vec![nav_discover(), tap_card(0)],
     );
     app.run().unwrap();
 
@@ -5601,7 +5708,7 @@ fn global_search_queries_every_source_and_labels_results() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(0), // Home -> global search keyboard
+        tap_card(0), // Home -> global search keyboard
         tap_key(Key::Char('n')),
         tap_key(Key::Search),
         tap_row(1), // second result -> ChapterList via its own source
@@ -5633,7 +5740,7 @@ fn global_search_with_no_hits_opens_results_then_back_to_keyboard() {
     gateway.search_results = Ok(Vec::new());
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('z')),
         tap_key(Key::Search),
         tap_back(), // leave the (empty) results -> back to the keyboard
@@ -5658,7 +5765,7 @@ fn global_search_retries_with_title_variants_on_a_miss() {
     gateway.hit_query = Some("ジャッジ".into());
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('j')),
         tap_key(Key::Search),
     ];
@@ -5686,7 +5793,7 @@ fn global_search_with_a_hit_never_looks_up_variants() {
     gateway.variants = vec!["Some Other Name".into()];
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search),
     ];
@@ -5710,7 +5817,7 @@ fn global_search_with_a_failing_source_still_opens_results() {
     gateway.search_results = Err("cloudflare tantrum".into());
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('a')),
         tap_key(Key::Search),
     ];
@@ -5726,7 +5833,7 @@ fn global_search_with_a_failing_source_still_opens_results() {
 #[test]
 fn listings_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
-    let events = vec![nav_discover(), tap_row(1), tap_row(0), tap_row(2)];
+    let events = vec![nav_discover(), tap_card(1), tap_row(0), tap_row(2)];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
 
@@ -5746,7 +5853,7 @@ fn typing_builds_the_query_with_partial_refreshes() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5775,7 +5882,7 @@ fn typing_builds_the_query_with_partial_refreshes() {
 #[test]
 fn every_eighth_keystroke_flashes_the_panel_clean() {
     let dir = tempfile::tempdir().unwrap();
-    let mut events = vec![nav_discover(), tap_row(1), tap_row(0), tap_row(2)];
+    let mut events = vec![nav_discover(), tap_card(1), tap_row(0), tap_row(2)];
     events.extend(std::iter::repeat_with(|| tap_key(Key::Char('a'))).take(8));
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
@@ -5793,7 +5900,7 @@ fn punctuation_for_manga_titles_is_typeable() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('r')),
@@ -5817,7 +5924,7 @@ fn space_is_not_allowed_leading_or_doubled() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Space), // leading — ignored
@@ -5839,7 +5946,7 @@ fn search_key_queries_the_gateway_and_shows_results() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5873,7 +5980,7 @@ fn search_results_open_chapters_like_any_list() {
     }];
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('n')),
@@ -5894,7 +6001,7 @@ fn empty_query_search_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Search),
@@ -5913,7 +6020,7 @@ fn empty_results_show_a_message_and_keep_the_keyboard_below() {
     gateway.search_results = Ok(Vec::new());
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('z')),
@@ -5936,7 +6043,7 @@ fn search_failure_shows_error_screen() {
     gateway.search_results = Err("source exploded".into());
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_key(Key::Char('a')),
@@ -5957,7 +6064,7 @@ fn back_leaves_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(1),
+        tap_card(1),
         tap_row(0),
         tap_row(2),
         tap_back(),
@@ -5999,7 +6106,7 @@ fn widen_installs_matching_sources_and_merges_their_results() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(0), // Home -> global search keyboard (no history)
+        tap_card(0), // Home -> global search keyboard (no history)
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults (1 hit from src)
         tap_row(1),           // the "Search more sources" row (index 1)
@@ -6053,7 +6160,7 @@ fn widen_with_no_matches_uninstalls_the_sources_it_tried() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('z')),
         tap_key(Key::Search), // -> empty SearchResults
         tap_row(0),           // the "Search more sources" row (index 0)
@@ -6176,7 +6283,7 @@ fn widen_with_nothing_left_to_try_says_so() {
     };
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults (1 hit)
         tap_row(1),           // "Search more sources"
@@ -6201,12 +6308,12 @@ fn recent_search_is_remembered_and_reopened_from_cache() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(0), // Home -> keyboard (no history yet)
+        tap_card(0), // Home -> keyboard (no history yet)
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // -> SearchResults, remembers "n"
         tap_back(),           // -> keyboard
         tap_back(),           // -> Discover
-        tap_row(0),           // -> RecentSearches (history exists now)
+        tap_card(0),          // -> RecentSearches (history exists now)
         tap_row(1),           // tap the recent "n" -> cached results
     ];
     let mut app = app(dir.path(), search_gateway(), events);
@@ -6226,13 +6333,13 @@ fn recents_screen_new_search_row_opens_the_keyboard() {
     let dir = tempfile::tempdir().unwrap();
     let events = vec![
         nav_discover(),
-        tap_row(0),
+        tap_card(0),
         tap_key(Key::Char('n')),
         tap_key(Key::Search), // remembers "n"
         tap_back(),
         tap_back(),
-        tap_row(0), // -> RecentSearches
-        tap_row(0), // "New search…" -> keyboard
+        tap_card(0), // -> RecentSearches
+        tap_row(0),  // "New search…" -> keyboard
     ];
     let mut app = app(dir.path(), search_gateway(), events);
     app.run().unwrap();
@@ -6495,7 +6602,7 @@ fn sleep_right_after_a_download_suspends_in_the_reader() {
     let (count, sleeper) = counting_sleeper();
     let events = vec![
         nav_discover(),
-        tap_row(1),        // Sources
+        tap_card(1),       // Sources
         tap_row(0),        // Listings
         tap_row(0),        // Popular
         tap_row(0),        // Manga One
@@ -6847,7 +6954,7 @@ fn update_prompt_back_declines() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_row(3), tap_back()],
+        vec![nav_discover(), tap_card(3), tap_back()],
     );
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
@@ -7757,7 +7864,7 @@ fn dump_demo() {
 fn quick_settings_opens_and_cycles_without_flashing() {
     // The panel has a non-flashing partial waveform (GLR16, GLRC16 for
     // colour). Sliding a sheet up changes only the strip it covers, and
-    // cycling a value changes one line — flashing the whole screen for
+    // cycling one tile changes one value — flashing the whole screen for
     // either is what makes an e-ink UI feel cheap. Closing DOES flash,
     // because it restores a region the panel has been holding stale.
     let dir = tempfile::tempdir().unwrap();
@@ -7779,27 +7886,23 @@ fn quick_settings_opens_and_cycles_without_flashing() {
         "opening the sheet must not flash"
     );
 
-    // Cycle the colour profile from inside the sheet.
-    let l = layout();
-    let (top, h) = app.sheet_bounds().expect("a sheet is open");
-    let rows = app.sheet_rows().1.len() as u32;
-    let row_h = l.row_h;
-    let title_h = h.saturating_sub(row_h * rows);
-    let at = |i: u32| (l.width / 2, top + title_h + i * row_h + row_h / 2);
-    // By label, not by index: the sheet's contents are a design decision and
-    // will move again.
-    let colour = app
-        .sheet_rows()
-        .1
+    // The tiles the sheet offers, and where they are: by label, because the
+    // contents are a design decision and will move again.
+    let tiles = app.quick_tiles();
+    assert_eq!(tiles.len(), QUICK_TILES, "the helpers know the tile count");
+    let colour = tiles
         .iter()
-        .position(|(label, ..)| label == "Colour profile")
-        .expect("the sheet offers the colour profile") as u32;
-    let (x, y) = at(colour);
+        .position(|(label, _)| *label == "Colour profile")
+        .expect("the sheet offers the colour profile");
+
+    let UiEvent::Tap { x, y } = tap_quick_tile(colour) else {
+        unreachable!()
+    };
     app.tap_sheet(x, y).unwrap();
     assert_eq!(
         app.display().flushes.last(),
         Some(&RefreshMode::Partial),
-        "cycling a value repaints one line; it must not flash"
+        "cycling a tile repaints one value; it must not flash"
     );
     assert_eq!(
         effective_settings(&settings_dir, &lib).color_profile,
@@ -7807,9 +7910,22 @@ fn quick_settings_opens_and_cycles_without_flashing() {
         "the tap should have advanced the colour profile"
     );
 
+    // The gutter between the columns is not a tile: a tap there changes
+    // nothing rather than cycling whichever neighbour rounding lands on.
+    let (_, grid, _) = quick_sheet();
+    let (cx, cy, cw, ch) = grid.cell(0);
+    let flushes = app.display().flushes.len();
+    app.tap_sheet(cx + cw + 1, cy + ch / 2).unwrap();
+    assert_eq!(
+        app.display().flushes.len(),
+        flushes,
+        "a tap in the gutter repaints nothing"
+    );
+
     // A tap above the sheet dismisses it, and that one flashes.
-    app.tap_sheet(l.width / 2, top.saturating_sub(10)).unwrap();
-    assert!(app.sheet_bounds().is_none(), "tapping outside dismisses");
+    let (top, ..) = quick_sheet();
+    app.tap_sheet(W / 2, top.saturating_sub(10)).unwrap();
+    assert!(app.sheet().is_none(), "tapping outside dismisses");
     assert_eq!(
         app.display().flushes.last(),
         Some(&RefreshMode::Full),
@@ -7894,10 +8010,10 @@ fn every_settings_row_changes_the_setting_its_label_names() {
         app.set_settings_page(page);
         let map = app.settings_hit_map();
         assert!(!map.is_empty(), "page {page} laid out no rows");
-        for (top, bottom, action) in map {
+        for (cx, cy, cw, ch, action) in map {
             seen.push(action);
             let before = effective_settings(&settings_dir, &lib);
-            app.tap_setting_at(W / 2, (top + bottom) / 2).unwrap();
+            app.tap_setting_at(cx + cw / 2, cy + ch / 2).unwrap();
             let after = effective_settings(&settings_dir, &lib);
 
             // The three navigation rows move the screen instead of a value.
@@ -7956,10 +8072,11 @@ fn every_settings_row_changes_the_setting_its_label_names() {
 }
 
 #[test]
-fn settings_pages_reach_every_row_and_open_at_the_top() {
-    // Fifteen rows and three headings need more height than any panel gideon
-    // runs on, so the screen pages. Before it did, the whole Device group was
-    // drawn off the bottom: visible nowhere, tappable nowhere.
+fn every_setting_fits_on_one_screen_as_a_grid() {
+    // Fifteen settings stacked as rows needed two panels, and the version
+    // before that simply drew the last group past the fold — visible
+    // nowhere, tappable nowhere. Two columns of tiles fit the lot on one
+    // screen, so there is no pager to get lost in.
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("Manga");
     make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
@@ -7972,30 +8089,51 @@ fn settings_pages_reach_every_row_and_open_at_the_top() {
     app.run().unwrap();
     app.goto_root(Screen::Settings).unwrap();
 
-    let pages = app.settings_page_count();
-    assert!(pages > 1, "the settings list is taller than the panel");
+    assert_eq!(app.settings_page_count(), 1, "everything fits on one page");
+    let map = app.settings_hit_map();
+    let defined: usize = super::settings_groups(&effective_settings(&settings_dir, &lib))
+        .iter()
+        .map(|(_, rows)| rows.len())
+        .sum();
+    assert_eq!(map.len(), defined, "every setting has a tile to tap");
 
-    // The pager strip: forward wraps back to the first page, and the left
-    // half walks backwards.
-    let l = layout();
-    let pager_y = l.nav_top() - l.row_h / 2;
-    for expected in 1..pages {
-        app.tap_setting_at(W * 3 / 4, pager_y).unwrap();
-        assert_eq!(app.settings_page(), expected, "forward advances one page");
+    // Tiles must not overlap each other or spill past the nav bar — the two
+    // ways a grid silently eats a tap.
+    let nav_top = layout().nav_top();
+    for (i, (ax, ay, aw, ah, _)) in map.iter().enumerate() {
+        assert!(
+            ay + ah <= nav_top,
+            "tile {i} runs under the nav bar ({ay}+{ah} > {nav_top})"
+        );
+        for (bx, by, bw, bh, _) in map.iter().skip(i + 1) {
+            let overlaps = ax < &(bx + bw) && bx < &(ax + aw) && ay < &(by + bh) && by < &(ay + ah);
+            assert!(!overlaps, "tiles overlap: {ax},{ay} and {bx},{by}");
+        }
     }
-    app.tap_setting_at(W * 3 / 4, pager_y).unwrap();
-    assert_eq!(app.settings_page(), 0, "forward wraps at the last page");
-    app.tap_setting_at(W / 4, pager_y).unwrap();
-    assert_eq!(app.settings_page(), pages - 1, "back wraps at the first");
+}
 
-    // Leaving and coming back starts at the top again.
-    app.goto_root(Screen::Library {
-        items: Vec::new(),
-        page: 0,
-    })
-    .unwrap();
-    app.goto_root(Screen::Settings).unwrap();
-    assert_eq!(app.settings_page(), 0);
+#[test]
+fn the_settings_pager_still_works_when_a_panel_is_too_small_for_the_grid() {
+    // The packing stays even though nothing pages today: a smaller panel, a
+    // larger font or one more group of settings all overflow it, and the
+    // failure mode without paging is a tile drawn past the fold.
+    let groups = super::settings_groups(&gideon_core::Settings::default());
+    let total: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+
+    // Room for two tile-rows per page, against three groups of settings.
+    let pages = super::paginate_settings(groups, 20, 100, 8, 2, 20 + 100 + 8 + 100);
+    assert!(pages.len() > 1, "a short panel has to page");
+    let placed: usize = pages
+        .iter()
+        .flat_map(|p| p.iter().map(|(_, rows)| rows.len()))
+        .sum();
+    assert_eq!(placed, total, "paging must not drop a setting");
+    for page in &pages {
+        assert!(!page.is_empty(), "no page is drawn empty");
+        for (_, rows) in page {
+            assert!(!rows.is_empty(), "a heading never sits alone on a page");
+        }
+    }
 }
 
 #[test]
@@ -8242,4 +8380,47 @@ fn storage_breaks_down_by_series_and_reads_sizes_in_human_units() {
     assert_eq!(super::human_size(700 * 1024), "700 KB");
     assert_eq!(super::human_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
     assert_eq!(super::human_size(2 * 1024 * 1024 * 1024), "2.00 GB");
+}
+
+#[test]
+fn discover_cards_are_a_grid_and_each_one_opens_its_own_destination() {
+    // Four rows of a list left two thirds of the panel white. Two columns of
+    // cards fill it — but a grid resolves taps by x AND y, and the old row
+    // dispatch would have sent every card in the right-hand column to its
+    // left-hand neighbour.
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = app(dir.path(), source_gateway(), vec![]);
+    probe.run().unwrap();
+    probe.goto_root(Screen::Home).unwrap();
+
+    let cards = probe.discover_cards();
+    assert_eq!(cards.len(), 4, "online, the four destinations");
+    let grid = probe.discover_grid(cards.len());
+    assert!(grid.cell(1).0 > grid.cell(0).0, "two columns");
+    assert!(grid.cell(2).1 > grid.cell(0).1, "two rows");
+
+    // The gutter between the columns is not a card: a tap there does nothing
+    // rather than activating whichever neighbour rounding lands on.
+    let l = layout();
+    let (cx, cy, cw, ch) = grid.cell(0);
+    assert_eq!(grid.hit(cx + cw / 2, cy + ch / 2, cards.len()), Some(0));
+    assert_eq!(grid.hit(cx + cw + 1, cy + ch / 2, cards.len()), None);
+    assert!(cy + ch <= l.nav_top(), "cards stay clear of the nav bar");
+
+    // Each card lands on its own screen.
+    for (i, want) in [(0usize, "search"), (1, "sources"), (2, "popular")] {
+        let mut card_app = app(
+            dir.path(),
+            source_gateway(),
+            vec![nav_discover(), tap_card(i)],
+        );
+        card_app.run().unwrap();
+        let landed = match card_app.screen() {
+            Screen::Search { .. } | Screen::RecentSearches { .. } => "search",
+            Screen::Sources { .. } => "sources",
+            Screen::MangaList { .. } | Screen::Message { .. } => "popular",
+            other => panic!("card {i} landed on {other:?}"),
+        };
+        assert_eq!(landed, want, "card {i}");
+    }
 }

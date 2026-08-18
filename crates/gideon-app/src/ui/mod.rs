@@ -45,12 +45,28 @@ const HOME_ROWS: [&str; 4] = [
     "Popular manga",
     "Check for updates",
 ];
+/// The line under each Discover card. Four destinations on a panel this size
+/// are cards, not a list: a list of four leaves two thirds of the screen
+/// white and makes each choice look like an afterthought.
+const HOME_DETAILS: [&str; 4] = [
+    "one query, every installed source",
+    "install, update and browse",
+    "what is trending right now",
+    "download the newest gideon",
+];
 /// A tappable top row shown on Home ONLY when offline (device only): a manual
 /// "scan + reconnect" for the roam-while-idle case, without a battery-draining
 /// background connectivity poll.
 /// Week-columns on the stats heatmap. Matches the web dashboard's 18 so the
 /// two surfaces show the same window of history.
 const STATS_HEATMAP_WEEKS: u32 = 18;
+/// The settings screen is a grid, not a list: two columns of tiles. Fifteen
+/// settings stacked as rows is two panels of paging; the same fifteen as
+/// tiles is one screen you can take in at a glance.
+const SETTINGS_COLS: u32 = 2;
+/// Gap between settings tiles, and between one group's grid and the next
+/// group's heading.
+const SETTINGS_GAP: u32 = 8;
 
 const HOME_RECONNECT_ROW: &str = "No Wi-Fi - tap to reconnect";
 /// Trailing row on the global-search results screen: widen the search to
@@ -1759,39 +1775,68 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Full)
     }
 
+    /// The quick-settings sheet's tiles: the handful of values worth changing
+    /// without leaving what you were reading.
+    fn quick_tiles(&self) -> Vec<(&'static str, String)> {
+        let s = self.load_settings();
+        vec![
+            // Who is reading comes first: it decides which library and which
+            // of these values you are even looking at.
+            ("Profile", self.active_profile.clone()),
+            ("Library view", s.library_view.clone()),
+            (
+                "Reader fit",
+                match FitMode::from_setting(&s.reader_fit) {
+                    FitMode::FitWidth => "fit-width".into(),
+                    _ => "contain".into(),
+                },
+            ),
+            (
+                "Full refresh",
+                format!("every {} pages", s.reader_full_refresh_interval),
+            ),
+            ("Colour profile", s.color_profile.clone()),
+        ]
+    }
+
+    /// The two rows under the tiles: the way through to everything else, and
+    /// the way out.
+    const QUICK_ACTIONS: [&'static str; 2] = ["All settings", "Close"];
+
+    /// Where the quick-settings sheet sits and how it is laid out:
+    /// `(top, height, tile grid, first action row's y)`.
+    fn quick_sheet_layout(&self) -> (u32, u32, widgets::GridLayout, u32) {
+        let l = &self.layout;
+        let gap = SETTINGS_GAP;
+        let title_h = (l.text_px * 1.6) as u32;
+        let cell_h = self.settings_cell_h();
+        let tiles = self.quick_tiles().len();
+        let rows = (tiles as u32).div_ceil(SETTINGS_COLS);
+        let grid_h = rows * cell_h + gap * rows.saturating_sub(1);
+        let actions_h = l.row_h * Self::QUICK_ACTIONS.len() as u32;
+        let h = (title_h + gap + grid_h + gap + actions_h).min(l.height);
+        let top = l.height - h;
+        let grid = widgets::GridLayout::new(
+            l.pad,
+            top + title_h + gap,
+            l.width.saturating_sub(l.pad * 2),
+            SETTINGS_COLS,
+            cell_h,
+            gap,
+        );
+        let actions_top = top + title_h + gap + grid_h + gap;
+        (top, h, grid, actions_top)
+    }
+
     /// The rows an open sheet shows. Kept beside the tap routing so drawing
     /// and hit-testing read the same list and cannot fall out of step.
     fn sheet_rows(&self) -> (String, Vec<(String, String, bool)>) {
         match self.sheet {
-            Some(Sheet::QuickSettings) => {
-                let s = self.load_settings();
-                (
-                    "Quick settings".to_string(),
-                    vec![
-                        // Who is reading comes first: it decides which
-                        // library and which of these values you are looking
-                        // at in the first place.
-                        ("Profile".into(), self.active_profile.clone(), false),
-                        ("Library view".into(), s.library_view.clone(), false),
-                        (
-                            "Reader fit".into(),
-                            match FitMode::from_setting(&s.reader_fit) {
-                                FitMode::FitWidth => "fit-width".into(),
-                                _ => "contain".into(),
-                            },
-                            false,
-                        ),
-                        (
-                            "Full refresh".into(),
-                            format!("every {} pages", s.reader_full_refresh_interval),
-                            false,
-                        ),
-                        ("Colour profile".into(), s.color_profile.clone(), false),
-                        ("All settings".into(), String::new(), false),
-                        ("Close".into(), String::new(), true),
-                    ],
-                )
-            }
+            // Quick settings is a grid, not a list (see `quick_sheet_layout`),
+            // so it states no rows here: five values that fit two to a line
+            // are two thirds of the panel as a stack and a third of it as
+            // tiles, and the sheet covers what you were reading.
+            Some(Sheet::QuickSettings) => (String::new(), Vec::new()),
             Some(Sheet::Book {
                 ref series_dir,
                 ref read_key,
@@ -1842,6 +1887,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Where an open sheet sits: anchored to the bottom, as tall as its rows
     /// need. Everything above it stays on screen and unrepainted.
     fn sheet_bounds(&self) -> Option<(u32, u32)> {
+        if matches!(self.sheet, Some(Sheet::QuickSettings)) {
+            let (top, h, ..) = self.quick_sheet_layout();
+            return Some((top, h));
+        }
         let (_, rows) = self.sheet_rows();
         if rows.is_empty() {
             return None;
@@ -1852,6 +1901,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Draw the open sheet over an already-composed screen.
     fn overlay_sheet(&self, canvas: &mut RgbPage) {
+        if matches!(self.sheet, Some(Sheet::QuickSettings)) {
+            return self.overlay_quick_settings(canvas);
+        }
         let Some((y, h)) = self.sheet_bounds() else {
             return;
         };
@@ -1881,33 +1933,51 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Where each settings row was drawn, and what it does. Built by walking
     /// exactly the list the screen draws, so a tap can be resolved by the y it
     /// landed on rather than by an index into a second, different list.
-    fn settings_hit_map(&self) -> Vec<(u32, u32, SettingAction)> {
+    fn settings_hit_map(&self) -> Vec<(u32, u32, u32, u32, SettingAction)> {
         let l = &self.layout;
-        let (page, pages) = self.settings_layout();
+        let (page, _) = self.settings_layout();
         let head_h = l.row_h * 2 / 3;
-        let mut y = l.content_top();
+        let mut y = l.content_top() + l.pad / 2;
         let mut map = Vec::new();
         for (_, rows) in page {
             y += head_h;
-            for (_, _, _, action) in rows {
-                map.push((y, y + l.row_h, action));
-                y += l.row_h;
+            let grid = self.settings_grid(y);
+            for (i, (_, _, _, action)) in rows.iter().enumerate() {
+                let (cx, cy, cw, ch) = grid.cell(i);
+                map.push((cx, cy, cw, ch, *action));
             }
+            y += grid.height(rows.len()) + SETTINGS_GAP;
         }
-        let _ = pages;
         map
+    }
+
+    /// The grid one settings group is laid out on, starting at `y`.
+    fn settings_grid(&self, y: u32) -> widgets::GridLayout {
+        let l = &self.layout;
+        widgets::GridLayout::new(
+            l.pad,
+            y,
+            l.width.saturating_sub(l.pad * 2),
+            SETTINGS_COLS,
+            self.settings_cell_h(),
+            SETTINGS_GAP,
+        )
+    }
+
+    /// Height of one settings tile: label, value and a line of explanation.
+    fn settings_cell_h(&self) -> u32 {
+        self.layout.row_h * 5 / 4
     }
 
     /// Top edge of the settings pager strip: the last row of content height,
     /// sitting directly on the nav bar.
-    #[cfg(test)]
-    fn settings_page_count(&self) -> usize {
-        self.settings_layout().1
+    fn settings_pager_top(&self) -> u32 {
+        self.layout.nav_top().saturating_sub(self.layout.row_h)
     }
 
     #[cfg(test)]
-    fn settings_page(&self) -> usize {
-        self.settings_page
+    fn settings_page_count(&self) -> usize {
+        self.settings_layout().1
     }
 
     #[cfg(test)]
@@ -1915,24 +1985,36 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.settings_page = page;
     }
 
-    fn settings_pager_top(&self) -> u32 {
-        self.layout.nav_top().saturating_sub(self.layout.row_h)
-    }
-
-    /// The settings rows on the current page, and how many pages there are.
+    /// The settings groups on the current page, and how many pages there are.
     /// One source of truth: the compositor draws exactly what this returns
-    /// and the hit map walks exactly what this returns, so a row can never
-    /// be drawn in one place and tapped in another.
+    /// and the hit map walks exactly what this returns, so a setting can
+    /// never be drawn in one place and tapped in another.
     fn settings_layout(&self) -> (Vec<SettingsGroup>, usize) {
         let l = &self.layout;
         let head_h = l.row_h * 2 / 3;
-        let avail = l.nav_top().saturating_sub(l.content_top());
+        let cell_h = self.settings_cell_h();
+        let avail = l
+            .nav_top()
+            .saturating_sub(l.content_top() + l.pad / 2 + l.pad);
         let groups = settings_groups(&self.load_settings());
-        let mut pages = paginate_settings(groups.clone(), head_h, l.row_h, avail);
+        let mut pages = paginate_settings(
+            groups.clone(),
+            head_h,
+            cell_h,
+            SETTINGS_GAP,
+            SETTINGS_COLS as usize,
+            avail,
+        );
         if pages.len() > 1 {
-            // Paging needs a pager row, which costs a row of content — so
-            // re-paginate against the smaller budget.
-            pages = paginate_settings(groups, head_h, l.row_h, avail.saturating_sub(l.row_h));
+            // Paging costs a pager row, so re-pack against the smaller budget.
+            pages = paginate_settings(
+                groups,
+                head_h,
+                cell_h,
+                SETTINGS_GAP,
+                SETTINGS_COLS as usize,
+                avail.saturating_sub(l.row_h),
+            );
         }
         let count = pages.len();
         let at = self.settings_page.min(count - 1);
@@ -1950,6 +2032,59 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         Ok(canvas)
     }
 
+    /// Draw the quick-settings sheet: a panel, a grid of value tiles, and the
+    /// two action rows under them.
+    fn overlay_quick_settings(&self, canvas: &mut RgbPage) {
+        let l = &self.layout;
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let (top, h, grid, actions_top) = self.quick_sheet_layout();
+        widgets::draw_panel(
+            canvas,
+            0,
+            top,
+            l.width,
+            h,
+            "Quick settings",
+            l.text_px,
+            &theme,
+        );
+        for (i, (label, value)) in self.quick_tiles().iter().enumerate() {
+            let (cx, cy, cw, ch) = grid.cell(i);
+            widgets::draw_tile(
+                canvas,
+                cx,
+                cy,
+                cw,
+                ch,
+                &widgets::Tile {
+                    label,
+                    value,
+                    detail: "",
+                },
+                l.text_px,
+                &theme,
+            );
+        }
+        let inner = l.width.saturating_sub(l.pad * 2);
+        for (i, action) in Self::QUICK_ACTIONS.iter().enumerate() {
+            widgets::draw_setting_row(
+                canvas,
+                l.pad,
+                actions_top + i as u32 * l.row_h,
+                inner,
+                l.row_h,
+                &widgets::SettingRow {
+                    label: action,
+                    value: if *action == "All settings" { "›" } else { "" },
+                    detail: "",
+                    selected: false,
+                },
+                l.text_px,
+                &theme,
+            );
+        }
+    }
+
     /// Open the quick-settings sheet over the current screen.
     fn open_quick_settings(&mut self) -> Result<()> {
         self.sheet = Some(Sheet::QuickSettings);
@@ -1963,7 +2098,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Route a tap while a sheet is open. A tap outside it dismisses, which is
     /// what every modal on every platform does and what a reader will try
     /// first; the sheet's own rows act.
-    fn tap_sheet(&mut self, _x: u32, y: u32) -> Result<Flow> {
+    fn tap_sheet(&mut self, x: u32, y: u32) -> Result<Flow> {
+        if matches!(self.sheet, Some(Sheet::QuickSettings)) {
+            return self.tap_quick_settings(x, y);
+        }
         let Some((top, h)) = self.sheet_bounds() else {
             return Ok(Flow::Continue);
         };
@@ -1980,15 +2118,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(Flow::Continue);
         }
         let index = ((y - top - title_h) / row_h.max(1)) as usize;
-        let Some((label, _, _)) = rows.get(index) else {
+        if rows.get(index).is_none() {
             return Ok(Flow::Continue);
-        };
+        }
         match self.sheet.clone() {
             Some(Sheet::Book {
                 entry,
                 series_dir,
                 read_key,
-            }) => return self.tap_book_sheet(index, entry, series_dir, read_key),
+            }) => self.tap_book_sheet(index, entry, series_dir, read_key),
             Some(Sheet::ConfirmDelete {
                 entry,
                 series_dir,
@@ -2000,29 +2138,68 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 } else {
                     self.render_current(RefreshMode::Full)?;
                 }
-                return Ok(Flow::Continue);
+                Ok(Flow::Continue)
             }
-            _ => {}
+            // Closing restores whatever the sheet was covering, so it earns a
+            // flash: a partial would leave the panel to reconstruct a region
+            // it has been holding stale, which is where REAGL residue shows.
+            _ => {
+                self.sheet = None;
+                self.render_current(RefreshMode::Full)?;
+                Ok(Flow::Continue)
+            }
         }
+    }
+
+    /// Act on a tap in the quick-settings sheet: a tile cycles its value, the
+    /// action rows go through or dismiss.
+    fn tap_quick_settings(&mut self, x: u32, y: u32) -> Result<Flow> {
+        let (top, _, grid, actions_top) = self.quick_sheet_layout();
+        if y < top {
+            self.sheet = None;
+            return self
+                .render_current(RefreshMode::Full)
+                .map(|_| Flow::Continue);
+        }
+        if y >= actions_top {
+            let index = ((y - actions_top) / self.layout.row_h.max(1)) as usize;
+            self.sheet = None;
+            if Self::QUICK_ACTIONS.get(index) == Some(&"All settings") {
+                return self.goto_root(Screen::Settings).map(|_| Flow::Continue);
+            }
+            return self
+                .render_current(RefreshMode::Full)
+                .map(|_| Flow::Continue);
+        }
+        let tiles = self.quick_tiles();
+        let Some(index) = grid.hit(x, y, tiles.len()) else {
+            return Ok(Flow::Continue);
+        };
         let mut settings = self.load_settings();
-        match label.as_str() {
+        match tiles[index].0 {
+            "Profile" => {
+                self.sheet = None;
+                return self.open_profile_menu().map(|_| Flow::Continue);
+            }
             "Library view" => {
                 settings.library_view = if settings.library_view == "list" {
                     "shelf".into()
                 } else {
                     "list".into()
                 };
-                self.save_settings(&settings);
             }
             "Reader fit" => {
                 settings.reader_fit = match FitMode::from_setting(&settings.reader_fit) {
                     FitMode::FitWidth => "contain".into(),
                     _ => "fit-width".into(),
                 };
-                // The next book opens with the new fit, without a restart:
-                // the reader is built from this field, not from the file.
+                // Live, so the next book opens with it.
                 self.reader_fit = FitMode::from_setting(&settings.reader_fit);
-                self.save_settings(&settings);
+            }
+            "Full refresh" => {
+                settings.reader_full_refresh_interval =
+                    cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
+                self.full_refresh_interval = settings.reader_full_refresh_interval;
             }
             "Colour profile" => {
                 let at = COLOR_PROFILE_STEPS
@@ -2030,34 +2207,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .position(|p| *p == settings.color_profile)
                     .map_or(0, |i| (i + 1) % COLOR_PROFILE_STEPS.len());
                 settings.color_profile = COLOR_PROFILE_STEPS[at].to_string();
-                self.save_settings(&settings);
             }
-            "Full refresh" => {
-                settings.reader_full_refresh_interval =
-                    cycle(&FULL_REFRESH_STEPS, settings.reader_full_refresh_interval);
-                // Live, so the book you are in picks up the new cadence.
-                self.full_refresh_interval = settings.reader_full_refresh_interval;
-                self.save_settings(&settings);
-            }
-            "Profile" => {
-                self.sheet = None;
-                return self.open_profile_menu().map(|_| Flow::Continue);
-            }
-            "All settings" => {
-                self.sheet = None;
-                return self.goto_root(Screen::Settings).map(|_| Flow::Continue);
-            }
-            // Closing restores whatever the sheet was covering, so it earns a
-            // flash: a partial would leave the panel to reconstruct a region
-            // it has been holding stale, which is where REAGL residue shows.
-            _ => {
-                self.sheet = None;
-                return self
-                    .render_current(RefreshMode::Full)
-                    .map(|_| Flow::Continue);
-            }
+            _ => return Ok(Flow::Continue),
         }
-        // A value cycle repaints one line. Partial, and no flash.
+        self.save_settings(&settings);
+        // One tile's value changed. Partial, and no flash.
         self.render_current(RefreshMode::Partial)?;
         Ok(Flow::Continue)
     }
@@ -2167,21 +2321,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Activate whatever sits at content row `row` (tap at `x`, `y`).
-    fn activate(&mut self, mut row: usize, x: u32, y: u32) -> Result<Flow> {
+    fn activate(&mut self, row: usize, x: u32, y: u32) -> Result<Flow> {
         let screen = self.stack.last().cloned().expect("stack never empty");
         match screen {
             Screen::Home => {
-                // Row 0 is the offline "reconnect Wi-Fi" button when shown;
-                // the standard rows are offset past it. The offset comes from
-                // the cached paint-time state, so it matches what was drawn.
+                // Resolved against the card grid, not a row index: the cards
+                // are two to a line and the offline reconnect card shifts
+                // every one of them.
+                let cards = self.discover_cards();
+                let Some(mut index) = self.discover_grid(cards.len()).hit(x, y, cards.len()) else {
+                    return Ok(Flow::Continue);
+                };
                 if self.home_offline {
-                    if row == 0 {
+                    if index == 0 {
                         self.reconnect_wifi()?;
                         return Ok(Flow::Continue);
                     }
-                    row -= 1;
+                    index -= 1;
                 }
-                match row {
+                match index {
                     0 => self.open_global_search()?,
                     1 => self.open_sources()?,
                     2 => self.open_popular()?,
@@ -2891,10 +3049,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // this is the one settings interaction that legitimately does.
             return self.render_current(RefreshMode::Full);
         }
-        let Some((_, _, action)) = self
+        let Some((.., action)) = self
             .settings_hit_map()
             .into_iter()
-            .find(|(top, bottom, _)| y >= *top && y < *bottom)
+            .find(|(cx, cy, cw, ch, _)| x >= *cx && x < cx + cw && y >= *cy && y < cy + ch)
         else {
             return Ok(());
         };
@@ -5018,25 +5176,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return Ok(Some(self.compose_storage()));
         }
         if matches!(self.stack.last(), Some(Screen::Home)) {
-            // Discover is a top-level destination, so it takes the colour
-            // path unconditionally: the nav bar is drawn in RGB, and without
-            // it the screen has no visible route anywhere else. The reading
-            // band that used to fill the space below the rows lives on Today
-            // now — showing it twice made two tabs look like one screen.
-            let l = &self.layout;
-            let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
-            let mut canvas = RgbPage::from_gray(&self.compose_current()?);
-            widgets::draw_nav_bar(
-                &mut canvas,
-                0,
-                l.nav_top(),
-                l.width,
-                l.nav_h,
-                &self.nav_items(),
-                l.text_px,
-                &theme,
-            );
-            return Ok(Some(canvas));
+            return Ok(Some(self.compose_discover()));
         }
         let Some(Screen::Library { items, page }) = self.stack.last() else {
             return Ok(None);
@@ -5677,21 +5817,166 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// device, the account — means you look in one place. The groups also
     /// say something true: the first two are yours alone, the third is the
     /// hardware everyone sharing this Kobo shares.
+    /// Discover: the four ways to find something new, as a grid of cards.
+    ///
+    /// Four rows of a list left two thirds of the panel white and made each
+    /// choice look like a line item; four cards fill the screen, give every
+    /// destination a finger-sized target, and have room for the line of
+    /// explanation that says what each one actually does.
+    fn compose_discover(&self) -> RgbPage {
+        let l = &self.layout;
+        let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+        let title = home_title(
+            env!("CARGO_PKG_VERSION"),
+            &self.active_profile,
+            self.battery_now(),
+        );
+        let mut chrome = compose_chrome_opts(l, &title, 0, 1, false);
+        // Status-icon row, right to left: power (slot 0), then a bell when the
+        // web has queued sends, then Bluetooth when a remote is connected.
+        draw_power_icon(&mut chrome, l);
+        let mut slot = 1;
+        if !crate::sync::cached_sends(&self.library_dir).is_empty() {
+            draw_bell_icon(&mut chrome, l, slot);
+            slot += 1;
+        }
+        if self.input.bluetooth_connected() {
+            draw_bluetooth_icon(&mut chrome, l, slot);
+        }
+        let mut canvas = RgbPage::from_gray(&chrome);
+
+        let cards = self.discover_cards();
+        let grid = self.discover_grid(cards.len());
+        for (i, (label, detail)) in cards.iter().enumerate() {
+            let (cx, cy, cw, ch) = grid.cell(i);
+            widgets::draw_tile(
+                &mut canvas,
+                cx,
+                cy,
+                cw,
+                ch,
+                &widgets::Tile {
+                    label: "",
+                    value: label,
+                    detail,
+                },
+                l.text_px,
+                &theme,
+            );
+        }
+
+        // What is installed, under the cards. It reads off disk, so it is
+        // the one thing on this screen that still says something useful with
+        // the radio off — and it answers "why is search finding nothing?"
+        // without making you open another screen to find out.
+        let head_h = l.row_h * 2 / 3;
+        let mut y = grid.y + grid.height(cards.len()) + l.pad;
+        let inner = l.width.saturating_sub(l.pad * 2);
+        if y + head_h + l.row_h / 2 <= l.nav_top() {
+            let sources = self.gateway.installed_sources().unwrap_or_default();
+            widgets::draw_section_header(
+                &mut canvas,
+                l.pad,
+                y,
+                inner,
+                head_h,
+                "Installed sources",
+                l.text_px,
+                &theme,
+            );
+            y += head_h + l.pad / 2;
+            let line_h = l.row_h * 3 / 4;
+            let mut layer = GrayPage::new_white(l.width, l.height);
+            if sources.is_empty() {
+                draw_text(
+                    &mut layer,
+                    l.pad,
+                    y,
+                    l.text_px * 0.7,
+                    "None yet — Browse sources installs one.",
+                    inner,
+                    false,
+                );
+            } else {
+                for source in &sources {
+                    if y + line_h > l.nav_top() {
+                        break;
+                    }
+                    draw_text(
+                        &mut layer,
+                        l.pad,
+                        y,
+                        l.text_px * 0.7,
+                        &source.name,
+                        inner,
+                        false,
+                    );
+                    y += line_h;
+                }
+            }
+            copy_gray_into_rgb(&mut canvas, &layer);
+        }
+
+        widgets::draw_nav_bar(
+            &mut canvas,
+            0,
+            l.nav_top(),
+            l.width,
+            l.nav_h,
+            &self.nav_items(),
+            l.text_px,
+            &theme,
+        );
+        canvas
+    }
+
+    /// Discover's cards: the offline reconnect card first when it applies,
+    /// then the four standard destinations.
+    fn discover_cards(&self) -> Vec<(&'static str, &'static str)> {
+        let mut cards: Vec<(&'static str, &'static str)> = Vec::new();
+        if self.home_offline {
+            cards.push((HOME_RECONNECT_ROW, "scan and rejoin your network"));
+        }
+        cards.extend(HOME_ROWS.iter().copied().zip(HOME_DETAILS.iter().copied()));
+        cards
+    }
+
+    /// The grid Discover's cards sit on: two columns, filling the content
+    /// area, so the cards grow with the panel instead of leaving it empty.
+    fn discover_grid(&self, count: usize) -> widgets::GridLayout {
+        let l = &self.layout;
+        let gap = l.pad / 2;
+        let top = l.content_top() + gap;
+        let avail = l.nav_top().saturating_sub(top + gap);
+        let rows = (count as u32).div_ceil(SETTINGS_COLS).max(1);
+        // Comfortably tall, but not the whole panel: a card with two lines of
+        // text stretched over 700px reads as a mistake. What is left below
+        // the grid goes to the installed-source list.
+        let cell_h = (avail.saturating_sub(gap * rows.saturating_sub(1)) / rows)
+            .clamp(l.row_h, l.row_h * 5 / 2);
+        widgets::GridLayout::new(
+            l.pad,
+            top,
+            l.width.saturating_sub(l.pad * 2),
+            SETTINGS_COLS,
+            cell_h,
+            gap,
+        )
+    }
+
     fn compose_settings(&self) -> RgbPage {
         let l = &self.layout;
         let settings = self.load_settings();
         let theme = widgets::Theme::from_setting(&settings.color_profile);
         let inner = l.width.saturating_sub(l.pad * 2);
         let (page, pages) = self.settings_layout();
-        let at = self.settings_page.min(pages - 1);
+        let at = self.settings_page.min(pages.saturating_sub(1));
         let mut canvas = RgbPage::from_gray(&compose_chrome_paged(
             l, "Settings", at, pages, false, 0, false,
         ));
 
         let head_h = l.row_h * 2 / 3;
-        let row_h = l.row_h;
-        let mut y = l.content_top();
-        let nav_top = l.nav_top();
+        let mut y = l.content_top() + l.pad / 2;
 
         for (heading, rows) in page {
             widgets::draw_section_header(
@@ -5705,24 +5990,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 &theme,
             );
             y += head_h;
-            for (label, value, detail, _) in rows {
-                widgets::draw_setting_row(
+            let grid = self.settings_grid(y);
+            for (i, (label, value, detail, _)) in rows.iter().enumerate() {
+                let (cx, cy, cw, ch) = grid.cell(i);
+                widgets::draw_tile(
                     &mut canvas,
-                    l.pad,
-                    y,
-                    inner,
-                    row_h,
-                    &widgets::SettingRow {
-                        label: &label,
-                        value: &value,
-                        detail: &detail,
-                        selected: false,
+                    cx,
+                    cy,
+                    cw,
+                    ch,
+                    &widgets::Tile {
+                        label,
+                        value,
+                        detail,
                     },
                     l.text_px,
                     &theme,
                 );
-                y += row_h;
             }
+            y += grid.height(rows.len()) + SETTINGS_GAP;
         }
 
         if pages > 1 {
@@ -5731,7 +6017,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 l.pad,
                 self.settings_pager_top(),
                 inner,
-                row_h,
+                l.row_h,
                 &widgets::SettingRow {
                     label: "‹  Previous",
                     value: "Next  ›",
@@ -5747,7 +6033,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             widgets::draw_nav_bar(
                 &mut canvas,
                 0,
-                nav_top,
+                l.nav_top(),
                 l.width,
                 l.nav_h,
                 &self.nav_items(),
@@ -5763,41 +6049,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let per_page = l.rows_per_page();
         let screen = self.stack.last().expect("stack never empty");
         Ok(match screen {
-            Screen::Home => {
-                // When offline (device only), a "reconnect Wi-Fi" row sits at
-                // the very top; the standard entries follow.
-                let mut rows: Vec<(String, bool)> = Vec::new();
-                if self.home_offline {
-                    rows.push((HOME_RECONNECT_ROW.to_string(), true));
-                }
-                rows.extend(HOME_ROWS.iter().map(|r| (r.to_string(), true)));
-                // The version in the title answers "did the update take?"
-                // at a glance; the profile name after it says whose library
-                // this is (tapping the left half switches); the battery
-                // percent closes the line (the panel has no status bar
-                // otherwise). No Back on Home — the power symbol in the
-                // top-right corner opens the restart/close menu instead.
-                let title = home_title(
-                    env!("CARGO_PKG_VERSION"),
-                    &self.active_profile,
-                    self.battery_now(),
-                );
-                let mut canvas = compose_list_opts(l, &title, &rows, 0, 1, false);
-                // Status-icon row, right to left: power (slot 0), then a bell
-                // when the web has queued sends, then the Bluetooth glyph when a
-                // remote is connected — each in the next slot so they never
-                // overlap.
-                draw_power_icon(&mut canvas, l);
-                let mut slot = 1;
-                if !crate::sync::cached_sends(&self.library_dir).is_empty() {
-                    draw_bell_icon(&mut canvas, l, slot);
-                    slot += 1;
-                }
-                if self.input.bluetooth_connected() {
-                    draw_bluetooth_icon(&mut canvas, l, slot);
-                }
-                canvas
-            }
+            // Discover composes in RGB (see `compose_discover`): its cards
+            // carry the accent, and the nav bar it needs is drawn in colour.
+            // The grayscale twin that used to live here is the shape that
+            // let a screen drift out of step with its own tap map.
+            Screen::Home => self.compose_discover().to_gray(),
             Screen::ChapterMenu {
                 title,
                 key,
@@ -8262,44 +8518,52 @@ type SettingsRow = (String, String, String, SettingAction);
 type SettingsGroup = (&'static str, Vec<SettingsRow>);
 
 /// Split the settings groups into pages that actually fit `avail` pixels of
-/// content. Without this the screen silently drops every row past the fold —
-/// fifteen rows and three headings need ~1734px of a 1680px panel, so the
-/// last group simply never rendered and could never be tapped.
+/// content, measuring in GRID rows rather than list rows: a group of five
+/// settings is three rows of a two-column grid, not five rows of a list.
 ///
-/// A group too tall for one page is split, and its heading repeats on the
-/// continuation, so a page never opens with orphan rows under no heading and
-/// a heading never sits alone at the bottom of a page.
+/// At the sizes gideon runs on everything lands on one page — which is the
+/// point of the grid — but the packing stays because a small panel, a large
+/// font or another group of settings can all overflow it, and the failure
+/// mode without it is a row drawn past the fold: visible nowhere, tappable
+/// nowhere. A group too tall for one page is split, and its heading repeats
+/// on the continuation.
 fn paginate_settings(
     groups: Vec<SettingsGroup>,
     head_h: u32,
-    row_h: u32,
+    cell_h: u32,
+    gap: u32,
+    cols: usize,
     avail: u32,
 ) -> Vec<Vec<SettingsGroup>> {
+    let cols = cols.max(1);
+    // Height a group of `n` settings needs, heading included.
+    let cost = |n: usize| -> u32 {
+        let rows = n.div_ceil(cols) as u32;
+        head_h + rows * cell_h + gap * rows.saturating_sub(1)
+    };
     let mut pages: Vec<Vec<SettingsGroup>> = Vec::new();
     let mut page: Vec<SettingsGroup> = Vec::new();
     let mut used = 0;
     for (heading, rows) in groups {
-        let mut pending: Vec<SettingsRow> = Vec::new();
-        // A heading is only worth placing if at least one of its rows fits
-        // beneath it on the same page.
-        if used + head_h + row_h > avail && !page.is_empty() {
+        let mut rest = rows;
+        loop {
+            if used + cost(1) > avail && !page.is_empty() {
+                pages.push(std::mem::take(&mut page));
+                used = 0;
+            }
+            // How many of `rest` fit in what is left of this page.
+            let room = avail.saturating_sub(used + head_h);
+            let fits = (((room + gap) / (cell_h + gap)) as usize * cols).max(cols);
+            if fits >= rest.len() {
+                used += cost(rest.len()) + gap;
+                page.push((heading, rest));
+                break;
+            }
+            let tail = rest.split_off(fits);
+            page.push((heading, rest));
             pages.push(std::mem::take(&mut page));
             used = 0;
-        }
-        used += head_h;
-        for r in rows {
-            if used + row_h > avail && !(page.is_empty() && pending.is_empty()) {
-                if !pending.is_empty() {
-                    page.push((heading, std::mem::take(&mut pending)));
-                }
-                pages.push(std::mem::take(&mut page));
-                used = head_h;
-            }
-            pending.push(r);
-            used += row_h;
-        }
-        if !pending.is_empty() {
-            page.push((heading, pending));
+            rest = tail;
         }
     }
     if !page.is_empty() {
