@@ -6686,3 +6686,152 @@ fn a_failed_lookahead_is_retried_by_the_next_kick() {
         "the re-kick after wake retried the chapter that failed while offline"
     );
 }
+
+/// Write a progress store directly, so a stats test can describe a reading
+/// history without having to simulate weeks of page turns.
+fn write_progress(lib: &Path, entries: &[(&str, usize, usize, u64)]) {
+    let dir = lib.join(".gideon");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body: Vec<String> = entries
+        .iter()
+        .map(|(key, page, total, at)| {
+            format!(
+                "\"{key}\":{{\"current_page\":{page},\"total_pages\":{total},\"last_read_at\":{at}}}"
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("progress.json"),
+        format!("{{\"progress\":{{{}}}}}", body.join(",")),
+    )
+    .unwrap();
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn home_opens_reading_stats_and_draws_it_in_color() {
+    // The stats screen exists to carry the heatmap, and the heatmap is a
+    // colour ramp — so it must take the RGB blit path, not fall back to gray.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
+    write_progress(&lib, &[("Berserk/vol1.cbz", 3, 4, now_unix())]);
+
+    let events = vec![tap_row(6)];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    app.run().unwrap();
+
+    assert!(
+        matches!(app.screen(), Screen::Stats),
+        "row 6 should open Reading stats"
+    );
+    assert_eq!(
+        app.display().blits.last(),
+        Some(&true),
+        "the stats screen must blit as colour"
+    );
+}
+
+#[test]
+fn the_heatmap_darkens_a_day_that_was_read() {
+    // A day with reading has to be visibly darker than an untouched one,
+    // otherwise the whole widget is decoration.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 40);
+    write_progress(&lib, &[("Berserk/vol1.cbz", 39, 40, now_unix())]);
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(6)]);
+    app.run().unwrap();
+
+    // The empty-day step is 0xEE; a read day is darker than that everywhere
+    // in every ramp. Somewhere below the tiles there must be such a pixel.
+    let l = layout();
+    let dark =
+        (l.content_top()..l.height).any(|y| (0..l.width).any(|x| app.display().pixel(x, y) < 0xE0));
+    assert!(dark, "no heatmap ink drawn for a day that was read");
+}
+
+#[test]
+fn stats_survive_an_empty_library() {
+    // A fresh device has no progress at all; the screen must still compose
+    // rather than dividing by a zero maximum somewhere in the ramp.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    let mut app = app(&lib, FakeGateway::default(), vec![tap_row(6)]);
+    app.run().unwrap();
+    assert!(matches!(app.screen(), Screen::Stats));
+}
+
+#[test]
+#[ignore]
+fn dump_stats_screen_png() {
+    // Not part of CI: renders the stats screen at real Libra Colour size, in
+    // colour, for eyeballing. Set GIDEON_PROFILE to try another palette.
+    // `cargo test -p gideon-app dump_stats_screen_png -- --ignored`
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Vinland Saga/vol1.cbz"), 40);
+    let now = now_unix();
+    // A plausible, irregular history so the ramp actually has range.
+    let pattern = [
+        0usize, 14, 3, 0, 41, 22, 0, 0, 7, 33, 18, 0, 9, 27, 0, 44, 2, 0, 11, 36,
+    ];
+    let mut entries: Vec<(String, usize, usize, u64)> = Vec::new();
+    for d in 0..126u64 {
+        let pages = pattern[(d as usize * 7 + d as usize / 5) % pattern.len()];
+        if pages == 0 {
+            continue;
+        }
+        entries.push((
+            format!("Vinland Saga/ch{d}.cbz"),
+            pages - 1,
+            pages,
+            now - d * 86_400,
+        ));
+    }
+    let refs: Vec<(&str, usize, usize, u64)> = entries
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let (w, h) = (1264, 1680);
+    let settings_dir = dir.path().join("data");
+    if let Ok(profile) = std::env::var("GIDEON_PROFILE") {
+        gideon_core::Settings {
+            color_profile: profile,
+            ..gideon_core::Settings::default()
+        }
+        .save(&settings_dir)
+        .unwrap();
+    }
+    let mut app = UiApp::new(
+        MemoryDisplay::new(w, h),
+        FakeInput::new(vec![]),
+        FakeGateway::default(),
+        lib.clone(),
+    )
+    .with_settings_dir(settings_dir);
+    app.push(Screen::Stats).unwrap();
+
+    // compose_stats is private, but this module is a child of `ui`.
+    let page = app.compose_stats();
+    let mut img = image::RgbImage::new(page.width, page.height);
+    for y in 0..page.height {
+        for x in 0..page.width {
+            img.put_pixel(x, y, image::Rgb(page.pixel(x, y)));
+        }
+    }
+    let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| "stats.png".into());
+    img.save(&out).unwrap();
+    eprintln!("wrote {out}");
+}

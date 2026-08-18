@@ -31,11 +31,11 @@ use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{rotate_page, rotate_page_rgb, FitMode, GrayPage, RgbPage};
+use gideon_render::{heatmap, rotate_page, rotate_page_rgb, FitMode, GrayPage, RgbPage};
 
 use crate::reader::Reader;
 
-const HOME_ROWS: [&str; 6] = [
+const HOME_ROWS: [&str; 7] = [
     "Library",
     "Search all sources",
     "Browse sources",
@@ -43,10 +43,15 @@ const HOME_ROWS: [&str; 6] = [
     "Check for updates",
     // Appended (not inserted) so the existing Home rows keep their indices.
     "Popular manga",
+    "Reading stats",
 ];
 /// A tappable top row shown on Home ONLY when offline (device only): a manual
 /// "scan + reconnect" for the roam-while-idle case, without a battery-draining
 /// background connectivity poll.
+/// Week-columns on the stats heatmap. Matches the web dashboard's 18 so the
+/// two surfaces show the same window of history.
+const STATS_HEATMAP_WEEKS: u32 = 18;
+
 const HOME_RECONNECT_ROW: &str = "No Wi-Fi - tap to reconnect";
 /// Trailing row on the global-search results screen: widen the search to
 /// sources that aren't installed yet (keeping any that match).
@@ -436,6 +441,9 @@ enum Screen {
     ConvertDefault {
         name: String,
     },
+    /// Reading stats for the active profile: the totals and the activity
+    /// heatmap, derived from this profile's own progress store.
+    Stats,
     /// Device-global settings (NOT per profile): each tap cycles a value
     /// and saves settings.json immediately.
     Settings,
@@ -1654,10 +1662,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     3 => self.push(Screen::Settings)?,
                     4 => self.check_updates()?,
                     5 => self.open_popular()?,
+                    6 => self.push(Screen::Stats)?,
                     _ => {}
                 }
                 Ok(Flow::Continue)
             }
+            // Nothing on the stats screen is tappable — Back in the chrome is
+            // handled before row dispatch, like every other read-only screen.
+            Screen::Stats => Ok(Flow::Continue),
             Screen::Library { items, page } => self.tap_library_cell(&items, page, x, y),
             Screen::Sources { rows, page } => {
                 let index = page * self.layout.rows_per_page() + row;
@@ -4364,6 +4376,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// shelf with at least one visible downloaded cover (.cover.jpg).
     /// Everything else renders grayscale.
     fn compose_color_current(&self) -> Result<Option<RgbPage>> {
+        // The stats screen is composed in RGB unconditionally: the heatmap is
+        // the one widget whose whole job is a colour ramp, and on a panel
+        // without a colour filter the ramp collapses to its greys anyway.
+        if matches!(self.stack.last(), Some(Screen::Stats)) {
+            return Ok(Some(self.compose_stats()));
+        }
         let Some(Screen::Library { items, page }) = self.stack.last() else {
             return Ok(None);
         };
@@ -4380,6 +4398,84 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
         Ok(Some(canvas))
+    }
+
+    /// The reading-stats screen: four totals across the top, then the
+    /// activity heatmap.
+    ///
+    /// Composed in RGB because the heatmap is a colour ramp; on a panel with
+    /// no colour filter the ramp collapses to its own greys, which is why
+    /// every ramp is monotonic in luma (`gideon_render::heatmap`).
+    ///
+    /// The stats are derived from THIS profile's progress store, so switching
+    /// profiles shows that reader's numbers rather than the device's.
+    fn compose_stats(&self) -> RgbPage {
+        let l = &self.layout;
+        let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
+        let palette = heatmap::Palette::from_setting(&self.load_settings().color_profile);
+
+        let mut canvas = RgbPage::from_gray(&compose_chrome(l, "Reading stats", 0, 1));
+        let mut gray = GrayPage::new_white(l.width, l.height);
+
+        // Four totals, two per row, so the labels have room at any panel width
+        // rather than being ellipsised into uselessness on the narrow ones.
+        let tiles = [
+            (
+                stats.current_streak.to_string(),
+                format!("day streak - best {}", stats.longest_streak),
+            ),
+            (
+                stats.chapters_finished.to_string(),
+                format!("chapters - {} series", stats.series_count),
+            ),
+            (stats.pages_read.to_string(), "pages read".to_string()),
+            (stats.active_days.to_string(), "days read".to_string()),
+        ];
+        let col_w = (l.width - l.pad * 2) / 2;
+        let tile_h = l.row_h;
+        let mut y = l.content_top() + l.pad;
+        for (i, (value, label)) in tiles.iter().enumerate() {
+            let x = l.pad + (i as u32 % 2) * col_w;
+            if i % 2 == 0 && i > 0 {
+                y += tile_h;
+            }
+            draw_text(&mut gray, x, y, l.text_px * 1.15, value, col_w, true);
+            draw_text(
+                &mut gray,
+                x,
+                y + (l.text_px * 1.3) as u32,
+                l.text_px * 0.62,
+                label,
+                col_w,
+                false,
+            );
+        }
+        y += tile_h + l.pad;
+
+        draw_text(
+            &mut gray,
+            l.pad,
+            y,
+            l.text_px * 0.62,
+            "READING ACTIVITY",
+            l.width - l.pad * 2,
+            true,
+        );
+        y += (l.text_px * 0.95) as u32;
+
+        copy_gray_into_rgb(&mut canvas, &gray);
+
+        // Size the grid to the panel instead of hardcoding a cell, so this is
+        // right on a 1072-wide Clara as well as a 1264-wide Libra Colour.
+        let weeks = STATS_HEATMAP_WEEKS;
+        let layout = heatmap::HeatmapLayout::fit(l.pad, y, weeks, l.width - l.pad * 2, 6);
+        heatmap::draw_heatmap(
+            &mut canvas,
+            &layout,
+            &stats.heatmap(weeks as usize),
+            &palette,
+        );
+        canvas
     }
 
     fn compose_current(&self) -> Result<GrayPage> {
@@ -4523,6 +4619,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 "Convert",
                 self.keyboard_shift,
             ),
+            Screen::Stats => self.compose_stats().to_gray(),
             Screen::Settings => {
                 let settings = self.load_settings();
                 let mut rows = settings_rows(&settings);
@@ -6175,6 +6272,22 @@ fn copy_into(dst: &mut GrayPage, src: &GrayPage, off_x: u32, off_y: u32) {
 }
 
 /// [`copy_into`] for RGB pages (3 bytes per pixel).
+/// Overlay a full-size grayscale layer onto an RGB canvas, keeping only its
+/// ink: white stays transparent so text can be drawn over colour without
+/// punching a white box through it.
+fn copy_gray_into_rgb(dst: &mut RgbPage, src: &GrayPage) {
+    for y in 0..src.height.min(dst.height) {
+        for x in 0..src.width.min(dst.width) {
+            let g = src.pixel(x, y);
+            if g == 0xFF {
+                continue;
+            }
+            let idx = ((y * dst.width + x) * 3) as usize;
+            dst.pixels[idx..idx + 3].copy_from_slice(&[g, g, g]);
+        }
+    }
+}
+
 fn copy_into_rgb(dst: &mut RgbPage, src: &RgbPage, off_x: u32, off_y: u32) {
     let copy_w = src.width.min(dst.width.saturating_sub(off_x));
     let copy_h = src.height.min(dst.height.saturating_sub(off_y));
