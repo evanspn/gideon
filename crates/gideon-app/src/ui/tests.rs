@@ -7532,3 +7532,183 @@ fn dump_today_png() {
     img.save(&out).unwrap();
     eprintln!("wrote {out}");
 }
+
+/// Render any screen to a PNG for the 1.0 demo. Not part of CI.
+/// `GIDEON_SCREEN` picks the screen, `GIDEON_PROFILE` the colour profile.
+/// `cargo test -p gideon-app dump_demo -- --ignored`
+#[test]
+#[ignore]
+fn dump_demo() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    let now = now_unix();
+    let series = [
+        (
+            "Vinland Saga",
+            8.74f32,
+            "Publishing",
+            vec!["Action", "Drama", "Historical"],
+            213u32,
+            18usize,
+            16usize,
+            2u64,
+        ),
+        (
+            "Chainsaw Man",
+            8.61,
+            "Publishing",
+            vec!["Action", "Supernatural"],
+            97,
+            9,
+            5,
+            4,
+        ),
+        (
+            "Frieren",
+            9.02,
+            "Publishing",
+            vec!["Adventure", "Fantasy"],
+            126,
+            12,
+            11,
+            6,
+        ),
+        (
+            "Oyasumi Punpun",
+            9.01,
+            "Finished",
+            vec!["Drama", "Psychological"],
+            147,
+            3,
+            3,
+            30,
+        ),
+        (
+            "Dandadan",
+            8.55,
+            "Publishing",
+            vec!["Action", "Comedy", "Sci-Fi"],
+            188,
+            5,
+            5,
+            45,
+        ),
+        (
+            "Blue Period",
+            8.33,
+            "Publishing",
+            vec!["Drama", "Slice of Life"],
+            74,
+            4,
+            0,
+            14,
+        ),
+    ];
+    let mut index = gideon_core::SeriesIndex::default();
+    let mut progress: Vec<(String, usize, usize, u64)> = Vec::new();
+    for (i, (title, score, status, genres, total, downloaded, read, days)) in
+        series.iter().enumerate()
+    {
+        for c in 0..*downloaded {
+            make_cbz(&lib.join(format!("{title}/ch{c}.cbz")), 20);
+        }
+        let cover =
+            image::RgbImage::from_pixel(200, 300, image::Rgb(COVER_TINTS[i % COVER_TINTS.len()]));
+        image::DynamicImage::ImageRgb8(cover)
+            .save(lib.join(title).join(".cover.jpg"))
+            .unwrap();
+        index.record(
+            title,
+            gideon_core::SeriesRef {
+                source_id: "s".into(),
+                source_name: "src".into(),
+                manga_id: "m".into(),
+                manga_title: (*title).into(),
+                meta: Some(gideon_core::SeriesMeta {
+                    score: Some(*score),
+                    status: Some((*status).into()),
+                    genres: genres.iter().map(|g| (*g).to_string()).collect(),
+                    rank: None,
+                    total_chapters: Some(*total),
+                }),
+                ..Default::default()
+            },
+        );
+        for c in 0..*read {
+            progress.push((format!("{title}/ch{c}.cbz"), 19, 20, now - days * 86_400));
+        }
+    }
+    // A partly-read chapter so Continue has somewhere to point.
+    progress.push((
+        "Vinland Saga/ch16.cbz".to_string(),
+        11,
+        44,
+        now - 2 * 86_400,
+    ));
+    // Longer history so the heatmap has range.
+    let pattern = [
+        0usize, 14, 3, 0, 41, 22, 0, 0, 7, 33, 18, 0, 9, 27, 0, 44, 2, 0, 11, 36,
+    ];
+    for d in 20..126u64 {
+        let pages = pattern[(d as usize * 7 + d as usize / 5) % pattern.len()];
+        if pages > 0 {
+            progress.push((
+                format!("Frieren/h{d}.cbz"),
+                pages - 1,
+                pages,
+                now - d * 86_400,
+            ));
+        }
+    }
+    index.save(&lib).unwrap();
+    let refs: Vec<(&str, usize, usize, u64)> = progress
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let screen = std::env::var("GIDEON_SCREEN").unwrap_or_else(|_| "today".into());
+    let settings_dir = dir.path().join("data");
+    gideon_core::Settings {
+        color_profile: std::env::var("GIDEON_PROFILE").unwrap_or_else(|_| "ink-rust".into()),
+        library_view: if screen == "shelf" {
+            "shelf".into()
+        } else {
+            "list".into()
+        },
+        ..gideon_core::Settings::default()
+    }
+    .save(&settings_dir)
+    .unwrap();
+
+    let mut app = UiApp::new(
+        MemoryDisplay::new(1264, 1680),
+        FakeInput::new(vec![]),
+        FakeGateway::default(),
+        lib.clone(),
+    )
+    .with_settings_dir(settings_dir);
+
+    match screen.as_str() {
+        "today" => app.push(Screen::Stats).unwrap(),
+        "library" | "shelf" => app.open_library().unwrap(),
+        "discover" => app.push(Screen::Home).unwrap(),
+        "settings" => app.push(Screen::Settings).unwrap(),
+        "storage" => app.push(Screen::Storage).unwrap(),
+        other => panic!("unknown screen {other}"),
+    }
+
+    let page = match app.compose_color_current().unwrap() {
+        Some(rgb) => rgb,
+        None => RgbPage::from_gray(&app.compose_current().unwrap()),
+    };
+    let mut img = image::RgbImage::new(page.width, page.height);
+    for y in 0..page.height {
+        for x in 0..page.width {
+            img.put_pixel(x, y, image::Rgb(page.pixel(x, y)));
+        }
+    }
+    let out = std::env::var("GIDEON_DUMP").unwrap_or_else(|_| format!("{screen}.png"));
+    img.save(&out).unwrap();
+    eprintln!("wrote {out}");
+}
