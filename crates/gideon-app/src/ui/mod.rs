@@ -4699,6 +4699,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // opened by an up-swipe that starts in the bottom eighth of the
         // reading frame.
         let mut sheet_open = false;
+        // The lamp level the edge slide in progress started from, so every
+        // in-flight report of one drag is applied to the same base.
+        let mut slide_base: Option<u8> = None;
         let mut outcome = ReaderOutcome::Back;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
@@ -4964,24 +4967,67 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // night-light warmth at every rotation, and "up" always
                     // increases — otherwise, in panel space, the controls land
                     // on the wrong edge and invert when the device is turned.
-                    // The reader's edge slides act on the finished gesture:
-                    // acting on motion would step the lamp on the way to a
-                    // page turn. Nothing in the reader scrubs live.
-                    Ok(UiEvent::Drag { .. }) => {}
+                    // An edge slide in flight: the lamp follows the finger
+                    // instead of jumping when it lifts. You are adjusting a
+                    // light you are looking at — waiting for the release means
+                    // aiming in the dark and correcting afterwards.
+                    //
+                    // Only the edges scrub. The mid-screen gestures below are
+                    // decisions (leave the manga, rotate, raise the sheet) and
+                    // a decision must not fire halfway through the gesture that
+                    // makes it.
+                    Ok(UiEvent::Drag { x0, y0, x1, y1 }) => {
+                        let Some((lamp, delta)) =
+                            reader_edge_slide(x0, y0, x1, y1, panel.width, panel.height, rotation)
+                        else {
+                            continue;
+                        };
+                        let Some(lights) = self.lights.as_mut() else {
+                            continue;
+                        };
+                        // The level this drag started from. The delta is always
+                        // measured from the finger's start, so applying it to a
+                        // fixed base is idempotent: reports arriving faster than
+                        // the panel repaints cost resolution, never runaway.
+                        let base = *slide_base.get_or_insert_with(|| match lamp {
+                            EdgeLamp::Brightness => lights.brightness(),
+                            EdgeLamp::Warmth => lights.warmth(),
+                        });
+                        let new = (base as i32 + delta).clamp(0, 100) as u8;
+                        let banner = match lamp {
+                            EdgeLamp::Brightness => {
+                                if new == lights.brightness() {
+                                    continue;
+                                }
+                                lights.set_brightness(new);
+                                format!("Brightness {new}%")
+                            }
+                            EdgeLamp::Warmth => {
+                                if new == lights.warmth() {
+                                    continue;
+                                }
+                                lights.set_warmth(new);
+                                format!("Night light {new}%")
+                            }
+                        };
+                        reader.show_banner(&banner)?;
+                    }
                     Ok(UiEvent::Swipe { x0, y0, x1, y1 }) => {
+                        let slid =
+                            reader_edge_slide(x0, y0, x1, y1, panel.width, panel.height, rotation);
+                        // The finger is up: the next gesture starts from
+                        // whatever this one left behind.
+                        let base = slide_base.take();
                         let (rx0, ry0) =
                             layout::map_reader_tap(x0, y0, panel.width, panel.height, rotation);
                         let (rx1, ry1) =
                             layout::map_reader_tap(x1, y1, panel.width, panel.height, rotation);
-                        let (reading_w, reading_h) = if rotation % 180 == 90 {
-                            (panel.height, panel.width)
+                        let reading_h = if rotation % 180 == 90 {
+                            panel.width
                         } else {
-                            (panel.width, panel.height)
+                            panel.height
                         };
-                        let edge = (reading_w / 8).max(1);
-                        let on_right = rx0 >= reading_w - edge && rx1 >= reading_w - edge;
-                        let on_left = rx0 < edge && rx1 < edge;
-                        if !on_right && !on_left {
+                        if slid.is_none() {
                             // Mid-screen gestures: swipe down to leave the manga,
                             // swipe up to rotate 90° clockwise — for reading on
                             // your side in bed. Both demand deliberate travel (a
@@ -5025,24 +5071,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             }
                             continue;
                         }
+                        let (lamp, delta) = slid.expect("checked above");
                         let Some(lights) = self.lights.as_mut() else {
                             continue;
                         };
-                        // Sliding up (in the reading frame) increases; the full
-                        // reading height is the full 0–100 range.
-                        let delta =
-                            ((ry0 as i64 - ry1 as i64) * 100 / reading_h.max(1) as i64) as i32;
-                        if delta == 0 {
-                            continue;
-                        }
-                        let banner = if on_right {
-                            let new = (lights.brightness() as i32 + delta).clamp(0, 100) as u8;
-                            lights.set_brightness(new);
-                            format!("Brightness {new}%")
-                        } else {
-                            let new = (lights.warmth() as i32 + delta).clamp(0, 100) as u8;
-                            lights.set_warmth(new);
-                            format!("Night light {new}%")
+                        // Land on the exact level. The base is where the drag
+                        // began — the same one every in-flight report used — so
+                        // the release agrees with the last thing shown rather
+                        // than adding the whole delta a second time.
+                        let base = base.unwrap_or(match lamp {
+                            EdgeLamp::Brightness => lights.brightness(),
+                            EdgeLamp::Warmth => lights.warmth(),
+                        });
+                        let new = (base as i32 + delta).clamp(0, 100) as u8;
+                        let banner = match lamp {
+                            EdgeLamp::Brightness => {
+                                if new == lights.brightness() {
+                                    continue;
+                                }
+                                lights.set_brightness(new);
+                                format!("Brightness {new}%")
+                            }
+                            EdgeLamp::Warmth => {
+                                if new == lights.warmth() {
+                                    continue;
+                                }
+                                lights.set_warmth(new);
+                                format!("Night light {new}%")
+                            }
                         };
                         reader.show_banner(&banner)?;
                     }
@@ -7217,6 +7273,56 @@ fn controls_sheet_origin(panel_w: u32, panel_h: u32, sheet_h: u32, rotation: u32
 /// Draw the controls sheet over the current page: composed in reading
 /// orientation, rotated into the panel and stamped via the reader's
 /// chrome overlay (a partial flush; the next page repaint wipes it).
+/// Which lamp an edge gesture is working, and by how much.
+///
+/// The reader's RIGHT edge is brightness and its LEFT edge is night warmth at
+/// every rotation, and "up" always increases — so both endpoints are mapped
+/// into the reading frame before the edges are decided. In panel space the
+/// controls land on the wrong edge and invert when the device is turned.
+///
+/// `None` means the gesture was not an edge slide; the caller's mid-screen
+/// gestures take it from there. Shared by the in-flight drag and the release
+/// so a scrub and its landing can never disagree about which lamp it is.
+fn reader_edge_slide(
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    panel_w: u32,
+    panel_h: u32,
+    rotation: u32,
+) -> Option<(EdgeLamp, i32)> {
+    let (rx0, ry0) = layout::map_reader_tap(x0, y0, panel_w, panel_h, rotation);
+    let (rx1, ry1) = layout::map_reader_tap(x1, y1, panel_w, panel_h, rotation);
+    let (reading_w, reading_h) = if rotation % 180 == 90 {
+        (panel_h, panel_w)
+    } else {
+        (panel_w, panel_h)
+    };
+    let edge = (reading_w / 8).max(1);
+    let lamp = if rx0 >= reading_w - edge && rx1 >= reading_w - edge {
+        EdgeLamp::Brightness
+    } else if rx0 < edge && rx1 < edge {
+        EdgeLamp::Warmth
+    } else {
+        return None;
+    };
+    // Sliding up (in the reading frame) increases; the full reading height is
+    // the full 0–100 range. Measured from where the finger STARTED, so the
+    // same drag reported again gives the same answer — that is what lets a
+    // live scrub apply it against the level the drag began at without the
+    // value running away as the reports come in.
+    let delta = ((ry0 as i64 - ry1 as i64) * 100 / reading_h.max(1) as i64) as i32;
+    Some((lamp, delta))
+}
+
+/// The lamp an edge slide is working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeLamp {
+    Brightness,
+    Warmth,
+}
+
 fn show_controls_sheet<D: Display>(
     reader: &mut Reader<D>,
     panel: &UiLayout,

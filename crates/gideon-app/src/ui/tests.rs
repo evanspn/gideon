@@ -4383,9 +4383,13 @@ fn reader_fit_toggle_applies_to_the_next_book_immediately() {
 
 // --- frontlight edge slides ---
 
-/// Scriptable light control recording every set.
+/// Scriptable light control recording every set — the final levels alone
+/// cannot tell a control that followed a finger from one that jumped at the
+/// end, and that difference is the whole point of a scrub.
+#[derive(Default)]
 struct FakeLights {
     levels: SharedLevels,
+    log: SharedLog,
 }
 
 impl LightControl for FakeLights {
@@ -4394,22 +4398,39 @@ impl LightControl for FakeLights {
     }
     fn set_brightness(&mut self, p: u8) {
         self.levels.borrow_mut().0 = p;
+        self.log.borrow_mut().push(Lamp::Brightness(p));
     }
     fn warmth(&self) -> u8 {
         self.levels.borrow().1
     }
     fn set_warmth(&mut self, p: u8) {
         self.levels.borrow_mut().1 = p;
+        self.log.borrow_mut().push(Lamp::Warmth(p));
     }
 }
 
+/// One recorded change, so a test can read the shape of a scrub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lamp {
+    Brightness(u8),
+    Warmth(u8),
+}
+
 type SharedLevels = std::rc::Rc<RefCell<(u8, u8)>>;
+type SharedLog = std::rc::Rc<RefCell<Vec<Lamp>>>;
 
 fn lights() -> (SharedLevels, Box<dyn LightControl>) {
+    let (levels, _, control) = lights_recording();
+    (levels, control)
+}
+
+fn lights_recording() -> (SharedLevels, SharedLog, Box<dyn LightControl>) {
     let levels = std::rc::Rc::new(RefCell::new((20u8, 0u8)));
+    let log = SharedLog::default();
     (
         levels.clone(),
-        Box::new(FakeLights { levels }) as Box<dyn LightControl>,
+        log.clone(),
+        Box::new(FakeLights { levels, log }) as Box<dyn LightControl>,
     )
 }
 
@@ -4433,6 +4454,94 @@ fn right_edge_slide_up_raises_brightness() {
 
     assert_eq!(levels.borrow().0, 70, "20 + 50 = 70");
     assert_eq!(levels.borrow().1, 0, "warmth untouched");
+}
+
+#[test]
+fn the_reader_lamp_follows_the_finger_and_the_release_does_not_double_it() {
+    // You are adjusting a light you are looking at: waiting for the lift means
+    // aiming in the dark and correcting afterwards. So the in-flight reports
+    // move the lamp...
+    //
+    // ...and the trap they open is the release. Every report of one drag
+    // carries the SAME start point, so the delta is the same each time; adding
+    // it to the running level would take the lamp to 20 + 50 + 50 + 50. Both
+    // the scrub and the landing apply it to the level the drag began at.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+    let (levels, log, lights) = lights_recording();
+
+    let drag_to = |y1: u32| UiEvent::Drag {
+        x0: W - 5,
+        y0: H - 100,
+        x1: W - 5,
+        y1,
+    };
+    // Up the right edge in three reports, then lift at the same place.
+    let quarter = drag_to(H - 100 - H / 4);
+    let half = drag_to(H - 100 - H / 2);
+    let release = UiEvent::Swipe {
+        x0: W - 5,
+        y0: H - 100,
+        x1: W - 5,
+        y1: H - 100 - H / 2,
+    };
+    let events = vec![
+        tap_nav(0),
+        tap_shelf_cell0(),
+        quarter,
+        half,
+        release,
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
+    app.run().unwrap();
+
+    // The two in-flight reports moved it on the way — a quarter of the screen
+    // is +25, half is +50 — and the release named the level it was already
+    // showing, so it changed nothing further.
+    assert_eq!(
+        *log.borrow(),
+        vec![Lamp::Brightness(45), Lamp::Brightness(70)],
+        "the lamp did not follow the finger"
+    );
+    assert_eq!(
+        levels.borrow().0,
+        70,
+        "20 + 50 — the release must land on the drag, not on top of it"
+    );
+    assert_eq!(levels.borrow().1, 0, "warmth untouched");
+}
+
+#[test]
+fn a_drag_across_the_middle_of_a_page_decides_nothing_until_it_is_released() {
+    // Leaving the manga, rotating it and raising the controls sheet are
+    // DECISIONS. Only the edges scrub; a decision must never fire halfway
+    // through the gesture that makes it, or a swipe that is still being aimed
+    // throws you out of the chapter.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    // A downward drag across the middle, reported in flight and never released.
+    let mid_drag = UiEvent::Drag {
+        x0: W / 2,
+        y0: H / 4,
+        x1: W / 2,
+        y1: H - 10,
+    };
+    let events = vec![
+        tap_nav(0),
+        tap_shelf_cell0(),
+        mid_drag,
+        mid_drag,
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    // If the in-flight reports had been taken as the exit gesture, the reader
+    // would have quit early and `reader_tap_back` would have landed on the
+    // library instead — leaving the run with events unconsumed.
+    app.run().unwrap();
 }
 
 #[test]
@@ -7921,6 +8030,7 @@ fn dump_demo() {
     .with_settings_dir(settings_dir)
     .with_lights(Box::new(FakeLights {
         levels: std::rc::Rc::new(std::cell::RefCell::new((42, 15))),
+        log: SharedLog::default(),
     }));
 
     // Top-level destinations REPLACE the root screen the way the nav bar
