@@ -33,6 +33,18 @@ pub enum UiEvent {
     /// finger release when the travel exceeds the tap slop. Edge slides
     /// adjust the frontlight in the reader.
     Swipe { x0: u32, y0: u32, x1: u32, y1: u32 },
+    /// The same drag, reported **while the finger is still down**: from its
+    /// start (x0, y0) to where it is right now (x1, y1). A control that is
+    /// being scrubbed — the quick-settings sliders — follows the finger with
+    /// these and lands on the exact value from the closing [`UiEvent::Swipe`].
+    /// Everything else ignores them, which is why they are a separate variant
+    /// and not a `Swipe` with an "in flight" flag: no existing swipe handler
+    /// can fire early by accident.
+    ///
+    /// These coalesce in the queue (see `kobo_input`): a slow repaint can
+    /// never make the UI chase a stale finger position, it only makes the
+    /// drag update less often.
+    Drag { x0: u32, y0: u32, x1: u32, y1: u32 },
     /// A press held in place (≥600 ms without travel) — context actions,
     /// e.g. a library book's chapter list.
     LongPress { x: u32, y: u32 },

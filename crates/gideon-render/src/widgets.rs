@@ -419,7 +419,7 @@ pub fn draw_stat_tiles(
         return;
     }
     let pad = scaled(text_px, 0.35, 2);
-    let mark_h = scaled(text_px, 0.16, 2);
+    let mark_h = scaled(text_px, 0.26, 6);
     let inner = col_w.saturating_sub(pad);
     if inner == 0 {
         return;
@@ -642,7 +642,7 @@ pub fn draw_library_row(
 
     // --- band 2: progress bar, then how much is read and what is next.
     let b2 = y + band * 2;
-    let bar_h = scaled(text_px, 0.22, 3);
+    let bar_h = scaled(text_px, 0.32, 6);
     let bar_w = (avail * 2 / 5).max(1);
     draw_progress(
         canvas,
@@ -731,7 +731,7 @@ pub fn draw_nav_bar(
         return;
     }
     let pad = scaled(text_px, 0.3, 2);
-    let mark_h = scaled(text_px, 0.18, 2);
+    let mark_h = scaled(text_px, 0.28, 6);
     let inner = slot.saturating_sub(pad * 2);
 
     for (i, item) in items.iter().enumerate() {
@@ -935,7 +935,7 @@ pub fn draw_section_header(
     // resolution, so a 2px mark of accent is a grey smudge on the panel
     // however clean it looks on a monitor — colour has to arrive in blocks
     // big enough to survive the filter.
-    let mark_w = scaled(text_px, 0.3, 4);
+    let mark_w = scaled(text_px, 0.42, 7);
     // The band the label lives in: everything above the closing rule.
     let band = h.saturating_sub(1).max(1);
     // A wash of the accent behind the whole band, so a heading reads as a
@@ -1026,7 +1026,7 @@ pub fn draw_setting_row(
     let pad = scaled(text_px, 0.35, 2);
     let gap = scaled(text_px, 0.4, 3);
     let small = text_px * 0.62;
-    let mark_w = scaled(text_px, 0.2, 2);
+    let mark_w = scaled(text_px, 0.32, 6);
 
     if row.selected {
         // A block down the left edge, inset from the row's own rule.
@@ -1142,7 +1142,7 @@ pub fn draw_meter(
     }
 
     let line_h = scaled(text_px, 1.25, 1);
-    let bar_h = scaled(text_px, 0.3, 3);
+    let bar_h = scaled(text_px, 0.4, 7);
     let gap = scaled(text_px, 0.25, 1);
 
     // The label, on its own line above the track.
@@ -1335,6 +1335,147 @@ mod tests {
             .chunks_exact(3)
             .filter(|p| p.iter().all(|&v| v < 0x60))
             .count()
+    }
+
+    /// Rows of the canvas that carry any accent-coloured pixel.
+    fn accent_rows(c: &RgbPage, t: &Theme) -> Vec<u32> {
+        (0..c.height)
+            .filter(|&y| (0..c.width).any(|x| c.pixel(x, y) == t.accent))
+            .collect()
+    }
+
+    #[test]
+    fn a_tiles_name_leads_and_its_value_follows() {
+        // This was backwards: the value was set loud and the name of the
+        // setting whispered under it, so scanning a grid of tiles for the one
+        // you came for meant reading the quiet line on every card.
+        //
+        // Same string on both lines, so the ONLY difference measured here is
+        // the styling.
+        let t = Theme::INK_RUST;
+        let (w, h) = (240u32, 120u32);
+        let mut c = RgbPage::new_white(w, h);
+        let tile = Tile {
+            label: "Mmmm",
+            value: "Mmmm",
+            detail: "",
+        };
+        draw_tile(&mut c, 0, 0, w, h, &tile, 40.0, &t);
+
+        let ink_between = |from: u32, to: u32| {
+            (from..to)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|&(x, y)| c.pixel(x, y).iter().all(|&v| v < 0x60))
+                .count()
+        };
+        // Split at the gap between the two lines: whichever row inside the
+        // text block carries the least ink.
+        let rows: Vec<u32> = (0..h).filter(|&y| ink_between(y, y + 1) > 0).collect();
+        let (first, last) = (rows[0], rows[rows.len() - 1]);
+        let split = (first..=last)
+            .min_by_key(|&y| ink_between(y, y + 1))
+            .unwrap();
+        let (name, value) = (ink_between(first, split), ink_between(split, last + 1));
+        assert!(
+            name > value,
+            "the value ({value} px) is set louder than the name ({name} px)"
+        );
+    }
+
+    // --- sliders ---
+
+    #[test]
+    fn a_slider_is_a_slab_you_could_put_a_thumb_on() {
+        // This control is dragged, not watched: a hairline reads as a
+        // progress bar, and at 150ppi a hairline is the first thing to smear.
+        let t = Theme::INK_RUST;
+        let (w, h) = (400u32, 100u32);
+        let mut c = RgbPage::new_white(w, h);
+        draw_slider(&mut c, 0, 0, w, h, "Brightness", 50, 40.0, &t);
+
+        let rows = accent_rows(&c, &t);
+        let (top, bottom) = (rows[0], rows[rows.len() - 1]);
+        assert!(
+            bottom - top >= h / 8,
+            "the track is {}px in a {h}px row — too thin to grab",
+            bottom - top
+        );
+        assert!(bottom < h, "the track has to stay inside its own row");
+    }
+
+    #[test]
+    fn a_sliders_track_sits_under_its_own_label_not_the_next_ones() {
+        // Stacked sliders put every label directly above the track it names.
+        // Pushing the track to the bottom of the row leaves it nearer the
+        // NEXT label than its own, and then you drag the wrong lamp.
+        let t = Theme::INK_RUST;
+        let (w, h) = (400u32, 100u32);
+        let mut c = RgbPage::new_white(w, h);
+        draw_slider(&mut c, 0, 0, w, h, "Brightness", 50, 40.0, &t);
+        let rows = accent_rows(&c, &t);
+        let track_top = rows[0];
+        let label_bottom = (0..h)
+            .rfind(|&y| (0..w).any(|x| c.pixel(x, y).iter().all(|&v| v < 0x60)))
+            .expect("the label is drawn");
+        assert!(
+            label_bottom < track_top,
+            "the label sits on top of its own track"
+        );
+        assert!(
+            track_top - label_bottom <= h / 8,
+            "{}px of air between a label and its track — from a row away it \
+             belongs to whichever label is nearer",
+            track_top - label_bottom
+        );
+    }
+
+    #[test]
+    fn the_fill_is_the_value_at_both_ends_of_the_track() {
+        // The position IS the value — that is what makes scrubbing from
+        // anywhere on the track meaningful.
+        let t = Theme::INK_RUST;
+        let (w, h) = (400u32, 100u32);
+        // One reference render fixes the row to sample; at 0% there is no
+        // fill to find the track by.
+        let mid = {
+            let mut c = RgbPage::new_white(w, h);
+            draw_slider(&mut c, 0, 0, w, h, "Brightness", 50, 40.0, &t);
+            let rows = accent_rows(&c, &t);
+            rows[rows.len() / 2]
+        };
+        let width_at = |percent: u8| {
+            let mut c = RgbPage::new_white(w, h);
+            draw_slider(&mut c, 0, 0, w, h, "Brightness", percent, 40.0, &t);
+            (0..w).filter(|&x| c.pixel(x, mid) == t.accent).count()
+        };
+        let (quarter, half, full) = (width_at(25), width_at(50), width_at(100));
+        assert!(quarter < half && half < full, "{quarter} {half} {full}");
+        assert!(
+            full >= w as usize - 2,
+            "100% has to fill the track, not stop short"
+        );
+        assert_eq!(width_at(0), 0, "0% draws no fill at all");
+    }
+
+    #[test]
+    fn nothing_a_slider_draws_escapes_its_box() {
+        // Including the leading edge, which deliberately stands proud of the
+        // track: proud of the TRACK, still inside the ROW.
+        let t = Theme::INK_RUST;
+        let mut c = RgbPage::new_white(400, 200);
+        draw_slider(&mut c, 40, 60, 300, 60, "Night warmth", 63, 40.0, &t);
+        for y in 0..200u32 {
+            for x in 0..400u32 {
+                let inside = (40..340).contains(&x) && (60..120).contains(&y);
+                if !inside {
+                    assert_eq!(
+                        c.pixel(x, y),
+                        [0xFF, 0xFF, 0xFF],
+                        "painted outside the row at ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 
     // --- themes ---
@@ -2120,6 +2261,21 @@ pub fn sheet_height(rows: usize, row_h: u32) -> u32 {
     row_h + row_h * rows as u32
 }
 
+/// The × a panel's title bar carries.
+const CLOSE_GLYPH: &str = "\u{00d7}";
+
+/// The dismiss target in a panel's title bar: a square at the top right,
+/// sized to a finger rather than to the glyph inside it.
+///
+/// One source of truth — `draw_panel` centres the × in this box and the
+/// caller hit-tests against the same one, so the target can never drift away
+/// from the mark that advertises it.
+pub fn panel_close_box(x: u32, y: u32, w: u32, text_px: f32) -> (u32, u32, u32, u32) {
+    let title_h = (text_px * 1.6) as u32;
+    let side = title_h.min(w);
+    ((x + w).saturating_sub(side), y, side, title_h)
+}
+
 /// A bottom-sheet modal: a solid panel anchored to the bottom of the screen,
 /// carrying a title and a short list of choices.
 ///
@@ -2162,13 +2318,30 @@ pub fn draw_panel(
     let pad = (text_px * 0.5) as u32;
     let title_h = (text_px * 1.6) as u32;
     let mut layer = GrayPage::new_white(w.max(1), title_h.max(1));
+    // The dismiss target eats into the title's width, so a long title runs
+    // out of room rather than under the ×.
+    let (bx, _, bw, _) = panel_close_box(x, y, w, text_px);
     draw_text(
         &mut layer,
         pad,
         (title_h.saturating_sub(text_px as u32)) / 2,
         text_px * 0.95,
         title,
-        w.saturating_sub(pad * 2),
+        (bx.saturating_sub(x)).saturating_sub(pad * 2),
+        true,
+    );
+    // The way out, where every sheet on every platform puts it. Tapping
+    // outside still dismisses; this is for the times the sheet covers almost
+    // everything and there is barely an outside left to hit.
+    let close_px = text_px * 1.15;
+    let glyph_w = measure_text(close_px, CLOSE_GLYPH, true);
+    draw_text(
+        &mut layer,
+        (bx + bw.saturating_sub(glyph_w) / 2).saturating_sub(x),
+        (title_h.saturating_sub(close_px as u32)) / 2,
+        close_px,
+        CLOSE_GLYPH,
+        glyph_w,
         true,
     );
     fill_rect(
@@ -2176,7 +2349,7 @@ pub fn draw_panel(
         &clip,
         x + pad / 2,
         y + pad,
-        6,
+        scaled(text_px, 0.34, 7),
         title_h.saturating_sub(pad * 2),
         t.accent,
     );
@@ -2271,7 +2444,7 @@ pub fn draw_sheet(
         &clip,
         x + pad / 2,
         y + pad,
-        6,
+        scaled(text_px, 0.34, 7),
         title_h.saturating_sub(pad * 2),
         t.accent,
     );
@@ -2388,8 +2561,11 @@ pub fn draw_tile(
     let mut layer = clip.text_layer();
 
     let pad = scaled(text_px, 0.32, 3);
-    let label_px = text_px * 0.62;
-    let value_px = text_px * 0.92;
+    // The NAME leads, bold. A tile is read to find the setting you came for;
+    // the value only matters once you have found it, and setting the value in
+    // the loud style put every tile's changing half in charge of the scan.
+    let label_px = text_px * 0.8;
+    let value_px = text_px * 0.72;
     let detail_px = text_px * 0.55;
     let inner = w.saturating_sub(pad * 2);
 
@@ -2401,7 +2577,7 @@ pub fn draw_tile(
     fill_rect(canvas, &clip, x + w.saturating_sub(1), y, 1, h, RULE);
     // Wide enough to read as a block of colour at 150ppi rather than a
     // coloured hairline, which is what the filter turns a thin one into.
-    let mark_w = scaled(text_px, 0.22, 4);
+    let mark_w = scaled(text_px, 0.34, 7);
     fill_rect(canvas, &clip, x, y, mark_w, h, t.accent);
 
     let tx = x + mark_w + pad;
@@ -2416,10 +2592,10 @@ pub fn draw_tile(
     // rendering accident rather than a card.
     let mut lines: Vec<(&str, f32, bool)> = Vec::new();
     if !tile.label.is_empty() {
-        lines.push((tile.label, label_px, false));
+        lines.push((tile.label, label_px, true));
     }
     if !tile.value.is_empty() && !navigates {
-        lines.push((tile.value, value_px, true));
+        lines.push((tile.value, value_px, false));
     }
     if !tile.detail.is_empty() {
         lines.push((tile.detail, detail_px, false));
@@ -2521,24 +2697,55 @@ pub fn draw_slider(
         true,
     );
 
-    // The track: thick enough to read as a control at 150ppi, not a rule.
-    let track_h = scaled(text_px, 0.34, 6);
-    let track_y = y + h.saturating_sub(track_h);
+    // The track is a slab, not a rule: the whole row is the grab zone, and a
+    // control you drag has to LOOK like something you can put a thumb on. A
+    // hairline reads as a progress bar you are meant to watch.
+    //
+    // It sits directly under its own label with the leftover space falling
+    // BELOW it, so a stack of sliders never leaves a track floating between
+    // two labels — closer to the next one's name than to its own.
+    let label_h = (label_px * 1.25) as u32;
+    let track_h = scaled(text_px, 0.85, 14).min(h.saturating_sub(label_h).max(1));
+    let track_y = y + label_h.min(h.saturating_sub(track_h));
     fill_rect(canvas, &clip, x, track_y, w, track_h, [0xD8, 0xD8, 0xD8]);
     let filled = (w as u64 * percent as u64 / 100) as u32;
     fill_rect(canvas, &clip, x, track_y, filled, track_h, t.accent);
 
-    // Quarter ticks, so a tap has something to aim at.
+    // Quarter ticks notched INTO the track — outside it they were a row of
+    // floating specks, and at 150ppi specks are the first thing to smear.
     for q in 1..4u32 {
         let tx = x + w * q / 4;
+        let tick_h = (track_h / 3).max(2);
+        let colour = if tx < x + filled {
+            [0xFF, 0xFF, 0xFF]
+        } else {
+            RULE
+        };
+        fill_rect(canvas, &clip, tx, track_y, 2, tick_h, colour);
         fill_rect(
             canvas,
             &clip,
             tx,
-            track_y.saturating_sub(track_h / 2),
+            track_y + track_h - tick_h,
             2,
-            track_h / 2,
-            RULE,
+            tick_h,
+            colour,
+        );
+    }
+
+    // The leading edge, standing a little proud of the track top and bottom:
+    // where the value IS, without a knob you have to catch to move it.
+    if filled > 0 && filled < w {
+        let grip_w = scaled(text_px, 0.18, 4);
+        let over = (track_h / 4).max(2);
+        fill_rect(
+            canvas,
+            &clip,
+            (x + filled).saturating_sub(grip_w),
+            track_y.saturating_sub(over),
+            grip_w,
+            track_h + over * 2,
+            t.accent,
         );
     }
     overlay_ink_at(canvas, &layer, clip.x0, clip.y0);

@@ -31,7 +31,9 @@ use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
 use gideon_render::text::{draw_text, measure_text};
-use gideon_render::{heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage};
+use gideon_render::{
+    calendar, heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage,
+};
 
 use crate::reader::Reader;
 
@@ -175,6 +177,7 @@ enum SettingAction {
     RotateSpreads,
     ColorProfile,
     LibraryView,
+    StatsView,
     Predownload,
     CleanupHours,
     StorageLimit,
@@ -1133,9 +1136,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         Err(e) => self.show_error(&e)?,
                     }
                 }
-                // Edge slides only matter in the reader; elsewhere a swipe
-                // is just an overshot tap — ignore it.
-                Ok(UiEvent::Swipe { .. }) => {}
+                // Edge slides only matter in the reader; elsewhere the only
+                // thing that takes a drag is a slider being scrubbed, live
+                // while the finger moves and exactly where it lifts.
+                Ok(UiEvent::Drag { x0, y0, x1, y1 } | UiEvent::Swipe { x0, y0, x1, y1 }) => {
+                    let (x0, y0) = self.map_menu_point(x0, y0);
+                    let (x1, y1) = self.map_menu_point(x1, y1);
+                    match self.drag_menu(x0, y0, x1, y1) {
+                        Ok(Flow::Quit(exit)) => return Ok(exit),
+                        Ok(Flow::Continue) => {}
+                        Err(e) => self.show_error(&e)?,
+                    }
+                }
                 Ok(UiEvent::LongPress { x, y }) => {
                     let (x, y) = self.map_menu_point(x, y);
                     match self.handle_long_press(x, y) {
@@ -1385,6 +1397,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.sheet.is_none() && self.screen_has_nav() && y >= self.layout.nav_top() {
             return self.tap_main_nav(x);
         }
+        // An open sheet owns EVERY tap, including the ones that land outside
+        // it. Falling through to the screen behind first meant the invisible
+        // pager targets in the bottom strip swallowed the sheet's own bottom
+        // rows on any screen long enough to paginate — the same bug the nav
+        // strip had, in the same strip.
+        if self.sheet.is_some() {
+            return self.tap_sheet(x, y);
+        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -1404,7 +1424,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.move_page(PageMove::Last)?;
                 Ok(Flow::Continue)
             }
-            _ if self.sheet.is_some() => self.tap_sheet(x, y),
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
@@ -1880,6 +1899,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // of these values you are even looking at.
             ("Profile", self.active_profile.clone()),
             ("Library view", s.library_view.clone()),
+            ("Today's chart", s.stats_view.clone()),
             (
                 "Reader fit",
                 match FitMode::from_setting(&s.reader_fit) {
@@ -1895,9 +1915,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         ]
     }
 
-    /// The two rows under the tiles: the way through to everything else, and
-    /// the way out.
-    const QUICK_ACTIONS: [&'static str; 2] = ["All settings", "Close"];
+    /// The one row under the tiles: the way through to everything the sheet
+    /// does not carry. There is no "Close" row — the way out is the × in the
+    /// title and the whole screen above the sheet, both of which are always
+    /// there and neither of which costs a row.
+    const QUICK_ACTIONS: [&'static str; 1] = ["All settings"];
 
     /// Where the quick-settings sheet sits and how it is laid out:
     /// `(top, height, tile grid, first action row's y)`.
@@ -2260,10 +2282,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Partial)
     }
 
+    /// Did this tap land on the × in the open sheet's title bar?
+    ///
+    /// Every sheet is drawn full width by `draw_panel`, so the box comes
+    /// straight from the widget that draws the mark — the target cannot drift
+    /// away from the glyph advertising it.
+    fn tap_sheet_close(&self, x: u32, y: u32) -> bool {
+        let Some((top, _)) = self.sheet_bounds() else {
+            return false;
+        };
+        let (bx, by, bw, bh) =
+            widgets::panel_close_box(0, top, self.layout.width, self.layout.text_px);
+        x >= bx && x < bx + bw && y >= by && y < by + bh
+    }
+
     /// Route a tap while a sheet is open. A tap outside it dismisses, which is
     /// what every modal on every platform does and what a reader will try
     /// first; the sheet's own rows act.
     fn tap_sheet(&mut self, x: u32, y: u32) -> Result<Flow> {
+        if self.tap_sheet_close(x, y) {
+            self.sheet = None;
+            return self
+                .render_current(RefreshMode::Full)
+                .map(|_| Flow::Continue);
+        }
         if matches!(self.sheet, Some(Sheet::QuickSettings)) {
             return self.tap_quick_settings(x, y);
         }
@@ -2349,6 +2391,69 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
+    /// Which quick-settings slider, if any, owns this y. `None` when the
+    /// sheet is closed, the device has no lamp, or y is somewhere else on
+    /// the sheet.
+    fn quick_slider_at(&self, y: u32) -> Option<usize> {
+        if !matches!(self.sheet, Some(Sheet::QuickSettings)) {
+            return None;
+        }
+        let sheet = self.quick_sheet_layout();
+        let count = self.quick_sliders().len();
+        if count == 0 || y < sheet.sliders_top || y >= sheet.grid.y {
+            return None;
+        }
+        let row = ((y - sheet.sliders_top) / (sheet.slider_h + SETTINGS_GAP).max(1)) as usize;
+        (row < count).then_some(row)
+    }
+
+    /// Put slider `row` at the level the x position names, and repaint if that
+    /// actually changed anything.
+    ///
+    /// The x IS the value, so a finger that starts anywhere on the track and
+    /// moves either way scrubs continuously — there is no knob to catch. The
+    /// no-change early-out is what keeps a scrub honest on e-ink: the panel
+    /// reports motion far faster than it can repaint, and repainting a level
+    /// it is already showing would spend a whole refresh on nothing.
+    fn scrub_quick_slider(&mut self, row: usize, x: u32) -> Result<()> {
+        let Some((label, current)) = self.quick_sliders().get(row).copied() else {
+            return Ok(());
+        };
+        let track = self.layout.width.saturating_sub(self.layout.pad * 2).max(1) as u64;
+        // Rounded, not truncated: the middle of the track has to give 50, and
+        // the far end 100.
+        let along = x.saturating_sub(self.layout.pad) as u64;
+        let percent = (((along * 100 + track / 2) / track).min(100)) as u8;
+        if percent == current {
+            return Ok(());
+        }
+        if let Some(lights) = self.lights.as_mut() {
+            match label {
+                "Brightness" => lights.set_brightness(percent),
+                _ => lights.set_warmth(percent),
+            }
+        }
+        // The device's `LightControl` persists the level itself (see
+        // `PersistedLights` in main.rs), so there is nothing to save here —
+        // and nothing to forget to save.
+        // One slider's fill changed. Partial, and no flash.
+        self.render_current(RefreshMode::Partial)?;
+        Ok(())
+    }
+
+    /// Route a drag — in flight or just released — at the menus.
+    ///
+    /// Only the quick-settings sliders take one, and the slider is chosen by
+    /// where the finger STARTED: once you are scrubbing, drifting up or down
+    /// off the row must not hand the drag to the slider next door, and must
+    /// not dismiss the sheet either.
+    fn drag_menu(&mut self, _x0: u32, y0: u32, x1: u32, _y1: u32) -> Result<Flow> {
+        if let Some(row) = self.quick_slider_at(y0) {
+            self.scrub_quick_slider(row, x1)?;
+        }
+        Ok(Flow::Continue)
+    }
+
     /// Act on a tap in the quick-settings sheet: a tile cycles its value, the
     /// action rows go through or dismiss.
     fn tap_quick_settings(&mut self, x: u32, y: u32) -> Result<Flow> {
@@ -2362,39 +2467,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if y >= actions_top {
             let index = ((y - actions_top) / self.layout.row_h.max(1)) as usize;
-            self.sheet = None;
             if Self::QUICK_ACTIONS.get(index) == Some(&"All settings") {
+                self.sheet = None;
                 return self.goto_root(Screen::Settings).map(|_| Flow::Continue);
             }
-            return self
-                .render_current(RefreshMode::Full)
-                .map(|_| Flow::Continue);
+            // Below the last row is the sheet's own bottom edge, not a
+            // choice: swallow it rather than dismissing on a near miss.
+            return Ok(Flow::Continue);
         }
         // A tap on a slider sets it to where you tapped — the whole point of
         // a track is that the position IS the value, and making the reader
         // step a level at a time to cross it would be worse than the edge
         // slide they already have.
-        let sliders = self.quick_sliders();
-        if !sliders.is_empty() && y >= sheet.sliders_top && y < grid.y {
-            let row = ((y - sheet.sliders_top) / (sheet.slider_h + SETTINGS_GAP).max(1)) as usize;
-            if let Some((label, _)) = sliders.get(row) {
-                let track = self.layout.width.saturating_sub(self.layout.pad * 2).max(1) as u64;
-                // Rounded, not truncated: tapping the middle of the track has
-                // to give 50, and the far end 100.
-                let along = x.saturating_sub(self.layout.pad) as u64;
-                let percent = (((along * 100 + track / 2) / track).min(100)) as u8;
-                if let Some(lights) = self.lights.as_mut() {
-                    match *label {
-                        "Brightness" => lights.set_brightness(percent),
-                        _ => lights.set_warmth(percent),
-                    }
-                }
-                // The device's `LightControl` persists the level itself (see
-                // `PersistedLights` in main.rs), so there is nothing to save
-                // here — and nothing to forget to save.
-                // One slider's fill changed. Partial, and no flash.
-                self.render_current(RefreshMode::Partial)?;
-            }
+        if let Some(row) = self.quick_slider_at(y) {
+            self.scrub_quick_slider(row, x)?;
+            return Ok(Flow::Continue);
+        }
+        if y >= sheet.sliders_top && y < grid.y {
             return Ok(Flow::Continue);
         }
         let tiles = self.quick_tiles();
@@ -2412,6 +2501,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     "shelf".into()
                 } else {
                     "list".into()
+                };
+            }
+            "Today's chart" => {
+                settings.stats_view = if settings.stats_view == "heatmap" {
+                    "calendar".into()
+                } else {
+                    "heatmap".into()
                 };
             }
             "Reader fit" => {
@@ -3321,6 +3417,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     "shelf".into()
                 } else {
                     "list".into()
+                };
+            }
+            SettingAction::StatsView => {
+                settings.stats_view = if settings.stats_view == "heatmap" {
+                    "calendar".into()
+                } else {
+                    "heatmap".into()
                 };
             }
             SettingAction::Predownload => {
@@ -4596,6 +4699,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // opened by an up-swipe that starts in the bottom eighth of the
         // reading frame.
         let mut sheet_open = false;
+        // The lamp level the edge slide in progress started from, so every
+        // in-flight report of one drag is applied to the same base.
+        let mut slide_base: Option<u8> = None;
         let mut outcome = ReaderOutcome::Back;
         {
             let mut reader = Reader::new(doc, &mut self.display, self.reader_fit, rotation);
@@ -4638,6 +4744,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if sheet_open {
                     match &event {
                         Err(_) => {}
+                        // In-flight motion is not a decision: closing the
+                        // sheet on the first report of a swipe would repaint
+                        // twice for one gesture. The release below closes it.
+                        Ok(UiEvent::Drag { .. }) => continue,
                         Ok(UiEvent::Tap { x, y }) | Ok(UiEvent::LongPress { x, y }) => {
                             let (_, my) =
                                 layout::map_reader_tap(*x, *y, panel.width, panel.height, rotation);
@@ -4857,20 +4967,67 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // night-light warmth at every rotation, and "up" always
                     // increases — otherwise, in panel space, the controls land
                     // on the wrong edge and invert when the device is turned.
+                    // An edge slide in flight: the lamp follows the finger
+                    // instead of jumping when it lifts. You are adjusting a
+                    // light you are looking at — waiting for the release means
+                    // aiming in the dark and correcting afterwards.
+                    //
+                    // Only the edges scrub. The mid-screen gestures below are
+                    // decisions (leave the manga, rotate, raise the sheet) and
+                    // a decision must not fire halfway through the gesture that
+                    // makes it.
+                    Ok(UiEvent::Drag { x0, y0, x1, y1 }) => {
+                        let Some((lamp, delta)) =
+                            reader_edge_slide(x0, y0, x1, y1, panel.width, panel.height, rotation)
+                        else {
+                            continue;
+                        };
+                        let Some(lights) = self.lights.as_mut() else {
+                            continue;
+                        };
+                        // The level this drag started from. The delta is always
+                        // measured from the finger's start, so applying it to a
+                        // fixed base is idempotent: reports arriving faster than
+                        // the panel repaints cost resolution, never runaway.
+                        let base = *slide_base.get_or_insert_with(|| match lamp {
+                            EdgeLamp::Brightness => lights.brightness(),
+                            EdgeLamp::Warmth => lights.warmth(),
+                        });
+                        let new = (base as i32 + delta).clamp(0, 100) as u8;
+                        let banner = match lamp {
+                            EdgeLamp::Brightness => {
+                                if new == lights.brightness() {
+                                    continue;
+                                }
+                                lights.set_brightness(new);
+                                format!("Brightness {new}%")
+                            }
+                            EdgeLamp::Warmth => {
+                                if new == lights.warmth() {
+                                    continue;
+                                }
+                                lights.set_warmth(new);
+                                format!("Night light {new}%")
+                            }
+                        };
+                        reader.show_banner(&banner)?;
+                    }
                     Ok(UiEvent::Swipe { x0, y0, x1, y1 }) => {
+                        let slid =
+                            reader_edge_slide(x0, y0, x1, y1, panel.width, panel.height, rotation);
+                        // The finger is up: the next gesture starts from
+                        // whatever this one left behind.
+                        let base = slide_base.take();
                         let (rx0, ry0) =
                             layout::map_reader_tap(x0, y0, panel.width, panel.height, rotation);
                         let (rx1, ry1) =
                             layout::map_reader_tap(x1, y1, panel.width, panel.height, rotation);
-                        let (reading_w, reading_h) = if rotation % 180 == 90 {
-                            (panel.height, panel.width)
+                        let reading_h = if rotation % 180 == 90 {
+                            panel.width
                         } else {
-                            (panel.width, panel.height)
+                            panel.height
                         };
-                        let edge = (reading_w / 8).max(1);
-                        let on_right = rx0 >= reading_w - edge && rx1 >= reading_w - edge;
-                        let on_left = rx0 < edge && rx1 < edge;
-                        if !on_right && !on_left {
+                        if slid.is_none() {
                             // Mid-screen gestures: swipe down to leave the manga,
                             // swipe up to rotate 90° clockwise — for reading on
                             // your side in bed. Both demand deliberate travel (a
@@ -4914,24 +5071,34 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             }
                             continue;
                         }
+                        let (lamp, delta) = slid.expect("checked above");
                         let Some(lights) = self.lights.as_mut() else {
                             continue;
                         };
-                        // Sliding up (in the reading frame) increases; the full
-                        // reading height is the full 0–100 range.
-                        let delta =
-                            ((ry0 as i64 - ry1 as i64) * 100 / reading_h.max(1) as i64) as i32;
-                        if delta == 0 {
-                            continue;
-                        }
-                        let banner = if on_right {
-                            let new = (lights.brightness() as i32 + delta).clamp(0, 100) as u8;
-                            lights.set_brightness(new);
-                            format!("Brightness {new}%")
-                        } else {
-                            let new = (lights.warmth() as i32 + delta).clamp(0, 100) as u8;
-                            lights.set_warmth(new);
-                            format!("Night light {new}%")
+                        // Land on the exact level. The base is where the drag
+                        // began — the same one every in-flight report used — so
+                        // the release agrees with the last thing shown rather
+                        // than adding the whole delta a second time.
+                        let base = base.unwrap_or(match lamp {
+                            EdgeLamp::Brightness => lights.brightness(),
+                            EdgeLamp::Warmth => lights.warmth(),
+                        });
+                        let new = (base as i32 + delta).clamp(0, 100) as u8;
+                        let banner = match lamp {
+                            EdgeLamp::Brightness => {
+                                if new == lights.brightness() {
+                                    continue;
+                                }
+                                lights.set_brightness(new);
+                                format!("Brightness {new}%")
+                            }
+                            EdgeLamp::Warmth => {
+                                if new == lights.warmth() {
+                                    continue;
+                                }
+                                lights.set_warmth(new);
+                                format!("Night light {new}%")
+                            }
                         };
                         reader.show_banner(&banner)?;
                     }
@@ -5535,34 +5702,66 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         );
         y += tile_h + l.pad;
 
-        // The grid needs saying what it is. Unlabelled, a block of coloured
-        // squares is decoration; with a header and a Less→More key it is a
-        // chart, and the same header style the settings groups use ties it to
-        // the rest of the interface.
-        let weeks = STATS_HEATMAP_WEEKS;
+        // The chart needs saying what it is. Unlabelled, a block of coloured
+        // squares is decoration; with a header and a key it is a chart, and
+        // the same header style the settings groups use ties it to the rest
+        // of the interface.
         let head_h = l.row_h * 2 / 3;
+        let calendar = settings.stats_view == "calendar";
+        let heading = if calendar {
+            let (year, month, _) = gideon_core::stats::civil_from_days(stats.today);
+            format!("{} {year}", month_name(month))
+        } else {
+            format!("Reading activity — last {STATS_HEATMAP_WEEKS} weeks")
+        };
         widgets::draw_section_header(
             &mut canvas,
             l.pad,
             y,
             inner,
             head_h,
-            &format!("Reading activity — last {weeks} weeks"),
+            &heading,
             l.text_px,
             &theme,
         );
         y += head_h + l.pad / 2;
-        let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
-        heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
-        y += grid.height() + l.pad;
-        self.draw_heatmap_key(&mut canvas, y, &palette);
+        if calendar {
+            let month = month_of(stats.today);
+            let cal = calendar::CalendarLayout::fit(l.pad, y, inner, self.calendar_height(), month);
+            let spans = stats.spans(
+                month.first_cell,
+                month.first_cell + i64::from(month.weeks()) * 7,
+            );
+            let spans: Vec<calendar::Span> = spans
+                .iter()
+                .map(|s| calendar::Span {
+                    series: &s.series,
+                    start_day: s.start_day,
+                    end_day: s.end_day,
+                })
+                .collect();
+            calendar::draw_calendar(
+                &mut canvas,
+                &cal,
+                month,
+                &spans,
+                stats.today,
+                l.text_px,
+                &theme,
+            );
+        } else {
+            let weeks = STATS_HEATMAP_WEEKS;
+            let grid = heatmap::HeatmapLayout::fit(l.pad, y, weeks, inner, 6);
+            heatmap::draw_heatmap(&mut canvas, &grid, &stats.heatmap(weeks as usize), &palette);
+            self.draw_heatmap_key(&mut canvas, y + grid.height() + l.pad, &palette);
+        }
         y = self.continue_card_top();
 
         // Continue: the chapter a tap resumes. Omitted on a fresh device
         // rather than drawn as an empty card.
         let nav_top = l.height.saturating_sub(l.nav_h);
         if let Some((title, chapter, pct)) = self.continue_card() {
-            if nav_top.saturating_sub(y) >= l.row_h * 2 {
+            if nav_top.saturating_sub(y) >= self.continue_card_height() {
                 let mut gray = GrayPage::new_white(l.width, l.height);
                 draw_text(
                     &mut gray,
@@ -5603,7 +5802,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // a third of the panel blank, which on a screen whose whole job is
         // "what should I read next" was the one question it declined to
         // answer.
-        let waiting = self.waiting_rows();
+        // The calendar fills the space the waiting list would use, and it
+        // already says which series have been in your hands lately.
+        let waiting = if calendar {
+            Vec::new()
+        } else {
+            self.waiting_rows()
+        };
         if !waiting.is_empty() {
             let mut wy = self.waiting_top();
             widgets::draw_section_header(
@@ -5715,6 +5920,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Top of the Continue card on Today, and the bottom of the area it can
     /// use. Shared with `compose_stats` so what is drawn is what is tapped —
     /// the card was drawn for a week before anything would open it.
+    /// How tall the month calendar is drawn: everything between the chart
+    /// heading and the Continue card.
+    ///
+    /// It is taller than the heatmap on purpose — a month of bars carrying
+    /// titles needs the room, and it is why the calendar view drops the
+    /// "waiting for you" list and keeps only the Continue card.
+    fn calendar_height(&self) -> u32 {
+        let l = &self.layout;
+        let head_h = l.row_h * 2 / 3;
+        let top = l.content_top() + l.pad + l.row_h * 2 + l.pad + head_h + l.pad / 2;
+        let bottom = l
+            .nav_top()
+            .saturating_sub(self.continue_card_height() + l.pad * 2);
+        bottom.saturating_sub(top)
+    }
+
+    /// Whether Today is showing the month calendar rather than the heatmap.
+    fn stats_is_calendar(&self) -> bool {
+        self.load_settings().stats_view == "calendar"
+    }
+
     fn continue_card_top(&self) -> u32 {
         let l = &self.layout;
         let grid = heatmap::HeatmapLayout::fit(
@@ -5724,19 +5950,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             l.width.saturating_sub(l.pad * 2),
             6,
         );
-        // tiles, then the activity header, the grid, and its key.
+        // tiles, then the chart heading, the chart, and (for the heatmap)
+        // its key.
         let head_h = l.row_h * 2 / 3;
+        let top = l.content_top() + l.pad + l.row_h * 2 + l.pad + head_h + l.pad / 2;
+        if self.stats_is_calendar() {
+            // The calendar runs right down to the Continue card.
+            return top + self.calendar_height() + l.pad;
+        }
         let key_h = (l.text_px * 0.5) as u32;
-        l.content_top()
-            + l.pad
-            + l.row_h * 2
-            + l.pad
-            + head_h
-            + l.pad / 2
-            + grid.height()
-            + l.pad
-            + key_h
-            + l.pad * 2
+        top + grid.height() + l.pad + key_h + l.pad * 2
     }
 
     /// How tall the Continue card is: eyebrow, title, chapter line, bar.
@@ -5748,7 +5971,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn continue_card_hit(&self, y: u32) -> bool {
         let top = self.continue_card_top();
         let bottom = (top + self.continue_card_height()).min(self.layout.nav_top());
-        self.layout.nav_top().saturating_sub(top) >= self.layout.row_h * 2 && y >= top && y < bottom
+        // Measured against the card's own height, not an unrelated two rows:
+        // the calendar view leaves it exactly the room it needs and no more.
+        self.layout.nav_top().saturating_sub(top) >= self.continue_card_height()
+            && y >= top
+            && y < bottom
     }
 
     /// Top of the "waiting for you" list: below the Continue card when there
@@ -6824,6 +7051,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Run `f` with the (cached) ProgressStore: the disk read + JSON parse
     /// happen at most once between [`Self::invalidate_progress_cache`]
     /// calls, not once per repaint.
+    /// This profile's reading statistics, from its own progress store.
+    #[cfg(test)]
+    fn reading_stats(&self) -> gideon_core::ReadingStats {
+        self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store))
+    }
+
     fn with_progress<R>(&self, f: impl FnOnce(&Self, &ProgressStore) -> R) -> R {
         let store = self.progress_cache.borrow_mut().take().unwrap_or_else(|| {
             ProgressStore::load(&progress_path(&self.library_dir)).unwrap_or_default()
@@ -7040,6 +7273,56 @@ fn controls_sheet_origin(panel_w: u32, panel_h: u32, sheet_h: u32, rotation: u32
 /// Draw the controls sheet over the current page: composed in reading
 /// orientation, rotated into the panel and stamped via the reader's
 /// chrome overlay (a partial flush; the next page repaint wipes it).
+/// Which lamp an edge gesture is working, and by how much.
+///
+/// The reader's RIGHT edge is brightness and its LEFT edge is night warmth at
+/// every rotation, and "up" always increases — so both endpoints are mapped
+/// into the reading frame before the edges are decided. In panel space the
+/// controls land on the wrong edge and invert when the device is turned.
+///
+/// `None` means the gesture was not an edge slide; the caller's mid-screen
+/// gestures take it from there. Shared by the in-flight drag and the release
+/// so a scrub and its landing can never disagree about which lamp it is.
+fn reader_edge_slide(
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    panel_w: u32,
+    panel_h: u32,
+    rotation: u32,
+) -> Option<(EdgeLamp, i32)> {
+    let (rx0, ry0) = layout::map_reader_tap(x0, y0, panel_w, panel_h, rotation);
+    let (rx1, ry1) = layout::map_reader_tap(x1, y1, panel_w, panel_h, rotation);
+    let (reading_w, reading_h) = if rotation % 180 == 90 {
+        (panel_h, panel_w)
+    } else {
+        (panel_w, panel_h)
+    };
+    let edge = (reading_w / 8).max(1);
+    let lamp = if rx0 >= reading_w - edge && rx1 >= reading_w - edge {
+        EdgeLamp::Brightness
+    } else if rx0 < edge && rx1 < edge {
+        EdgeLamp::Warmth
+    } else {
+        return None;
+    };
+    // Sliding up (in the reading frame) increases; the full reading height is
+    // the full 0–100 range. Measured from where the finger STARTED, so the
+    // same drag reported again gives the same answer — that is what lets a
+    // live scrub apply it against the level the drag began at without the
+    // value running away as the reports come in.
+    let delta = ((ry0 as i64 - ry1 as i64) * 100 / reading_h.max(1) as i64) as i32;
+    Some((lamp, delta))
+}
+
+/// The lamp an edge slide is working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeLamp {
+    Brightness,
+    Warmth,
+}
+
 fn show_controls_sheet<D: Display>(
     reader: &mut Reader<D>,
     panel: &UiLayout,
@@ -8894,6 +9177,12 @@ fn settings_groups(s: &gideon_core::Settings) -> Vec<SettingsGroup> {
                     SettingAction::LibraryView,
                 ),
                 row(
+                    "Today's chart",
+                    s.stats_view.clone(),
+                    "months at a glance, or this month by series",
+                    SettingAction::StatsView,
+                ),
+                row(
                     "Pre-download ahead",
                     s.predownload_unread_chapters.to_string(),
                     "chapters fetched past the one you are on",
@@ -8981,6 +9270,44 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{} KB", (b / KB).round() as u64)
     }
+}
+
+/// The month a local day index falls in, as the calendar widget needs it.
+fn month_of(day: i64) -> calendar::Month {
+    use gideon_core::stats::{civil_from_days, days_from_civil, weekday};
+    let (year, month, _) = civil_from_days(day);
+    let first_day = days_from_civil(year, month, 1);
+    let next = if month == 12 {
+        days_from_civil(year + 1, 1, 1)
+    } else {
+        days_from_civil(year, month + 1, 1)
+    };
+    // Monday-first: `weekday` is Sunday-first, so Monday is 1.
+    let column = (weekday(first_day) + 6) % 7;
+    calendar::Month {
+        first_cell: first_day - i64::from(column),
+        first_day,
+        days: (next - first_day) as u32,
+    }
+}
+
+/// English month name, for the calendar heading.
+fn month_name(month: u32) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    NAMES[(month.clamp(1, 12) - 1) as usize]
 }
 
 /// Next value in a cycle: the entry after `current`, wrapping around; the

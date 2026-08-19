@@ -23,6 +23,6 @@ pub use series::{SeriesIndex, SeriesMeta, SeriesRef};
 pub use settings::{
     ProfileSettings, Settings, StorageSize, DEFAULT_FINISHED_CLEANUP_HOURS, FINISHED_CLEANUP_STEPS,
 };
-pub use stats::ReadingStats;
+pub use stats::{ReadingSpan, ReadingStats};
 
 pub type Result<T> = std::result::Result<T, Error>;

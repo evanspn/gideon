@@ -176,10 +176,22 @@ pub struct TouchTracker {
     down_ms: Option<u64>,
     touching: bool,
     release_seen: bool,
+    /// The position of the last in-flight report we emitted, so a finger
+    /// holding still does not generate motion at the panel's report rate.
+    reported: Option<(i32, i32)>,
 }
 
 /// A completed raw gesture: start position, end position, hold time (ms).
 pub type RawGesture = ((u32, u32), (u32, u32), u64);
+
+/// What one batch of raw events amounted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawTouch {
+    /// The finger is still down and has moved since the last report.
+    Moved { start: (u32, u32), at: (u32, u32) },
+    /// The finger lifted.
+    Done(RawGesture),
+}
 
 /// Kernel timestamp of an event, in milliseconds.
 fn ev_millis(ev: &libc::input_event) -> u64 {
@@ -191,9 +203,11 @@ impl TouchTracker {
         Self::default()
     }
 
-    /// Process one event. Returns the raw `(start, end)` positions and the
-    /// contact duration (ms) of a completed gesture when the finger lifts.
-    pub fn push(&mut self, ev: &libc::input_event) -> Option<RawGesture> {
+    /// Process one event. Returns [`RawTouch::Done`] with the raw
+    /// `(start, end)` positions and the contact duration (ms) when the finger
+    /// lifts, and [`RawTouch::Moved`] at each report the finger moves while
+    /// it is still down.
+    pub fn push(&mut self, ev: &libc::input_event) -> Option<RawTouch> {
         match (ev.type_, ev.code) {
             (EV_ABS, ABS_MT_POSITION_X) | (EV_ABS, ABS_X) => {
                 if self.first_x.is_none() {
@@ -236,9 +250,40 @@ impl TouchTracker {
             (EV_SYN, SYN_REPORT) if self.release_seen => {
                 return self.finish_tap(ev_millis(ev));
             }
+            // A report boundary with the finger still down: the contact has a
+            // new position, so anything tracking it (a slider being scrubbed)
+            // can follow. Only on actual movement — a finger resting on the
+            // panel reports continuously.
+            (EV_SYN, SYN_REPORT) if self.touching => {
+                return self.moved();
+            }
             _ => {}
         }
         None
+    }
+
+    /// The in-flight position, if the finger has moved since the last one we
+    /// reported.
+    fn moved(&mut self) -> Option<RawTouch> {
+        let (x, y) = (self.last_x?, self.last_y?);
+        // The first report of a contact is where the finger landed, not
+        // motion; it only establishes the baseline the next one is measured
+        // against.
+        let first_report = self.reported.is_none();
+        if self.reported == Some((x, y)) {
+            return None;
+        }
+        self.reported = Some((x, y));
+        if first_report {
+            return None;
+        }
+        Some(RawTouch::Moved {
+            start: (
+                self.first_x.unwrap_or(x).max(0) as u32,
+                self.first_y.unwrap_or(y).max(0) as u32,
+            ),
+            at: (x.max(0) as u32, y.max(0) as u32),
+        })
     }
 
     /// Mark the contact as active, stamping its start time on the
@@ -250,8 +295,9 @@ impl TouchTracker {
         self.touching = true;
     }
 
-    fn finish_tap(&mut self, now_ms: u64) -> Option<RawGesture> {
+    fn finish_tap(&mut self, now_ms: u64) -> Option<RawTouch> {
         self.release_seen = false;
+        self.reported = None;
         let (first_x, first_y) = (self.first_x.take(), self.first_y.take());
         let down_ms = self.down_ms.take();
         if !self.touching {
@@ -266,7 +312,7 @@ impl TouchTracker {
                     first_y.unwrap_or(y).max(0) as u32,
                 );
                 let held = now_ms.saturating_sub(down_ms.unwrap_or(now_ms));
-                Some((start, end, held))
+                Some(RawTouch::Done((start, end, held)))
             }
             _ => None,
         }
@@ -296,6 +342,36 @@ fn classify_gesture(start: (u32, u32), end: (u32, u32), held_ms: u64) -> UiEvent
             y1: end.1,
         }
     }
+}
+
+/// The in-flight counterpart of [`classify_gesture`]: a contact that has
+/// already travelled past the tap slop is a drag in progress. Under the slop
+/// it is still a candidate tap, and reporting it early would make a control
+/// move under a finger that is about to tap something else.
+fn classify_motion(start: (u32, u32), at: (u32, u32)) -> Option<UiEvent> {
+    if start.0.abs_diff(at.0) <= TAP_SLOP_PX && start.1.abs_diff(at.1) <= TAP_SLOP_PX {
+        return None;
+    }
+    Some(UiEvent::Drag {
+        x0: start.0,
+        y0: start.1,
+        x1: at.0,
+        y1: at.1,
+    })
+}
+
+/// Queue an event, collapsing a run of in-flight drags into the newest one.
+///
+/// The panel reports motion far faster than an e-ink repaint completes. If
+/// each report were queued, a scrub would leave the UI painting positions the
+/// finger left behind seconds ago. Coalescing means a slow repaint costs
+/// resolution, never sync.
+fn queue(pending: &mut std::collections::VecDeque<UiEvent>, event: UiEvent) {
+    if matches!(event, UiEvent::Drag { .. }) && matches!(pending.back(), Some(UiEvent::Drag { .. }))
+    {
+        pending.pop_back();
+    }
+    pending.push_back(event);
 }
 
 /// Pure state machine for the power button and the magnetic sleep cover.
@@ -885,22 +961,24 @@ impl KoboTouch {
             let (screen_w, screen_h) = (self.screen_w, self.screen_h);
             let drain = drain_events(pfd.fd, |ev| {
                 if is_touch {
-                    if let Some((raw_start, raw_end, held_ms)) = tracker.push(ev) {
-                        let start = transform.apply(
-                            raw_start.0,
-                            raw_start.1,
-                            max_x,
-                            max_y,
-                            screen_w,
-                            screen_h,
-                        );
-                        let end =
-                            transform.apply(raw_end.0, raw_end.1, max_x, max_y, screen_w, screen_h);
-                        pending.push_back(classify_gesture(start, end, held_ms));
+                    let screen =
+                        |p: (u32, u32)| transform.apply(p.0, p.1, max_x, max_y, screen_w, screen_h);
+                    match tracker.push(ev) {
+                        Some(RawTouch::Done((raw_start, raw_end, held_ms))) => {
+                            let event =
+                                classify_gesture(screen(raw_start), screen(raw_end), held_ms);
+                            queue(pending, event);
+                        }
+                        Some(RawTouch::Moved { start, at }) => {
+                            if let Some(event) = classify_motion(screen(start), screen(at)) {
+                                queue(pending, event);
+                            }
+                        }
+                        None => {}
                     }
                 }
                 if let Some(event) = buttons.push(ev) {
-                    pending.push_back(event);
+                    queue(pending, event);
                 }
                 gyro.observe(ev, now);
             });
@@ -1136,7 +1214,7 @@ mod tests {
         assert_eq!(t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1)), None);
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some(((320, 540), (320, 540), 0))
+            Some(RawTouch::Done(((320, 540), (320, 540), 0)))
         );
         // Nothing further without a new touch.
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
@@ -1151,7 +1229,7 @@ mod tests {
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
         assert_eq!(
             t.push(&ev(EV_KEY, BTN_TOUCH, 0)),
-            Some(((10, 20), (10, 20), 0))
+            Some(RawTouch::Done(((10, 20), (10, 20), 0)))
         );
         // The trailing SYN_REPORT must not double-emit.
         assert_eq!(t.push(&ev(EV_SYN, SYN_REPORT, 0)), None);
@@ -1170,7 +1248,110 @@ mod tests {
         // A drag: the gesture carries both where it started and ended.
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some(((100, 100), (250, 300), 0))
+            Some(RawTouch::Done(((100, 100), (250, 300), 0)))
+        );
+    }
+
+    #[test]
+    fn a_finger_still_down_reports_where_it_has_moved_to() {
+        // A slider you scrub has to follow the finger, so motion cannot wait
+        // for the lift. Contact, then two moves, then release.
+        let mut t = TouchTracker::new();
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 100));
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 100));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            None,
+            "landing is not motion"
+        );
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 400));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Moved {
+                start: (100, 100),
+                at: (400, 100)
+            })
+        );
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            None,
+            "a finger resting still must not report over and over"
+        );
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 200));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Moved {
+                start: (100, 100),
+                at: (200, 100)
+            }),
+            "scrubbing back the other way reports too"
+        );
+        t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
+        assert_eq!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Done(((100, 100), (200, 100), 0)))
+        );
+    }
+
+    #[test]
+    fn motion_inside_the_tap_slop_is_not_a_drag_yet() {
+        // Otherwise the smallest wobble of a finger on its way to a tap would
+        // start dragging whatever is under it.
+        assert_eq!(classify_motion((100, 100), (100 + TAP_SLOP_PX, 100)), None);
+        assert_eq!(
+            classify_motion((100, 100), (100 + TAP_SLOP_PX + 1, 100)),
+            Some(UiEvent::Drag {
+                x0: 100,
+                y0: 100,
+                x1: 100 + TAP_SLOP_PX + 1,
+                y1: 100
+            })
+        );
+    }
+
+    #[test]
+    fn queued_drags_collapse_so_a_slow_repaint_never_chases_a_stale_finger() {
+        let mut pending = std::collections::VecDeque::new();
+        queue(&mut pending, UiEvent::Tap { x: 1, y: 1 });
+        for x in [100, 200, 300] {
+            queue(
+                &mut pending,
+                UiEvent::Drag {
+                    x0: 10,
+                    y0: 10,
+                    x1: x,
+                    y1: 10,
+                },
+            );
+        }
+        queue(
+            &mut pending,
+            UiEvent::Swipe {
+                x0: 10,
+                y0: 10,
+                x1: 300,
+                y1: 10,
+            },
+        );
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![
+                UiEvent::Tap { x: 1, y: 1 },
+                // Only the newest position survives...
+                UiEvent::Drag {
+                    x0: 10,
+                    y0: 10,
+                    x1: 300,
+                    y1: 10
+                },
+                // ...and the release still lands, exactly, behind it.
+                UiEvent::Swipe {
+                    x0: 10,
+                    y0: 10,
+                    x1: 300,
+                    y1: 10
+                },
+            ]
         );
     }
 
@@ -1189,7 +1370,7 @@ mod tests {
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some(((0, 7), (0, 7), 0))
+            Some(RawTouch::Done(((0, 7), (0, 7), 0)))
         );
     }
 
@@ -1201,7 +1382,7 @@ mod tests {
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some(((1, 2), (1, 2), 0))
+            Some(RawTouch::Done(((1, 2), (1, 2), 0)))
         );
 
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, 3));
@@ -1210,7 +1391,7 @@ mod tests {
         t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some(((9, 8), (9, 8), 0))
+            Some(RawTouch::Done(((9, 8), (9, 8), 0)))
         );
     }
 
@@ -1234,7 +1415,7 @@ mod tests {
         assert_eq!(t.push(&ev(EV_ABS, ABS_MT_PRESSURE, 0)), None);
         assert_eq!(
             t.push(&ev(EV_SYN, SYN_REPORT, 0)),
-            Some(((100, 200), (100, 200), 0)),
+            Some(RawTouch::Done(((100, 200), (100, 200), 0))),
             "pressure 0 + SYN should tap"
         );
     }
@@ -1593,7 +1774,7 @@ mod tests {
             ev(EV_SYN, SYN_REPORT, 0),
         ];
         for e in &stream {
-            if let Some((start, end, held)) = touch.push(e) {
+            if let Some(RawTouch::Done((start, end, held))) = touch.push(e) {
                 out.push(classify_gesture(start, end, held));
             }
             if let Some(event) = buttons.push(e) {
@@ -1700,7 +1881,7 @@ mod tests {
         assert_eq!(t.push(&at(1700, EV_ABS, ABS_MT_TRACKING_ID, -1)), None);
         assert_eq!(
             t.push(&at(1700, EV_SYN, SYN_REPORT, 0)),
-            Some(((50, 60), (50, 60), 700)),
+            Some(RawTouch::Done(((50, 60), (50, 60), 700))),
             "held 700ms"
         );
     }

@@ -292,9 +292,9 @@ fn quick_sheet() -> (u32, gideon_render::widgets::GridLayout, u32) {
 }
 
 /// How many value tiles the quick sheet shows, and how many action rows sit
-/// under them ("All settings", "Close").
-const QUICK_TILES: usize = 5;
-const QUICK_ACTIONS: usize = 2;
+/// under them ("All settings" — the way out is the × in the title bar).
+const QUICK_TILES: usize = 6;
+const QUICK_ACTIONS: usize = 1;
 
 /// Tap tile `i` of the quick-settings grid.
 fn tap_quick_tile(i: usize) -> UiEvent {
@@ -2536,15 +2536,10 @@ fn predownload_runs_in_the_background_without_blocking() {
     app.predownload_ahead(&source, &manga, &chapters, "c1");
 
     // The worker fetches them on its own thread; give it a moment.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if app.downloaded_chapter_path(&source, &manga, "c2").is_some()
+    let _ = wait_for(|| {
+        app.downloaded_chapter_path(&source, &manga, "c2").is_some()
             && app.downloaded_chapter_path(&source, &manga, "c3").is_some()
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    });
 
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
@@ -2618,22 +2613,12 @@ fn leaving_a_manga_cancels_its_queued_pre_downloads() {
     });
 
     // The worker has begun c2 — leave the manga while it's still downloading.
-    assert_eq!(
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap(),
-        "c2"
-    );
+    assert_eq!(started_rx.recv_timeout(WORKER_WAIT).unwrap(), "c2");
     app.pop().unwrap(); // pops the chapter list → cancels the queued rest
 
     // c2 (already in flight) finishes; c3/c4 are dropped. Wait for c2 to land,
     // then give the worker ample time to (not) fetch the cancelled ones.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline
-        && app.downloaded_chapter_path(&source, &manga, "c2").is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let _ = wait_for(|| app.downloaded_chapter_path(&source, &manga, "c2").is_some());
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     assert!(
@@ -2697,12 +2682,7 @@ fn switching_profile_repoints_the_predownloader_at_the_new_library() {
         persistent: true,
     });
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline
-        && app.downloaded_chapter_path(&source, &manga, "c1").is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let _ = wait_for(|| app.downloaded_chapter_path(&source, &manga, "c1").is_some());
 
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c1").is_some(),
@@ -2987,23 +2967,17 @@ fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
     );
 
     // The worker has begun the batch; now leave the manga entirely.
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    started_rx.recv_timeout(WORKER_WAIT).unwrap();
     app.pop().unwrap(); // leave the confirmation
     app.pop().unwrap(); // leave the chapter list → would cancel a look-ahead
 
     // All five queued chapters still land; the sixth was never requested.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if (1..=5).all(|i| {
+    let _ = wait_for(|| {
+        (1..=5).all(|i| {
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
                 .is_some()
-        }) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+        })
+    });
     for i in 1..=5 {
         assert!(
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
@@ -3015,6 +2989,36 @@ fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
         app.downloaded_chapter_path(&source, &manga, "c6").is_none(),
         "only the requested five chapters were queued"
     );
+}
+
+/// How long a test may wait for the background download worker.
+///
+/// The worker runs at IDLE cpu/io priority on purpose
+/// (`lower_current_thread_to_idle`, so pre-fetching never makes the reader
+/// stutter). On a CI box running the whole suite in parallel that thread can be
+/// starved for seconds at a stretch — which is exactly what a few seconds of
+/// headroom here buys back. This is a synchronisation ceiling, not a
+/// performance assertion: [`wait_for`] returns the instant its condition holds,
+/// so a generous ceiling costs a fast machine nothing and costs a loaded one a
+/// green run.
+const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Poll until `done`, up to [`WORKER_WAIT`]. Returns whether it happened.
+///
+/// `#[must_use]` on purpose: a wait that quietly falls through on timeout turns
+/// every assertion after it into a statement about something else. The tests
+/// that wait for a *failed* attempt are the ones this bites — they then assert
+/// "nothing is on disk yet", which a worker that never ran also satisfies.
+#[must_use]
+fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + WORKER_WAIT;
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    done()
 }
 
 /// A gateway that fails each chapter's FIRST download attempt and succeeds on
@@ -3148,12 +3152,11 @@ fn explicit_batch_retries_after_a_failed_attempt() {
     assert_eq!(queued, 3, "all three were requested");
 
     // Wait until the worker has attempted (and failed) all three.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while started.load(std::sync::atomic::Ordering::SeqCst) < 3
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        wait_for(|| started.load(std::sync::atomic::Ordering::SeqCst) >= 3),
+        "the worker never attempted all three, so what follows would be \
+         measuring the wait rather than the retry"
+    );
     assert!(
         (1..=3).all(|i| app
             .downloaded_chapter_path(&source, &manga, &format!("c{i}"))
@@ -3171,16 +3174,12 @@ fn explicit_batch_retries_after_a_failed_attempt() {
         "the still-missing chapters are requested again"
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if (1..=3).all(|i| {
+    let _ = wait_for(|| {
+        (1..=3).all(|i| {
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
                 .is_some()
-        }) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+        })
+    });
     for i in 1..=3 {
         assert!(
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
@@ -4383,9 +4382,13 @@ fn reader_fit_toggle_applies_to_the_next_book_immediately() {
 
 // --- frontlight edge slides ---
 
-/// Scriptable light control recording every set.
+/// Scriptable light control recording every set — the final levels alone
+/// cannot tell a control that followed a finger from one that jumped at the
+/// end, and that difference is the whole point of a scrub.
+#[derive(Default)]
 struct FakeLights {
     levels: SharedLevels,
+    log: SharedLog,
 }
 
 impl LightControl for FakeLights {
@@ -4394,22 +4397,39 @@ impl LightControl for FakeLights {
     }
     fn set_brightness(&mut self, p: u8) {
         self.levels.borrow_mut().0 = p;
+        self.log.borrow_mut().push(Lamp::Brightness(p));
     }
     fn warmth(&self) -> u8 {
         self.levels.borrow().1
     }
     fn set_warmth(&mut self, p: u8) {
         self.levels.borrow_mut().1 = p;
+        self.log.borrow_mut().push(Lamp::Warmth(p));
     }
 }
 
+/// One recorded change, so a test can read the shape of a scrub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lamp {
+    Brightness(u8),
+    Warmth(u8),
+}
+
 type SharedLevels = std::rc::Rc<RefCell<(u8, u8)>>;
+type SharedLog = std::rc::Rc<RefCell<Vec<Lamp>>>;
 
 fn lights() -> (SharedLevels, Box<dyn LightControl>) {
+    let (levels, _, control) = lights_recording();
+    (levels, control)
+}
+
+fn lights_recording() -> (SharedLevels, SharedLog, Box<dyn LightControl>) {
     let levels = std::rc::Rc::new(RefCell::new((20u8, 0u8)));
+    let log = SharedLog::default();
     (
         levels.clone(),
-        Box::new(FakeLights { levels }) as Box<dyn LightControl>,
+        log.clone(),
+        Box::new(FakeLights { levels, log }) as Box<dyn LightControl>,
     )
 }
 
@@ -4433,6 +4453,94 @@ fn right_edge_slide_up_raises_brightness() {
 
     assert_eq!(levels.borrow().0, 70, "20 + 50 = 70");
     assert_eq!(levels.borrow().1, 0, "warmth untouched");
+}
+
+#[test]
+fn the_reader_lamp_follows_the_finger_and_the_release_does_not_double_it() {
+    // You are adjusting a light you are looking at: waiting for the lift means
+    // aiming in the dark and correcting afterwards. So the in-flight reports
+    // move the lamp...
+    //
+    // ...and the trap they open is the release. Every report of one drag
+    // carries the SAME start point, so the delta is the same each time; adding
+    // it to the running level would take the lamp to 20 + 50 + 50 + 50. Both
+    // the scrub and the landing apply it to the level the drag began at.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+    let (levels, log, lights) = lights_recording();
+
+    let drag_to = |y1: u32| UiEvent::Drag {
+        x0: W - 5,
+        y0: H - 100,
+        x1: W - 5,
+        y1,
+    };
+    // Up the right edge in three reports, then lift at the same place.
+    let quarter = drag_to(H - 100 - H / 4);
+    let half = drag_to(H - 100 - H / 2);
+    let release = UiEvent::Swipe {
+        x0: W - 5,
+        y0: H - 100,
+        x1: W - 5,
+        y1: H - 100 - H / 2,
+    };
+    let events = vec![
+        tap_nav(0),
+        tap_shelf_cell0(),
+        quarter,
+        half,
+        release,
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events).with_lights(lights);
+    app.run().unwrap();
+
+    // The two in-flight reports moved it on the way — a quarter of the screen
+    // is +25, half is +50 — and the release named the level it was already
+    // showing, so it changed nothing further.
+    assert_eq!(
+        *log.borrow(),
+        vec![Lamp::Brightness(45), Lamp::Brightness(70)],
+        "the lamp did not follow the finger"
+    );
+    assert_eq!(
+        levels.borrow().0,
+        70,
+        "20 + 50 — the release must land on the drag, not on top of it"
+    );
+    assert_eq!(levels.borrow().1, 0, "warmth untouched");
+}
+
+#[test]
+fn a_drag_across_the_middle_of_a_page_decides_nothing_until_it_is_released() {
+    // Leaving the manga, rotating it and raising the controls sheet are
+    // DECISIONS. Only the edges scrub; a decision must never fire halfway
+    // through the gesture that makes it, or a swipe that is still being aimed
+    // throws you out of the chapter.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Sample/vol1.cbz"), 3);
+
+    // A downward drag across the middle, reported in flight and never released.
+    let mid_drag = UiEvent::Drag {
+        x0: W / 2,
+        y0: H / 4,
+        x1: W / 2,
+        y1: H - 10,
+    };
+    let events = vec![
+        tap_nav(0),
+        tap_shelf_cell0(),
+        mid_drag,
+        mid_drag,
+        reader_tap_back(),
+    ];
+    let mut app = app(&lib, FakeGateway::default(), events);
+    // If the in-flight reports had been taken as the exit gesture, the reader
+    // would have quit early and `reader_tap_back` would have landed on the
+    // library instead — leaving the run with events unconsumed.
+    app.run().unwrap();
 }
 
 #[test]
@@ -7188,12 +7296,11 @@ fn a_failed_lookahead_is_retried_by_the_next_kick() {
 
     // Read c1: the look-ahead queues c2, whose first attempt fails.
     app.predownload_ahead(&source, &manga, &chapters, "c1");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while started.load(std::sync::atomic::Ordering::SeqCst) < 1
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        wait_for(|| started.load(std::sync::atomic::Ordering::SeqCst) >= 1),
+        "the look-ahead never attempted c2, so the re-kick below would be \
+         testing a first attempt rather than a retry"
+    );
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c2").is_none(),
         "the first attempt failed, so nothing is on disk yet"
@@ -7201,13 +7308,7 @@ fn a_failed_lookahead_is_retried_by_the_next_kick() {
 
     // Waking re-fires the same look-ahead — and this time it lands.
     app.rekick_lookahead();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if app.downloaded_chapter_path(&source, &manga, "c2").is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let _ = wait_for(|| app.downloaded_chapter_path(&source, &manga, "c2").is_some());
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
         "the re-kick after wake retried the chapter that failed while offline"
@@ -7846,6 +7947,24 @@ fn dump_demo() {
             index.record_download(title, &format!("c{i}"), &format!("ch{i}.cbz"));
         }
     }
+    // Consecutive-day runs, which is what the calendar exists to show: four
+    // evenings of one series, three of another overlapping it, and a couple
+    // of single days.
+    for (title, start, run) in [
+        ("Frieren", 2u64, 4u64),
+        ("Chainsaw Man", 4, 3),
+        ("Pluto", 9, 2),
+    ] {
+        for d in 0..run {
+            progress.push((
+                format!("{title}/cal{d}.cbz"),
+                19,
+                20,
+                now - (start + d) * 86_400,
+            ));
+        }
+    }
+
     // A partly-read chapter so Continue has somewhere to point.
     progress.push((
         "Vinland Saga/ch16.cbz".to_string(),
@@ -7903,6 +8022,7 @@ fn dump_demo() {
     .with_settings_dir(settings_dir)
     .with_lights(Box::new(FakeLights {
         levels: std::rc::Rc::new(std::cell::RefCell::new((42, 15))),
+        log: SharedLog::default(),
     }));
 
     // Top-level destinations REPLACE the root screen the way the nav bar
@@ -7914,6 +8034,13 @@ fn dump_demo() {
         // there the way a person does.
         "library" | "shelf" => app.open_library().unwrap(),
         "today" => app.goto_root(Screen::Stats).unwrap(),
+        // Today with the month calendar instead of the heatmap.
+        "calendar" => {
+            let mut settings = app.load_settings();
+            settings.stats_view = "calendar".into();
+            app.save_settings(&settings);
+            app.goto_root(Screen::Stats).unwrap();
+        }
         "discover" => app.goto_root(Screen::Home).unwrap(),
         "settings" => app.goto_root(Screen::Settings).unwrap(),
         "storage" => app.push(Screen::Storage).unwrap(),
@@ -8116,6 +8243,7 @@ fn every_settings_row_changes_the_setting_its_label_names() {
                 }
                 SettingAction::ColorProfile => before.color_profile != after.color_profile,
                 SettingAction::LibraryView => before.library_view != after.library_view,
+                SettingAction::StatsView => before.stats_view != after.stats_view,
                 SettingAction::Predownload => {
                     before.predownload_unread_chapters != after.predownload_unread_chapters
                 }
@@ -8693,6 +8821,219 @@ fn quick_settings_sliders_set_the_lamp_where_you_tap() {
 }
 
 #[test]
+fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
+    // The track has no knob to catch: put a finger down anywhere on it and
+    // move, and the level follows the finger — up OR back down — live, before
+    // the finger lifts. A control you can only tap is not a slider.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let (levels, lights) = lights();
+    let mut app = app(&lib, FakeGateway::default(), vec![])
+        .with_lights(lights)
+        .with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+
+    let l = layout();
+    let sheet_top = app.sheet_bounds().expect("a sheet is open").0;
+    let title_h = (l.text_px * 1.6) as u32;
+    let track = l.width - l.pad * 2;
+    let slider_row = |i: u32| {
+        sheet_top
+            + title_h
+            + super::SETTINGS_GAP
+            + i * (l.row_h + super::SETTINGS_GAP)
+            + l.row_h / 2
+    };
+    let at = |fraction: u32| l.pad + track * fraction / 100;
+
+    // Land at a tenth of the way along and drag up to nine tenths, reporting
+    // in flight. Every report moves the lamp; nothing waits for the lift.
+    let start = (at(10), slider_row(0));
+    for stop in [30, 60, 90] {
+        app.drag_menu(start.0, start.1, at(stop), start.1).unwrap();
+        assert_eq!(
+            levels.borrow().0,
+            stop as u8,
+            "the lamp follows the finger mid-drag"
+        );
+    }
+
+    // Now scrub back the other way without lifting — the same drag, reversing.
+    let before = app.display().flushes.len();
+    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    assert_eq!(levels.borrow().0, 40, "dragging back down lowers it");
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "one slider's fill changed; scrubbing must never flash"
+    );
+
+    // A report that names the level it is already showing costs nothing: the
+    // panel reports motion far faster than e-ink can repaint, and a scrub that
+    // spent a refresh per report would lag behind the finger.
+    let before = app.display().flushes.len();
+    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    assert_eq!(app.display().flushes[before..], [], "no change, no repaint");
+
+    // Vertical drift off the row keeps scrubbing the slider it started on —
+    // it must not hand the drag to the row below.
+    app.drag_menu(start.0, start.1, at(80), slider_row(1))
+        .unwrap();
+    assert_eq!(levels.borrow().0, 80, "brightness kept the drag");
+    assert_eq!(levels.borrow().1, 0, "warmth was never touched");
+}
+
+#[test]
+fn a_drag_that_starts_off_the_sliders_leaves_the_sheet_alone() {
+    // Dismissal is a TAP outside the sheet. A drag that begins on a tile, on
+    // the title, or off the sheet entirely must not set a level and must not
+    // close anything — otherwise a swipe aimed past the sheet moves the lamp
+    // on its way out.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let (levels, lights) = lights();
+    let mut app = app(&lib, FakeGateway::default(), vec![])
+        .with_lights(lights)
+        .with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+
+    let l = layout();
+    let sheet = app.quick_sheet_layout();
+    let before = app.display().flushes.len();
+    let untouched = *levels.borrow();
+    for (y0, what) in [
+        (sheet.top / 2, "above the sheet"),
+        (sheet.top + 2, "on the sheet's title"),
+        (sheet.grid.y + sheet.grid.cell_h / 2, "on a tile"),
+        (sheet.actions_top + l.row_h / 2, "on an action row"),
+    ] {
+        app.drag_menu(l.pad, y0, l.width - l.pad, y0).unwrap();
+        assert_eq!(*levels.borrow(), untouched, "the lamp moved from {what}");
+        assert!(app.sheet().is_some(), "the sheet closed from {what}");
+    }
+    assert_eq!(
+        app.display().flushes[before..],
+        [],
+        "a drag with nothing to scrub repaints nothing at all"
+    );
+}
+
+#[test]
+fn an_open_sheet_owns_every_tap_even_on_a_paginated_screen() {
+    // The bug this pins: a paginated screen puts invisible First/Prev/Next/Last
+    // targets in the bottom strip, and the quick sheet's action rows sit in
+    // exactly that strip. Falling through to the screen behind meant the sheet's
+    // own bottom row silently paged the library instead — so "Close" did nothing
+    // on any library big enough to paginate, and only on those.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..12 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
+    }
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_library().unwrap();
+    assert!(app.current_page_count() > 1, "needs to paginate");
+    let page_before = app.current_page();
+
+    app.open_quick_settings().unwrap();
+    let sheet = app.quick_sheet_layout();
+    let l = layout();
+
+    // Sweep the whole sheet, both edges and the middle. Nothing behind it may
+    // move: not the page, not the stack.
+    let depth = app.stack_depth();
+    let mut y = sheet.top;
+    while y < l.height {
+        for x in [l.pad, l.width / 2, l.width - l.pad - 1] {
+            // The tiles and the action row DO act; what must never happen is
+            // the screen behind reacting.
+            app.handle_tap(x, y).unwrap();
+            if app.sheet().is_none() {
+                // A dismiss (the ×, or a miss below the last row) — reopen and
+                // carry on sweeping.
+                assert_eq!(app.stack_depth(), depth, "the sheet popped a screen");
+                app.open_quick_settings().unwrap();
+            }
+            assert_eq!(
+                app.current_page(),
+                page_before,
+                "a tap at ({x}, {y}) paged the library behind the sheet"
+            );
+        }
+        y += l.row_h / 3;
+    }
+
+    // And the row that DOES navigate still navigates, from the same strip.
+    app.handle_tap(l.width / 2, sheet.actions_top + l.row_h / 2)
+        .unwrap();
+    assert!(
+        matches!(app.screen(), Screen::Settings),
+        "\"All settings\" is unreachable on a paginated screen: {:?}",
+        app.screen()
+    );
+}
+
+#[test]
+fn every_sheet_carries_an_x_that_closes_it() {
+    // There is no "Close" row any more — it cost a row to say what the ×, and
+    // the whole screen above the sheet, already say. Both of those have to work
+    // for every sheet, or a sheet becomes a trap.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let l = layout();
+
+    for open in ["quick", "profiles", "book"] {
+        let mut app =
+            app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join(open));
+        app.run().unwrap();
+        match open {
+            "quick" => app.open_quick_settings().unwrap(),
+            "profiles" => app.open_profile_menu().unwrap(),
+            _ => {
+                app.open_library().unwrap();
+                let (cx, cy) = app.shelf_layout().cell_origin(0);
+                app.handle_long_press(cx + 4, l.content_top() + cy + 4)
+                    .unwrap();
+            }
+        }
+        assert!(app.sheet().is_some(), "{open}: nothing opened");
+        let top = app.sheet_bounds().unwrap().0;
+        let (bx, by, bw, bh) = gideon_render::widgets::panel_close_box(0, top, l.width, l.text_px);
+
+        // Just inside the × box.
+        app.handle_tap(bx + bw / 2, by + bh / 2).unwrap();
+        assert!(app.sheet().is_none(), "{open}: the × did not close it");
+
+        // And a tap above the sheet still closes it too.
+        let depth = app.stack_depth();
+        match open {
+            "quick" => app.open_quick_settings().unwrap(),
+            "profiles" => app.open_profile_menu().unwrap(),
+            _ => {
+                let (cx, cy) = app.shelf_layout().cell_origin(0);
+                app.handle_long_press(cx + 4, l.content_top() + cy + 4)
+                    .map(|_| ())
+                    .unwrap()
+            }
+        }
+        let top = app.sheet_bounds().unwrap().0;
+        app.handle_tap(l.width / 2, top.saturating_sub(l.row_h / 2))
+            .unwrap();
+        assert!(
+            app.sheet().is_none(),
+            "{open}: tapping outside did not close it"
+        );
+        assert_eq!(app.stack_depth(), depth, "{open}: dismissing navigated");
+    }
+}
+
+#[test]
 fn a_device_without_a_lamp_gets_no_sliders() {
     // Drawing a control that cannot do anything is worse than not offering
     // it: the desktop build and the test harness have no frontlight.
@@ -8747,4 +9088,106 @@ fn the_title_bar_pages_and_does_not_swallow_the_view_toggle() {
     // The chevrons are finger-sized, not glyph-sized.
     assert!(next.1 - next.0 >= l.title_h.min(88), "next zone too small");
     assert!(prev.1 - prev.0 >= l.title_h.min(88), "prev zone too small");
+}
+
+#[test]
+fn the_calendar_is_a_per_profile_choice_that_replaces_the_heatmap() {
+    // Two views of the same history answering different questions — "how
+    // much, lately" against "what was I on, and for how many days running".
+    // Which one you want is taste, so it lives with the profile.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Manga");
+    let alex = root.join("@alex");
+    make_cbz(&root.join("Berserk/vol1.cbz"), 4);
+    make_cbz(&alex.join("Pluto/vol1.cbz"), 4);
+    let now = now_unix();
+    write_progress(&root, &[("Berserk/vol1.cbz", 1, 4, now - 3600)]);
+    write_progress(&alex, &[("Pluto/vol1.cbz", 1, 4, now - 3600)]);
+    let settings_dir = profile_settings_dir(dir.path(), &["default", "alex"]);
+
+    // The default profile takes the calendar; alex is untouched.
+    gideon_core::ProfileSettings {
+        stats_view: Some("calendar".into()),
+        ..Default::default()
+    }
+    .save(&root)
+    .unwrap();
+
+    let mut chosen =
+        app(&root, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+    chosen.run().unwrap();
+    assert!(
+        chosen.stats_is_calendar(),
+        "the profile that chose it gets it"
+    );
+    assert_eq!(
+        effective_settings(&settings_dir, &alex).stats_view,
+        "heatmap",
+        "and the other profile keeps the default"
+    );
+
+    // The calendar takes the room the waiting list would use, so Today shows
+    // the chart and the Continue card and nothing else.
+    assert!(
+        chosen.waiting_rows().is_empty() || chosen.stats_is_calendar(),
+        "the calendar view drops the waiting list"
+    );
+
+    // Both views still leave the Continue card somewhere it can be tapped.
+    for view in ["calendar", "heatmap"] {
+        gideon_core::ProfileSettings {
+            stats_view: Some(view.into()),
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let mut view_app =
+            app(&root, FakeGateway::default(), vec![]).with_settings_dir(settings_dir.clone());
+        view_app.run().unwrap();
+        let top = view_app.continue_card_top();
+        assert!(
+            view_app.continue_card_hit(top + 1),
+            "{view}: the Continue card must still be reachable"
+        );
+        assert!(
+            top + view_app.continue_card_height() <= layout().nav_top(),
+            "{view}: the Continue card runs under the nav bar"
+        );
+    }
+}
+
+#[test]
+fn the_calendar_draws_a_run_of_days_as_one_bar() {
+    // The point of the view, end to end: four evenings of one series is one
+    // bar four days wide on the screen, not four marks.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 4);
+    gideon_core::ProfileSettings {
+        stats_view: Some("calendar".into()),
+        ..Default::default()
+    }
+    .save(&lib)
+    .unwrap();
+
+    let now = now_unix();
+    let entries: Vec<(String, usize, usize, u64)> = (0..4)
+        .map(|d| (format!("Berserk/ch{d}.cbz"), 3, 4, now - (d + 1) * 86_400))
+        .collect();
+    let refs: Vec<(&str, usize, usize, u64)> = entries
+        .iter()
+        .map(|(k, p, t, a)| (k.as_str(), *p, *t, *a))
+        .collect();
+    write_progress(&lib, &refs);
+
+    let mut app =
+        app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("data"));
+    app.run().unwrap();
+
+    let stats = app.reading_stats();
+    let spans = stats.spans(stats.today - 40, stats.today);
+    let berserk: Vec<&gideon_core::ReadingSpan> =
+        spans.iter().filter(|s| s.series == "Berserk").collect();
+    assert_eq!(berserk.len(), 1, "four consecutive evenings are ONE run");
+    assert_eq!(berserk[0].days(), 4);
 }
