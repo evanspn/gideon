@@ -1397,6 +1397,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.sheet.is_none() && self.screen_has_nav() && y >= self.layout.nav_top() {
             return self.tap_main_nav(x);
         }
+        // An open sheet owns EVERY tap, including the ones that land outside
+        // it. Falling through to the screen behind first meant the invisible
+        // pager targets in the bottom strip swallowed the sheet's own bottom
+        // rows on any screen long enough to paginate — the same bug the nav
+        // strip had, in the same strip.
+        if self.sheet.is_some() {
+            return self.tap_sheet(x, y);
+        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -1416,7 +1424,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.move_page(PageMove::Last)?;
                 Ok(Flow::Continue)
             }
-            _ if self.sheet.is_some() => self.tap_sheet(x, y),
             TapTarget::None => Ok(Flow::Continue),
             TapTarget::Row(row) => self.activate(row, x, y),
             TapTarget::Title => {
@@ -1908,9 +1915,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         ]
     }
 
-    /// The two rows under the tiles: the way through to everything else, and
-    /// the way out.
-    const QUICK_ACTIONS: [&'static str; 2] = ["All settings", "Close"];
+    /// The one row under the tiles: the way through to everything the sheet
+    /// does not carry. There is no "Close" row — the way out is the × in the
+    /// title and the whole screen above the sheet, both of which are always
+    /// there and neither of which costs a row.
+    const QUICK_ACTIONS: [&'static str; 1] = ["All settings"];
 
     /// Where the quick-settings sheet sits and how it is laid out:
     /// `(top, height, tile grid, first action row's y)`.
@@ -2273,10 +2282,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(RefreshMode::Partial)
     }
 
+    /// Did this tap land on the × in the open sheet's title bar?
+    ///
+    /// Every sheet is drawn full width by `draw_panel`, so the box comes
+    /// straight from the widget that draws the mark — the target cannot drift
+    /// away from the glyph advertising it.
+    fn tap_sheet_close(&self, x: u32, y: u32) -> bool {
+        let Some((top, _)) = self.sheet_bounds() else {
+            return false;
+        };
+        let (bx, by, bw, bh) =
+            widgets::panel_close_box(0, top, self.layout.width, self.layout.text_px);
+        x >= bx && x < bx + bw && y >= by && y < by + bh
+    }
+
     /// Route a tap while a sheet is open. A tap outside it dismisses, which is
     /// what every modal on every platform does and what a reader will try
     /// first; the sheet's own rows act.
     fn tap_sheet(&mut self, x: u32, y: u32) -> Result<Flow> {
+        if self.tap_sheet_close(x, y) {
+            self.sheet = None;
+            return self
+                .render_current(RefreshMode::Full)
+                .map(|_| Flow::Continue);
+        }
         if matches!(self.sheet, Some(Sheet::QuickSettings)) {
             return self.tap_quick_settings(x, y);
         }
@@ -2438,13 +2467,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if y >= actions_top {
             let index = ((y - actions_top) / self.layout.row_h.max(1)) as usize;
-            self.sheet = None;
             if Self::QUICK_ACTIONS.get(index) == Some(&"All settings") {
+                self.sheet = None;
                 return self.goto_root(Screen::Settings).map(|_| Flow::Continue);
             }
-            return self
-                .render_current(RefreshMode::Full)
-                .map(|_| Flow::Continue);
+            // Below the last row is the sheet's own bottom edge, not a
+            // choice: swallow it rather than dismissing on a near miss.
+            return Ok(Flow::Continue);
         }
         // A tap on a slider sets it to where you tapped — the whole point of
         // a track is that the position IS the value, and making the reader

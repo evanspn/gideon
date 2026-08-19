@@ -292,9 +292,9 @@ fn quick_sheet() -> (u32, gideon_render::widgets::GridLayout, u32) {
 }
 
 /// How many value tiles the quick sheet shows, and how many action rows sit
-/// under them ("All settings", "Close").
+/// under them ("All settings" — the way out is the × in the title bar).
 const QUICK_TILES: usize = 6;
-const QUICK_ACTIONS: usize = 2;
+const QUICK_ACTIONS: usize = 1;
 
 /// Tap tile `i` of the quick-settings grid.
 fn tap_quick_tile(i: usize) -> UiEvent {
@@ -8818,6 +8818,117 @@ fn a_drag_that_starts_off_the_sliders_leaves_the_sheet_alone() {
         [],
         "a drag with nothing to scrub repaints nothing at all"
     );
+}
+
+#[test]
+fn an_open_sheet_owns_every_tap_even_on_a_paginated_screen() {
+    // The bug this pins: a paginated screen puts invisible First/Prev/Next/Last
+    // targets in the bottom strip, and the quick sheet's action rows sit in
+    // exactly that strip. Falling through to the screen behind meant the sheet's
+    // own bottom row silently paged the library instead — so "Close" did nothing
+    // on any library big enough to paginate, and only on those.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..12 {
+        make_cbz(&lib.join(format!("Series {i:02}/vol1.cbz")), 1);
+    }
+    let mut app = app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_library().unwrap();
+    assert!(app.current_page_count() > 1, "needs to paginate");
+    let page_before = app.current_page();
+
+    app.open_quick_settings().unwrap();
+    let sheet = app.quick_sheet_layout();
+    let l = layout();
+
+    // Sweep the whole sheet, both edges and the middle. Nothing behind it may
+    // move: not the page, not the stack.
+    let depth = app.stack_depth();
+    let mut y = sheet.top;
+    while y < l.height {
+        for x in [l.pad, l.width / 2, l.width - l.pad - 1] {
+            // The tiles and the action row DO act; what must never happen is
+            // the screen behind reacting.
+            app.handle_tap(x, y).unwrap();
+            if app.sheet().is_none() {
+                // A dismiss (the ×, or a miss below the last row) — reopen and
+                // carry on sweeping.
+                assert_eq!(app.stack_depth(), depth, "the sheet popped a screen");
+                app.open_quick_settings().unwrap();
+            }
+            assert_eq!(
+                app.current_page(),
+                page_before,
+                "a tap at ({x}, {y}) paged the library behind the sheet"
+            );
+        }
+        y += l.row_h / 3;
+    }
+
+    // And the row that DOES navigate still navigates, from the same strip.
+    app.handle_tap(l.width / 2, sheet.actions_top + l.row_h / 2)
+        .unwrap();
+    assert!(
+        matches!(app.screen(), Screen::Settings),
+        "\"All settings\" is unreachable on a paginated screen: {:?}",
+        app.screen()
+    );
+}
+
+#[test]
+fn every_sheet_carries_an_x_that_closes_it() {
+    // There is no "Close" row any more — it cost a row to say what the ×, and
+    // the whole screen above the sheet, already say. Both of those have to work
+    // for every sheet, or a sheet becomes a trap.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let l = layout();
+
+    for open in ["quick", "profiles", "book"] {
+        let mut app =
+            app(&lib, FakeGateway::default(), vec![]).with_settings_dir(dir.path().join(open));
+        app.run().unwrap();
+        match open {
+            "quick" => app.open_quick_settings().unwrap(),
+            "profiles" => app.open_profile_menu().unwrap(),
+            _ => {
+                app.open_library().unwrap();
+                let (cx, cy) = app.shelf_layout().cell_origin(0);
+                app.handle_long_press(cx + 4, l.content_top() + cy + 4)
+                    .unwrap();
+            }
+        }
+        assert!(app.sheet().is_some(), "{open}: nothing opened");
+        let top = app.sheet_bounds().unwrap().0;
+        let (bx, by, bw, bh) = gideon_render::widgets::panel_close_box(0, top, l.width, l.text_px);
+
+        // Just inside the × box.
+        app.handle_tap(bx + bw / 2, by + bh / 2).unwrap();
+        assert!(app.sheet().is_none(), "{open}: the × did not close it");
+
+        // And a tap above the sheet still closes it too.
+        let depth = app.stack_depth();
+        match open {
+            "quick" => app.open_quick_settings().unwrap(),
+            "profiles" => app.open_profile_menu().unwrap(),
+            _ => {
+                let (cx, cy) = app.shelf_layout().cell_origin(0);
+                app.handle_long_press(cx + 4, l.content_top() + cy + 4)
+                    .map(|_| ())
+                    .unwrap()
+            }
+        }
+        let top = app.sheet_bounds().unwrap().0;
+        app.handle_tap(l.width / 2, top.saturating_sub(l.row_h / 2))
+            .unwrap();
+        assert!(
+            app.sheet().is_none(),
+            "{open}: tapping outside did not close it"
+        );
+        assert_eq!(app.stack_depth(), depth, "{open}: dismissing navigated");
+    }
 }
 
 #[test]
