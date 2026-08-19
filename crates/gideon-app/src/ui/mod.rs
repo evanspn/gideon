@@ -1136,9 +1136,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         Err(e) => self.show_error(&e)?,
                     }
                 }
-                // Edge slides only matter in the reader; elsewhere a swipe
-                // is just an overshot tap — ignore it.
-                Ok(UiEvent::Swipe { .. }) => {}
+                // Edge slides only matter in the reader; elsewhere the only
+                // thing that takes a drag is a slider being scrubbed, live
+                // while the finger moves and exactly where it lifts.
+                Ok(UiEvent::Drag { x0, y0, x1, y1 } | UiEvent::Swipe { x0, y0, x1, y1 }) => {
+                    let (x0, y0) = self.map_menu_point(x0, y0);
+                    let (x1, y1) = self.map_menu_point(x1, y1);
+                    match self.drag_menu(x0, y0, x1, y1) {
+                        Ok(Flow::Quit(exit)) => return Ok(exit),
+                        Ok(Flow::Continue) => {}
+                        Err(e) => self.show_error(&e)?,
+                    }
+                }
                 Ok(UiEvent::LongPress { x, y }) => {
                     let (x, y) = self.map_menu_point(x, y);
                     match self.handle_long_press(x, y) {
@@ -2353,6 +2362,69 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
     }
 
+    /// Which quick-settings slider, if any, owns this y. `None` when the
+    /// sheet is closed, the device has no lamp, or y is somewhere else on
+    /// the sheet.
+    fn quick_slider_at(&self, y: u32) -> Option<usize> {
+        if !matches!(self.sheet, Some(Sheet::QuickSettings)) {
+            return None;
+        }
+        let sheet = self.quick_sheet_layout();
+        let count = self.quick_sliders().len();
+        if count == 0 || y < sheet.sliders_top || y >= sheet.grid.y {
+            return None;
+        }
+        let row = ((y - sheet.sliders_top) / (sheet.slider_h + SETTINGS_GAP).max(1)) as usize;
+        (row < count).then_some(row)
+    }
+
+    /// Put slider `row` at the level the x position names, and repaint if that
+    /// actually changed anything.
+    ///
+    /// The x IS the value, so a finger that starts anywhere on the track and
+    /// moves either way scrubs continuously — there is no knob to catch. The
+    /// no-change early-out is what keeps a scrub honest on e-ink: the panel
+    /// reports motion far faster than it can repaint, and repainting a level
+    /// it is already showing would spend a whole refresh on nothing.
+    fn scrub_quick_slider(&mut self, row: usize, x: u32) -> Result<()> {
+        let Some((label, current)) = self.quick_sliders().get(row).copied() else {
+            return Ok(());
+        };
+        let track = self.layout.width.saturating_sub(self.layout.pad * 2).max(1) as u64;
+        // Rounded, not truncated: the middle of the track has to give 50, and
+        // the far end 100.
+        let along = x.saturating_sub(self.layout.pad) as u64;
+        let percent = (((along * 100 + track / 2) / track).min(100)) as u8;
+        if percent == current {
+            return Ok(());
+        }
+        if let Some(lights) = self.lights.as_mut() {
+            match label {
+                "Brightness" => lights.set_brightness(percent),
+                _ => lights.set_warmth(percent),
+            }
+        }
+        // The device's `LightControl` persists the level itself (see
+        // `PersistedLights` in main.rs), so there is nothing to save here —
+        // and nothing to forget to save.
+        // One slider's fill changed. Partial, and no flash.
+        self.render_current(RefreshMode::Partial)?;
+        Ok(())
+    }
+
+    /// Route a drag — in flight or just released — at the menus.
+    ///
+    /// Only the quick-settings sliders take one, and the slider is chosen by
+    /// where the finger STARTED: once you are scrubbing, drifting up or down
+    /// off the row must not hand the drag to the slider next door, and must
+    /// not dismiss the sheet either.
+    fn drag_menu(&mut self, _x0: u32, y0: u32, x1: u32, _y1: u32) -> Result<Flow> {
+        if let Some(row) = self.quick_slider_at(y0) {
+            self.scrub_quick_slider(row, x1)?;
+        }
+        Ok(Flow::Continue)
+    }
+
     /// Act on a tap in the quick-settings sheet: a tile cycles its value, the
     /// action rows go through or dismiss.
     fn tap_quick_settings(&mut self, x: u32, y: u32) -> Result<Flow> {
@@ -2378,27 +2450,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // a track is that the position IS the value, and making the reader
         // step a level at a time to cross it would be worse than the edge
         // slide they already have.
-        let sliders = self.quick_sliders();
-        if !sliders.is_empty() && y >= sheet.sliders_top && y < grid.y {
-            let row = ((y - sheet.sliders_top) / (sheet.slider_h + SETTINGS_GAP).max(1)) as usize;
-            if let Some((label, _)) = sliders.get(row) {
-                let track = self.layout.width.saturating_sub(self.layout.pad * 2).max(1) as u64;
-                // Rounded, not truncated: tapping the middle of the track has
-                // to give 50, and the far end 100.
-                let along = x.saturating_sub(self.layout.pad) as u64;
-                let percent = (((along * 100 + track / 2) / track).min(100)) as u8;
-                if let Some(lights) = self.lights.as_mut() {
-                    match *label {
-                        "Brightness" => lights.set_brightness(percent),
-                        _ => lights.set_warmth(percent),
-                    }
-                }
-                // The device's `LightControl` persists the level itself (see
-                // `PersistedLights` in main.rs), so there is nothing to save
-                // here — and nothing to forget to save.
-                // One slider's fill changed. Partial, and no flash.
-                self.render_current(RefreshMode::Partial)?;
-            }
+        if let Some(row) = self.quick_slider_at(y) {
+            self.scrub_quick_slider(row, x)?;
+            return Ok(Flow::Continue);
+        }
+        if y >= sheet.sliders_top && y < grid.y {
             return Ok(Flow::Continue);
         }
         let tiles = self.quick_tiles();
@@ -4656,6 +4712,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if sheet_open {
                     match &event {
                         Err(_) => {}
+                        // In-flight motion is not a decision: closing the
+                        // sheet on the first report of a swipe would repaint
+                        // twice for one gesture. The release below closes it.
+                        Ok(UiEvent::Drag { .. }) => continue,
                         Ok(UiEvent::Tap { x, y }) | Ok(UiEvent::LongPress { x, y }) => {
                             let (_, my) =
                                 layout::map_reader_tap(*x, *y, panel.width, panel.height, rotation);
@@ -4875,6 +4935,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // night-light warmth at every rotation, and "up" always
                     // increases — otherwise, in panel space, the controls land
                     // on the wrong edge and invert when the device is turned.
+                    // The reader's edge slides act on the finished gesture:
+                    // acting on motion would step the lamp on the way to a
+                    // page turn. Nothing in the reader scrubs live.
+                    Ok(UiEvent::Drag { .. }) => {}
                     Ok(UiEvent::Swipe { x0, y0, x1, y1 }) => {
                         let (rx0, ry0) =
                             layout::map_reader_tap(x0, y0, panel.width, panel.height, rotation);

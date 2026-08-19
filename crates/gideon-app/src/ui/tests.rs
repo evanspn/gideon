@@ -8719,6 +8719,108 @@ fn quick_settings_sliders_set_the_lamp_where_you_tap() {
 }
 
 #[test]
+fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
+    // The track has no knob to catch: put a finger down anywhere on it and
+    // move, and the level follows the finger — up OR back down — live, before
+    // the finger lifts. A control you can only tap is not a slider.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let (levels, lights) = lights();
+    let mut app = app(&lib, FakeGateway::default(), vec![])
+        .with_lights(lights)
+        .with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+
+    let l = layout();
+    let sheet_top = app.sheet_bounds().expect("a sheet is open").0;
+    let title_h = (l.text_px * 1.6) as u32;
+    let track = l.width - l.pad * 2;
+    let slider_row = |i: u32| {
+        sheet_top
+            + title_h
+            + super::SETTINGS_GAP
+            + i * (l.row_h + super::SETTINGS_GAP)
+            + l.row_h / 2
+    };
+    let at = |fraction: u32| l.pad + track * fraction / 100;
+
+    // Land at a tenth of the way along and drag up to nine tenths, reporting
+    // in flight. Every report moves the lamp; nothing waits for the lift.
+    let start = (at(10), slider_row(0));
+    for stop in [30, 60, 90] {
+        app.drag_menu(start.0, start.1, at(stop), start.1).unwrap();
+        assert_eq!(
+            levels.borrow().0,
+            stop as u8,
+            "the lamp follows the finger mid-drag"
+        );
+    }
+
+    // Now scrub back the other way without lifting — the same drag, reversing.
+    let before = app.display().flushes.len();
+    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    assert_eq!(levels.borrow().0, 40, "dragging back down lowers it");
+    assert_eq!(
+        app.display().flushes[before..],
+        [RefreshMode::Partial],
+        "one slider's fill changed; scrubbing must never flash"
+    );
+
+    // A report that names the level it is already showing costs nothing: the
+    // panel reports motion far faster than e-ink can repaint, and a scrub that
+    // spent a refresh per report would lag behind the finger.
+    let before = app.display().flushes.len();
+    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    assert_eq!(app.display().flushes[before..], [], "no change, no repaint");
+
+    // Vertical drift off the row keeps scrubbing the slider it started on —
+    // it must not hand the drag to the row below.
+    app.drag_menu(start.0, start.1, at(80), slider_row(1))
+        .unwrap();
+    assert_eq!(levels.borrow().0, 80, "brightness kept the drag");
+    assert_eq!(levels.borrow().1, 0, "warmth was never touched");
+}
+
+#[test]
+fn a_drag_that_starts_off_the_sliders_leaves_the_sheet_alone() {
+    // Dismissal is a TAP outside the sheet. A drag that begins on a tile, on
+    // the title, or off the sheet entirely must not set a level and must not
+    // close anything — otherwise a swipe aimed past the sheet moves the lamp
+    // on its way out.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 2);
+    let (levels, lights) = lights();
+    let mut app = app(&lib, FakeGateway::default(), vec![])
+        .with_lights(lights)
+        .with_settings_dir(dir.path().join("d"));
+    app.run().unwrap();
+    app.open_quick_settings().unwrap();
+
+    let l = layout();
+    let sheet = app.quick_sheet_layout();
+    let before = app.display().flushes.len();
+    let untouched = *levels.borrow();
+    for (y0, what) in [
+        (sheet.top / 2, "above the sheet"),
+        (sheet.top + 2, "on the sheet's title"),
+        (sheet.grid.y + sheet.grid.cell_h / 2, "on a tile"),
+        (sheet.actions_top + l.row_h / 2, "on an action row"),
+    ] {
+        app.drag_menu(l.pad, y0, l.width - l.pad, y0).unwrap();
+        assert_eq!(*levels.borrow(), untouched, "the lamp moved from {what}");
+        assert!(app.sheet().is_some(), "the sheet closed from {what}");
+    }
+    assert_eq!(
+        app.display().flushes[before..],
+        [],
+        "a drag with nothing to scrub repaints nothing at all"
+    );
+}
+
+#[test]
 fn a_device_without_a_lamp_gets_no_sliders() {
     // Drawing a control that cannot do anything is worse than not offering
     // it: the desktop build and the test harness have no frontlight.
