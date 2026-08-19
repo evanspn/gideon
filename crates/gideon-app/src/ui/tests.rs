@@ -2536,15 +2536,10 @@ fn predownload_runs_in_the_background_without_blocking() {
     app.predownload_ahead(&source, &manga, &chapters, "c1");
 
     // The worker fetches them on its own thread; give it a moment.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if app.downloaded_chapter_path(&source, &manga, "c2").is_some()
+    let _ = wait_for(|| {
+        app.downloaded_chapter_path(&source, &manga, "c2").is_some()
             && app.downloaded_chapter_path(&source, &manga, "c3").is_some()
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    });
 
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
@@ -2618,22 +2613,12 @@ fn leaving_a_manga_cancels_its_queued_pre_downloads() {
     });
 
     // The worker has begun c2 — leave the manga while it's still downloading.
-    assert_eq!(
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap(),
-        "c2"
-    );
+    assert_eq!(started_rx.recv_timeout(WORKER_WAIT).unwrap(), "c2");
     app.pop().unwrap(); // pops the chapter list → cancels the queued rest
 
     // c2 (already in flight) finishes; c3/c4 are dropped. Wait for c2 to land,
     // then give the worker ample time to (not) fetch the cancelled ones.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline
-        && app.downloaded_chapter_path(&source, &manga, "c2").is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let _ = wait_for(|| app.downloaded_chapter_path(&source, &manga, "c2").is_some());
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     assert!(
@@ -2697,12 +2682,7 @@ fn switching_profile_repoints_the_predownloader_at_the_new_library() {
         persistent: true,
     });
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline
-        && app.downloaded_chapter_path(&source, &manga, "c1").is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let _ = wait_for(|| app.downloaded_chapter_path(&source, &manga, "c1").is_some());
 
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c1").is_some(),
@@ -2987,23 +2967,17 @@ fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
     );
 
     // The worker has begun the batch; now leave the manga entirely.
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    started_rx.recv_timeout(WORKER_WAIT).unwrap();
     app.pop().unwrap(); // leave the confirmation
     app.pop().unwrap(); // leave the chapter list → would cancel a look-ahead
 
     // All five queued chapters still land; the sixth was never requested.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if (1..=5).all(|i| {
+    let _ = wait_for(|| {
+        (1..=5).all(|i| {
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
                 .is_some()
-        }) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+        })
+    });
     for i in 1..=5 {
         assert!(
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
@@ -3015,6 +2989,36 @@ fn download_from_here_queues_a_persistent_batch_that_survives_leaving() {
         app.downloaded_chapter_path(&source, &manga, "c6").is_none(),
         "only the requested five chapters were queued"
     );
+}
+
+/// How long a test may wait for the background download worker.
+///
+/// The worker runs at IDLE cpu/io priority on purpose
+/// (`lower_current_thread_to_idle`, so pre-fetching never makes the reader
+/// stutter). On a CI box running the whole suite in parallel that thread can be
+/// starved for seconds at a stretch — which is exactly what a few seconds of
+/// headroom here buys back. This is a synchronisation ceiling, not a
+/// performance assertion: [`wait_for`] returns the instant its condition holds,
+/// so a generous ceiling costs a fast machine nothing and costs a loaded one a
+/// green run.
+const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Poll until `done`, up to [`WORKER_WAIT`]. Returns whether it happened.
+///
+/// `#[must_use]` on purpose: a wait that quietly falls through on timeout turns
+/// every assertion after it into a statement about something else. The tests
+/// that wait for a *failed* attempt are the ones this bites — they then assert
+/// "nothing is on disk yet", which a worker that never ran also satisfies.
+#[must_use]
+fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + WORKER_WAIT;
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    done()
 }
 
 /// A gateway that fails each chapter's FIRST download attempt and succeeds on
@@ -3148,12 +3152,11 @@ fn explicit_batch_retries_after_a_failed_attempt() {
     assert_eq!(queued, 3, "all three were requested");
 
     // Wait until the worker has attempted (and failed) all three.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while started.load(std::sync::atomic::Ordering::SeqCst) < 3
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        wait_for(|| started.load(std::sync::atomic::Ordering::SeqCst) >= 3),
+        "the worker never attempted all three, so what follows would be \
+         measuring the wait rather than the retry"
+    );
     assert!(
         (1..=3).all(|i| app
             .downloaded_chapter_path(&source, &manga, &format!("c{i}"))
@@ -3171,16 +3174,12 @@ fn explicit_batch_retries_after_a_failed_attempt() {
         "the still-missing chapters are requested again"
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if (1..=3).all(|i| {
+    let _ = wait_for(|| {
+        (1..=3).all(|i| {
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
                 .is_some()
-        }) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+        })
+    });
     for i in 1..=3 {
         assert!(
             app.downloaded_chapter_path(&source, &manga, &format!("c{i}"))
@@ -7297,12 +7296,11 @@ fn a_failed_lookahead_is_retried_by_the_next_kick() {
 
     // Read c1: the look-ahead queues c2, whose first attempt fails.
     app.predownload_ahead(&source, &manga, &chapters, "c1");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while started.load(std::sync::atomic::Ordering::SeqCst) < 1
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        wait_for(|| started.load(std::sync::atomic::Ordering::SeqCst) >= 1),
+        "the look-ahead never attempted c2, so the re-kick below would be \
+         testing a first attempt rather than a retry"
+    );
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c2").is_none(),
         "the first attempt failed, so nothing is on disk yet"
@@ -7310,13 +7308,7 @@ fn a_failed_lookahead_is_retried_by_the_next_kick() {
 
     // Waking re-fires the same look-ahead — and this time it lands.
     app.rekick_lookahead();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if app.downloaded_chapter_path(&source, &manga, "c2").is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let _ = wait_for(|| app.downloaded_chapter_path(&source, &manga, "c2").is_some());
     assert!(
         app.downloaded_chapter_path(&source, &manga, "c2").is_some(),
         "the re-kick after wake retried the chapter that failed while offline"
