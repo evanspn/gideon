@@ -1337,6 +1337,109 @@ mod tests {
             .count()
     }
 
+    /// Rows of the canvas that carry any accent-coloured pixel.
+    fn accent_rows(c: &RgbPage, t: &Theme) -> Vec<u32> {
+        (0..c.height)
+            .filter(|&y| (0..c.width).any(|x| c.pixel(x, y) == t.accent))
+            .collect()
+    }
+
+    // --- sliders ---
+
+    #[test]
+    fn a_slider_is_a_slab_you_could_put_a_thumb_on() {
+        // This control is dragged, not watched: a hairline reads as a
+        // progress bar, and at 150ppi a hairline is the first thing to smear.
+        let t = Theme::INK_RUST;
+        let (w, h) = (400u32, 100u32);
+        let mut c = RgbPage::new_white(w, h);
+        draw_slider(&mut c, 0, 0, w, h, "Brightness", 50, 40.0, &t);
+
+        let rows = accent_rows(&c, &t);
+        let (top, bottom) = (rows[0], rows[rows.len() - 1]);
+        assert!(
+            bottom - top >= h / 8,
+            "the track is {}px in a {h}px row — too thin to grab",
+            bottom - top
+        );
+        assert!(bottom < h, "the track has to stay inside its own row");
+    }
+
+    #[test]
+    fn a_sliders_track_sits_under_its_own_label_not_the_next_ones() {
+        // Stacked sliders put every label directly above the track it names.
+        // Pushing the track to the bottom of the row leaves it nearer the
+        // NEXT label than its own, and then you drag the wrong lamp.
+        let t = Theme::INK_RUST;
+        let (w, h) = (400u32, 100u32);
+        let mut c = RgbPage::new_white(w, h);
+        draw_slider(&mut c, 0, 0, w, h, "Brightness", 50, 40.0, &t);
+        let rows = accent_rows(&c, &t);
+        let track_top = rows[0];
+        let label_bottom = (0..h)
+            .rfind(|&y| (0..w).any(|x| c.pixel(x, y).iter().all(|&v| v < 0x60)))
+            .expect("the label is drawn");
+        assert!(
+            label_bottom < track_top,
+            "the label sits on top of its own track"
+        );
+        assert!(
+            track_top - label_bottom <= h / 8,
+            "{}px of air between a label and its track — from a row away it \
+             belongs to whichever label is nearer",
+            track_top - label_bottom
+        );
+    }
+
+    #[test]
+    fn the_fill_is_the_value_at_both_ends_of_the_track() {
+        // The position IS the value — that is what makes scrubbing from
+        // anywhere on the track meaningful.
+        let t = Theme::INK_RUST;
+        let (w, h) = (400u32, 100u32);
+        // One reference render fixes the row to sample; at 0% there is no
+        // fill to find the track by.
+        let mid = {
+            let mut c = RgbPage::new_white(w, h);
+            draw_slider(&mut c, 0, 0, w, h, "Brightness", 50, 40.0, &t);
+            let rows = accent_rows(&c, &t);
+            rows[rows.len() / 2]
+        };
+        let width_at = |percent: u8| {
+            let mut c = RgbPage::new_white(w, h);
+            draw_slider(&mut c, 0, 0, w, h, "Brightness", percent, 40.0, &t);
+            (0..w).filter(|&x| c.pixel(x, mid) == t.accent).count()
+        };
+        let (quarter, half, full) = (width_at(25), width_at(50), width_at(100));
+        assert!(quarter < half && half < full, "{quarter} {half} {full}");
+        assert!(
+            full >= w as usize - 2,
+            "100% has to fill the track, not stop short"
+        );
+        assert_eq!(width_at(0), 0, "0% draws no fill at all");
+    }
+
+    #[test]
+    fn nothing_a_slider_draws_escapes_its_box() {
+        // Including the leading edge, which deliberately stands proud of the
+        // track: proud of the TRACK, still inside the ROW.
+        let t = Theme::INK_RUST;
+        let mut c = RgbPage::new_white(400, 200);
+        draw_slider(&mut c, 40, 60, 300, 60, "Night warmth", 63, 40.0, &t);
+        for y in 0..200u32 {
+            for x in 0..400u32 {
+                let inside = (40..340).contains(&x) && (60..120).contains(&y);
+                if !inside {
+                    assert_eq!(
+                        c.pixel(x, y),
+                        [0xFF, 0xFF, 0xFF],
+                        "painted outside the row at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
     // --- themes ---
 
     #[test]
@@ -2521,24 +2624,55 @@ pub fn draw_slider(
         true,
     );
 
-    // The track: thick enough to read as a control at 150ppi, not a rule.
-    let track_h = scaled(text_px, 0.34, 6);
-    let track_y = y + h.saturating_sub(track_h);
+    // The track is a slab, not a rule: the whole row is the grab zone, and a
+    // control you drag has to LOOK like something you can put a thumb on. A
+    // hairline reads as a progress bar you are meant to watch.
+    //
+    // It sits directly under its own label with the leftover space falling
+    // BELOW it, so a stack of sliders never leaves a track floating between
+    // two labels — closer to the next one's name than to its own.
+    let label_h = (label_px * 1.25) as u32;
+    let track_h = scaled(text_px, 0.85, 14).min(h.saturating_sub(label_h).max(1));
+    let track_y = y + label_h.min(h.saturating_sub(track_h));
     fill_rect(canvas, &clip, x, track_y, w, track_h, [0xD8, 0xD8, 0xD8]);
     let filled = (w as u64 * percent as u64 / 100) as u32;
     fill_rect(canvas, &clip, x, track_y, filled, track_h, t.accent);
 
-    // Quarter ticks, so a tap has something to aim at.
+    // Quarter ticks notched INTO the track — outside it they were a row of
+    // floating specks, and at 150ppi specks are the first thing to smear.
     for q in 1..4u32 {
         let tx = x + w * q / 4;
+        let tick_h = (track_h / 3).max(2);
+        let colour = if tx < x + filled {
+            [0xFF, 0xFF, 0xFF]
+        } else {
+            RULE
+        };
+        fill_rect(canvas, &clip, tx, track_y, 2, tick_h, colour);
         fill_rect(
             canvas,
             &clip,
             tx,
-            track_y.saturating_sub(track_h / 2),
+            track_y + track_h - tick_h,
             2,
-            track_h / 2,
-            RULE,
+            tick_h,
+            colour,
+        );
+    }
+
+    // The leading edge, standing a little proud of the track top and bottom:
+    // where the value IS, without a knob you have to catch to move it.
+    if filled > 0 && filled < w {
+        let grip_w = scaled(text_px, 0.18, 4);
+        let over = (track_h / 4).max(2);
+        fill_rect(
+            canvas,
+            &clip,
+            (x + filled).saturating_sub(grip_w),
+            track_y.saturating_sub(over),
+            grip_w,
+            track_h + over * 2,
+            t.accent,
         );
     }
     overlay_ink_at(canvas, &layer, clip.x0, clip.y0);
