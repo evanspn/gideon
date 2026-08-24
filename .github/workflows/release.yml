@@ -21,10 +21,18 @@ name: Release
 on:
   push:
     branches: [main]
-    # A docs-only merge ships no new binary, so it should not cut a release.
-    # Safe to filter here (unlike CI) because this workflow is not a required
-    # status check — skipping it blocks nothing.
+    # A merge that ships no new binary should not cut a release. The web
+    # dashboard is deployed by deploy-web.yml, not shipped in the bundle, so
+    # a web-only merge used to mint a version, a tag and an OTA VERSION for
+    # a byte-identical binary — every device offered an update with nothing
+    # in it. Safe to filter here (unlike CI) because this workflow is not a
+    # required status check — skipping it blocks nothing. paths-ignore skips
+    # only when EVERY changed file matches, so a merge that touches both the
+    # dashboard and a crate still releases.
     paths-ignore:
+      - 'web/**'
+      - 'api/**'
+      - 'vercel.json'
       - 'docs/**'
       - '**/*.md'
       - 'LICENSE'
