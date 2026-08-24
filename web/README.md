@@ -10,14 +10,19 @@ rewind your place. The Supabase anon key is embedded on purpose (public by
 design — RLS, keyed to `auth.uid()`, is what scopes every row to its owner).
 
 Two write paths exist, both through `send_queue`: the **Send to Kobo** box on
-Stats, and the **Discover** tab — point it at a public **MyAnimeList**
-username and it recommends manga from your anime list (the source manga
-of your top-rated anime, plus community picks seeded from those), each with a
-one-tap Send to Kobo. The tab also carries a manga search box and Trending /
-Top-rated browse rows — every card shows its community ★ score — and library
-titles get a rating chip (resolved via Jikan search, cached in localStorage
-for a week). Outages surface as retryable error states, and missing ratings
-just don't render.
+Stats, and the **Discover** tab.
+
+Discover is **one** left-to-right library rail, and a row of preference pills
+decides what fills it: **For you** (recommendations from a connected
+MyAnimeList — the source manga of your top-rated anime, plus community picks
+seeded from those and from what you have read), **Trending**, **Top rated**,
+and a pill per genre. Every card carries its community ★ score and a one-tap
+Send to Kobo. Genre pills filter one cached 200-title top-manga fetch —
+MAL's API has no genre query, so a request per pill tap would be the only
+alternative. The tab also carries a manga search box, whose results replace
+the rail until cleared, and library titles get a rating chip (resolved via a
+MAL search, cached in localStorage for a week). Outages surface as retryable
+error states, and missing ratings just don't render.
 
 All MAL data is first-party, through the same-origin serverless proxy
 `api/mal.js` (browsers can't call MAL directly — no CORS). One-time

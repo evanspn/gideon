@@ -582,10 +582,36 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .disc-who b { color: var(--ink); font-weight: 600; }
 .disc-who .ghost { padding: 4px 10px; font-size: 12.5px; margin-left: auto; }
 
-/* Two-up card grid on phones, three-up when there's room. */
-.rec-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 12px; }
-@media (min-width: 480px) { .rec-grid { grid-template-columns: repeat(3, 1fr); } }
-.rec-card { display: flex; flex-direction: column; min-width: 0; }
+/* Preference pills: one row, scrolling left to right so twelve genres fit a
+   phone without hiding behind a menu. */
+.pills {
+  display: flex; gap: 8px; overflow-x: auto; margin-bottom: 14px;
+  padding-bottom: 2px; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.pills::-webkit-scrollbar { display: none; }
+.pill {
+  flex: 0 0 auto; font: inherit; font-size: 13px; font-weight: 600;
+  color: var(--muted); background: var(--track); border: 1px solid transparent;
+  padding: 7px 14px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+}
+.pill:hover { color: var(--ink); }
+.pill.on { background: var(--accent); color: var(--accent-ink); }
+
+/* The one library rail: two rows of cards, scroll-snapped left to right,
+   with the next column peeking so it reads as scrollable. */
+.rec-rail {
+  display: grid; grid-auto-flow: column;
+  grid-template-rows: repeat(2, auto);
+  grid-auto-columns: calc((100% - 24px) / 2.4);
+  gap: 16px 12px; overflow-x: auto; scroll-snap-type: x proximity;
+  padding-bottom: 8px; -webkit-overflow-scrolling: touch;
+}
+@media (min-width: 480px) { .rec-rail { grid-auto-columns: calc((100% - 36px) / 3.4); } }
+.rec-card {
+  display: flex; flex-direction: column; min-width: 0; scroll-snap-align: start;
+}
+.mal-connect-card { text-align: center; padding: 6px 0 4px; }
+.mal-connect-card .primary { margin-top: 4px; }
 .rec-art {
   position: relative; aspect-ratio: 5 / 7; border-radius: 10px; overflow: hidden;
   background: var(--track); border: 1px solid var(--line);
@@ -627,7 +653,6 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 }
 .search-form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .search-form .primary { padding: 11px 16px; }
-.browse-seg { margin-bottom: 0; }
 .disc-error .ghost { margin-left: 10px; padding: 4px 10px; font-size: 12.5px; }
 
 /* Community-score badge on library cards */
