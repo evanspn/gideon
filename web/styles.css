@@ -607,14 +607,22 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
   padding-bottom: 8px; -webkit-overflow-scrolling: touch;
 }
 @media (min-width: 480px) { .rec-rail { grid-auto-columns: calc((100% - 36px) / 3.4); } }
+.rec-rail.one-row { grid-template-rows: auto; }
 .rec-card {
   display: flex; flex-direction: column; min-width: 0; scroll-snap-align: start;
 }
 .mal-connect-card { text-align: center; padding: 6px 0 4px; }
 .mal-connect-card .primary { margin-top: 4px; }
+/* Cover + title are one button: the doorway into the title's digest. */
+.rec-open {
+  display: flex; flex-direction: column; align-items: stretch;
+  background: none; border: none; padding: 0; margin: 0;
+  font: inherit; color: inherit; text-align: left; cursor: pointer; min-width: 0;
+}
+.rec-open:hover .rec-art { border-color: var(--accent); }
 .rec-art {
-  position: relative; aspect-ratio: 5 / 7; border-radius: 10px; overflow: hidden;
-  background: var(--track); border: 1px solid var(--line);
+  position: relative; display: block; aspect-ratio: 5 / 7; border-radius: 10px;
+  overflow: hidden; background: var(--track); border: 1px solid var(--line);
 }
 .rec-cover { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .rec-ph {
@@ -703,3 +711,73 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
   background: rgba(0, 0, 0, 0.25); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
 }
 .ob-copy { background: var(--panel); color: var(--ink); }
+
+/* --- digest: one manga, everything MyAnimeList knows ---------------------- */
+
+.digest { padding-bottom: 40px; }
+.dg-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 0 14px; margin-bottom: 4px;
+}
+.dg-bar .ghost { padding: 6px 12px; }
+.dg-bar-title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted); font-size: 13.5px; text-align: right;
+}
+
+.dg-hero { display: flex; gap: 14px; align-items: flex-start; }
+.dg-art { flex: 0 0 118px; }
+.dg-cover {
+  display: block; width: 118px; aspect-ratio: 5 / 7; object-fit: cover;
+  border-radius: 12px; background: var(--track); border: 1px solid var(--line);
+}
+.dg-ph {
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 34px; color: var(--muted);
+}
+.dg-head { flex: 1; min-width: 0; }
+.dg-title { font-size: 21px; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 4px; }
+.dg-alt { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.dg-by { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+.dg-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.dg-chip {
+  font-size: 11.5px; font-weight: 600; color: var(--muted);
+  background: var(--track); border-radius: 999px; padding: 4px 10px;
+}
+.dg-send { width: 100%; margin: 16px 0 4px; padding: 12px; font-size: 14px; }
+
+.digest .tabs { margin: 14px 0 16px; }
+.dg-tab-body { min-height: 120px; }
+
+.dg-genres { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.dg-genre {
+  font-size: 12px; font-weight: 600; color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 999px; padding: 4px 11px;
+}
+
+.dg-prose p { font-size: 14.5px; line-height: 1.55; margin: 0 0 12px; }
+.dg-prose.clamped {
+  display: -webkit-box; -webkit-line-clamp: 9; -webkit-box-orient: vertical; overflow: hidden;
+}
+.dg-more {
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--accent);
+  border: none; background: none; padding: 2px 0 4px; cursor: pointer;
+}
+
+.dg-stats {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 16px 0 4px;
+}
+@media (min-width: 520px) { .dg-stats { grid-template-columns: repeat(4, 1fr); } }
+.dg-stat {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+}
+.dg-stat-v { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.dg-stat-k { font-size: 12.5px; font-weight: 600; margin-top: 2px; }
+.dg-stat-s { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+
+.dg-facts { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; margin: 0; }
+.dg-facts dt { font-size: 13px; color: var(--muted); }
+.dg-facts dd { font-size: 13.5px; margin: 0; }
+.dg-note { font-size: 12px; color: var(--muted); line-height: 1.45; margin: 14px 0 0; }
+.digest .section-label { margin: 20px 0 10px; }
+.digest .hint { color: var(--muted); font-size: 14px; }
