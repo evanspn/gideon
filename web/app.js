@@ -514,6 +514,93 @@ async function opMangaFull(id) {
   };
 }
 
+// --- digest: one manga, everything MyAnimeList knows about it --------------
+//
+// Tapping a card's cover or title opens the digest — the ratings, the
+// description, how long it is and whether it's still running, who made it,
+// and what its readers loved next. One fetch fills three tabs; nothing here
+// costs a second request.
+//
+// On "comments": MAL's official API v2 has no reviews or comments endpoint,
+// and the Jikan mirror that had one is deliberately out of this stack (it
+// had multi-day outages while MAL itself was up). So the Community tab is
+// what the API really exposes — the score and how many readers cast it,
+// rank, popularity, list members, and the community's own recommendations.
+
+const DIGEST_FIELDS = [
+  "id", "title", "main_picture", "alternative_titles", "start_date", "end_date",
+  "synopsis", "mean", "rank", "popularity", "num_list_users", "num_scoring_users",
+  "media_type", "status", "genres", "num_volumes", "num_chapters",
+  "authors{first_name,last_name}", "serialization{name}", "background", "recommendations",
+].join(",");
+
+const MEDIA_TYPES = {
+  manga: "Manga", one_shot: "One-shot", manhwa: "Manhwa", manhua: "Manhua",
+  doujinshi: "Doujinshi", light_novel: "Light novel", novel: "Novel",
+};
+const PUB_STATUS = {
+  currently_publishing: "Ongoing", finished: "Finished", on_hiatus: "On hiatus",
+  discontinued: "Discontinued", not_yet_published: "Not yet published",
+};
+
+const malYear = (d) => (d || "").slice(0, 4);
+const malCount = (n) => (n == null ? null : n.toLocaleString());
+
+async function opMangaDigest(id) {
+  const d = await malGet(`manga/${id}?fields=${DIGEST_FIELDS}`);
+  const alt = d.alternative_titles || {};
+  return {
+    id: d.id,
+    title: d.title || "",
+    english: alt.en && alt.en !== d.title ? alt.en : "",
+    japanese: alt.ja || "",
+    cover: malCover(d),
+    synopsis: d.synopsis || "",
+    background: d.background || "",
+    // The raw 0–10 mean, not the card's rounded ★ — a digest shows the
+    // score MyAnimeList actually publishes (8.62, not 8.6).
+    score: d.mean ?? null,
+    rank: d.rank ?? null,
+    popularity: d.popularity ?? null,
+    members: d.num_list_users ?? null,
+    voters: d.num_scoring_users ?? null,
+    type: MEDIA_TYPES[d.media_type] || d.media_type || "",
+    status: PUB_STATUS[d.status] || "",
+    ongoing: d.status === "currently_publishing",
+    start: d.start_date || "",
+    end: d.end_date || "",
+    volumes: d.num_volumes || 0,
+    chapters: d.num_chapters || 0,
+    genres: (d.genres || []).map((g) => g.name),
+    authors: (d.authors || [])
+      .map((a) => {
+        const name = [a.node?.first_name, a.node?.last_name].filter(Boolean).join(" ");
+        return name ? (a.role ? `${name} (${a.role})` : name) : "";
+      })
+      .filter(Boolean),
+    serialization: (d.serialization || []).map((x) => x.node?.name).filter(Boolean),
+    recs: (d.recommendations || [])
+      .filter((r) => r.node?.id)
+      .map((r) => ({
+        id: r.node.id,
+        title: r.node.title || "",
+        cover: malCover(r.node),
+        score: null,
+        reason:
+          r.num_recommendations > 1
+            ? `${r.num_recommendations} readers recommend it`
+            : "Recommended by a reader",
+      })),
+  };
+}
+
+// Library titles come from directory names, never MAL ids — resolve one.
+async function resolveMangaId(title) {
+  if (normTitle(title).length < 3) return null;
+  const d = await malGet(`manga?q=${encodeURIComponent(title.slice(0, 64))}&limit=1&fields=id`);
+  return d.data?.[0]?.node?.id ?? null;
+}
+
 async function malRecommend(onStatus) {
   onStatus("Reading your MyAnimeList…");
   const anime = await opAnimeList();
@@ -601,6 +688,7 @@ async function malBrowse({ search, mode, limit = 18 }) {
     .filter(Boolean)
     .filter((n) => !["light_novel", "novel"].includes(n.media_type) && (n.nsfw ?? "white") === "white")
     .map((n) => ({
+      id: n.id,
       title: n.title || "",
       cover: malCover(n),
       score: malScore(n.mean),
@@ -741,11 +829,22 @@ function wireDiscover(email, rows) {
     });
   });
   for (const btn of body.querySelectorAll('[data-testid="rec-send"]')) wireRecSend(btn);
+  for (const btn of body.querySelectorAll('[data-testid="rec-open"]')) wireRecOpen(btn);
 }
 
 // One card's Send button: optimistic in-place states (Sending… → Sent ✓),
 // with an inline error and re-arm on failure — no re-render, so the grid
 // never jumps back to the top.
+// A card's cover/title: into the digest for that manga.
+function wireRecOpen(btn) {
+  btn.addEventListener("click", () => {
+    openDigest({
+      id: Number(btn.getAttribute("data-id")) || null,
+      title: btn.getAttribute("data-title") || "",
+    });
+  });
+}
+
 function wireRecSend(btn) {
   btn.addEventListener("click", async () => {
     const title = btn.getAttribute("data-title");
@@ -1036,7 +1135,13 @@ async function runDiscover(email, rows) {
 }
 
 // Session + resume state, so the reader can push progress and return home.
-const state = { session: null, resume: {}, sends: [], rails: {} };
+const state = {
+  session: null, resume: {}, sends: [], rails: {},
+  // Digest: cached by MAL id, a back-stack so nested "readers also loved"
+  // hops unwind one at a time, and a token that voids a fetch the reader
+  // has already navigated away from.
+  digests: {}, digestStack: [], digestToken: 0, digestTab: "overview",
+};
 
 // --- theme (defaults to dark; a header toggle persists the choice) ---------
 
@@ -1533,11 +1638,14 @@ function recCardHtml(rec) {
     : `<span class="rec-cover rec-ph">${esc([...rec.title][0] || "?")}</span>`;
   return `
     <div class="rec-card" data-testid="rec-card">
-      <div class="rec-art">
-        ${art}
-        ${rec.score ? `<span class="rec-score" title="Community score">★ ${(rec.score / 10).toFixed(1)}</span>` : ""}
-      </div>
-      <div class="rec-title" title="${esc(rec.title)}">${esc(rec.title)}</div>
+      <button class="rec-open" data-testid="rec-open" title="${esc(rec.title)}"
+        data-id="${esc(rec.id || "")}" data-title="${esc(rec.title)}">
+        <span class="rec-art">
+          ${art}
+          ${rec.score ? `<span class="rec-score" title="Community score">★ ${(rec.score / 10).toFixed(1)}</span>` : ""}
+        </span>
+        <span class="rec-title">${esc(rec.title)}</span>
+      </button>
       <div class="rec-reason">${esc(rec.reason)}</div>
       <button class="rec-send ${sent ? "sent" : ""}" data-testid="rec-send"
         data-title="${esc(rec.title)}" data-cover="${esc(rec.cover || "")}" ${sent ? "disabled" : ""}>
@@ -1556,9 +1664,13 @@ function recSectionHtml(label, recs, testid) {
   </section>`;
 }
 
-// The library rail: cards two rows deep, scrolling left to right.
-function railHtml(cards, testid) {
-  return `<div class="rec-rail" data-testid="${testid}">${cards.map(recCardHtml).join("")}</div>`;
+// The library rail: cards two rows deep, scrolling left to right. A handful
+// of cards (a digest's recommendations) get one row — two rows of two reads
+// as a stack, not a shelf.
+function railHtml(cards, testid, rows = 2) {
+  return `<div class="rec-rail ${rows === 1 ? "one-row" : ""}" data-testid="${testid}">${cards
+    .map(recCardHtml)
+    .join("")}</div>`;
 }
 
 // The search bar sits above everything on the Discover tab; results replace
@@ -1880,6 +1992,7 @@ function openBookSheet(g, email, rows) {
         </div>
         <button class="sheet-btn" data-act="open" data-testid="sheet-open">Open</button>
         <button class="sheet-btn" data-act="stats" data-testid="sheet-stats">View stats</button>
+        <button class="sheet-btn" data-act="digest" data-testid="sheet-digest">Title details</button>
         <button class="sheet-btn" data-act="hide" data-testid="sheet-hide">${
           hidden ? "Unhide title" : "Hide title"
         }</button>
@@ -1901,6 +2014,9 @@ function openBookSheet(g, email, rows) {
         openReader(g.current.chapter_key, parseKey(g.current.chapter_key));
       } else if (act === "stats") {
         openStatsSheet(g);
+      } else if (act === "digest") {
+        closeSheet();
+        openDigest({ id: null, title });
       } else if (act === "hide") {
         const set = loadHidden(email);
         if (set.has(g.series)) set.delete(g.series);
@@ -2050,6 +2166,7 @@ function signOut() {
 // The signed-in dashboard: a header, a Stats/Library tab switch, and the active
 // view. Rows are fetched once and reused across tab switches.
 function renderDashboard(email, rows) {
+  state.email = email;
   const tab = ["library", "discover"].includes(state.tab) ? state.tab : "stats";
   let body;
   if (tab === "discover") {
@@ -2216,8 +2333,234 @@ function renderDashboard(email, rows) {
   for (const btn of app.querySelectorAll('[data-testid="rec-send"]')) {
     if (!btn.closest("#disc-body")) wireRecSend(btn);
   }
+  for (const btn of app.querySelectorAll('[data-testid="rec-open"]')) {
+    if (!btn.closest("#disc-body")) wireRecOpen(btn);
+  }
   wireDiscover(email, rows);
   ensureRail(email, rows);
+}
+
+// --- digest screen ---------------------------------------------------------
+//
+// A full screen, like the reader: the dashboard's DOM is replaced and Back
+// puts it right back, with the pill, the rail and every "Sent ✓" intact
+// (they all live in state, not in the DOM).
+
+const DIGEST_TABS = [
+  { id: "overview", label: "Overview" },
+  { id: "details", label: "Details" },
+  { id: "community", label: "Community" },
+];
+
+// "12 volumes · 118 chapters", or nothing if MAL doesn't know yet (an
+// ongoing series usually reports 0 for both).
+function digestLength(d) {
+  const parts = [];
+  if (d.volumes) parts.push(`${d.volumes} volume${d.volumes === 1 ? "" : "s"}`);
+  if (d.chapters) parts.push(`${d.chapters} chapter${d.chapters === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
+// "2016 – ongoing" / "1998 – 2015" / "2019"
+function digestRun(d) {
+  const from = malYear(d.start);
+  if (!from) return "";
+  if (d.ongoing) return `${from} – ongoing`;
+  const to = malYear(d.end);
+  return to && to !== from ? `${from} – ${to}` : from;
+}
+
+function digestHeroHtml(d) {
+  const art = d.cover
+    ? `<img class="dg-cover" src="${esc(d.cover)}" alt="" referrerpolicy="no-referrer" />`
+    : `<span class="dg-cover dg-ph">${esc([...d.title][0] || "?")}</span>`;
+  const chips = [digestRun(d), d.status, digestLength(d), d.type]
+    .filter(Boolean)
+    .map((c) => `<span class="dg-chip">${esc(c)}</span>`)
+    .join("");
+  const sent = isQueued(d.title);
+  return `
+    <div class="dg-hero">
+      <div class="dg-art">${art}</div>
+      <div class="dg-head">
+        <h1 class="dg-title" data-testid="digest-title">${esc(d.title)}</h1>
+        ${d.english ? `<div class="dg-alt">${esc(d.english)}</div>` : ""}
+        ${d.authors.length ? `<div class="dg-by">${esc(d.authors.join(", "))}</div>` : ""}
+        <div class="dg-chips">${chips}</div>
+      </div>
+    </div>
+    <button class="rec-send dg-send ${sent ? "sent" : ""}" data-testid="rec-send"
+      data-title="${esc(d.title)}" data-cover="${esc(d.cover || "")}" ${sent ? "disabled" : ""}>
+      ${sent ? "Sent to Kobo ✓" : "Send to Kobo"}
+    </button>`;
+}
+
+function digestStatsHtml(d) {
+  const tiles = [
+    ["★ Score", d.score ? d.score.toFixed(2) : "—", d.voters ? `${malCount(d.voters)} ratings` : ""],
+    ["Ranked", d.rank ? `#${malCount(d.rank)}` : "—", "by score"],
+    ["Popularity", d.popularity ? `#${malCount(d.popularity)}` : "—", "by readers"],
+    ["Members", malCount(d.members) || "—", "have it listed"],
+  ];
+  return `<div class="dg-stats" data-testid="digest-stats">${tiles
+    .map(
+      ([k, v, sub]) => `<div class="dg-stat">
+        <div class="dg-stat-v">${esc(v)}</div>
+        <div class="dg-stat-k">${esc(k)}</div>
+        ${sub ? `<div class="dg-stat-s">${esc(sub)}</div>` : ""}
+      </div>`
+    )
+    .join("")}</div>`;
+}
+
+// MAL synopses run long; clamp to a readable block with a toggle rather than
+// making the reader scroll past a wall to reach the tabs' other content.
+function digestProse(text, testid) {
+  const paras = String(text)
+    .split(/\n\s*\n/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => `<p>${esc(t)}</p>`)
+    .join("");
+  return `<div class="dg-prose clamped" data-testid="${testid}">${paras}</div>
+    <button class="dg-more" data-testid="digest-more" hidden>Read more</button>`;
+}
+
+function digestTabHtml(d) {
+  if (state.digestTab === "details") {
+    const rows = [
+      ["Title", d.title],
+      ["English", d.english],
+      ["Japanese", d.japanese],
+      ["Type", d.type],
+      ["Status", d.status],
+      ["Published", digestRun(d)],
+      ["Length", digestLength(d)],
+      ["Authors", d.authors.join(", ")],
+      ["Serialization", d.serialization.join(", ")],
+      ["Genres", d.genres.join(", ")],
+      ["Score", d.score ? `${d.score.toFixed(2)}${d.voters ? ` from ${malCount(d.voters)} ratings` : ""}` : ""],
+      ["Ranked", d.rank ? `#${malCount(d.rank)}` : ""],
+      ["Popularity", d.popularity ? `#${malCount(d.popularity)}` : ""],
+      ["Members", malCount(d.members)],
+    ].filter(([, v]) => v);
+    return `<dl class="dg-facts" data-testid="digest-details">${rows
+      .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`)
+      .join("")}</dl>`;
+  }
+
+  if (state.digestTab === "community") {
+    // MAL's API has no reviews endpoint — say so plainly rather than
+    // leaving a gap where a reader expects comments.
+    const recs = d.recs.length
+      ? `<div class="section-label">Readers of this also loved</div>${railHtml(d.recs, "digest-recs", 1)}`
+      : `<p class="hint" data-testid="digest-no-recs">No community recommendations for this one yet.</p>`;
+    return `${digestStatsHtml(d)}
+      ${d.background ? `<div class="section-label">Background</div>${digestProse(d.background, "digest-background")}` : ""}
+      ${recs}
+      <p class="dg-note">MyAnimeList's public API doesn't serve reviews or comments, so these are its community's recommendations and scores rather than what individual readers wrote.</p>`;
+  }
+
+  const genres = d.genres.length
+    ? `<div class="dg-genres" data-testid="digest-genres">${d.genres
+        .map((g) => `<span class="dg-genre">${esc(g)}</span>`)
+        .join("")}</div>`
+    : "";
+  const synopsis = d.synopsis
+    ? digestProse(d.synopsis, "digest-synopsis")
+    : `<p class="hint" data-testid="digest-no-synopsis">MyAnimeList has no description for this one.</p>`;
+  return `${genres}${synopsis}${digestStatsHtml(d)}`;
+}
+
+function digestBodyHtml(view) {
+  if (view.phase === "loading") {
+    return `<div class="disc-loading" data-testid="digest-loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="disc-status">Reading MyAnimeList…</div>
+    </div>`;
+  }
+  if (view.phase === "error") {
+    return `<div class="note disc-error" data-testid="digest-error">${esc(view.error)}
+      <button class="ghost" id="dg-retry" data-testid="digest-retry">Retry</button></div>`;
+  }
+  const d = view.d;
+  const tabs = DIGEST_TABS.map(
+    (t) => `<button class="tab ${state.digestTab === t.id ? "on" : ""}" data-dtab="${t.id}"
+      data-testid="digest-tab-${t.id}">${t.label}</button>`
+  ).join("");
+  return `${digestHeroHtml(d)}
+    <div class="tabs" role="tablist">${tabs}</div>
+    <div class="dg-tab-body" id="dg-tab-body">${digestTabHtml(d)}</div>`;
+}
+
+function renderDigest(view) {
+  const title = view.phase === "done" ? view.d.title : view.ref?.title || "";
+  app.innerHTML = `
+    <div class="digest" data-testid="digest">
+      <div class="dg-bar">
+        <button class="ghost" id="dg-back" data-testid="digest-back">‹ Back</button>
+        <div class="dg-bar-title">${esc(title)}</div>
+      </div>
+      ${digestBodyHtml(view)}
+    </div>`;
+  window.scrollTo(0, 0);
+  document.getElementById("dg-back").addEventListener("click", digestBack);
+  document.getElementById("dg-retry")?.addEventListener("click", () => {
+    const ref = state.digestStack[state.digestStack.length - 1];
+    if (ref?.id) delete state.digests[ref.id];
+    if (ref) openDigest(ref, { push: false });
+  });
+  for (const btn of app.querySelectorAll("[data-dtab]")) {
+    btn.addEventListener("click", () => {
+      state.digestTab = btn.getAttribute("data-dtab");
+      renderDigest(view);
+    });
+  }
+  for (const btn of app.querySelectorAll('[data-testid="rec-send"]')) wireRecSend(btn);
+  for (const btn of app.querySelectorAll('[data-testid="rec-open"]')) wireRecOpen(btn);
+  // "Read more" only exists when the text is actually longer than the clamp
+  // — a two-line synopsis with a toggle under it reads like a bug.
+  const more = app.querySelector('[data-testid="digest-more"]');
+  if (more) {
+    const prose = more.previousElementSibling;
+    if (prose.scrollHeight - prose.clientHeight > 4) {
+      more.hidden = false;
+      more.addEventListener("click", () => {
+        const clamped = prose.classList.toggle("clamped");
+        more.textContent = clamped ? "Read more" : "Show less";
+      });
+    } else {
+      prose.classList.remove("clamped");
+    }
+  }
+}
+
+async function openDigest(ref, { push = true } = {}) {
+  const token = ++state.digestToken;
+  if (push) state.digestStack.push(ref);
+  state.digestTab = "overview";
+  renderDigest({ phase: "loading", ref });
+  try {
+    const id = ref.id || (await resolveMangaId(ref.title));
+    if (!id) throw new Error(`Couldn't find “${ref.title}” on MyAnimeList.`);
+    if (!state.digests[id]) state.digests[id] = await opMangaDigest(id);
+    if (state.digestToken !== token) return; // they've already moved on
+    ref.id = id; // a Retry (or a re-open) skips the title lookup
+    renderDigest({ phase: "done", d: state.digests[id] });
+  } catch (e) {
+    if (state.digestToken !== token) return;
+    renderDigest({ phase: "error", ref, error: e.message || "Couldn't load this title." });
+  }
+}
+
+// Back unwinds one hop at a time — a digest reached from another digest
+// returns there, and the last one hands back the dashboard.
+function digestBack() {
+  state.digestToken++;
+  state.digestStack.pop();
+  const prev = state.digestStack[state.digestStack.length - 1];
+  if (prev) openDigest(prev, { push: false });
+  else renderDashboard(state.email, state.rows || []);
 }
 
 // --- reader ---------------------------------------------------------------

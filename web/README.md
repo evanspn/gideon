@@ -24,6 +24,18 @@ the rail until cleared, and library titles get a rating chip (resolved via a
 MAL search, cached in localStorage for a week). Outages surface as retryable
 error states, and missing ratings just don't render.
 
+Tapping a card's cover or title (or **Title details** in a library book's
+action sheet, which resolves the id by title) opens the **digest**: a
+full-screen view of everything MyAnimeList knows about that manga — cover,
+English/Japanese titles, authors, run and status, length, genres, the
+description, and the score/rank/popularity/members tiles — across three tabs
+(Overview · Details · Community) filled by a **single** `manga/{id}` fetch,
+cached by id. The Community tab also carries the community's own
+recommendations, each opening its own digest; Back unwinds one hop at a time
+and hands the dashboard back with its pill, rail and "Sent ✓" states intact.
+MAL's public API serves no reviews or comments (Jikan did, and that mirror is
+deliberately out of this stack), so the tab says so rather than leaving a gap.
+
 All MAL data is first-party, through the same-origin serverless proxy
 `api/mal.js` (browsers can't call MAL directly — no CORS). One-time
 *deployment* setup: create a Client ID at myanimelist.net → Preferences →
