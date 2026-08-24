@@ -34,6 +34,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       shell: ${{ steps.filter.outputs.shell }}
+      web: ${{ steps.filter.outputs.web }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -50,6 +51,14 @@ jobs:
             shell:
               - 'installer/**'
               - 'ci/**'
+              - '.github/workflows/**'
+            # The dashboard and the serverless functions it calls. Note what
+            # is NOT here: crates/**. A Kobo change cannot break a static
+            # page, so it should not pay for a browser download.
+            web:
+              - 'web/**'
+              - 'api/**'
+              - 'vercel.json'
               - '.github/workflows/**'
 
   lint:
@@ -145,6 +154,46 @@ jobs:
       - name: Run installer test suite
         if: needs.changes.outputs.shell == 'true'
         run: ./ci/installer_test.sh
+
+  # The web dashboard: the Playwright suite and the serverless-function
+  # tests. Until this existed, web/ and api/ shipped with no CI at all —
+  # the filters skipped the Rust jobs for a web change and nothing ran in
+  # their place, so a broken dashboard reached production green.
+  web:
+    name: Web dashboard
+    runs-on: ubuntu-latest
+    # Slowest observed: 26s of tests, plus the browser download.
+    timeout-minutes: 12
+    needs: changes
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.changes.outputs.web == 'true'
+      - uses: actions/setup-node@v4
+        if: needs.changes.outputs.web == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        if: needs.changes.outputs.web == 'true'
+        run: npm ci
+      - name: Install Chromium
+        if: needs.changes.outputs.web == 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Serverless function tests
+        if: needs.changes.outputs.web == 'true'
+        run: npm run test:api
+      # --ignore-snapshots on purpose: .gitignore excludes *.png repo-wide,
+      # so the visual baselines are a local-and-macOS affair and a runner has
+      # nothing to compare against. Everything else — behaviour, wiring,
+      # error states — runs. Drop the flag the day the baselines are
+      # committed for linux.
+      - name: Browser tests
+        if: needs.changes.outputs.web == 'true'
+        run: npx playwright test --ignore-snapshots
 
   kobo-cross:
     name: Cross-check (Kobo armv7)

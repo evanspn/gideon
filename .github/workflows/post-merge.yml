@@ -6,6 +6,19 @@ name: Post-merge integration
 on:
   push:
     branches: [main]
+    # A web-only merge changes no binary, so cross-compiling armv7 and
+    # booting QEMU for it is four minutes spent proving nothing. Safe to
+    # filter at this level (unlike CI) because this workflow is not a
+    # required status check — skipping it blocks nothing. paths-ignore skips
+    # only when EVERY changed file matches, so a merge that touches both the
+    # dashboard and a crate still runs in full.
+    paths-ignore:
+      - 'web/**'
+      - 'api/**'
+      - 'vercel.json'
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 env:
