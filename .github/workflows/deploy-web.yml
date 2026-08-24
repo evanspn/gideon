@@ -14,7 +14,13 @@ name: Deploy web dashboard
 # One-time setup: add a repo secret named VERCEL_TOKEN
 #   Settings → Secrets and variables → Actions → New repository secret
 #   (create the token at https://vercel.com/account/tokens)
-# Until it's set, this workflow skips the deploy and stays green.
+#
+# A missing OR expired token skips the CLI deploy with a loud warning rather
+# than failing the merge build — rotating it is the repo owner's job, and a
+# dead credential is not a reason to paint main red. What is NOT skipped is
+# the verification below: the Vercel Git integration deploys main on push
+# too, so the live site still has to match what was merged. If it doesn't,
+# this job fails, which is the signal that actually matters.
 
 on:
   push:
@@ -36,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check for deploy token
+      - name: Check the deploy token
         id: guard
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -44,8 +50,16 @@ jobs:
           if [ -z "$VERCEL_TOKEN" ]; then
             echo "has_token=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=Vercel deploy skipped::Set the VERCEL_TOKEN repo secret to enable auto-deploy (Settings → Secrets and variables → Actions)."
-          else
+            exit 0
+          fi
+          # A token that exists but has expired used to fail the deploy step
+          # and, with it, every merge to main. Ask first, and treat a dead
+          # token exactly like a missing one.
+          if npx --yes vercel@latest whoami --token "$VERCEL_TOKEN" >/dev/null 2>&1; then
             echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Vercel token rejected::VERCEL_TOKEN is set but Vercel rejected it (expired or revoked). Rotate it at https://vercel.com/account/tokens and update the repo secret. Falling back to the Git integration's own deploy; the live-site check below still runs."
           fi
 
       - name: Deploy (production)
@@ -59,18 +73,19 @@ jobs:
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify live site
-        if: steps.guard.outputs.has_token == 'true'
         run: |
-          # The static files must match what we just shipped, byte for byte.
-          # Retry briefly to absorb production-alias propagation.
+          # The static files must match what was merged, byte for byte —
+          # whether this job deployed them or the Git integration did. The
+          # retry window is generous because an integration deploy starts on
+          # its own schedule, not ours.
           for f in app.js styles.css index.html; do
             ok=false
-            for attempt in 1 2 3 4 5; do
+            for attempt in $(seq 1 20); do
               code=$(curl -s -o "/tmp/live_$f" -w "%{http_code}" "https://gideon-sync.vercel.app/$f")
               if [ "$code" = "200" ] && cmp -s "/tmp/live_$f" "web/$f"; then
                 ok=true; break
               fi
-              sleep 5
+              sleep 15
             done
             if [ "$ok" != "true" ]; then
               echo "::error::$f on the live site did not match web/$f (last HTTP $code)"; exit 1
