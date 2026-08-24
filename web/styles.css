@@ -781,3 +781,74 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .dg-note { font-size: 12px; color: var(--muted); line-height: 1.45; margin: 14px 0 0; }
 .digest .section-label { margin: 20px 0 10px; }
 .digest .hint { color: var(--muted); font-size: 14px; }
+
+/* --- Today: the month calendar (ported from the device) ------------------- */
+
+.today-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.today-date { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+.today-streak { font-size: 13px; color: var(--muted); }
+
+.today-cont .cont-row {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  background: none; border: none; padding: 0; font: inherit; color: inherit;
+  text-align: left; cursor: pointer;
+}
+.today-cont .cover { flex: 0 0 auto; width: 52px; height: 73px; border-radius: 8px; object-fit: cover; }
+.today-cont .cover-ph {
+  display: flex; align-items: center; justify-content: center;
+  background: var(--track); border: 1px solid var(--line);
+  font-weight: 700; font-size: 22px; color: var(--muted);
+}
+.today-cont .grow { flex: 1; min-width: 0; display: block; }
+.today-cont .title { display: block; font-weight: 600; letter-spacing: -0.01em; }
+.today-cont .chapter { display: block; font-size: 13px; color: var(--muted); margin-top: 1px; }
+.today-cont .meta { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
+.today-cont .bar { flex: 1; height: 5px; border-radius: 999px; background: var(--track); overflow: hidden; }
+.today-cont .bar > i { display: block; height: 100%; background: var(--accent); }
+.today-cont .pct { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.today-cont .ago { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.today-cont .chev { color: var(--muted); font-size: 20px; }
+
+.cal-nav { display: flex; align-items: center; gap: 4px; }
+.cal-nav .ghost { padding: 4px 10px; font-size: 13px; }
+.cal-arrow { font-size: 16px; line-height: 1; padding: 3px 11px; }
+
+.cal { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.cal-heads, .cal-days, .cal-bars { display: grid; grid-template-columns: repeat(7, 1fr); }
+.cal-head {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); text-align: center; padding: 6px 0; background: var(--track);
+}
+.cal-week { position: relative; }
+.cal-day {
+  min-height: 62px; border-top: 1px solid var(--line); border-left: 1px solid var(--line);
+  padding: 3px 5px;
+}
+.cal-day:first-child { border-left: none; }
+.cal-day.outside { background: var(--track); }
+.cal-num { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* Today gets a block under its number, not a ring — the same mark the panel
+   uses, for the same reason: a 1px outline is what a colour filter loses. */
+.cal-day.today .cal-num { color: var(--ink); font-weight: 700; }
+.cal-day.today::after {
+  content: ""; display: block; width: 13px; height: 3px; border-radius: 2px;
+  background: var(--accent); margin-top: 1px;
+}
+.cal-bars {
+  position: absolute; left: 0; right: 0; top: 22px; bottom: 3px;
+  grid-auto-rows: 17px; gap: 2px; align-content: start; pointer-events: none;
+}
+.cal-bar {
+  pointer-events: auto; overflow: hidden; min-width: 0;
+  display: flex; align-items: center;
+  margin: 0 2px; padding: 0 4px;
+  font: inherit; font-size: 10.5px; font-weight: 600; line-height: 1;
+  color: var(--ink); text-align: left; cursor: pointer;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border: none; border-left: 3px solid var(--accent); border-radius: 4px;
+}
+/* A run that started in an earlier week keeps the fill but drops the accent
+   edge, so it reads as a continuation rather than a new book. */
+.cal-bar.cont { border-left-color: transparent; border-radius: 0 4px 4px 0; margin-left: 0; }
+.cal-bar > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cal-foot { font-size: 12.5px; color: var(--muted); margin-top: 10px; }

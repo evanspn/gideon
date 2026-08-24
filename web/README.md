@@ -9,6 +9,16 @@ It is **read-only** for progress: the device is the writer, so the web can't
 rewind your place. The Supabase anon key is embedded on purpose (public by
 design — RLS, keyed to `auth.uid()`, is what scopes every row to its owner).
 
+The landing page is **Today**, ported from the device's Today screen: the
+chapter you're mid-way through, then a **month calendar** of what you read.
+A series read three evenings running is ONE bar three days wide — the
+heatmap on Stats answers "how much, over months"; this answers "what was I
+reading, and for how long". Monday-first columns, lanes so two series on one
+day stack instead of overlapping, and a run that wraps a week keeps its fill
+but drops the accent edge so it reads as a continuation, not a new book
+(`crates/gideon-render/src/calendar.rs` is the original). Bars open where
+that series was left off, ‹ › page through months, and Today comes home.
+
 Two write paths exist, both through `send_queue`: the **Send to Kobo** box on
 Stats, and the **Discover** tab.
 
