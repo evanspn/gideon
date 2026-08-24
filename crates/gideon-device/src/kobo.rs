@@ -735,13 +735,13 @@ fn write_gray_row(gray: &[u8], out: &mut [u8], bytes_per_pixel: usize) {
 fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize, swap_rb: bool) {
     match bytes_per_pixel {
         1 => {
-            for (i, px) in rgb.chunks_exact(3).enumerate() {
+            for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
                 out[i] = gideon_render::luma_rec601(px[0], px[1], px[2]);
             }
         }
         2 => {
             // RGB565, little-endian: r in the top 5 bits.
-            for (i, px) in rgb.chunks_exact(3).enumerate() {
+            for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
                 let v =
                     ((px[0] as u16 >> 3) << 11) | ((px[1] as u16 >> 2) << 5) | (px[2] as u16 >> 3);
                 out[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
@@ -749,7 +749,7 @@ fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize, swap_rb: bo
         }
         3 => {
             // 24bpp BGR or RGB.
-            for (i, px) in rgb.chunks_exact(3).enumerate() {
+            for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
                 let (b0, b2) = if swap_rb {
                     (px[2], px[0])
                 } else {
@@ -760,7 +760,7 @@ fn write_rgb_row(rgb: &[u8], out: &mut [u8], bytes_per_pixel: usize, swap_rb: bo
         }
         4 => {
             // 32bpp BGRA or RGBA with opaque alpha.
-            for (i, px) in rgb.chunks_exact(3).enumerate() {
+            for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
                 let (b0, b2) = if swap_rb {
                     (px[2], px[0])
                 } else {

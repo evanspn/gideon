@@ -1324,7 +1324,12 @@ mod tests {
     }
 
     fn ink_pixels(c: &RgbPage) -> usize {
-        c.pixels.chunks_exact(3).filter(|p| *p != WHITE).count()
+        c.pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|p| **p != WHITE)
+            .count()
     }
 
     /// Pixels dark enough to be text rather than a tint or a rule. Counting
@@ -1332,7 +1337,9 @@ mod tests {
     /// once headings gained a washed band behind them.
     fn text_pixels(c: &RgbPage) -> usize {
         c.pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .filter(|p| p.iter().all(|&v| v < 0x60))
             .count()
     }
@@ -1801,7 +1808,12 @@ mod tests {
             let mut c = RgbPage::new_white(300, 60);
             let clip = Clip::new(&c, 0, 0, 300, 60);
             draw_progress(&mut c, &clip, 10, 10, 200, 8, pct, false, &t);
-            c.pixels.chunks_exact(3).filter(|p| *p == t.bar).count()
+            c.pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .filter(|p| **p == t.bar)
+                .count()
         };
         assert_eq!(bar_pixels(0.0), 0);
         assert!(bar_pixels(0.5) > 0);
@@ -1926,7 +1938,7 @@ mod tests {
         bare.genres = "";
         let mut c = RgbPage::new_white(300, 100);
         draw_library_row(&mut c, 5, 5, 280, 90, &bare, 20.0, &t);
-        let has = |color: [u8; 3]| c.pixels.chunks_exact(3).any(|p| p == color);
+        let has = |color: [u8; 3]| c.pixels.as_chunks::<3>().0.contains(&color);
         assert!(!has(t.star), "a scoreless row drew a score marker");
         assert!(!has(t.status_tint), "a statusless row drew a status chip");
         assert!(!has(t.genre_tint), "a genreless row drew a genre chip");
@@ -2194,7 +2206,12 @@ mod tests {
             let filled = |f: f32| {
                 let mut c = RgbPage::new_white(320, 100);
                 draw_meter(&mut c, 5, 5, 300, 90, f, "", "", 20.0, &t);
-                c.pixels.chunks_exact(3).filter(|p| *p == t.bar).count()
+                c.pixels
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .filter(|p| **p == t.bar)
+                    .count()
             };
             assert_eq!(filled(0.0), 0, "{name} filled an empty meter");
             assert!(filled(0.5) > 0, "{name} drew no fill at all");

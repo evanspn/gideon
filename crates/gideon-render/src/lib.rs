@@ -107,7 +107,9 @@ impl RgbPage {
             height: self.height,
             pixels: self
                 .pixels
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|px| luma_rec601(px[0], px[1], px[2]))
                 .collect(),
         }
@@ -780,7 +782,12 @@ mod tests {
     /// The pixel triples of `page` in row-major order, reduced to their
     /// gray-index (first channel) for easy comparison with the gray tests.
     fn rgb_indices(page: &RgbPage) -> Vec<u8> {
-        page.pixels.chunks_exact(3).map(|px| px[0]).collect()
+        page.pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|px| px[0])
+            .collect()
     }
 
     #[test]
