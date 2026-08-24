@@ -1481,6 +1481,165 @@ function statTilesHtml(s) {
 // every ordinary day onto level 1, leaving a pale wash with a single dark
 // square. `heatmap_thresholds` in crates/gideon-core/src/stats.rs does the
 // same arithmetic so the device and the dashboard shade a day identically.
+// --- Today: the month calendar --------------------------------------------
+//
+// Ported from the device's Today screen (crates/gideon-render/src/calendar.rs),
+// and it answers the same question: the heatmap says "how much, over months";
+// this says "what was I reading, and for how many days running". A series
+// read three evenings in a row is ONE bar three days wide — that continuity
+// is the information, and three separate marks would throw it away.
+//
+// Monday-first columns, lanes so two series on one day stack instead of
+// overlapping, and the leading edge of a run carries the accent so a bar
+// that wraps a week reads as a continuation rather than a new book.
+
+const CAL_LANES = 3;
+const CAL_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+// Days since 1970-01-01 for a civil date (month 1-12). No timezone in sight,
+// because every day key here is already local civil — going through Date
+// would drag one back in.
+function daysFromCivil(y, m, d) {
+  const year = y - (m <= 2 ? 1 : 0);
+  const era = Math.floor(year / 400);
+  const yoe = year - era * 400;
+  const doy = Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+const dayIndex = (key) => {
+  const [y, m, d] = key.split("-").map(Number);
+  return daysFromCivil(y, m, d);
+};
+// Monday-first column for a day index. Day 0 was a Thursday, so the shift
+// is three.
+const columnOf = (day) => (((day + 3) % 7) + 7) % 7;
+
+// Which cells a month occupies: the Monday on or before the 1st, how many
+// days it has, and the week rows it needs — four for a short February that
+// starts on a Monday, six for a long month that starts on a Sunday.
+function monthGrid(year, month) {
+  const offset = (new Date(year, month, 1).getDay() + 6) % 7;
+  const days = new Date(year, month + 1, 0).getDate();
+  return {
+    year,
+    month,
+    days,
+    offset,
+    weeks: Math.max(1, Math.ceil((offset + days) / 7)),
+    firstCell: daysFromCivil(year, month + 1, 1) - offset,
+  };
+}
+
+// Runs of consecutive days each series was read on.
+function readingSpans(rows) {
+  const bySeries = new Map();
+  for (const r of rows) {
+    const day = dayKey(r.updated_at);
+    if (!day) continue;
+    const series = parseKey(r.chapter_key).series;
+    if (!bySeries.has(series)) bySeries.set(series, new Set());
+    bySeries.get(series).add(day);
+  }
+  const spans = [];
+  for (const [series, set] of bySeries) {
+    let start = null;
+    let prev = null;
+    for (const key of [...set].sort()) {
+      if (prev && prevDayKey(key) === prev) {
+        prev = key;
+        continue;
+      }
+      if (prev) spans.push({ series, start: dayIndex(start), end: dayIndex(prev) });
+      start = key;
+      prev = key;
+    }
+    if (prev) spans.push({ series, start: dayIndex(start), end: dayIndex(prev) });
+  }
+  return spans.sort((a, b) => a.start - b.start || a.series.localeCompare(b.series));
+}
+
+// Break spans into per-week segments and assign each a lane, greedily, in
+// span order. A series keeps its lane across a week boundary when it can.
+// A week busier than the cell is tall drops the piece rather than painting
+// it over another series' bar.
+function calSegments(spans, firstCell, weeks, lanes = CAL_LANES) {
+  const lastCell = firstCell + weeks * 7 - 1;
+  const occupied = Array.from({ length: weeks }, () => new Array(lanes).fill(null));
+  const out = [];
+  for (const span of spans) {
+    const start = Math.max(span.start, firstCell);
+    const end = Math.min(span.end, lastCell);
+    if (start > end) continue;
+    let day = start;
+    let preferred = null;
+    while (day <= end) {
+      const week = Math.floor((day - firstCell) / 7);
+      const from = columnOf(day);
+      const pieceEnd = Math.min(end, firstCell + week * 7 + 6);
+      const to = columnOf(pieceEnd);
+      const free = [];
+      for (let l = 0; l < lanes; l++) {
+        if (occupied[week][l] === null || occupied[week][l] < from) free.push(l);
+      }
+      if (!free.length) {
+        day = pieceEnd + 1;
+        continue;
+      }
+      const lane = free.includes(preferred) ? preferred : free[0];
+      occupied[week][lane] = to;
+      preferred = lane;
+      out.push({
+        series: span.series,
+        week,
+        from,
+        to,
+        lane,
+        continuesBefore: start < day,
+        continuesAfter: pieceEnd < end,
+      });
+      day = pieceEnd + 1;
+    }
+  }
+  return out;
+}
+
+function calendarHtml(rows, grid) {
+  const segs = calSegments(readingSpans(rows), grid.firstCell, grid.weeks);
+  const today = keyFromDate(new Date());
+  const heads = CAL_DAYS.map((d) => `<div class="cal-head">${d}</div>`).join("");
+  const weeks = [];
+  for (let w = 0; w < grid.weeks; w++) {
+    const cells = [];
+    for (let c = 0; c < 7; c++) {
+      const n = w * 7 + c - grid.offset + 1;
+      const inside = n >= 1 && n <= grid.days;
+      const key = inside ? `${grid.year}-${pad2(grid.month + 1)}-${pad2(n)}` : "";
+      const isToday = inside && key === today;
+      cells.push(
+        `<div class="cal-day${inside ? "" : " outside"}${isToday ? " today" : ""}"${
+          inside ? ` data-testid="cal-day" data-day="${key}"` : ""
+        }>${inside ? `<span class="cal-num">${n}</span>` : ""}</div>`
+      );
+    }
+    const bars = segs
+      .filter((sg) => sg.week === w)
+      .map(
+        (sg) => `<button class="cal-bar${sg.continuesBefore ? " cont" : ""}" data-testid="cal-bar"
+          data-series="${esc(sg.series)}" title="${esc(displayTitle(sg.series))}"
+          style="grid-column:${sg.from + 1}/${sg.to + 2};grid-row:${sg.lane + 1}"
+        ><span>${esc(displayTitle(sg.series))}</span></button>`
+      )
+      .join("");
+    weeks.push(
+      `<div class="cal-week"><div class="cal-days">${cells.join("")}</div>
+        <div class="cal-bars">${bars}</div></div>`
+    );
+  }
+  return `<div class="cal" data-testid="calendar">
+    <div class="cal-heads">${heads}</div>${weeks.join("")}</div>`;
+}
+
 function heatmapLevels(byDay) {
   const counts = [...byDay.values()].filter((v) => v > 0).sort((a, b) => a - b);
   if (!counts.length) return [0, 0, 0];
@@ -1607,6 +1766,92 @@ function sendPanelHtml(sends) {
     <div class="note send-note" id="send-note" data-testid="send-note"></div>
     ${list}
   </section>`;
+}
+
+// --- Today view -------------------------------------------------------------
+//
+// The landing page, like the Kobo app's Today: what you're in the middle of,
+// then the month you've just read.
+
+function calMonth() {
+  const now = new Date();
+  const c = state.calMonth || { year: now.getFullYear(), month: now.getMonth() };
+  return monthGrid(c.year, c.month);
+}
+
+function shiftMonth(by) {
+  const g = calMonth();
+  const d = new Date(g.year, g.month + by, 1);
+  state.calMonth = { year: d.getFullYear(), month: d.getMonth() };
+}
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+// The one you're in the middle of: cover, chapter, progress, one tap back in.
+function continueHtml(groups, covers) {
+  const g = groups
+    .slice()
+    .sort((a, b) => new Date(b.current.updated_at) - new Date(a.current.updated_at))[0];
+  if (!g) return "";
+  const title = displayTitle(g.series);
+  const { chapter } = parseKey(g.current.chapter_key);
+  const meta = progressMeta(g.current);
+  const cover = covers.get(g.series);
+  const art = cover
+    ? `<img class="cover" src="${esc(cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+    : `<span class="cover cover-ph">${esc([...title][0] || "?")}</span>`;
+  return `<section class="panel today-cont" data-testid="today-continue">
+    <div class="section-label">Continue reading</div>
+    <button class="cont-row" data-testid="continue" data-key="${esc(g.current.chapter_key)}">
+      ${art}
+      <span class="grow">
+        <span class="title">${esc(title)}</span>
+        ${chapter ? `<span class="chapter">${esc(displayTitle(chapter))}</span>` : ""}
+        <span class="meta">
+          <span class="bar"><i style="width:${meta.pct}%"></i></span>
+          <span class="pct">${esc(meta.label)}</span>
+        </span>
+        <span class="ago">${esc(timeAgo(g.current.updated_at))}</span>
+      </span>
+      <span class="chev" aria-hidden="true">›</span>
+    </button>
+  </section>`;
+}
+
+function viewToday(stats, groups, covers, rows) {
+  const grid = calMonth();
+  const now = new Date();
+  const isThisMonth = grid.year === now.getFullYear() && grid.month === now.getMonth();
+  const prefix = `${grid.year}-${pad2(grid.month + 1)}-`;
+  const read = [...stats.byDay.keys()].filter((k) => k.startsWith(prefix)).length;
+  const streak = stats.currentStreak
+    ? `${stats.currentStreak}-day streak`
+    : "No streak going — read something today";
+  return `
+    <section class="panel today-head" data-testid="today-head">
+      <div class="today-date">${esc(
+        now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })
+      )}</div>
+      <div class="today-streak">${esc(streak)}</div>
+    </section>
+    ${continueHtml(groups, covers)}
+    <section class="panel">
+      <div class="lib-head">
+        <div class="section-label" data-testid="cal-month">${esc(MONTH_NAMES[grid.month])} ${grid.year}</div>
+        <div class="cal-nav">
+          ${isThisMonth ? "" : `<button class="ghost" data-cal="today" data-testid="cal-today">Today</button>`}
+          <button class="ghost cal-arrow" data-cal="prev" data-testid="cal-prev" aria-label="Previous month">‹</button>
+          <button class="ghost cal-arrow" data-cal="next" data-testid="cal-next" aria-label="Next month">›</button>
+        </div>
+      </div>
+      ${calendarHtml(rows, grid)}
+      <div class="cal-foot" data-testid="cal-foot">${
+        read ? `Read on ${read} day${read === 1 ? "" : "s"} this month` : "Nothing read this month yet"
+      }</div>
+    </section>`;
 }
 
 function viewStats(stats, groups, sends) {
@@ -2167,12 +2412,19 @@ function signOut() {
 // view. Rows are fetched once and reused across tab switches.
 function renderDashboard(email, rows) {
   state.email = email;
-  const tab = ["library", "discover"].includes(state.tab) ? state.tab : "stats";
+  const tab = ["stats", "library", "discover"].includes(state.tab) ? state.tab : "today";
   let body;
   if (tab === "discover") {
     body = viewDiscover();
   } else if (!rows.length) {
     body = `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`;
+  } else if (tab === "today") {
+    body = viewToday(
+      computeStats(rows),
+      groupBySeries(rows),
+      state.covers || new Map(),
+      rows
+    );
   } else if (tab === "library") {
     body = viewLibrary(
       groupBySeries(rows),
@@ -2193,6 +2445,7 @@ function renderDashboard(email, rows) {
       </div>
     </div>
     <div class="tabs" role="tablist">
+      <button class="tab ${tab === "today" ? "on" : ""}" data-tab="today" data-testid="tab-today">Today</button>
       <button class="tab ${tab === "stats" ? "on" : ""}" data-tab="stats" data-testid="tab-stats">Stats</button>
       <button class="tab ${tab === "library" ? "on" : ""}" data-tab="library" data-testid="tab-library">Library</button>
       <button class="tab ${tab === "discover" ? "on" : ""}" data-tab="discover" data-testid="tab-discover">Discover</button>
@@ -2234,9 +2487,31 @@ function renderDashboard(email, rows) {
       renderDashboard(email, rows);
     });
   }
-  // Tapping a chapter (library list or recent-read) or a shelf tile opens
-  // the reader.
-  for (const btn of app.querySelectorAll('[data-testid="chapter"], [data-testid="tile"]')) {
+  // Month nav on Today. The calendar is the whole panel, so a full
+  // re-render is the honest thing here — nothing else is in flight.
+  for (const btn of app.querySelectorAll("[data-cal]")) {
+    btn.addEventListener("click", () => {
+      const act = btn.getAttribute("data-cal");
+      if (act === "today") state.calMonth = null;
+      else shiftMonth(act === "next" ? 1 : -1);
+      renderDashboard(email, rows);
+    });
+  }
+  // A calendar bar is that series: it opens where you left off.
+  {
+    const bySeries = new Map(groupBySeries(rows).map((g) => [g.series, g]));
+    for (const bar of app.querySelectorAll('[data-testid="cal-bar"]')) {
+      const g = bySeries.get(bar.getAttribute("data-series"));
+      if (!g) continue;
+      bar.addEventListener("click", () =>
+        openReader(g.current.chapter_key, parseKey(g.current.chapter_key))
+      );
+      wireBookSheet(bar, g, email, rows);
+    }
+  }
+  // Tapping a chapter (library list or recent-read), a shelf tile or the
+  // Continue card opens the reader.
+  for (const btn of app.querySelectorAll('[data-testid="chapter"], [data-testid="tile"], [data-testid="continue"]')) {
     btn.addEventListener("click", () => {
       const key = btn.getAttribute("data-key");
       openReader(key, parseKey(key));

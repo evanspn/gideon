@@ -150,19 +150,33 @@ test("empty progress shows the empty state", async ({ page }) => {
   await expect(page.getByTestId("empty")).toContainText("No reading progress yet");
 });
 
-// --- stats (default view) -------------------------------------------------
+// --- Today (landing view) --------------------------------------------------
 
-test("signing in lands on the stats dashboard", async ({ page }) => {
+test("signing in lands on Today, with the month calendar", async ({ page }) => {
   await mockAuthOk(page);
   await mockProgress(page, ROWS);
   await page.goto("/");
   await fillAndSubmit(page);
 
-  await expect(page.getByTestId("tab-stats")).toHaveClass(/on/);
+  await expect(page.getByTestId("tab-today")).toHaveClass(/on/);
+  await expect(page.getByTestId("today-head")).toBeVisible();
+  await expect(page.getByTestId("today-continue")).toBeVisible();
+  await expect(page.getByTestId("calendar")).toBeVisible();
+  await expect(page.getByText("reader@example.com")).toBeVisible();
+});
+
+// --- stats -----------------------------------------------------------------
+
+test("the Stats tab has the tiles and the heatmap", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
+
   await expect(page.getByTestId("stat")).toHaveCount(4);
   await expect(page.getByTestId("heatmap")).toBeVisible();
   await expect(page.getByText("Reading activity")).toBeVisible();
-  await expect(page.getByText("reader@example.com")).toBeVisible();
 });
 
 test("stat tiles and most-read reflect the data", async ({ page }) => {
@@ -170,6 +184,7 @@ test("stat tiles and most-read reflect the data", async ({ page }) => {
   await mockProgress(page, STATS_ROWS);
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
 
   // 3 of the 4 chapters are finished; 20+22+18+5 = 65 pages; 2 series.
   await expect(page.getByTestId("stat").filter({ hasText: "Chapters read" })).toContainText("3");
@@ -195,6 +210,7 @@ test("recently read lists books (not chapters) newest-first and opens the reader
   );
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
 
   // One row per book, newest first: Berserk (read an hour ago) on top, and the
   // row shows the book, not the individual chapter.
@@ -222,6 +238,7 @@ test("the stats view has a Send to Kobo box", async ({ page }) => {
   await mockProgress(page, ROWS);
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
   await expect(page.getByText("Send to Kobo")).toBeVisible();
   await expect(page.getByTestId("send-input")).toBeVisible();
   await expect(page.getByTestId("send-btn")).toBeVisible();
@@ -233,6 +250,7 @@ test("sending a title enqueues it and lists it", async ({ page }) => {
   await mockSends(page); // starts empty
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
 
   await expect(page.getByTestId("send-item")).toHaveCount(0);
   await page.getByTestId("send-input").fill("Berserk");
@@ -266,6 +284,7 @@ test("a send on a stale session refreshes and retries (401 → refresh → 201)"
   });
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
 
   await page.getByTestId("send-input").fill("Berserk");
   await page.getByTestId("send-btn").click();
@@ -285,6 +304,7 @@ test("a failed send surfaces the error and keeps the typed title", async ({ page
   );
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
 
   await page.getByTestId("send-input").fill("Berserk");
   await page.getByTestId("send-btn").click();
@@ -299,6 +319,7 @@ test("a pending send can be removed", async ({ page }) => {
   await mockSends(page, [{ id: "id-1", title: "Vagabond", created_at: new Date().toISOString() }]);
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
 
   await expect(page.getByTestId("send-item")).toHaveCount(1);
   await page.getByTestId("send-remove").first().click();
@@ -504,6 +525,7 @@ async function openReader(page, { pages = READER_PAGES, currentPage = 0 } = {}) 
   );
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
   await page.getByTestId("chapter").first().click(); // recently-read → reader
 }
 
@@ -563,7 +585,7 @@ test("a persisted session skips the sign-in screen", async ({ page }) => {
     );
   });
   await page.goto("/");
-  await expect(page.getByTestId("heatmap")).toBeVisible();
+  await expect(page.getByTestId("calendar")).toBeVisible();
   await page.getByTestId("tab-library").click();
   await expect(page.getByTestId("tile")).toHaveCount(2);
 });
@@ -581,6 +603,7 @@ test("stats dashboard looks right", async ({ page }) => {
   await mockProgress(page, STATS_ROWS);
   await page.goto("/");
   await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
   await expect(page.getByTestId("heatmap")).toBeVisible();
   await expect(page).toHaveScreenshot("stats.png", { maxDiffPixelRatio: 0.02 });
 });
