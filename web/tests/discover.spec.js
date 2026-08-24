@@ -1,8 +1,9 @@
 import { test, expect } from "@playwright/test";
 
-// Discover tab: manga recommendations from a MyAnimeList account (official
-// API via the site's serverless proxy), plus search and trending/top browse — all with
-// one-tap Send to Kobo. MAL and Supabase are mocked at the HTTP boundary,
+// Discover tab: one left-to-right library rail whose contents follow the
+// selected pill — "For you" (MyAnimeList recommendations through the site's
+// serverless proxy), Trending / Top rated (MAL rankings), or any genre —
+// plus search, all with one-tap Send to Kobo. MAL and Supabase are mocked at the HTTP boundary,
 // so these run fully offline and deterministically even while the real
 // services are having outages. tests/live.spec.js covers the real MAL API.
 
@@ -184,24 +185,22 @@ test("the full recommend flow runs on MAL's official API", async ({ page }) => {
   await page.addInitScript(CONNECTED);
   await signInAnd(page, "tab-discover"); // connected → recs auto-run
 
-  // Frieren via the related_manga edge (One Piece resolves via the
-  // search-by-title fallback and is then excluded — it's in the library).
-  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
-  await expect(sources).toHaveCount(1, { timeout: 15000 });
-  await expect(sources.first()).toContainText("Frieren");
-  await expect(sources.first()).toContainText("You rated the anime 10/10");
-  await expect(sources.first()).toContainText("★ 8.6");
-
-  // Similar: Yokohama (loved by readers of the source) AND Real (because
-  // they read Vagabond); Vagabond itself is dropped (already on their list).
-  const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
-  await expect(similar).toHaveCount(2);
-  await expect(similar.filter({ hasText: "Yokohama" })).toContainText("Loved by readers of");
-  await expect(similar.filter({ hasText: "Real" })).toContainText("Because you read Vagabond");
+  // Sources and community picks share ONE rail now, sources first: Frieren
+  // via the related_manga edge (One Piece resolves via the search-by-title
+  // fallback and is then excluded — it's in the library), then Yokohama
+  // (loved by readers of the source) and Real (because they read Vagabond).
+  // Vagabond itself is dropped — already on their list.
+  const cards = page.getByTestId("disc-rail").getByTestId("rec-card");
+  await expect(cards).toHaveCount(3, { timeout: 15000 });
+  await expect(cards.first()).toContainText("Frieren");
+  await expect(cards.first()).toContainText("You rated the anime 10/10");
+  await expect(cards.first()).toContainText("★ 8.6");
+  await expect(cards.filter({ hasText: "Yokohama" })).toContainText("Loved by readers of");
+  await expect(cards.filter({ hasText: "Real" })).toContainText("Because you read Vagabond");
 
   // A card sends title + cover into the Kobo queue.
-  await sources.first().getByTestId("rec-send").click();
-  await expect(sources.first().getByTestId("rec-send")).toHaveText(/Sent to Kobo/);
+  await cards.first().getByTestId("rec-send").click();
+  await expect(cards.first().getByTestId("rec-send")).toHaveText(/Sent to Kobo/);
   expect(posted).toEqual([
     { title: "Frieren: Beyond Journey's End", cover_url: "https://img.test/frieren.jpg" },
   ]);
@@ -213,26 +212,25 @@ test("recommendations work from reading history alone (no anime list)", async ({
   await page.addInitScript(CONNECTED);
   await signInAnd(page, "tab-discover"); // connected → recs auto-run
 
-  // No anime → no "read the source" section, but the manga they've READ
-  // (Vagabond) seeds community picks.
-  const similar = page.getByTestId("rec-similar").getByTestId("rec-card");
-  await expect(similar).toHaveCount(1, { timeout: 15000 });
-  await expect(similar.first()).toContainText("Real");
-  await expect(similar.first()).toContainText("Because you read Vagabond");
-  await expect(page.getByTestId("rec-sources")).toHaveCount(0);
+  // No anime → nothing to read the source of, but the manga they've READ
+  // (Vagabond) still seeds community picks.
+  const cards = page.getByTestId("disc-rail").getByTestId("rec-card");
+  await expect(cards).toHaveCount(1, { timeout: 15000 });
+  await expect(cards.first()).toContainText("Real");
+  await expect(cards.first()).toContainText("Because you read Vagabond");
 });
 
-test("an unconfigured deployment surfaces a clear browse error", async ({ page }) => {
+test("an unconfigured deployment surfaces a clear rail error", async ({ page }) => {
   await mockSends(page);
   await page.route(/\/api\/mal\?path=/, (route) =>
     route.fulfill({ status: 503, contentType: "application/json", body: '{"error":"proxy-unconfigured"}' })
   );
   await signInAnd(page, "tab-discover");
 
-  await expect(page.getByTestId("browse-error")).toContainText("isn't configured");
+  await expect(page.getByTestId("disc-error")).toContainText("isn't configured");
 });
 
-test("a browse outage shows an inline error with a working Retry", async ({ page }) => {
+test("a rail outage shows an inline error with a working Retry", async ({ page }) => {
   await mockSends(page);
   let rankingCalls = 0;
   await page.route(/\/api\/mal\?path=/, (route) => {
@@ -246,12 +244,12 @@ test("a browse outage shows an inline error with a working Retry", async ({ page
   });
   await signInAnd(page, "tab-discover");
 
-  await expect(page.getByTestId("browse-error")).toContainText("didn't answer");
-  await page.getByTestId("browse-retry").click();
-  await expect(page.getByTestId("browse-results").getByTestId("rec-card")).toHaveCount(2);
+  await expect(page.getByTestId("disc-error")).toContainText("didn't answer");
+  await page.getByTestId("disc-retry").click();
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card")).toHaveCount(2);
 });
 
-test("the browse row arriving does not wipe a half-typed username", async ({ page }) => {
+test("the rail arriving does not wipe a half-typed search", async ({ page }) => {
   await mockSends(page);
   await page.route(/\/api\/mal\?path=/, async (route) => {
     const [p] = (new URL(route.request().url()).searchParams.get("path") || "").split("?");
@@ -266,17 +264,18 @@ test("the browse row arriving does not wipe a half-typed username", async ({ pag
   await signInAnd(page, "tab-discover");
 
   await page.getByTestId("search-input").fill("halftyped");
-  await expect(page.getByTestId("browse-results")).toBeVisible();
+  await expect(page.getByTestId("disc-rail")).toBeVisible();
   await expect(page.getByTestId("search-input")).toHaveValue("halftyped");
 });
 
-test("browse and search run on official rankings/search with ratings", async ({ page }) => {
+test("the rail and search run on official rankings/search with ratings", async ({ page }) => {
   await mockSends(page);
   await mockMalProxy(page);
   await signInAnd(page, "tab-discover");
 
-  // Ranking-backed browse: light novel filtered by media_type, ★ from mean.
-  const cards = page.getByTestId("browse-results").getByTestId("rec-card");
+  // Signed out of MAL the rail opens on Trending: light novel filtered by
+  // media_type, ★ from mean.
+  const cards = page.getByTestId("disc-rail").getByTestId("rec-card");
   await expect(cards).toHaveCount(2);
   await expect(cards.nth(0)).toContainText("Chainsaw Man");
   await expect(cards.nth(0)).toContainText("★ 8.6");
@@ -290,6 +289,69 @@ test("browse and search run on official rankings/search with ratings", async ({ 
 });
 
 
+
+// --- pills: one rail, many preferences ---------------------------------------
+
+test("genre pills refill the one rail from the shared top-manga pool", async ({ page }) => {
+  await mockSends(page);
+  await mockMalProxy(page);
+  await signInAnd(page, "tab-discover");
+
+  // Trending by default (signed out of MAL), then a genre pill filters the
+  // pool: Chainsaw Man is Action/Horror, Vagabond is Drama.
+  await expect(page.getByTestId("pill-trending")).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card")).toHaveCount(2);
+
+  await page.getByTestId("pill-genre-horror").click();
+  const horror = page.getByTestId("disc-rail").getByTestId("rec-card");
+  await expect(horror).toHaveCount(1);
+  await expect(horror.first()).toContainText("Chainsaw Man");
+  await expect(page.getByTestId("pill-genre-horror")).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("pill-trending")).toHaveAttribute("aria-selected", "false");
+
+  // A genre with nothing in the pool says so instead of spinning forever.
+  await page.getByTestId("pill-genre-sports").click();
+  await expect(page.getByTestId("disc-error")).toContainText("Nothing here yet");
+
+  // Switching back is instant — the loaded rail is cached, not refetched.
+  await page.getByTestId("pill-genre-horror").click();
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card")).toHaveCount(1);
+});
+
+test("the genre pool is fetched once, not per pill", async ({ page }) => {
+  await mockSends(page);
+  let poolFetches = 0;
+  await page.route(/\/api\/mal\?path=/, (route) => {
+    const raw = new URL(route.request().url()).searchParams.get("path") || "";
+    const [p, qs = ""] = raw.split("?");
+    const json = (b) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
+    if (p === "manga/ranking") {
+      if (new URLSearchParams(qs).get("limit") === "200") poolFetches++;
+      return json(MAL.ranking);
+    }
+    return json({ data: [] });
+  });
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("pill-genre-horror").click();
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card")).toHaveCount(1);
+  await page.getByTestId("pill-genre-drama").click();
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card")).toHaveCount(1);
+  await page.getByTestId("pill-genre-action").click();
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card")).toHaveCount(1);
+  expect(poolFetches).toBe(1);
+});
+
+test("the For you pill asks for a MyAnimeList connection instead of a rail", async ({ page }) => {
+  await mockSends(page);
+  await mockMalProxy(page);
+  await signInAnd(page, "tab-discover");
+
+  await page.getByTestId("pill-foryou").click();
+  await expect(page.getByTestId("mal-connect-card")).toBeVisible();
+  await expect(page.getByTestId("disc-rail")).toHaveCount(0);
+});
 
 // --- "Connect MyAnimeList" (per-user OAuth) ----------------------------------
 
@@ -452,9 +514,9 @@ test("a connected account runs its recommendations automatically", async ({ page
   // No typing, no button: the linked account's picks just arrive.
   await expect(page.getByTestId("mal-connected")).toContainText("evan_mal");
   await expect(page.getByTestId("disc-user")).toHaveCount(0); // manual form hidden
-  const sources = page.getByTestId("rec-sources").getByTestId("rec-card");
-  await expect(sources).toHaveCount(1, { timeout: 15000 });
-  await expect(sources.first()).toContainText("Frieren");
+  const cards = page.getByTestId("disc-rail").getByTestId("rec-card");
+  await expect(cards).toHaveCount(1, { timeout: 15000 });
+  await expect(cards.first()).toContainText("Frieren");
 
   // Disconnect restores the manual path.
   await page.getByTestId("mal-disconnect").click();
@@ -565,7 +627,7 @@ test("connected recommendations read the private @me list, never the public path
   await signInWithRows(page, ROWS);
 
   // Auto-run recommendations for the connected account arrive via @me.
-  await expect(page.getByTestId("rec-sources").getByTestId("rec-card").first()).toBeVisible({
+  await expect(page.getByTestId("disc-rail").getByTestId("rec-card").first()).toBeVisible({
     timeout: 15000,
   });
   expect(personal).toContain("GET users/@me/animelist");
@@ -775,17 +837,21 @@ test("recommendations arriving don't wipe a half-typed search or double-send", a
 
   await expect(page.getByTestId("disc-loading")).toBeVisible();
   await page.getByTestId("search-input").fill("berserk");
-  // Send a browse card while recs are still in flight.
-  const card = page.getByTestId("browse-results").getByTestId("rec-card").first();
+  // Park on Trending and send a card while the "For you" picks are still in
+  // flight behind the pill.
+  await page.getByTestId("pill-trending").click();
+  const card = page.getByTestId("disc-rail").getByTestId("rec-card").first();
   await card.getByTestId("rec-send").click();
 
   finishRecs();
-  await expect(page.getByTestId("rec-similar")).toBeVisible({ timeout: 15000 });
+  await page.waitForTimeout(600);
 
-  // Typed query survived, and the card still reads as sent — one row only.
+  // Typed query survived, the rail stayed on the pill the reader chose, and
+  // the card still reads as sent — one row only.
   await expect(page.getByTestId("search-input")).toHaveValue("berserk");
+  await expect(page.getByTestId("pill-trending")).toHaveAttribute("aria-selected", "true");
   await expect(
-    page.getByTestId("browse-results").getByTestId("rec-card").first().getByTestId("rec-send")
+    page.getByTestId("disc-rail").getByTestId("rec-card").first().getByTestId("rec-send")
   ).toHaveText(/Sent to Kobo/);
   await page.waitForTimeout(300);
   expect(posted).toHaveLength(1);

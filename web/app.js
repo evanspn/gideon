@@ -584,17 +584,17 @@ async function malRecommend(onStatus) {
   return { sources, similar, alreadyReading };
 }
 
-// -- browse / search --
+// -- rankings / search --
 //
 // One card shape everywhere: { title, cover, score (0-100 or null), reason }.
-// Browse and search don't filter against the library — you're allowed to look
+// Rankings and search don't filter against the library — you're allowed to look
 // at what you own — the card just shows "queued" instead of a Send button.
 
-async function malBrowse({ search, mode }) {
+async function malBrowse({ search, mode, limit = 18 }) {
   const fields = "mean,genres,main_picture,media_type,nsfw";
   const path = search
-    ? `manga?q=${encodeURIComponent(search)}&limit=18&fields=${fields}`
-    : `manga/ranking?ranking_type=${mode === "top" ? "all" : "bypopularity"}&limit=18&fields=${fields}`;
+    ? `manga?q=${encodeURIComponent(search)}&limit=${limit}&fields=${fields}`
+    : `manga/ranking?ranking_type=${mode === "top" ? "all" : "bypopularity"}&limit=${limit}&fields=${fields}`;
   const d = await malGet(path);
   return (d.data || [])
     .map((r) => r.node)
@@ -604,6 +604,7 @@ async function malBrowse({ search, mode }) {
       title: n.title || "",
       cover: malCover(n),
       score: malScore(n.mean),
+      genres: (n.genres || []).map((g) => g.name),
       reason: (n.genres || []).slice(0, 3).map((g) => g.name).join(" · "),
     }));
 }
@@ -617,43 +618,128 @@ async function opRating(title) {
   return { score: malScore(d.data?.[0]?.node?.mean) };
 }
 
-async function runBrowse(mode, email, rows) {
-  state.browse = { phase: "loading", mode };
-  patchBrowse(email, rows);
-  try {
-    const cards = await opBrowse({ mode });
-    state.browse = { phase: "done", mode, cards };
-  } catch (e) {
-    state.browse = { phase: "error", mode, error: e.message || "Couldn't load." };
-  }
-  patchBrowse(email, rows);
+// --- one rail, many pills ---------------------------------------------------
+//
+// Browse and recommendations used to be two stacked grids. They are one
+// left-to-right library now, and the pills above it choose what fills it:
+// "For you" (the MyAnimeList picks), Trending / Top rated (MAL rankings), or
+// any genre. MAL's API has no genre query, so genre rails are filtered out of
+// a single cached top-manga pool — one 200-title fetch instead of a request
+// per pill tap.
+
+const DISC_GENRES = [
+  "Action", "Adventure", "Comedy", "Drama", "Fantasy", "Horror",
+  "Mystery", "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural",
+];
+const GENRE_POOL_LIMIT = 200;
+const GENRE_RAIL_MAX = 24;
+
+function discPills() {
+  return [
+    { id: "foryou", label: "For you" },
+    { id: "trending", label: "Trending" },
+    { id: "top", label: "Top rated" },
+    ...DISC_GENRES.map((g) => ({ id: `genre:${g}`, label: g })),
+  ];
 }
 
-// Update just the Browse panel in place. A full renderDashboard here would
-// wipe whatever the reader is typing into the username or search box while
-// the auto-loaded browse row arrives — patch the one section instead.
-function patchBrowse(email, rows) {
+// Stable, readable test ids: pill-foryou, pill-genre-slice-of-life, …
+const pillTestId = (id) =>
+  `pill-${id.replace("genre:", "genre-").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+
+// Signed out of MAL there is nothing personal to show, so the rail opens on
+// Trending — day one is still a library you can scroll.
+function currentPill() {
+  const want = state.pill || (malConn() ? "foryou" : "trending");
+  return discPills().some((p) => p.id === want) ? want : "trending";
+}
+
+// The shared genre pool: one top-manga fetch, filtered per pill. A failure
+// clears the cache so the next Retry actually retries.
+function genrePool() {
+  if (!state.genrePool) {
+    state.genrePool = opBrowse({ mode: "top", limit: GENRE_POOL_LIMIT }).catch((e) => {
+      state.genrePool = null;
+      throw e;
+    });
+  }
+  return state.genrePool;
+}
+
+async function railCards(pill) {
+  if (pill === "trending" || pill === "top") return opBrowse({ mode: pill });
+  const genre = pill.slice("genre:".length);
+  const pool = await genrePool();
+  return pool.filter((c) => (c.genres || []).includes(genre)).slice(0, GENRE_RAIL_MAX);
+}
+
+async function runRail(pill, email, rows) {
+  state.rails[pill] = { phase: "loading" };
+  patchDiscover(email, rows);
+  try {
+    const cards = await railCards(pill);
+    state.rails[pill] = cards.length
+      ? { phase: "done", cards }
+      : { phase: "error", error: "Nothing here yet — try another pill." };
+  } catch (e) {
+    state.rails[pill] = { phase: "error", error: e.message || "Couldn't load." };
+  }
+  patchDiscover(email, rows);
+}
+
+// Load whatever the selected pill needs, once. "For you" runs the (much
+// slower) recommendation engine; every other pill is a ranking fetch.
+function ensureRail(email, rows) {
   if (state.tab !== "discover" || state.search) return;
-  const body = document.getElementById("browse-body");
+  const pill = currentPill();
+  if (pill === "foryou") {
+    if (malConn() && !state.discover) runDiscover(email, rows);
+    return;
+  }
+  if (!state.rails[pill]) runRail(pill, email, rows);
+}
+
+function selectPill(id, email, rows) {
+  state.pill = id;
+  patchDiscover(email, rows);
+  ensureRail(email, rows);
+}
+
+// Update just the rail. A full renderDashboard here would wipe whatever the
+// reader is typing into the search box while a slow rail arrives — and it
+// would reset an in-flight "Sending…" button — so patch the one region.
+function patchDiscover(email, rows) {
+  if (state.tab !== "discover" || state.search) return;
+  const body = document.getElementById("disc-body");
   if (!body) {
     renderDashboard(email, rows);
     return;
   }
-  body.innerHTML = browseBodyHtml();
-  wireBrowse(email, rows);
+  body.innerHTML = discBodyHtml();
+  wireDiscover(email, rows);
 }
 
-// Handlers for everything inside #browse-body (mode chips, retry, card
+// Handlers for everything inside #disc-body (pills, connect, retry, card
 // sends) — called after both a full render and an in-place patch.
-function wireBrowse(email, rows) {
-  const body = document.getElementById("browse-body");
+function wireDiscover(email, rows) {
+  const body = document.getElementById("disc-body");
   if (!body) return;
-  for (const chip of body.querySelectorAll(".browse-seg .seg-btn")) {
-    chip.addEventListener("click", () => runBrowse(chip.getAttribute("data-mode"), email, rows));
+  for (const pill of body.querySelectorAll(".pill")) {
+    pill.addEventListener("click", () => selectPill(pill.getAttribute("data-pill"), email, rows));
   }
-  body.querySelector("#browse-retry")?.addEventListener("click", () =>
-    runBrowse(state.browse?.mode || "trending", email, rows)
-  );
+  body.querySelector("#disc-retry")?.addEventListener("click", () => {
+    const pill = currentPill();
+    if (pill === "foryou") state.discover = null;
+    else delete state.rails[pill];
+    patchDiscover(email, rows);
+    ensureRail(email, rows);
+  });
+  body.querySelector("#mal-connect")?.addEventListener("click", () => {
+    startMalConnect().catch((e) => {
+      state.malError = e.message || "Couldn't start the MyAnimeList connection.";
+      renderDashboard(email, rows);
+    });
+  });
   for (const btn of body.querySelectorAll('[data-testid="rec-send"]')) wireRecSend(btn);
 }
 
@@ -930,7 +1016,7 @@ function buildRecommendations({ sources, similar, alreadyReading }) {
 
 async function runDiscover(email, rows) {
   state.discover = { phase: "loading", status: "Reading your MyAnimeList…" };
-  patchDiscoverRecs(email, rows);
+  patchDiscover(email, rows);
   const onStatus = (msg) => {
     if (state.discover?.phase === "loading") state.discover.status = msg;
     const el = document.getElementById("disc-status");
@@ -946,32 +1032,11 @@ async function runDiscover(email, rows) {
   } catch (e) {
     state.discover = { phase: "error", error: e.message || "Something went wrong." };
   }
-  patchDiscoverRecs(email, rows);
-}
-
-// Recommendations take many seconds (sequential MAL calls) and now start on
-// every Discover visit, so they routinely finish after the reader has moved
-// on. Never re-render the whole dashboard from here: that would yank someone
-// out of the manga reader mid-chapter, and even on Discover it would wipe a
-// half-typed search or reset an in-flight "Sending…" button. Patch just the
-// recommendations region, and only while it's actually on screen.
-function patchDiscoverRecs(email, rows) {
-  if (state.tab !== "discover" || state.search) return; // reader/other tab: leave the DOM alone
-  const host = document.getElementById("disc-recs");
-  if (!host) {
-    renderDashboard(email, rows);
-    return;
-  }
-  host.innerHTML = discoverRecsHtml();
-  document.getElementById("disc-retry")?.addEventListener("click", () => {
-    state.discover = null;
-    renderDashboard(email, rows); // the auto-run kicks back in
-  });
-  for (const btn of host.querySelectorAll('[data-testid="rec-send"]')) wireRecSend(btn);
+  patchDiscover(email, rows);
 }
 
 // Session + resume state, so the reader can push progress and return home.
-const state = { session: null, resume: {}, sends: [] };
+const state = { session: null, resume: {}, sends: [], rails: {} };
 
 // --- theme (defaults to dark; a header toggle persists the choice) ---------
 
@@ -1481,16 +1546,23 @@ function recCardHtml(rec) {
     </div>`;
 }
 
+// A labelled rail in its own panel — used for search results. The Discover
+// rail itself is unlabelled: the selected pill is the label.
 function recSectionHtml(label, recs, testid) {
   if (!recs.length) return "";
   return `<section class="panel">
     <div class="section-label">${esc(label)}</div>
-    <div class="rec-grid" data-testid="${testid}">${recs.map(recCardHtml).join("")}</div>
+    ${railHtml(recs, testid)}
   </section>`;
 }
 
+// The library rail: cards two rows deep, scrolling left to right.
+function railHtml(cards, testid) {
+  return `<div class="rec-rail" data-testid="${testid}">${cards.map(recCardHtml).join("")}</div>`;
+}
+
 // The search bar sits above everything on the Discover tab; results replace
-// the recommendation/browse sections until cleared.
+// the pills + rail until cleared.
 function searchPanelHtml() {
   const s = state.search;
   return `<section class="panel">
@@ -1517,31 +1589,48 @@ function searchResultsHtml() {
   return recSectionHtml(`Results for “${s.q}”`, s.cards, "search-results");
 }
 
-// Trending / top-rated browse rows — available even before a list is
-// connected, so the tab is useful on day one. The inner markup lives in its
-// own function because patchBrowse re-renders it in place.
-function browseBodyHtml() {
-  const b = state.browse;
-  const mode = b?.mode || "trending";
-  const chips = `
-    <div class="seg browse-seg" role="group" aria-label="Browse">
-      <button type="button" class="seg-btn ${mode === "trending" ? "on" : ""}" data-mode="trending" data-testid="browse-trending">Trending</button>
-      <button type="button" class="seg-btn ${mode === "top" ? "on" : ""}" data-mode="top" data-testid="browse-top">Top rated</button>
-    </div>`;
-  let body;
-  if (!b || b.phase === "loading") {
-    body = `<div class="disc-loading" data-testid="browse-loading"><div class="spinner" aria-hidden="true"></div></div>`;
-  } else if (b.phase === "error") {
-    body = `<div class="note disc-error" data-testid="browse-error">${esc(b.error)}
-      <button class="ghost" id="browse-retry" data-testid="browse-retry">Retry</button></div>`;
-  } else {
-    body = `<div class="rec-grid" data-testid="browse-results">${b.cards.map(recCardHtml).join("")}</div>`;
-  }
-  return `<div class="lib-head"><div class="section-label">Browse</div>${chips}</div>${body}`;
+// The pill rail: one row of preferences, itself scrolling left to right so
+// twelve genres fit a phone without a menu.
+function pillsHtml() {
+  const cur = currentPill();
+  return `<div class="pills" role="tablist" aria-label="Picks" data-testid="disc-pills">${discPills()
+    .map(
+      (p) => `<button type="button" class="pill ${p.id === cur ? "on" : ""}" role="tab"
+        aria-selected="${p.id === cur}" data-pill="${esc(p.id)}"
+        data-testid="${esc(pillTestId(p.id))}">${esc(p.label)}</button>`
+    )
+    .join("")}</div>`;
 }
 
-function browseSectionHtml() {
-  return `<section class="panel"><div id="browse-body">${browseBodyHtml()}</div></section>`;
+// What the selected pill is showing right now — recommendations and rankings
+// collapsed into one shape so the rail renders them identically.
+function railState() {
+  const pill = currentPill();
+  if (pill !== "foryou") return state.rails[pill] || { phase: "loading" };
+  if (!malConn()) return { phase: "connect" };
+  const d = state.discover;
+  if (!d || d.phase === "loading") return { phase: "loading", status: d?.status };
+  if (d.phase === "error") return { phase: "error", error: d.error };
+  return { phase: "done", cards: [...d.recs.sources, ...d.recs.similar] };
+}
+
+function discBodyHtml() {
+  const s = railState();
+  let body;
+  if (s.phase === "connect") {
+    body = connectCardHtml();
+  } else if (s.phase === "loading") {
+    body = `<div class="disc-loading" data-testid="disc-loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="disc-status" id="disc-status">${esc(s.status || "Loading…")}</div>
+    </div>`;
+  } else if (s.phase === "error") {
+    body = `<div class="note disc-error" data-testid="disc-error">${esc(s.error)}
+      <button class="ghost" id="disc-retry" data-testid="disc-retry">Retry</button></div>`;
+  } else {
+    body = railHtml(s.cards, "disc-rail");
+  }
+  return `${pillsHtml()}${body}`;
 }
 
 // One-shot MAL notices (connect success/failure), rendered at the top of
@@ -1559,11 +1648,10 @@ function malNoticesHtml() {
 // The one-time gateway: shown until the account is connected, and again only
 // when the connection dies and needs a re-auth.
 function connectCardHtml() {
-  return `<section class="panel" data-testid="mal-connect-card">
-    <div class="section-label">MyAnimeList</div>
-    <p class="send-hint">Connect your MyAnimeList and this tab fills with personal manga picks — from what you've read and what you've watched. One tap, private lists included.</p>
+  return `<div class="mal-connect-card" data-testid="mal-connect-card">
+    <p class="send-hint">Connect your MyAnimeList and this rail fills with personal manga picks — from what you've read and what you've watched. One tap, private lists included.</p>
     <button class="primary" id="mal-connect" data-testid="mal-connect">Connect MyAnimeList</button>
-  </section>`;
+  </div>`;
 }
 
 // Once connected the account hides away: a slim footer at the bottom of the
@@ -1616,43 +1704,28 @@ function patchMalSync() {
   if (el) el.innerHTML = malSyncBodyHtml();
 }
 
+// Search results replace the rail until cleared; otherwise the tab is the
+// pills and the single library rail underneath them, with the connected
+// MyAnimeList account tucked into a slim footer.
 function viewDiscover() {
   const search = searchPanelHtml();
   if (state.search) return `${search}${searchResultsHtml()}`;
   const notices = malNoticesHtml();
-
-  // Not connected: the Connect card is the whole story (browse/search below
-  // need no account). It reappears by itself when a connection dies.
-  if (!malConn()) {
-    return `${search}${notices}${connectCardHtml()}${browseSectionHtml()}`;
-  }
-
-  // Connected: recommendations simply appear; the account lives in a slim
-  // footer at the bottom until it's needed. The recs live in their own host
-  // element so they can be patched in place when they arrive (see
-  // patchDiscoverRecs) instead of rebuilding the tab.
-  return `${search}${notices}<div id="disc-recs">${discoverRecsHtml()}</div>${browseSectionHtml()}${malFooterHtml()}`;
-}
-
-function discoverRecsHtml() {
-  const d = state.discover;
-  if (d?.phase === "loading") {
-    return `<section class="panel disc-loading" data-testid="disc-loading">
-      <div class="spinner" aria-hidden="true"></div>
-      <div class="disc-status" id="disc-status">${esc(d.status || "Working…")}</div>
-    </section>`;
-  }
-  if (d?.phase === "error") {
-    return `<section class="panel">
-        <div class="note disc-error" data-testid="disc-error">${esc(d.error)}</div>
-        <button class="primary" id="disc-retry" data-testid="disc-retry">Try again</button>
-      </section>`;
-  }
-  if (d?.phase === "done") {
-    return `${recSectionHtml("Read the source of what you watched", d.recs.sources, "rec-sources")}
-      ${recSectionHtml("More like what you love", d.recs.similar, "rec-similar")}`;
-  }
-  return "";
+  // Not connected, the offer follows you across every pill as a slim strip —
+  // except on "For you", where the rail itself is already making the offer.
+  const footer = malConn()
+    ? malFooterHtml()
+    : currentPill() === "foryou"
+      ? ""
+      : `<section class="panel mal-footer" data-testid="mal-connect-strip">
+          <div class="mal-row">
+            <span class="send-hint">Connect MyAnimeList for picks made from what you read and watch.</span>
+            <span class="mal-actions"><button class="primary" id="mal-connect" data-testid="mal-connect">Connect</button></span>
+          </div>
+        </section>`;
+  return `${search}${notices}
+    <section class="panel"><div id="disc-body">${discBodyHtml()}</div></section>
+    ${footer}`;
 }
 
 // One library card: cover (published page art, or a lettered placeholder),
@@ -1962,7 +2035,9 @@ function signOut() {
   state.sends = [];
   state.discover = null;
   state.search = null;
-  state.browse = null;
+  state.rails = {};
+  state.pill = null;
+  state.genrePool = null;
   state.sentTitles = null;
   state.ratings = null;
   state.malSync = null;
@@ -2103,15 +2178,17 @@ function renderDashboard(email, rows) {
       renderDashboard(email, rows);
     });
   }
-  // Discover: connect form (username), change-list link,
-  // and the per-card Send to Kobo buttons.
-  // MyAnimeList account: connect (OAuth redirect) and disconnect.
-  document.getElementById("mal-connect")?.addEventListener("click", () => {
-    startMalConnect().catch((e) => {
-      state.malError = e.message || "Couldn't start the MyAnimeList connection.";
-      renderDashboard(email, rows);
+  // Discover: the MyAnimeList account footer. The connect button inside the
+  // rail is wired by wireDiscover (the two are never on screen together).
+  for (const btn of app.querySelectorAll('[data-testid="mal-connect"]')) {
+    if (btn.closest("#disc-body")) continue;
+    btn.addEventListener("click", () => {
+      startMalConnect().catch((e) => {
+        state.malError = e.message || "Couldn't start the MyAnimeList connection.";
+        renderDashboard(email, rows);
+      });
     });
-  });
+  }
   document.getElementById("mal-disconnect")?.addEventListener("click", () => {
     clearMalConn();
     state.discover = null;
@@ -2121,15 +2198,7 @@ function renderDashboard(email, rows) {
   document.getElementById("mal-sync")?.addEventListener("click", () => {
     syncKoboToMal(email, rows);
   });
-  document.getElementById("disc-retry")?.addEventListener("click", () => {
-    state.discover = null;
-    renderDashboard(email, rows); // the auto-run below kicks back in
-  });
-  // A connected account runs its recommendations without being asked.
-  if (tab === "discover" && !state.search && !state.discover && malConn()) {
-    runDiscover(email, rows);
-  }
-  // Search: submit runs it, Clear returns to recommendations + browse.
+  // Search: submit runs it, Clear returns to the pills + rail.
   const searchForm = document.getElementById("search-form");
   if (searchForm) {
     searchForm.addEventListener("submit", (e) => {
@@ -2142,13 +2211,13 @@ function renderDashboard(email, rows) {
       renderDashboard(email, rows);
     });
   }
+  // Search results sit outside the rail, so they need their own send wiring;
+  // everything inside #disc-body is wired by wireDiscover.
   for (const btn of app.querySelectorAll('[data-testid="rec-send"]')) {
-    if (!btn.closest("#browse-body")) wireRecSend(btn); // browse's own wiring covers the rest
+    if (!btn.closest("#disc-body")) wireRecSend(btn);
   }
-  wireBrowse(email, rows);
-  if (tab === "discover" && !state.search && !state.browse) {
-    runBrowse("trending", email, rows);
-  }
+  wireDiscover(email, rows);
+  ensureRail(email, rows);
 }
 
 // --- reader ---------------------------------------------------------------
