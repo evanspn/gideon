@@ -677,8 +677,20 @@ async function malRecommend(onStatus) {
 // Rankings and search don't filter against the library — you're allowed to look
 // at what you own — the card just shows "queued" instead of a Send button.
 
+// MAL's `title` is the romanised Japanese one — "Sousou no Frieren", not
+// "Frieren: Beyond Journey's End". Show the English title when MAL has one,
+// since that's the name an English-reading user typed into the search box and
+// the one they'll recognise in a result; fall back to the romanisation when
+// MAL has nothing, which is common for series never licensed in English.
+//
+// Only the *display* name changes. Matching elsewhere (the Kobo→MAL sync's
+// exact-title rule, the ratings cache) still runs on MAL's own title, so
+// nothing that writes to a real list starts matching on a different string.
+const malDisplayTitle = (n) =>
+  (n?.alternative_titles?.en || "").trim() || n?.title || "";
+
 async function malBrowse({ search, mode, limit = 18 }) {
-  const fields = "mean,genres,main_picture,media_type,nsfw";
+  const fields = "mean,genres,main_picture,media_type,nsfw,alternative_titles";
   const path = search
     ? `manga?q=${encodeURIComponent(search)}&limit=${limit}&fields=${fields}`
     : `manga/ranking?ranking_type=${mode === "top" ? "all" : "bypopularity"}&limit=${limit}&fields=${fields}`;
@@ -689,7 +701,7 @@ async function malBrowse({ search, mode, limit = 18 }) {
     .filter((n) => !["light_novel", "novel"].includes(n.media_type) && (n.nsfw ?? "white") === "white")
     .map((n) => ({
       id: n.id,
-      title: n.title || "",
+      title: malDisplayTitle(n),
       cover: malCover(n),
       score: malScore(n.mean),
       genres: (n.genres || []).map((g) => g.name),

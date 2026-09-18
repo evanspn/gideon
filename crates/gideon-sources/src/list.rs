@@ -53,6 +53,45 @@ impl SourceInformation {
             .as_deref()
             .or_else(|| self.languages.first().map(String::as_str))
     }
+
+    /// Whether this source serves any of `allowed` (language codes as the
+    /// lists spell them: "en", "tr", …).
+    ///
+    /// The community list is every language at once, sorted by name, so
+    /// without this a widened search installs Turkish and Indonesian sources
+    /// as readily as English ones and returns their results.
+    ///
+    /// Two kinds of source are deliberately kept whatever `allowed` says,
+    /// because dropping them costs more than the noise they let through:
+    ///
+    /// - one declaring *no* language, since a list that omits the field
+    ///   would otherwise have its entire catalogue silently vanish;
+    /// - one declaring "multi"/"all", which carries English alongside
+    ///   everything else — MangaDex-style catalogues are the main way most
+    ///   series are reachable at all, and they filter per chapter instead.
+    ///
+    /// An empty `allowed` means no filtering at all.
+    pub fn serves_language(&self, allowed: &[String]) -> bool {
+        if allowed.is_empty() {
+            return true;
+        }
+        let mut declared = self
+            .languages
+            .iter()
+            .map(String::as_str)
+            .chain(self.lang.as_deref())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .peekable();
+        if declared.peek().is_none() {
+            return true;
+        }
+        declared.any(|l| {
+            l.eq_ignore_ascii_case("multi")
+                || l.eq_ignore_ascii_case("all")
+                || allowed.iter().any(|a| a.trim().eq_ignore_ascii_case(l))
+        })
+    }
 }
 
 /// The set of configured source lists (defaults + user additions).
@@ -259,6 +298,43 @@ mod tests {
             sources[1].origin.as_deref(),
             Some("raw.githubusercontent.com")
         );
+    }
+
+    /// The language filter is what keeps a widened search from installing
+    /// whatever is alphabetically next in an all-languages catalogue.
+    #[test]
+    fn serves_language_filters_the_catalogue_by_language() {
+        let src = |lang: Option<&str>, languages: &[&str]| SourceInformation {
+            id: "x".into(),
+            name: "X".into(),
+            version: 1,
+            file: None,
+            lang: lang.map(str::to_string),
+            languages: languages.iter().map(|l| l.to_string()).collect(),
+            icon: None,
+            origin: None,
+        };
+        let en = vec!["en".to_string()];
+
+        assert!(src(Some("en"), &[]).serves_language(&en));
+        assert!(src(None, &["en"]).serves_language(&en));
+        // The whole point: a Turkish source is not an English search result.
+        assert!(!src(Some("tr"), &[]).serves_language(&en));
+        assert!(!src(None, &["id"]).serves_language(&en));
+        // A source listing several languages counts if any of them matches.
+        assert!(src(None, &["tr", "en"]).serves_language(&en));
+        // Case and stray whitespace in a hand-edited setting still match.
+        assert!(src(Some("EN"), &[]).serves_language(&[" en ".to_string()]));
+
+        // Kept on purpose: a multi-language catalogue carries English too,
+        // and an undeclared language means the list didn't say, not "no".
+        assert!(src(Some("multi"), &[]).serves_language(&en));
+        assert!(src(Some("all"), &[]).serves_language(&en));
+        assert!(src(None, &[]).serves_language(&en));
+        assert!(src(Some(""), &[]).serves_language(&en));
+
+        // No filter configured = the whole catalogue, as before.
+        assert!(src(Some("tr"), &[]).serves_language(&[]));
     }
 
     #[test]
