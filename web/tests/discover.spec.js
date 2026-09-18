@@ -527,7 +527,7 @@ test("a connected account runs its recommendations automatically", async ({ page
 
 // One dispatcher for /api/mal covering both client-id catalog calls and
 // user-token personal calls; records PATCH writes and every personal path hit.
-function mockMalApi(page, { patches = [], personal = [] } = {}) {
+function mockMalApi(page, { patches = [], personal = [], patchStatus = 200 } = {}) {
   page.route(/\/api\/mal\?path=/, (route) => {
     const req = route.request();
     const url = new URL(req.url());
@@ -537,7 +537,10 @@ function mockMalApi(page, { patches = [], personal = [] } = {}) {
     const json = (b, s = 200) =>
       route.fulfill({ status: s, contentType: "application/json", body: JSON.stringify(b) });
     if (req.method() === "PATCH") {
+      // Every attempt is recorded, so a test can count them (a 429 must be
+      // attempted exactly once, never immediately retried).
       patches.push({ path: p, body: JSON.parse(req.postData() || "{}") });
+      if (patchStatus !== 200) return json({ error: "rate limited" }, patchStatus);
       return json({ status: "reading" });
     }
     if (p === "users/@me") return json({ id: 1, name: "evan_mal" });
@@ -672,6 +675,78 @@ test("auto-sync runs again once another chapter is finished", async ({ page }) =
     path: "manga/2/my_list_status",
     body: { status: "reading", num_chapters_read: 2 },
   });
+});
+
+// The watermark the auto-sync gate reads. Seeding it is how these tests put
+// the clock where they need it without waiting out a real backoff.
+const SYNC_MARK_KEY = "gideon.malsync.reader@example.com";
+const seedSyncMark = (mark) => (page) =>
+  page.addInitScript(
+    ([k, m]) => localStorage.setItem(k, JSON.stringify(m)),
+    [SYNC_MARK_KEY, mark]
+  );
+
+const ONE_FINISHED = [
+  { chapter_key: "Berserk/ch1.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+];
+
+test("a rate-limited sync is never retried on the spot, and backs off hard", async ({ page }) => {
+  await mockSends(page);
+  const { patches } = mockMalApi(page, { patchStatus: 429 });
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, ONE_FINISHED);
+
+  await expect(page.getByTestId("mal-sync-error")).toBeVisible({ timeout: 20000 });
+  await expect(page.getByTestId("mal-sync-error")).toContainText("rate-limiting");
+  // Exactly one attempt: a 429 retried two seconds later is what earns a
+  // longer block, so that path must not exist.
+  expect(patches).toHaveLength(1);
+
+  // The watermark enters the ladder several doublings in (1h), not at 15m.
+  const mark = await page.evaluate((k) => JSON.parse(localStorage.getItem(k)), SYNC_MARK_KEY);
+  expect(mark.ok).toBe(false);
+  expect(mark.fails).toBeGreaterThanOrEqual(3);
+
+  // And the next dashboard load spends nothing while that backoff holds.
+  await page.reload();
+  await page.getByTestId("tab-discover").click();
+  await expect(page.getByTestId("mal-connected")).toBeVisible();
+  await page.waitForTimeout(1500);
+  expect(patches).toHaveLength(1);
+});
+
+test("a failed sync retries once its backoff has expired", async ({ page }) => {
+  await mockSends(page);
+  const { patches } = mockMalApi(page);
+  await page.addInitScript(CONNECTED);
+  // One past failure → a 15-minute backoff, which expired an hour ago.
+  await seedSyncMark({ at: Date.now() - 60 * 60_000, sig: "stale", ok: false, fails: 1 })(page);
+  await signInWithRows(page, ONE_FINISHED);
+
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  expect(patches).toHaveLength(1);
+  // A success clears the ladder, so the next real failure starts at the bottom.
+  const mark = await page.evaluate((k) => JSON.parse(localStorage.getItem(k)), SYNC_MARK_KEY);
+  expect(mark).toMatchObject({ ok: true, fails: 0 });
+});
+
+test("a long-failing sync waits out the doubled backoff, not the first one", async ({ page }) => {
+  await mockSends(page);
+  const { patches } = mockMalApi(page);
+  await page.addInitScript(CONNECTED);
+  // Four consecutive failures → a 2-hour wait; 30 minutes ago is not enough.
+  await seedSyncMark({ at: Date.now() - 30 * 60_000, sig: "stale", ok: false, fails: 4 })(page);
+  await signInWithRows(page, ONE_FINISHED);
+
+  await expect(page.getByTestId("mal-connected")).toBeVisible();
+  await page.waitForTimeout(1500);
+  expect(patches).toHaveLength(0);
+  await expect(page.getByTestId("mal-sync-running")).toHaveCount(0);
+
+  // The button still overrides it — an explicit ask is never gated.
+  await page.getByTestId("mal-sync").click();
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  expect(patches).toHaveLength(1);
 });
 
 test("connected recommendations read the private @me list, never the public path", async ({ page }) => {

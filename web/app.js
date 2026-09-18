@@ -1015,10 +1015,26 @@ function setMalSyncMark(mark) {
   } catch {}
 }
 
-// A run that failed backs off this long before the next load retries it.
-// Without the cooldown a MAL outage would be retried on every page load; with
-// it, a real outage costs one wasted run every quarter hour.
-const MAL_AUTOSYNC_RETRY_MS = 15 * 60_000;
+// Backoff for a failed run. A flat cooldown is the wrong shape here: a MAL
+// outage or a rate-limit lasts as long as it lasts, and retrying it at a fixed
+// interval from every dashboard load is exactly how an account earns a longer
+// ban. So each consecutive failure doubles the wait — 15m, 30m, 1h, 2h … up to
+// a day — and one success clears the count.
+const MAL_AUTOSYNC_BACKOFF_MS = 15 * 60_000;
+const MAL_AUTOSYNC_BACKOFF_MAX_MS = 24 * 60 * 60_000;
+
+// A 429 is MAL explicitly saying we asked too often, so it doesn't start at the
+// bottom of the ladder: it enters several doublings in (1h) even on the first
+// one. Backing off too far costs a late sync; backing off too little costs the
+// user's access to the API.
+const MAL_AUTOSYNC_RATE_LIMIT_FLOOR = 3;
+
+function malSyncBackoffMs(fails) {
+  return Math.min(
+    MAL_AUTOSYNC_BACKOFF_MS * 2 ** Math.max(0, fails - 1),
+    MAL_AUTOSYNC_BACKOFF_MAX_MS
+  );
+}
 
 // What the sync would send, as a comparable string: every series' normalized
 // title and finished-chapter count. Page-level progress inside an unfinished
@@ -1038,7 +1054,7 @@ function maybeAutoSyncMal(email, rows) {
   if (!groups.some((g) => finishedChapters(g) > 0)) return;
   const mark = malSyncMark();
   if (mark?.ok && mark.sig === malSyncSignature(groups)) return;
-  if (mark && !mark.ok && Date.now() - (mark.at || 0) < MAL_AUTOSYNC_RETRY_MS) return;
+  if (mark && !mark.ok && Date.now() - (mark.at || 0) < malSyncBackoffMs(mark.fails || 1)) return;
   // Nothing awaits this, so it must swallow its own rejection: an unhandled
   // one here would surface as a console error on an ordinary dashboard load.
   syncKoboToMal(email, rows).catch(() => {});
@@ -1055,7 +1071,13 @@ async function syncKoboToMal(email, rows) {
   // considered: a run that couldn't reach MAL's search left series unmatched
   // that a later run could still match, so it counts as a failure and retries.
   const done = state.malSync?.phase === "done" && !state.malSync?.retryable;
-  setMalSyncMark({ at: Date.now(), sig, ok: done });
+  const fails = done
+    ? 0
+    : Math.max(
+        (malSyncMark()?.fails || 0) + 1,
+        state.malSync?.rateLimited ? MAL_AUTOSYNC_RATE_LIMIT_FLOOR : 0
+      );
+  setMalSyncMark({ at: Date.now(), sig, ok: done, fails });
 }
 
 async function runKoboToMalSync(email, rows) {
@@ -1071,6 +1093,7 @@ async function runKoboToMalSync(email, rows) {
     state.malSync = {
       phase: "error",
       error: e.reconnect ? "MyAnimeList needs a reconnect first." : "Couldn't read your MAL list — try again.",
+      rateLimited: e.status === 429,
     };
     patchMalSync();
     return;
@@ -1146,19 +1169,29 @@ async function runKoboToMalSync(email, rows) {
       report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
     } catch (e) {
       if (e.status === 429 || e.status >= 500) {
-        // One paused retry; if MAL is really struggling, stop — the run is
-        // idempotent, so "Sync again" resumes exactly where this left off.
-        await sleep(2000);
-        try {
-          await malUserPatch(`manga/${id}/my_list_status`, { status, num_chapters_read: target });
-          updated++;
-          report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
-          continue;
-        } catch {}
+        // A 5xx is MAL briefly unwell, so one paused retry is worth it. A 429
+        // is MAL telling us to stop asking — retrying it two seconds later is
+        // the behaviour that earns a longer block, so that one stops dead and
+        // leaves the rest to the backoff.
+        if (e.status !== 429) {
+          await sleep(2000);
+          try {
+            await malUserPatch(`manga/${id}/my_list_status`, { status, num_chapters_read: target });
+            updated++;
+            report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
+            continue;
+          } catch {}
+        }
+        // The run is idempotent, so both the backoff and a manual "Sync again"
+        // resume exactly where this left off.
         state.malSync = {
           phase: "error",
-          error: "MyAnimeList is rate-limiting — tap Sync again in a minute to resume.",
+          error:
+            e.status === 429
+              ? "MyAnimeList is rate-limiting — paused, and it'll pick up again on its own."
+              : "MyAnimeList is having trouble — paused, and it'll pick up again on its own.",
           report,
+          rateLimited: e.status === 429,
         };
         patchMalSync();
         return;
