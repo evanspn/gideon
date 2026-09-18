@@ -226,10 +226,18 @@ impl SourceGateway for AidokuGateway {
 
     fn available_sources(&self) -> Result<Vec<SourceEntry>> {
         let lists = manga::configured_lists(&self.data_dir)?;
+        // The language filter belongs here rather than at the call sites:
+        // both the Sources screen and a widened search read this list, and a
+        // widen that installs whatever is alphabetically next is exactly how
+        // a search for an English manga comes back in Turkish.
+        let languages = gideon_core::Settings::load(&self.data_dir)
+            .unwrap_or_default()
+            .languages;
         let fetcher = UreqFetcher::new();
         let sources = lists.available_sources(&fetcher)?;
         Ok(sources
             .into_iter()
+            .filter(|s| s.serves_language(&languages))
             .map(|s| SourceEntry {
                 id: s.id,
                 name: s.name,

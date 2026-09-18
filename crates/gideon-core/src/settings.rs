@@ -70,7 +70,19 @@ pub struct Settings {
     /// defaults.
     pub source_lists: Vec<String>,
 
-    /// If set, only show sources/chapters for these languages.
+    /// Which languages the source catalogue is filtered to, as the source
+    /// lists spell them ("en", "ja", …). Empty means no filtering.
+    ///
+    /// Defaults to English rather than to "everything": the community list is
+    /// every language at once, so an unfiltered catalogue means a widened
+    /// search quietly installs Turkish and Indonesian sources and returns
+    /// their results, which is nobody's idea of a search. Someone who wants
+    /// the whole catalogue back sets this to `[]`.
+    ///
+    /// Only the *available* catalogue is filtered. Sources already installed
+    /// keep working and keep being searched, whatever language they are — a
+    /// filter that retroactively hid a source could strand a reader halfway
+    /// through a series.
     pub languages: Vec<String>,
 
     /// Profiles: each profile sees its own library subdirectory. The
@@ -210,7 +222,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             source_lists: Vec::new(),
-            languages: Vec::new(),
+            languages: vec!["en".to_string()],
             profiles: vec!["default".to_string()],
             active_profile: "default".to_string(),
             storage_size_limit: StorageSize(DEFAULT_STORAGE_LIMIT_BYTES),
@@ -1036,6 +1048,23 @@ mod tests {
 
         let loaded = Settings::load(dir.path()).unwrap();
         assert_eq!(loaded, s);
+    }
+
+    /// A fresh install filters the source catalogue to English. Without a
+    /// default here the setting is inert, and a widened search installs
+    /// whatever the all-languages community list offers next.
+    #[test]
+    fn a_fresh_install_filters_sources_to_english() {
+        assert_eq!(Settings::default().languages, vec!["en".to_string()]);
+    }
+
+    /// Opting out has to stay possible, and an explicit empty list is how:
+    /// it must survive a load rather than being re-defaulted to English.
+    #[test]
+    fn an_explicit_empty_language_list_means_no_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(Settings::path(dir.path()), r#"{"languages": []}"#).unwrap();
+        assert!(Settings::load(dir.path()).unwrap().languages.is_empty());
     }
 
     #[test]

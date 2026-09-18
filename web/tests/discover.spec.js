@@ -749,6 +749,42 @@ test("a long-failing sync waits out the doubled backoff, not the first one", asy
   expect(patches).toHaveLength(1);
 });
 
+test("search results show the English title, not the romanised one", async ({ page }) => {
+  await mockSends(page);
+  await page.route(/\/api\/mal\?path=/, (route) => {
+    const path = new URL(route.request().url()).searchParams.get("path") || "";
+    const json = (b) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
+    if (path.startsWith("manga?q=")) {
+      return json({
+        data: [
+          {
+            node: {
+              id: 1,
+              title: "Sousou no Frieren",
+              media_type: "manga",
+              nsfw: "white",
+              alternative_titles: { en: "Frieren: Beyond Journey's End" },
+            },
+          },
+          // No English title on MAL → the romanisation is all there is, and
+          // it must still show rather than blanking the card.
+          { node: { id: 2, title: "Oyasumi Punpun", media_type: "manga", nsfw: "white", alternative_titles: {} } },
+        ],
+      });
+    }
+    return json({ data: [] });
+  });
+  await signInWithRows(page, ROWS);
+
+  await page.getByTestId("search-input").fill("frieren");
+  await page.getByTestId("search-btn").click();
+  const cards = page.getByTestId("rec-card");
+  await expect(cards.first()).toContainText("Frieren: Beyond Journey's End", { timeout: 15000 });
+  await expect(cards.first()).not.toContainText("Sousou no Frieren");
+  await expect(cards.nth(1)).toContainText("Oyasumi Punpun");
+});
+
 test("connected recommendations read the private @me list, never the public path", async ({ page }) => {
   await mockSends(page);
   const { personal } = mockMalApi(page);
