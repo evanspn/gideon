@@ -979,8 +979,108 @@ async function malUserPatch(path, fields) {
 const seriesQuery = (title) =>
   title.replace(/\s*\([^)]*\)/g, "").replace(/^manga[\s-]+/i, "").trim() || title;
 
+// How many chapters of a series are finished — the only number this sync ever
+// writes to MAL. Shared with the auto-sync signature below so "has anything
+// changed?" can never drift from "what would we actually send?".
+const finishedChapters = (g) =>
+  g.chapters.filter((c) => c.total_pages > 0 && c.current_page + 1 >= c.total_pages).length;
+
+// --- Auto-sync -------------------------------------------------------------
+//
+// Connecting an account is the user saying "keep my list up to date"; a button
+// they have to remember to press is not that. So the sync runs itself on every
+// dashboard load — which also covers the moment right after the OAuth return,
+// since boot() awaits finishMalConnect() before showDashboard().
+//
+// It is gated, not unconditional: a full run is one MAL request per series and
+// MAL rate-limits hard, so a run only happens when the finished-chapter picture
+// has actually changed since the last successful one. The watermark lives in
+// localStorage next to the tokens (browser-only, like everything MAL here —
+// there is no server-side copy of the token, so there is nothing to sync from
+// while the dashboard is closed).
+
+const malSyncKeyFor = (email) => `gideon.malsync.${email || "anon"}`;
+const malSyncKey = () => malSyncKeyFor(state.session?.email || loadSession()?.email);
+
+function malSyncMark() {
+  try {
+    return JSON.parse(localStorage.getItem(malSyncKey()));
+  } catch {
+    return null;
+  }
+}
+function setMalSyncMark(mark) {
+  try {
+    localStorage.setItem(malSyncKey(), JSON.stringify(mark));
+  } catch {}
+}
+
+// Backoff for a failed run. A flat cooldown is the wrong shape here: a MAL
+// outage or a rate-limit lasts as long as it lasts, and retrying it at a fixed
+// interval from every dashboard load is exactly how an account earns a longer
+// ban. So each consecutive failure doubles the wait — 15m, 30m, 1h, 2h … up to
+// a day — and one success clears the count.
+const MAL_AUTOSYNC_BACKOFF_MS = 15 * 60_000;
+const MAL_AUTOSYNC_BACKOFF_MAX_MS = 24 * 60 * 60_000;
+
+// A 429 is MAL explicitly saying we asked too often, so it doesn't start at the
+// bottom of the ladder: it enters several doublings in (1h) even on the first
+// one. Backing off too far costs a late sync; backing off too little costs the
+// user's access to the API.
+const MAL_AUTOSYNC_RATE_LIMIT_FLOOR = 3;
+
+function malSyncBackoffMs(fails) {
+  return Math.min(
+    MAL_AUTOSYNC_BACKOFF_MS * 2 ** Math.max(0, fails - 1),
+    MAL_AUTOSYNC_BACKOFF_MAX_MS
+  );
+}
+
+// What the sync would send, as a comparable string: every series' normalized
+// title and finished-chapter count. Page-level progress inside an unfinished
+// chapter deliberately does NOT move this — it would change nothing on MAL, so
+// it must not cost a sync run.
+function malSyncSignature(groups) {
+  return groups
+    .map((g) => `${normTitle(displayTitle(g.series))}:${finishedChapters(g)}`)
+    .sort()
+    .join("|");
+}
+
+function maybeAutoSyncMal(email, rows) {
+  if (!malConn() || state.malSync?.phase === "running") return;
+  const groups = groupBySeries(rows);
+  // Nothing finished yet — a run would read the MAL list and write nothing.
+  if (!groups.some((g) => finishedChapters(g) > 0)) return;
+  const mark = malSyncMark();
+  if (mark?.ok && mark.sig === malSyncSignature(groups)) return;
+  if (mark && !mark.ok && Date.now() - (mark.at || 0) < malSyncBackoffMs(mark.fails || 1)) return;
+  // Nothing awaits this, so it must swallow its own rejection: an unhandled
+  // one here would surface as a console error on an ordinary dashboard load.
+  syncKoboToMal(email, rows).catch(() => {});
+}
+
+// Records the watermark around a run, so the next load knows whether there is
+// anything new to send. A manual tap on "Sync Kobo reading" comes through here
+// too and is never gated — an explicit ask always runs.
 async function syncKoboToMal(email, rows) {
   if (!malConn() || state.malSync?.phase === "running") return;
+  const sig = malSyncSignature(groupBySeries(rows));
+  await runKoboToMalSync(email, rows);
+  // "Done" is only worth remembering if the whole picture was actually
+  // considered: a run that couldn't reach MAL's search left series unmatched
+  // that a later run could still match, so it counts as a failure and retries.
+  const done = state.malSync?.phase === "done" && !state.malSync?.retryable;
+  const fails = done
+    ? 0
+    : Math.max(
+        (malSyncMark()?.fails || 0) + 1,
+        state.malSync?.rateLimited ? MAL_AUTOSYNC_RATE_LIMIT_FLOOR : 0
+      );
+  setMalSyncMark({ at: Date.now(), sig, ok: done, fails });
+}
+
+async function runKoboToMalSync(email, rows) {
   const groups = groupBySeries(rows);
   state.malSync = { phase: "running", note: "Reading your MAL list…", report: [] };
   patchMalSync();
@@ -993,6 +1093,7 @@ async function syncKoboToMal(email, rows) {
     state.malSync = {
       phase: "error",
       error: e.reconnect ? "MyAnimeList needs a reconnect first." : "Couldn't read your MAL list — try again.",
+      rateLimited: e.status === 429,
     };
     patchMalSync();
     return;
@@ -1003,12 +1104,15 @@ async function syncKoboToMal(email, rows) {
   const report = [];
   state.malSync.report = report;
   let i = 0;
+  // Set when a series was skipped for a reason a later run could do better on
+  // (MAL search unreachable), as opposed to a settled "no confident match".
+  let retryable = false;
   for (const g of groups) {
     i++;
     state.malSync.note = `Matching ${i}/${groups.length}…`;
     patchMalSync();
     const title = displayTitle(g.series);
-    const finished = g.chapters.filter((c) => c.total_pages > 0 && c.current_page + 1 >= c.total_pages).length;
+    const finished = finishedChapters(g);
     const q = seriesQuery(title);
     let match = null;
     try {
@@ -1021,6 +1125,7 @@ async function syncKoboToMal(email, rows) {
         .filter((n) => !["light_novel", "novel"].includes(n.media_type))
         .find((n) => normTitle(n.title) === normTitle(q));
     } catch {
+      retryable = true;
       report.push({ title, outcome: "skipped", note: "search unavailable — run sync again later" });
       continue;
     }
@@ -1064,19 +1169,29 @@ async function syncKoboToMal(email, rows) {
       report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
     } catch (e) {
       if (e.status === 429 || e.status >= 500) {
-        // One paused retry; if MAL is really struggling, stop — the run is
-        // idempotent, so "Sync again" resumes exactly where this left off.
-        await sleep(2000);
-        try {
-          await malUserPatch(`manga/${id}/my_list_status`, { status, num_chapters_read: target });
-          updated++;
-          report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
-          continue;
-        } catch {}
+        // A 5xx is MAL briefly unwell, so one paused retry is worth it. A 429
+        // is MAL telling us to stop asking — retrying it two seconds later is
+        // the behaviour that earns a longer block, so that one stops dead and
+        // leaves the rest to the backoff.
+        if (e.status !== 429) {
+          await sleep(2000);
+          try {
+            await malUserPatch(`manga/${id}/my_list_status`, { status, num_chapters_read: target });
+            updated++;
+            report.push({ title: t.malTitle, outcome: "updated", note: `${status}, ${target} ch` });
+            continue;
+          } catch {}
+        }
+        // The run is idempotent, so both the backoff and a manual "Sync again"
+        // resume exactly where this left off.
         state.malSync = {
           phase: "error",
-          error: "MyAnimeList is rate-limiting — tap Sync again in a minute to resume.",
+          error:
+            e.status === 429
+              ? "MyAnimeList is rate-limiting — paused, and it'll pick up again on its own."
+              : "MyAnimeList is having trouble — paused, and it'll pick up again on its own.",
           report,
+          rateLimited: e.status === 429,
         };
         patchMalSync();
         return;
@@ -1085,7 +1200,7 @@ async function syncKoboToMal(email, rows) {
     }
   }
 
-  state.malSync = { phase: "done", updated, report };
+  state.malSync = { phase: "done", updated, report, retryable };
   patchMalSync();
 }
 
@@ -2583,6 +2698,9 @@ function renderDashboard(email, rows) {
   }
   document.getElementById("mal-disconnect")?.addEventListener("click", () => {
     clearMalConn();
+    try {
+      localStorage.removeItem(malSyncKey());
+    } catch {}
     state.discover = null;
     state.malSync = null;
     renderDashboard(email, rows);
@@ -2938,6 +3056,10 @@ async function showDashboard(session) {
     // Covers for the library shelf (best-effort decor).
     state.covers = coverBySeries(await fetchAllChapterPages().catch(() => []));
     renderDashboard(email, rows);
+    // Push what they've read onto their MAL list without waiting to be asked.
+    // Fire-and-forget: it patches its own panel as it goes and must never hold
+    // up the dashboard.
+    maybeAutoSyncMal(email, rows);
     // Community ratings for the shelf (decor): resolved in the background,
     // then the library re-renders if it's on screen. Never blocks sign-in.
     const seriesTitles = [...new Set(rows.map((r) => displayTitle(parseKey(r.chapter_key).series)))];
