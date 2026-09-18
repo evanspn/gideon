@@ -587,7 +587,7 @@ async function signInWithRows(page, rows) {
   await page.getByTestId("tab-discover").click();
 }
 
-test("Sync Kobo→MAL: exact matches written furthest-wins, the rest reported", async ({ page }) => {
+test("Sync Kobo→MAL runs itself on load: exact matches written furthest-wins, the rest reported", async ({ page }) => {
   await mockSends(page);
   const { patches } = mockMalApi(page);
   await page.addInitScript(CONNECTED);
@@ -600,7 +600,7 @@ test("Sync Kobo→MAL: exact matches written furthest-wins, the rest reported", 
     { chapter_key: "Weird Unknown Manga/c1.cbz", current_page: 9, total_pages: 10, updated_at: new Date().toISOString() },
   ]);
 
-  await page.getByTestId("mal-sync").click();
+  // No tap on "Sync Kobo reading" — a connected account syncs on its own.
   await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
   await expect(page.getByTestId("mal-sync-done")).toContainText("1 update");
 
@@ -613,6 +613,65 @@ test("Sync Kobo→MAL: exact matches written furthest-wins, the rest reported", 
   await expect(rows.filter({ hasText: "kept" })).toContainText("already at 5");
   await expect(rows.filter({ hasText: "skipped" })).toContainText("no confident match");
   await expect(rows.filter({ hasText: "updated" })).toContainText("Berserk");
+});
+
+test("auto-sync doesn't repeat itself when nothing new was finished", async ({ page }) => {
+  await mockSends(page);
+  const { patches } = mockMalApi(page);
+  await page.addInitScript(CONNECTED);
+  const ROWS_ONE = [
+    { chapter_key: "Berserk/ch1.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+  ];
+  await signInWithRows(page, ROWS_ONE);
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  expect(patches).toHaveLength(1);
+
+  // Same finished-chapter picture on the next load → no second run, so a MAL
+  // request per series isn't spent every time the dashboard is opened.
+  await page.reload();
+  await page.getByTestId("tab-discover").click();
+  await expect(page.getByTestId("mal-connected")).toBeVisible();
+  await page.waitForTimeout(1500);
+  expect(patches).toHaveLength(1);
+  await expect(page.getByTestId("mal-sync-running")).toHaveCount(0);
+
+  // The button is still there for an explicit re-run, and is never gated.
+  await page.getByTestId("mal-sync").click();
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  expect(patches.length).toBeGreaterThan(1);
+});
+
+test("auto-sync runs again once another chapter is finished", async ({ page }) => {
+  await mockSends(page);
+  const { patches } = mockMalApi(page);
+  await page.addInitScript(CONNECTED);
+  await signInWithRows(page, [
+    { chapter_key: "Berserk/ch1.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+  ]);
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  expect(patches).toEqual([
+    { path: "manga/2/my_list_status", body: { status: "reading", num_chapters_read: 1 } },
+  ]);
+
+  // A second finished chapter changes what MAL should hold → a run, unprompted.
+  await page.route("**/rest/v1/reading_progress**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        { chapter_key: "Berserk/ch1.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+        { chapter_key: "Berserk/ch2.cbz", current_page: 19, total_pages: 20, updated_at: new Date().toISOString() },
+      ]),
+    })
+  );
+  await page.reload();
+  await page.getByTestId("tab-discover").click();
+  await expect(page.getByTestId("mal-sync-done")).toBeVisible({ timeout: 20000 });
+  expect(patches).toHaveLength(2);
+  expect(patches[1]).toEqual({
+    path: "manga/2/my_list_status",
+    body: { status: "reading", num_chapters_read: 2 },
+  });
 });
 
 test("connected recommendations read the private @me list, never the public path", async ({ page }) => {
