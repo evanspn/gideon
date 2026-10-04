@@ -9191,3 +9191,32 @@ fn the_calendar_draws_a_run_of_days_as_one_bar() {
     assert_eq!(berserk.len(), 1, "four consecutive evenings are ONE run");
     assert_eq!(berserk[0].days(), 4);
 }
+
+#[test]
+fn slow_handled_tap_drops_the_taps_queued_behind_it() {
+    // Regression: taps made while a slow handler (render, e-ink refresh wait,
+    // IO) ran used to fire afterwards against a screen that had moved on —
+    // the "queued taps fire late and select the wrong thing" bug.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    make_cbz(&lib.join("Berserk/vol1.cbz"), 3);
+
+    let tap = UiEvent::Tap { x: 5, y: 5 };
+    let mut slow = app(&lib, FakeGateway::default(), vec![tap])
+        .with_stale_tap_after(std::time::Duration::ZERO);
+    slow.run().unwrap();
+    assert!(
+        slow.input().discard_taps_calls >= 1,
+        "a handler that took 'too long' must flush the stale queue"
+    );
+
+    // A handler that finishes quickly must not eat the user's next tap.
+    let mut fast = app(&lib, FakeGateway::default(), vec![tap])
+        .with_stale_tap_after(std::time::Duration::from_secs(3600));
+    fast.run().unwrap();
+    assert_eq!(
+        fast.input().discard_taps_calls,
+        0,
+        "fast handling must never drop input"
+    );
+}

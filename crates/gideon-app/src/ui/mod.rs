@@ -632,6 +632,11 @@ const IDLE_SUSPEND: std::time::Duration = std::time::Duration::from_secs(15 * 60
 /// How long each idle-detection poll waits between wall-clock checks.
 const IDLE_SUSPEND_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A handled event that took at least this long (render + e-ink refresh wait,
+/// IO, network) leaves the screen changed under any taps made meanwhile: they
+/// were aimed at the old screen, so they are dropped instead of firing late.
+const STALE_TAP_AFTER: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// Idle-suspend choices the Settings row cycles through, in minutes — the
 /// same increments Nickel and KOReader offer. 0 means "never".
 const IDLE_SUSPEND_STEPS: [u32; 6] = [5, 10, 15, 30, 60, 0];
@@ -801,6 +806,8 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// [`IDLE_SUSPEND`]); only enforced when a sleeper is installed. Tests
     /// shrink it to zero to exercise the path.
     idle_suspend: std::time::Duration,
+    /// See [`STALE_TAP_AFTER`]; a field so tests can force or disable it.
+    stale_tap_after: std::time::Duration,
     /// Charger-plugged probe (sysfs on hardware). With one installed, a
     /// suspend refused while charging waits for the unplug and then sleeps
     /// (see [`sleep_once_unplugged`]); `None` (tests, headless) keeps the
@@ -897,6 +904,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             settings_dir: None,
             battery: None,
             idle_suspend: IDLE_SUSPEND,
+            stale_tap_after: STALE_TAP_AFTER,
             charger: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
             sheet: None,
@@ -1007,6 +1015,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Apply the saved idle-suspend timeout (minutes; 0 = never). Enforced
     /// only when a suspend hook is installed.
+    /// Test hook: how long a handled event may take before queued taps count
+    /// as stale (zero = always drop, huge = never).
+    #[cfg(test)]
+    fn with_stale_tap_after(mut self, after: std::time::Duration) -> Self {
+        self.stale_tap_after = after;
+        self
+    }
+
     pub fn with_idle_suspend_minutes(mut self, minutes: u32) -> Self {
         self.idle_suspend = idle_suspend_duration(minutes);
         self
@@ -1122,6 +1138,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             } else {
                 self.input.next_event()
             };
+            let handling_started = std::time::Instant::now();
             match event {
                 Err(_) => return Ok(Exit::Close), // input source closed
                 // Every pointer event funnels through map_menu_point first
@@ -1183,6 +1200,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                 }
             }
+            self.drop_stale_taps(handling_started);
+        }
+    }
+
+    /// After handling an event that took long enough for the user to tap
+    /// again, throw away everything queued meanwhile: those taps targeted the
+    /// screen as it was, not as it is now (sleep requests survive the drain).
+    fn drop_stale_taps(&mut self, handling_started: std::time::Instant) {
+        if handling_started.elapsed() >= self.stale_tap_after {
+            self.input.discard_taps();
         }
     }
 
