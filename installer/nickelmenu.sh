@@ -63,21 +63,24 @@ if [ "$CMD" = status ]; then
 fi
 
 # install
+USER_TGZ=1
 if [ -z "$TGZ" ]; then
+    USER_TGZ=0
     CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/gideon"
     TGZ="$CACHE/NickelMenu-$NM_VERSION-KoboRoot.tgz"
     if [ ! -f "$TGZ" ]; then
         [ "$DRY" -eq 1 ] && { echo "would download $NM_URL"; echo "would verify sha256 $NM_SHA256"; echo "would write $PENDING"; exit 0; }
         mkdir -p "$CACHE"
         command -v curl >/dev/null 2>&1 || die "curl not found; pass --tgz FILE"
-        curl -fsSL -o "$TGZ.part" "$NM_URL" || { rm -f "$TGZ.part"; die "download failed"; }
+        curl --proto =https --tlsv1.2 -fsSL -o "$TGZ.part" "$NM_URL" || { rm -f "$TGZ.part"; die "download failed"; }
         mv "$TGZ.part" "$TGZ"
     fi
 fi
 [ -f "$TGZ" ] || die "no such file: $TGZ"
 GOT=$(sha256_of "$TGZ")
 if [ "$GOT" != "$NM_SHA256" ]; then
-    rm -f "$TGZ" 2>/dev/null || true
+    # Only ever delete our own cache file, never a file the user passed in.
+    [ "$USER_TGZ" -eq 1 ] || rm -f "$TGZ" 2>/dev/null || true
     die "checksum mismatch for NickelMenu $NM_VERSION (got $GOT); refusing to install"
 fi
 
@@ -87,6 +90,12 @@ if [ -f "$PENDING" ] && [ "$FORCE" -ne 1 ]; then
 fi
 
 if [ "$DRY" -eq 1 ]; then echo "would write $PENDING (verified $NM_VERSION)"; exit 0; fi
-cp "$TGZ" "$PENDING.part"
+cp "$TGZ" "$PENDING.part" || { rm -f "$PENDING.part"; die "copy to the Kobo failed"; }
+sync
+if [ "$(sha256_of "$PENDING.part")" != "$NM_SHA256" ]; then
+    rm -f "$PENDING.part"
+    die "copy on the Kobo does not match the checksum; nothing staged"
+fi
 mv "$PENDING.part" "$PENDING"
+sync
 echo "Staged NickelMenu $NM_VERSION. Eject the Kobo; it installs on the next boot."

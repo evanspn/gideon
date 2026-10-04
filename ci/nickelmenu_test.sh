@@ -18,6 +18,7 @@ echo "==> refuses non-Kobo"; sh "$T2" install --root "$W/nope" --tgz "$W/fake.tg
 echo "==> status"; OUT=$(sh "$T2" status --root "$R"); case "$OUT" in *"Pending:   none"*) ;; *) fail "status";; esac
 echo "==> bad checksum refused"; echo bad > "$W/bad.tgz"; sh "$T2" install --root "$R" --tgz "$W/bad.tgz" 2>/dev/null && fail "bad tgz accepted"
 [ ! -e "$R/.kobo/KoboRoot.tgz" ] || fail "wrote on bad checksum"
+[ -f "$W/bad.tgz" ] || fail "deleted the user-supplied tgz"
 echo "==> dry run writes nothing"; sh "$T2" install --root "$R" --tgz "$W/fake.tgz" --dry-run >/dev/null; [ ! -e "$R/.kobo/KoboRoot.tgz" ] || fail "dry-run wrote"
 echo "==> install stages tgz"; sh "$T2" install --root "$R" --tgz "$W/fake.tgz" >/dev/null; cmp "$W/fake.tgz" "$R/.kobo/KoboRoot.tgz" || fail "not staged"
 echo "==> idempotent"; OUT=$(sh "$T2" install --root "$R" --tgz "$W/fake.tgz"); case "$OUT" in *already*) ;; *) fail "not idempotent";; esac
