@@ -9220,3 +9220,39 @@ fn slow_handled_tap_drops_the_taps_queued_behind_it() {
         "fast handling must never drop input"
     );
 }
+
+/// Headless latency harness (not part of the normal run):
+/// `cargo test --release -p gideon-app tap_latency_bench -- --ignored --nocapture`.
+/// Reports host-side CPU cost per handled tap and panel flushes per tap. It
+/// excludes the e-ink refresh wait, which only exists on the device.
+#[test]
+#[ignore]
+fn tap_latency_bench() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("Manga");
+    for i in 0..40 {
+        make_cbz(&lib.join(format!("Series{i:02}/vol1.cbz")), 3);
+    }
+    let taps: Vec<UiEvent> = (0..60)
+        .map(|i| UiEvent::Tap {
+            x: 60 + (i % 5) * 100,
+            y: 150 + (i % 7) * 90,
+        })
+        .collect();
+    let n = taps.len();
+    let mut app = app(&lib, FakeGateway::default(), taps);
+    let start = std::time::Instant::now();
+    app.run().unwrap();
+    let total = start.elapsed();
+    let flushes = app.display().flushes.len();
+    let full = app
+        .display()
+        .flushes
+        .iter()
+        .filter(|m| **m == RefreshMode::Full)
+        .count();
+    println!(
+        "BENCH taps={n} total={total:?} per_tap={:?} flushes={flushes} full={full}",
+        total / n as u32
+    );
+}
