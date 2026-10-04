@@ -53,7 +53,7 @@ PENDING="$ROOT/.kobo/KoboRoot.tgz"
 if [ "$CMD" = status ]; then
     echo "Kobo:      $ROOT"
     [ -f "$ROOT/.kobo/version" ] && echo "Firmware:  $(cut -d, -f3 "$ROOT/.kobo/version")"
-    if [ -d "$ROOT/.adds/nm" ]; then echo "Menu dir:  .adds/nm present ($(ls "$ROOT/.adds/nm" | tr '\n' ' '))"
+    if [ -d "$ROOT/.adds/nm" ]; then echo "Menu dir:  .adds/nm present ($(find "$ROOT/.adds/nm" -maxdepth 1 -type f -exec basename {} \; | tr '\n' ' '))"
     else echo "Menu dir:  .adds/nm MISSING"; fi
     if [ -f "$PENDING" ]; then echo "Pending:   KoboRoot.tgz waiting (installs on next reboot)"
     else echo "Pending:   none"; fi
