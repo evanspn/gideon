@@ -150,10 +150,12 @@ jobs:
       # lint below fails with command-not-found, which is loud and obvious.
       - name: Lint shell scripts
         if: needs.changes.outputs.shell == 'true'
-        run: shellcheck installer/install.sh installer/gideon-launch.sh ci/installer_test.sh ci/qemu_integration.sh
+        run: shellcheck installer/install.sh installer/gideon-launch.sh installer/nickelmenu.sh ci/installer_test.sh ci/nickelmenu_test.sh ci/qemu_integration.sh
       - name: Run installer test suite
         if: needs.changes.outputs.shell == 'true'
-        run: ./ci/installer_test.sh
+        run: |
+          ./ci/installer_test.sh
+          ./ci/nickelmenu_test.sh
 
   # The web dashboard: the Playwright suite and the serverless-function
   # tests. Until this existed, web/ and api/ shipped with no CI at all —

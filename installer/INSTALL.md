@@ -84,14 +84,25 @@ back to a full reboot, which always recovers the device.
 
 ### The gideon menu entry disappears from Home after a Kobo firmware update
 
-Kobo firmware updates reset the device's system partition, which is where
-NickelMenu's own hook into Nickel lives. Your `.adds/` folder (everything
-under it, including `.adds/gideon/` and `.adds/nm/gideon`) is on the FAT32
-user partition and is untouched by a firmware update — so your reading
-progress and settings are never at risk here. What's gone is just
-NickelMenu's ability to read `.adds/nm/gideon` and add the entry to Home.
+Most likely cause: NickelMenu parks its hook (`libnm.so`) as
+`libnm.so.failsafe` on every Nickel start and renames it back a few seconds
+later. A firmware update reboots the device several times; if one of those
+boots is cut short inside that window the hook stays parked and the menu is
+missing next time. (An update that replaces the system partition would do the
+same.) This is a diagnosis from the source, not something confirmed on a
+device. Either way, your `.adds/` folder (including `.adds/gideon/` and
+`.adds/nm/gideon`) is on the user partition and is untouched, so your reading
+progress and settings are never at risk. Kobo has no setting to turn off
+firmware updates, so this can't be fully prevented.
 
-**Fix: reinstall NickelMenu, not gideon.**
+**One-step fix from a computer:** plug the Kobo in and run
+`installer/nickelmenu.sh install`. It stages a checksum-verified NickelMenu
+`KoboRoot.tgz` (writes only `.kobo/KoboRoot.tgz`, never `.adds/`), then eject
+and the Kobo installs it on the next boot. `installer/nickelmenu.sh status`
+shows what is visible over USB. It cannot see the system partition, so it
+can't tell whether the hook is alive; reinstalling is harmless either way.
+
+Manual steps, if you prefer (reinstall NickelMenu, not gideon):
 
 1. Plug the Kobo into your computer and let it mount as `KOBOeReader`.
 2. Download the latest `KoboRoot.tgz` from
