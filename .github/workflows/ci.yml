@@ -132,6 +132,9 @@ jobs:
           ./target/debug/gideon library /tmp/manga
           printf 'n\nq\n' | ./target/debug/gideon read "/tmp/manga/Sample Manga/vol1.cbz"
           ./target/debug/gideon library /tmp/manga | grep -F "(page 2/3)"
+          # The archive.org CLI builds and answers; its network paths are
+          # covered by captured-response tests, not by CI's network.
+          ./target/debug/archivist --help | grep -F "Internet Archive"
 
   installer:
     name: Installer tests
