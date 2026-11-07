@@ -20,6 +20,45 @@ fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
     choices[at.map_or(0, |i| (i + 1) % choices.len())].clone()
 }
 
+fn bookmark_banner(set: bool) -> &'static str {
+    if set {
+        "Bookmarked"
+    } else {
+        "Bookmark removed"
+    }
+}
+
+/// The word of `spans` (one laid-out line) drawn at `x` pixels from the
+/// line's left edge, or `None` on a gap or past the end. Words are the
+/// whitespace-separated tokens, measured as the page draws them.
+fn word_at_x(px: f32, spans: &[BookSpan], x: u32) -> Option<String> {
+    let mut cursor = 0u32;
+    for span in spans {
+        let width = measure_text(px, &span.text, span.bold);
+        if x < cursor + width {
+            let within = x - cursor;
+            let mut start = None;
+            for (i, c) in span.text.char_indices().chain([(span.text.len(), ' ')]) {
+                match (c.is_whitespace(), start) {
+                    (false, None) => start = Some(i),
+                    (true, Some(s)) => {
+                        let left = measure_text(px, &span.text[..s], span.bold);
+                        let right = measure_text(px, &span.text[..i], span.bold);
+                        if within >= left && within < right {
+                            return Some(span.text[s..i].to_string());
+                        }
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        cursor += width;
+    }
+    None
+}
+
 /// "normal" → "Normal", for a setting shown on a row.
 fn title_case(s: &str) -> String {
     let mut c = s.chars();
@@ -195,7 +234,21 @@ enum Sheet {
     /// row cycles its setting; the page behind re-flows at once so the
     /// change is seen with the sheet still open.
     BookText,
+    /// A word looked up: the headword as the dictionary spells it, and its
+    /// definition wrapped to the sheet's width.
+    Definition { word: String, lines: Vec<String> },
+    /// A word was pressed but no dictionary is installed: offer the one
+    /// gideon knows how to fetch.
+    NoDictionary,
 }
+
+/// The English dictionary the reader offers to download: WordNet 3.1,
+/// converted to StarDict by the release workflow (`scripts/wn2stardict.py`)
+/// and attached to every release.
+pub const DICTIONARY_URL: &str =
+    "https://github.com/evanspn/gideon/releases/latest/download/wordnet-3.1-stardict.zip";
+/// The most definition lines a sheet shows before trailing off.
+const DEFINITION_LINES: usize = 8;
 
 /// What a settings row does when tapped. The grouped list is built once and
 /// used for BOTH drawing and hit-testing: the screen previously drew from
@@ -1221,6 +1274,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Where settings.json lives, for persisting in-reader changes
     /// (rotation lock). `None` skips persistence.
     settings_dir: Option<PathBuf>,
+    /// The installed dictionaries, read from `<settings_dir>/dicts` on the
+    /// first lookup; `None` until then, and again after an install.
+    dictionaries: Option<Vec<gideon_core::Dictionary>>,
     /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
     /// hides the percentage from the Home title and the sleep notice.
     battery: Option<Box<dyn Fn() -> Option<u8>>>,
@@ -1328,6 +1384,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             last_wake: None,
             keyboard_paints: 0,
             keyboard_shift: false,
+            dictionaries: None,
             lights: None,
             settings_dir: None,
             battery: None,
@@ -2130,9 +2187,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 self.handle_tap(x, y)
             }
-            // A long press on a book page marks it (or unmarks it); the
-            // reading menu lists the marks.
-            Screen::BookReader { .. } if self.sheet.is_none() => self.toggle_bookmark(),
+            // A long press on a word looks it up; on the margin or a blank
+            // it marks the page (or unmarks it). The reading menu has both.
+            Screen::BookReader { .. } if self.sheet.is_none() => match self.book_word_at(x, y) {
+                Some(word) => self.look_up(&word),
+                None => self.toggle_bookmark(),
+            },
             _ => self.handle_tap(x, y),
         }
     }
@@ -2610,8 +2670,41 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 vec![
                     ("Contents".into(), "›".into(), false),
                     ("Bookmarks".into(), "›".into(), false),
+                    (
+                        if self.page_is_bookmarked() {
+                            "Unmark this page"
+                        } else {
+                            "Mark this page"
+                        }
+                        .into(),
+                        String::new(),
+                        false,
+                    ),
                     ("Text".into(), "›".into(), false),
                     ("Close book".into(), String::new(), false),
+                    ("Close".into(), String::new(), true),
+                ],
+            ),
+            Some(Sheet::Definition {
+                ref word,
+                ref lines,
+            }) => {
+                let mut rows: Vec<(String, String, bool)> = lines
+                    .iter()
+                    .map(|l| (l.clone(), String::new(), false))
+                    .collect();
+                rows.push(("Close".into(), String::new(), true));
+                (word.clone(), rows)
+            }
+            Some(Sheet::NoDictionary) => (
+                "Dictionary".to_string(),
+                vec![
+                    (
+                        "No dictionary on this Kobo yet.".into(),
+                        String::new(),
+                        false,
+                    ),
+                    ("Download English dictionary".into(), "8 MB".into(), false),
                     ("Close".into(), String::new(), true),
                 ],
             ),
@@ -3020,12 +3113,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     0 => self.open_book_contents()?,
                     1 => self.open_book_bookmarks()?,
                     2 => {
+                        // The sheet closing reveals the page whole, so
+                        // this one is a flash, unlike the long-press.
+                        let set = self.flip_bookmark();
+                        self.book_banner = Some(bookmark_banner(set).to_string());
+                        let result = self.render_current(RefreshMode::Full);
+                        self.book_banner = None;
+                        result?;
+                    }
+                    3 => {
                         // One sheet replaces another over a page that has
                         // not moved: the sheet region alone changes.
                         self.sheet = Some(Sheet::BookText);
                         self.render_current(RefreshMode::Partial)?;
                     }
-                    3 => {
+                    4 => {
                         self.save_book_place();
                         return self.pop();
                     }
@@ -3033,6 +3135,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Some(Sheet::Definition { ref lines, .. }) => {
+                if index < lines.len() {
+                    // The definition's own lines are not buttons.
+                    return Ok(Flow::Continue);
+                }
+                self.sheet = None;
+                self.render_current(RefreshMode::Full)?;
+                Ok(Flow::Continue)
+            }
+            Some(Sheet::NoDictionary) => match index {
+                0 => Ok(Flow::Continue),
+                1 => {
+                    self.sheet = None;
+                    self.install_dictionary()
+                }
+                _ => {
+                    self.sheet = None;
+                    self.render_current(RefreshMode::Full)?;
+                    Ok(Flow::Continue)
+                }
+            },
             Some(Sheet::BookText) => {
                 match index {
                     0..=2 => {
@@ -8344,6 +8467,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// is the page's top paragraph and line, with its first words for the
     /// list. One partial repaint shows the corner mark and a banner.
     fn toggle_bookmark(&mut self) -> Result<Flow> {
+        if !matches!(self.stack.last(), Some(Screen::BookReader { .. })) {
+            return Ok(Flow::Continue);
+        }
+        let set = self.flip_bookmark();
+        self.book_banner = Some(bookmark_banner(set).to_string());
+        let result = self.render_current(RefreshMode::Partial);
+        self.book_banner = None;
+        result.map(|_| Flow::Continue)
+    }
+
+    /// Whether any mark falls on the page the reader shows.
+    fn page_is_bookmarked(&self) -> bool {
         let Some(Screen::BookReader {
             book,
             chapter,
@@ -8352,10 +8487,37 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             ..
         }) = self.stack.last()
         else {
-            return Ok(Flow::Continue);
+            return false;
         };
         let Some(lines) = pages.get(*page) else {
-            return Ok(Flow::Continue);
+            return false;
+        };
+        let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
+            return false;
+        };
+        let lo = (*chapter, first.block, first.line);
+        let hi = (*chapter, last.block, last.line);
+        gideon_core::BookPlaces::load(&self.books_dir)
+            .bookmarks(&book.relative_path)
+            .iter()
+            .any(|b| (lo..=hi).contains(&b.place()))
+    }
+
+    /// Mark the page the reader shows, or unmark it; `true` when it is now
+    /// marked. Saves; draws nothing.
+    fn flip_bookmark(&mut self) -> bool {
+        let Some(Screen::BookReader {
+            book,
+            chapter,
+            pages,
+            page,
+            ..
+        }) = self.stack.last()
+        else {
+            return false;
+        };
+        let Some(lines) = pages.get(*page) else {
+            return false;
         };
         let (block, line) = lines.first().map(BookLine::place).unwrap_or((0, 0));
         let snippet: String = lines
@@ -8375,17 +8537,120 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if let Err(e) = places.save(&self.books_dir) {
             eprintln!("gideon: couldn't save bookmarks: {e}");
         }
-        self.book_banner = Some(
-            if set {
-                "Bookmarked"
-            } else {
-                "Bookmark removed"
+        set
+    }
+
+    // --- the dictionary ---
+
+    /// Where downloaded dictionaries live: beside settings.json.
+    fn dicts_dir(&self) -> Option<PathBuf> {
+        self.settings_dir.as_ref().map(|d| d.join("dicts"))
+    }
+
+    fn dictionaries(&mut self) -> &mut Vec<gideon_core::Dictionary> {
+        if self.dictionaries.is_none() {
+            let found = self
+                .dicts_dir()
+                .map(|d| gideon_core::Dictionary::installed(&d))
+                .unwrap_or_default();
+            self.dictionaries = Some(found);
+        }
+        self.dictionaries.as_mut().expect("just loaded")
+    }
+
+    /// The word drawn under screen point (x, y) on the reader's page, if
+    /// the point is on one: the line from the page geometry, the word from
+    /// the line's runs and their measured widths.
+    fn book_word_at(&self, x: u32, y: u32) -> Option<String> {
+        let Some(Screen::BookReader { pages, page, .. }) = self.stack.last() else {
+            return None;
+        };
+        let lines = pages.get(*page)?;
+        let (px, margin, _, top, line_h, _) = self.book_page_metrics();
+        let mut ly = top;
+        for line in lines {
+            let rows = line.image.as_ref().map_or(1, |img| img.rows as u32);
+            let h = rows * line_h;
+            if y >= ly && y < ly + h {
+                if line.image.is_some() {
+                    return None;
+                }
+                return word_at_x(px, &line.spans, x.checked_sub(margin)?);
             }
-            .to_string(),
-        );
-        let result = self.render_current(RefreshMode::Partial);
-        self.book_banner = None;
-        result.map(|_| Flow::Continue)
+            ly += h;
+        }
+        None
+    }
+
+    /// Look `word` up and show the first dictionary's answer as a sheet.
+    /// No dictionary installed offers the download; no entry says so on
+    /// the page's banner. Every repaint here is partial: the page behind
+    /// has not moved.
+    fn look_up(&mut self, word: &str) -> Result<Flow> {
+        if self.dictionaries().is_empty() {
+            self.sheet = Some(Sheet::NoDictionary);
+            return self
+                .render_current(RefreshMode::Partial)
+                .map(|_| Flow::Continue);
+        }
+        let hit = self.dictionaries().iter_mut().find_map(|d| d.lookup(word));
+        match hit {
+            Some(def) => {
+                let max_w = self.layout.width.saturating_sub(self.layout.pad * 2);
+                let mut lines = wrap_text(self.layout.text_px, &def.text, max_w);
+                if lines.len() > DEFINITION_LINES {
+                    lines.truncate(DEFINITION_LINES);
+                    lines.push("…".to_string());
+                }
+                self.sheet = Some(Sheet::Definition {
+                    word: def.word,
+                    lines,
+                });
+                self.render_current(RefreshMode::Partial)?;
+            }
+            None => {
+                let shown = gideon_core::dict::trim_word(word);
+                self.book_banner = Some(format!("No entry for “{shown}”"));
+                let result = self.render_current(RefreshMode::Partial);
+                self.book_banner = None;
+                result?;
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Fetch the English dictionary and unpack it beside settings.json.
+    fn install_dictionary(&mut self) -> Result<Flow> {
+        let Some(dicts) = self.dicts_dir() else {
+            self.push(Screen::Message {
+                title: "Dictionary".to_string(),
+                body: "This gideon has nowhere to keep a dictionary.".to_string(),
+            })?;
+            return Ok(Flow::Continue);
+        };
+        self.ensure_online()?;
+        self.show_status(&["Downloading the dictionary…"])?;
+        let url = url::Url::parse(DICTIONARY_URL).expect("a constant URL");
+        let outcome = self
+            .gateway
+            .fetch(&url)
+            .and_then(|bytes| Ok(gideon_core::dict::install_zip(&dicts, &bytes)?));
+        self.dictionaries = None;
+        match outcome {
+            Ok(_) => self.push(Screen::Message {
+                title: "Dictionary".to_string(),
+                body: "Installed WordNet.\n\nPress and hold a word while reading\nto look it up."
+                    .to_string(),
+            })?,
+            Err(e) => {
+                eprintln!("gideon: dictionary download failed: {e:#}");
+                self.push(Screen::Message {
+                    title: "Dictionary".to_string(),
+                    body: format!("Couldn't download the dictionary:\n{e:#}"),
+                })?;
+            }
+        }
+        Ok(Flow::Continue)
     }
 
     /// Jump the reader beneath a list to `chapter`, at the page holding

@@ -214,6 +214,10 @@ impl SourceGateway for FakeGateway {
         )?)
     }
 
+    fn fetch(&self, url: &url::Url) -> Result<Vec<u8>> {
+        Ok(gideon_sources::Fetcher::get(&self.web, url)?)
+    }
+
     fn check_updates(&self) -> Result<super::gateway::UpdateCheck> {
         Ok(super::gateway::UpdateCheck {
             message: self.update_message.clone(),
@@ -9842,10 +9846,41 @@ mod library_tabs {
         UiEvent::Tap { x, y: H / 2 }
     }
 
-    /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 text,
-    /// 3 close book, 4 close.
+    /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 mark page,
+    /// 3 text, 4 close book, 5 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(5, i)
+        tap_modal_row(6, i)
+    }
+
+    /// The y of row `i` of the reading menu.
+    fn reading_row_y(i: usize) -> u32 {
+        tap_modal_row_y(6, i)
+    }
+
+    /// A plain StarDict dictionary (ifo, idx, dict) at `dir/<stem>`.
+    fn write_stardict(dir: &Path, stem: &str, entries: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut sorted = entries.to_vec();
+        sorted.sort_by_key(|(w, _)| w.to_lowercase());
+        let (mut idx, mut data) = (Vec::new(), Vec::new());
+        for (w, d) in &sorted {
+            idx.extend_from_slice(w.as_bytes());
+            idx.push(0);
+            idx.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            idx.extend_from_slice(&(d.len() as u32).to_be_bytes());
+            data.extend_from_slice(d.as_bytes());
+        }
+        std::fs::write(dir.join(format!("{stem}.idx")), &idx).unwrap();
+        std::fs::write(dir.join(format!("{stem}.dict")), &data).unwrap();
+        std::fs::write(
+            dir.join(format!("{stem}.ifo")),
+            format!(
+                "StarDict's dict ifo file\nversion=2.4.2\nwordcount={}\nidxfilesize={}\nbookname=Test Words\nsametypesequence=m\n",
+                sorted.len(),
+                idx.len()
+            ),
+        )
+        .unwrap();
     }
 
     /// The y of row `i` of the Text sheet: 0 size, 1 line spacing,
@@ -10240,7 +10275,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(3)]);
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(4)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10263,7 +10298,7 @@ mod library_tabs {
         // Larger text (Text › Size): same paragraph stays on the page, the
         // sheet stays up, and the whole page re-flowed, so a Full.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookText)));
         ui.tap_sheet(W / 2, text_row_y(0)).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookText)), "sheet stays up");
@@ -10292,7 +10327,7 @@ mod library_tabs {
         // The menu's Text row opens the sheet over the unchanged page: no flash.
         ui.handle_tap(W / 2, H / 2).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
-        ui.handle_tap(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        ui.handle_tap(W / 2, reading_row_y(3)).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookText)));
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
         let (title, rows) = ui.sheet_rows();
@@ -10622,7 +10657,7 @@ mod library_tabs {
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::Back),
-            tap_reading_row(3),
+            tap_reading_row(4),
             tap_today(),
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10668,8 +10703,9 @@ mod library_tabs {
         let dir = tempfile::tempdir().unwrap();
         let (lib, books) = novel(dir.path());
         let l = layout();
+        // Held on the margin: a word would be looked up instead.
         let hold = UiEvent::LongPress {
-            x: l.width / 2,
+            x: 2,
             y: l.height / 2,
         };
         // Page 3, hold: bookmarked, with a dog-ear and a banner, partially.
@@ -10700,7 +10736,7 @@ mod library_tabs {
         assert!(ui.display().pixel(1, 1) > 0xf0, "only the corner");
 
         // Hold again: gone, corner white.
-        ui.handle_long_press(l.width / 2, l.height / 2).unwrap();
+        ui.handle_long_press(2, l.height / 2).unwrap();
         assert!(gideon_core::BookPlaces::load(&books)
             .bookmarks("Kurt Vonnegut/book-0001.epub")
             .is_empty());
@@ -10708,11 +10744,11 @@ mod library_tabs {
 
         // Mark page 3 again, go to page 1, open Bookmarks, tap the mark:
         // back on page 3.
-        ui.handle_long_press(l.width / 2, l.height / 2).unwrap();
+        ui.handle_long_press(2, l.height / 2).unwrap();
         ui.turn_book_page(-1).unwrap();
         ui.turn_book_page(-1).unwrap();
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(5, 1)).unwrap();
+        ui.tap_sheet(W / 2, reading_row_y(1)).unwrap();
         let Screen::BookBookmarks { entries, .. } = ui.screen() else {
             panic!("expected the bookmarks, got {:?}", ui.screen());
         };
@@ -10730,7 +10766,230 @@ mod library_tabs {
         let mut fresh = app(&lib2, FakeGateway::default(), open_first_book());
         fresh.run().unwrap();
         fresh.sheet = Some(Sheet::BookReading);
-        fresh.tap_sheet(W / 2, tap_modal_row_y(5, 1)).unwrap();
+        fresh.tap_sheet(W / 2, reading_row_y(1)).unwrap();
         assert!(matches!(fresh.screen(), Screen::Message { .. }));
+    }
+
+    #[test]
+    fn word_at_x_finds_the_word_under_a_press() {
+        let spans = vec![
+            BookSpan {
+                text: "So it ".into(),
+                italic: false,
+                bold: false,
+            },
+            BookSpan {
+                text: "goes".into(),
+                italic: true,
+                bold: false,
+            },
+            BookSpan {
+                text: ", Billy.".into(),
+                italic: false,
+                bold: false,
+            },
+        ];
+        let px = 44.0;
+        let so = measure_text(px, "So", false);
+        let so_it = measure_text(px, "So it", false);
+        let plain = measure_text(px, "So it ", false);
+        let goes = measure_text(px, "goes", false);
+        assert_eq!(word_at_x(px, &spans, so / 2).as_deref(), Some("So"));
+        assert_eq!(word_at_x(px, &spans, so_it - 2).as_deref(), Some("it"));
+        assert_eq!(
+            word_at_x(px, &spans, plain + goes / 2).as_deref(),
+            Some("goes")
+        );
+        assert_eq!(
+            word_at_x(px, &spans, plain + goes + 4).as_deref(),
+            Some(",")
+        );
+        let billy_at = plain + goes + measure_text(px, ", ", false) + 4;
+        assert_eq!(word_at_x(px, &spans, billy_at).as_deref(), Some("Billy."));
+        assert_eq!(
+            word_at_x(px, &spans, so + 1),
+            None,
+            "the space between words"
+        );
+        assert_eq!(
+            word_at_x(px, &spans, 5000),
+            None,
+            "past the end of the line"
+        );
+    }
+
+    #[test]
+    fn a_long_press_on_a_word_shows_its_definition_partially() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let data = dir.path().join("data");
+        write_stardict(
+            &data.join("dicts/words"),
+            "words",
+            &[
+                ("pilgrim", "n. someone who journeys to a sacred place\nn. one of the English colonists"),
+                ("time", "n. the continuum of experience in which events pass from the future through the present to the past"),
+            ],
+        );
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book()).with_settings_dir(data);
+        ui.run().unwrap();
+        let (px, margin, _, top, line_h, _) = ui.book_page_metrics();
+        // "Paragraph 0: Billy Pilgrim has come unstuck in time, ..." is the
+        // first paragraph line under the heading; press on "Pilgrim".
+        let (row, first) = match ui.screen() {
+            Screen::BookReader { pages, .. } => pages[0]
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.text.contains("Pilgrim"))
+                .map(|(i, l)| (i as u32, l.text.clone()))
+                .expect("the fixture's first paragraph"),
+            other => panic!("expected the reader, got {other:?}"),
+        };
+        let at = first.find("Pilgrim").unwrap();
+        let x = margin + measure_text(px, &first[..at], false) + measure_text(px, "Pil", false);
+        let y = top + row * line_h + line_h / 2;
+        assert_eq!(ui.book_word_at(x, y).as_deref(), Some("Pilgrim"));
+
+        ui.handle_long_press(x, y).unwrap();
+        let Some(Sheet::Definition { word, lines }) = &ui.sheet else {
+            panic!("expected the definition, got {:?}", ui.sheet);
+        };
+        assert_eq!(word, "pilgrim", "cased as the dictionary spells it");
+        assert!(lines[0].starts_with("n. someone who journeys"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("English colonists")));
+        // The page behind has not moved: the sheet alone repaints.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(
+            gideon_core::BookPlaces::load(&books)
+                .bookmarks("Kurt Vonnegut/book-0001.epub")
+                .is_empty(),
+            "a lookup is not a bookmark"
+        );
+        // The sheet's rows read as the definition, then Close.
+        let (title, rows) = ui.sheet_rows();
+        assert_eq!(title, "pilgrim");
+        assert!(rows.last().unwrap().2, "last row dismisses");
+        // Tapping a definition line does nothing; Close reveals the page: Full.
+        let n = rows.len() as u32;
+        ui.tap_sheet(W / 2, tap_modal_row_y(n, 0)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::Definition { .. })));
+        ui.tap_sheet(W / 2, tap_modal_row_y(n, rows.len() - 1))
+            .unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // A word the dictionary lacks: a banner, no sheet, no bookmark.
+        let at = first.find("Billy").unwrap();
+        let x = margin + measure_text(px, &first[..at], false) + measure_text(px, "Bil", false);
+        ui.handle_long_press(x, y).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(gideon_core::BookPlaces::load(&books)
+            .bookmarks("Kurt Vonnegut/book-0001.epub")
+            .is_empty());
+
+        // The margin still bookmarks.
+        ui.handle_long_press(2, y).unwrap();
+        assert_eq!(
+            gideon_core::BookPlaces::load(&books)
+                .bookmarks("Kurt Vonnegut/book-0001.epub")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn without_a_dictionary_a_pressed_word_offers_the_download_which_installs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let data = dir.path().join("data");
+        // The download the fake web serves: a zip of a small dictionary.
+        let src = dir.path().join("src");
+        write_stardict(&src, "wordnet", &[("time", "n. what clocks measure")]);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            for f in ["wordnet.ifo", "wordnet.idx", "wordnet.dict"] {
+                w.start_file(format!("wordnet/{f}"), opts).unwrap();
+                w.write_all(&std::fs::read(src.join(f)).unwrap()).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let gateway = FakeGateway {
+            web: gideon_sources::FakeFetcher::new().with(DICTIONARY_URL, buf.into_inner()),
+            ..Default::default()
+        };
+        let mut ui = app(&lib, gateway, open_first_book()).with_settings_dir(data.clone());
+        ui.run().unwrap();
+        let (px, margin, _, top, line_h, _) = ui.book_page_metrics();
+        let (row, first) = match ui.screen() {
+            Screen::BookReader { pages, .. } => pages[0]
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.text.contains("time"))
+                .map(|(i, l)| (i as u32, l.text.clone()))
+                .expect("the fixture's first paragraph"),
+            other => panic!("expected the reader, got {other:?}"),
+        };
+        let at = first.find("time").unwrap();
+        let x = margin + measure_text(px, &first[..at], false) + measure_text(px, "ti", false);
+        let y = top + row * line_h + line_h / 2;
+
+        ui.handle_long_press(x, y).unwrap();
+        assert!(
+            matches!(ui.sheet, Some(Sheet::NoDictionary)),
+            "{:?}",
+            ui.sheet
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        let (_, rows) = ui.sheet_rows();
+        assert_eq!(rows[1].0, "Download English dictionary");
+
+        ui.tap_sheet(W / 2, tap_modal_row_y(3, 1)).unwrap();
+        let Screen::Message { title, body } = ui.screen() else {
+            panic!("expected the installed message, got {:?}", ui.screen());
+        };
+        assert_eq!(title, "Dictionary");
+        assert!(body.starts_with("Installed WordNet"), "{body}");
+        assert!(data.join("dicts/wordnet/wordnet.ifo").exists());
+
+        // Back to the book: the same press now defines.
+        ui.pop().unwrap();
+        ui.handle_long_press(x, y).unwrap();
+        let Some(Sheet::Definition { word, lines }) = &ui.sheet else {
+            panic!("expected the definition, got {:?}", ui.sheet);
+        };
+        assert_eq!(
+            (word.as_str(), lines[0].as_str()),
+            ("time", "n. what clocks measure")
+        );
+    }
+
+    #[test]
+    fn the_reading_menu_marks_and_unmarks_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[2].0, "Mark this page");
+        ui.tap_sheet(W / 2, reading_row_y(2)).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(
+            gideon_core::BookPlaces::load(&books)
+                .bookmarks("Kurt Vonnegut/book-0001.epub")
+                .len(),
+            1
+        );
+        // The sheet closing reveals the page: a flash, dog-ear included.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert!(ui.display().pixel(W - 2, 1) < 0x40);
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[2].0, "Unmark this page");
+        ui.tap_sheet(W / 2, reading_row_y(2)).unwrap();
+        assert!(gideon_core::BookPlaces::load(&books)
+            .bookmarks("Kurt Vonnegut/book-0001.epub")
+            .is_empty());
     }
 }

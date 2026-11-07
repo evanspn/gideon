@@ -40,4 +40,9 @@ pub enum Error {
     /// so it names the mismatch in their terms.
     #[error("{0}")]
     InvalidUpload(String),
+
+    /// A StarDict dictionary that cannot be read, or an archive that holds
+    /// none.
+    #[error("dictionary: {0}")]
+    Dictionary(String),
 }
