@@ -173,8 +173,12 @@ pub fn draw_text_styled(
         };
         let bounds = outline.px_bounds();
         outline.draw(|gx, gy, coverage| {
-            // Lean: rows above the baseline shift right, below it left.
-            let above = ascent - (bounds.min.y + gy as f32);
+            // Lean: a shear about the baseline. `bounds.min.y + gy` is the
+            // row relative to the baseline (negative above it), so rows
+            // above shift right and descenders shift left; the baseline
+            // itself stays put, which keeps runs flush with their
+            // neighbours.
+            let above = -(bounds.min.y + gy as f32);
             let lean = (above * slant).round() as i64;
             let px_x = x as i64 + bounds.min.x as i64 + gx as i64 + lean;
             let px_y = y as i64 + (ascent + bounds.min.y) as i64 + gy as i64;
