@@ -13,12 +13,29 @@
 
 mod gateway;
 mod layout;
+/// The entry after `current` in `choices`, wrapping; the first when
+/// `current` is not a choice (a hand-edited settings file).
+fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
+    let at = choices.iter().position(|c| c == current);
+    choices[at.map_or(0, |i| (i + 1) % choices.len())].clone()
+}
+
+/// "normal" → "Normal", for a setting shown on a row.
+fn title_case(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
 pub use gateway::{AidokuGateway, ChapterEntry, MangaEntry, SourceEntry, SourceGateway};
 pub use layout::{page_button_advances, Key, ReaderZone, TapTarget, UiLayout};
 
+use gideon_core::settings::{BOOK_LINE_SPACINGS, BOOK_MARGINS, BOOK_TEXT_PX_STEPS};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,8 +189,12 @@ enum Sheet {
     BookFile { book: gideon_core::Book },
     /// Confirmation before a book is deleted.
     ConfirmDeleteBook { book: gideon_core::Book },
-    /// The book reader's menu: text size, and the way out.
+    /// The book reader's menu: contents, bookmarks, text, and the way out.
     BookReading,
+    /// The reader's typography: text size, line spacing and margins. Each
+    /// row cycles its setting; the page behind re-flows at once so the
+    /// change is seen with the sheet still open.
+    BookText,
 }
 
 /// What a settings row does when tapped. The grouped list is built once and
@@ -2589,12 +2610,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 vec![
                     ("Contents".into(), "›".into(), false),
                     ("Bookmarks".into(), "›".into(), false),
-                    ("Larger text".into(), String::new(), false),
-                    ("Smaller text".into(), String::new(), false),
+                    ("Text".into(), "›".into(), false),
                     ("Close book".into(), String::new(), false),
                     ("Close".into(), String::new(), true),
                 ],
             ),
+            Some(Sheet::BookText) => {
+                let settings = self.load_settings();
+                (
+                    "Text".to_string(),
+                    vec![
+                        (
+                            "Size".into(),
+                            format!("{} px", settings.book_text_px),
+                            false,
+                        ),
+                        (
+                            "Line spacing".into(),
+                            title_case(&settings.book_line_spacing),
+                            false,
+                        ),
+                        ("Margins".into(), title_case(&settings.book_margins), false),
+                        ("Close".into(), String::new(), true),
+                    ],
+                )
+            }
             Some(Sheet::ConfirmDeleteBook { ref book }) => (
                 format!("Delete \"{}\"?", book.title),
                 vec![
@@ -2979,13 +3019,51 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 match index {
                     0 => self.open_book_contents()?,
                     1 => self.open_book_bookmarks()?,
-                    2 => self.resize_book_text(6)?,
-                    3 => self.resize_book_text(-6)?,
-                    4 => {
+                    2 => {
+                        // One sheet replaces another over a page that has
+                        // not moved: the sheet region alone changes.
+                        self.sheet = Some(Sheet::BookText);
+                        self.render_current(RefreshMode::Partial)?;
+                    }
+                    3 => {
                         self.save_book_place();
                         return self.pop();
                     }
                     _ => self.render_current(RefreshMode::Full)?,
+                }
+                Ok(Flow::Continue)
+            }
+            Some(Sheet::BookText) => {
+                match index {
+                    0..=2 => {
+                        let mut settings = self.load_settings();
+                        match index {
+                            0 => {
+                                settings.book_text_px =
+                                    next_in(&BOOK_TEXT_PX_STEPS, &settings.book_text_px);
+                            }
+                            1 => {
+                                let names: Vec<&str> =
+                                    BOOK_LINE_SPACINGS.iter().map(|(n, _)| *n).collect();
+                                settings.book_line_spacing =
+                                    next_in(&names, &settings.book_line_spacing.as_str())
+                                        .to_string();
+                            }
+                            _ => {
+                                let names: Vec<&str> =
+                                    BOOK_MARGINS.iter().map(|(n, _)| *n).collect();
+                                settings.book_margins =
+                                    next_in(&names, &settings.book_margins.as_str()).to_string();
+                            }
+                        }
+                        self.save_settings(&settings);
+                        // The sheet stays up; the page behind re-flows.
+                        self.reflow_book()?;
+                    }
+                    _ => {
+                        self.sheet = None;
+                        self.render_current(RefreshMode::Full)?;
+                    }
                 }
                 Ok(Flow::Continue)
             }
@@ -4311,6 +4389,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             device.frontlight_brightness = settings.frontlight_brightness;
             device.frontlight_warmth = settings.frontlight_warmth;
             device.book_text_px = settings.book_text_px;
+            device.book_line_spacing = settings.book_line_spacing.clone();
+            device.book_margins = settings.book_margins.clone();
             if let Err(e) = device.save(dir) {
                 eprintln!("gideon: couldn't save settings: {e}");
             }
@@ -8143,15 +8223,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     // --- the book reader ---
 
-    /// The reader's page geometry at the current text size: text px, left
+    /// The reader's page geometry at the current typography: text px, left
     /// margin, text width, first baseline-top, line height, lines per page.
     fn book_page_metrics(&self) -> (f32, u32, u32, u32, u32, usize) {
         let l = &self.layout;
-        let px = self.load_settings().book_text_px as f32;
-        let margin = l.pad * 3;
+        let settings = self.load_settings();
+        let px = settings.book_text_px as f32;
+        let margin_pads = BOOK_MARGINS
+            .iter()
+            .find(|(n, _)| *n == settings.book_margins)
+            .map_or(3, |(_, pads)| *pads);
+        let spacing = BOOK_LINE_SPACINGS
+            .iter()
+            .find(|(n, _)| *n == settings.book_line_spacing)
+            .map_or(1.45, |(_, ratio)| *ratio);
+        let margin = l.pad * margin_pads;
         let max_w = l.width.saturating_sub(margin * 2).max(1);
         let top = l.pad * 2;
-        let line_h = (px * 1.45) as u32;
+        let line_h = (px * spacing) as u32;
         // The footer: one small line of status with air around it.
         let footer_h = (l.text_px * 0.75) as u32 + l.pad * 3;
         let lines = (l.height.saturating_sub(top + footer_h) / line_h.max(1)).max(1) as usize;
@@ -8434,19 +8523,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(mode)
     }
 
-    /// Change the reader text size by `delta` px and re-flow the chapter,
-    /// keeping the paragraph that was at the top of the page.
-    fn resize_book_text(&mut self, delta: i32) -> Result<()> {
-        let mut settings = self.load_settings();
-        let next = (settings.book_text_px as i32 + delta).clamp(
-            gideon_core::settings::BOOK_TEXT_PX_MIN as i32,
-            gideon_core::settings::BOOK_TEXT_PX_MAX as i32,
-        ) as u32;
-        if next == settings.book_text_px {
-            return self.render_current(RefreshMode::Full);
-        }
-        settings.book_text_px = next;
-        self.save_settings(&settings);
+    /// Re-flow the open chapter at the current typography, keeping the
+    /// paragraph that was at the top of the page.
+    fn reflow_book(&mut self) -> Result<()> {
         let Some(Screen::BookReader {
             text,
             chapter,
