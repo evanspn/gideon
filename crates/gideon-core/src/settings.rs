@@ -185,6 +185,12 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_stats_view")]
     pub stats_view: String,
 
+    /// Text size for gideon's book reader, in pixels (28–80). Parsed
+    /// leniently — anything out of range or wrong-typed means the default.
+    #[serde(default = "default_book_text_px")]
+    #[serde(deserialize_with = "lenient_book_text_px")]
+    pub book_text_px: u32,
+
     /// Page turns between full (flashing) e-ink refreshes. Higher flashes
     /// less often (smoother reading) but lets ghosting build up longer.
     /// Parsed leniently — out-of-range or wrong-typed values fall back to the
@@ -316,6 +322,7 @@ impl Default for Settings {
             color_profile: default_color_profile(),
             library_view: default_library_view(),
             stats_view: default_stats_view(),
+            book_text_px: default_book_text_px(),
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
@@ -473,6 +480,26 @@ fn default_color_profile() -> String {
 /// away for browsing by art, and the choice is per profile and sticky.
 fn default_library_view() -> String {
     "list".to_string()
+}
+
+/// The smallest, default and largest book text sizes, in pixels: a 300 dpi
+/// panel wants ~44px for a comfortable novel page.
+pub const BOOK_TEXT_PX_MIN: u32 = 28;
+pub const BOOK_TEXT_PX_MAX: u32 = 80;
+
+fn default_book_text_px() -> u32 {
+    44
+}
+
+fn lenient_book_text_px<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<u32, D::Error> {
+    let raw: serde_json::Value = Deserialize::deserialize(d)?;
+    Ok(raw
+        .as_u64()
+        .map(|v| v as u32)
+        .filter(|v| (BOOK_TEXT_PX_MIN..=BOOK_TEXT_PX_MAX).contains(v))
+        .unwrap_or_else(default_book_text_px))
 }
 
 fn default_stats_view() -> String {
@@ -1122,6 +1149,7 @@ mod tests {
             reader_rotation_locked: false,
             color_post_process: "standard".into(),
             reader_full_refresh_interval: 12,
+            book_text_px: 52,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
             idle_suspend_minutes: 5,
@@ -1374,6 +1402,7 @@ mod tests {
             library_view: "list".into(),
             stats_view: "calendar".into(),
             reader_full_refresh_interval: 20,
+            book_text_px: 36,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
             idle_suspend_minutes: 5,

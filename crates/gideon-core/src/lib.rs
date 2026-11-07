@@ -7,6 +7,7 @@
 pub mod books;
 pub mod cbz;
 pub mod comicinfo;
+pub mod epub;
 pub mod error;
 pub mod library;
 pub mod natsort;
@@ -16,9 +17,10 @@ pub mod settings;
 pub mod stats;
 pub mod upload;
 
-pub use books::Book;
+pub use books::{Book, BookPlace, BookPlaces};
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
+pub use epub::{Block as BookBlock, EpubText};
 pub use error::Error;
 pub use library::{Library, LibraryEntry, ProgressStore, ReadingProgress};
 pub use profile::DEFAULT_PROFILE;
