@@ -862,3 +862,11 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .cal-bar.cont { border-left-color: transparent; border-radius: 0 4px 4px 0; margin-left: 0; }
 .cal-bar > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cal-foot { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+
+/* Books: the EPUB reader's synced places, one row each. */
+.books .book-row { display: flex; gap: 12px; align-items: center; padding: 12px 14px; }
+.books .book-row + .book-row { border-top: 1px solid var(--line, rgba(127,127,127,.25)); }
+.book-spine { font-size: 24px; flex: 0 0 auto; }
+.book-body { min-width: 0; }
+.book-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.book-meta, .book-when { font-size: 13px; opacity: .72; }

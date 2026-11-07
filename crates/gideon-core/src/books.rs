@@ -179,6 +179,13 @@ pub struct BookPlace {
     pub updated_at: u64,
 }
 
+impl BookPlace {
+    /// The place as an ordered tuple: further into the book compares greater.
+    pub fn place(&self) -> (usize, usize, usize) {
+        (self.chapter, self.block, self.line)
+    }
+}
+
 /// A page the reader marked: the paragraph and line at its top, and the
 /// first words on it so the list says more than a number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -229,6 +236,25 @@ impl BookPlaces {
 
     pub fn get(&self, relative_path: &str) -> Option<BookPlace> {
         self.places.get(relative_path).copied()
+    }
+
+    /// Fold this copy's places into what is on disk now and save: a place
+    /// moves forward only (chapter, paragraph, line compared in that
+    /// order), and the disk's bookmarks are kept as they are. For a writer
+    /// racing the reader's own saves — the sync sweep — where a blind
+    /// `save` would lose a page the reader just turned.
+    pub fn merge_save(&self, books_dir: &Path) -> std::io::Result<()> {
+        let mut disk = Self::load(books_dir);
+        for (key, mine) in &self.places {
+            let ahead = disk
+                .places
+                .get(key)
+                .is_none_or(|theirs| mine.place() > theirs.place());
+            if ahead {
+                disk.places.insert(key.clone(), *mine);
+            }
+        }
+        disk.save(books_dir)
     }
 
     pub fn set(&mut self, relative_path: &str, place: BookPlace) {

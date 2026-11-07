@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use gideon_core::ProgressStore;
+use gideon_core::{BookPlace, BookPlaces, ProgressStore};
 use serde::{Deserialize, Serialize};
 
 pub mod account;
@@ -48,6 +48,47 @@ pub struct ProgressUpdate {
     pub total_pages: usize,
 }
 
+/// A remote book place (one per user + book), as returned by a pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBookPlace {
+    /// The book's path under Books/, the key the device reads by.
+    pub book_key: String,
+    pub chapter: usize,
+    pub block: usize,
+    pub line: usize,
+    pub chapters: usize,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    /// Server timestamp; the pull cursor only, never a conflict rule.
+    pub updated_at: String,
+}
+
+/// A place to push: the arguments to the `upsert_book_place` RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookPlaceUpdate {
+    pub book_key: String,
+    pub chapter: usize,
+    pub block: usize,
+    pub line: usize,
+    pub chapters: usize,
+    pub title: Option<String>,
+    pub author: Option<String>,
+}
+
+impl BookPlaceUpdate {
+    fn place(&self) -> (usize, usize, usize) {
+        (self.chapter, self.block, self.line)
+    }
+}
+
+/// The network boundary for book places, beside [`ProgressTransport`].
+pub trait BookPlaceTransport {
+    /// Rows updated since `cursor`, or all of the user's rows when `None`.
+    fn pull_places(&self, cursor: Option<&str>) -> Result<Vec<RemoteBookPlace>>;
+    /// Upsert a batch through the furthest-place-wins RPC.
+    fn push_places(&self, updates: &[BookPlaceUpdate]) -> Result<()>;
+}
+
 /// The network boundary. The real implementation talks to Supabase
 /// (PostgREST `select` for pull, the `upsert_progress` RPC for push) with the
 /// user's JWT; tests use a fake.
@@ -75,6 +116,12 @@ pub struct SyncState {
     /// sign-out, so re-signing re-publishes into the (possibly new) account.
     #[serde(default)]
     pub published_pages: BTreeSet<String>,
+    /// The book-places pull cursor, and per book the place the server is
+    /// known to hold, so a device pushes only where it is further on.
+    #[serde(default)]
+    pub book_cursor: Option<String>,
+    #[serde(default)]
+    pub server_places: BTreeMap<String, (usize, usize, usize)>,
 }
 
 /// What a [`Syncer::sync`] did, for logging/UI.
@@ -143,16 +190,100 @@ pub fn pending_pushes(local: &ProgressStore, state: &SyncState) -> Vec<ProgressU
     out
 }
 
+/// Merge remote book places into `local` with furthest-place-wins: a
+/// remote place further into the book (chapter, then paragraph, then line)
+/// replaces the local one; one behind is ignored, and the device pushes
+/// its own back. Books the device does not have are recorded too, so the
+/// place is there the day the file arrives. Returns how many local places
+/// changed. `now` stamps a merged place for the Today ordering.
+pub fn merge_remote_places(
+    local: &mut BookPlaces,
+    remote: &[RemoteBookPlace],
+    state: &mut SyncState,
+    now: u64,
+) -> usize {
+    let mut changed = 0;
+    for r in remote {
+        let theirs = (r.chapter, r.block, r.line);
+        let ahead = local
+            .get(&r.book_key)
+            .is_none_or(|mine| theirs > mine.place());
+        if ahead {
+            let chapters = match local.get(&r.book_key) {
+                Some(mine) if r.chapters == 0 => mine.chapters,
+                _ => r.chapters,
+            };
+            local.set(
+                &r.book_key,
+                BookPlace {
+                    chapter: r.chapter,
+                    block: r.block,
+                    line: r.line,
+                    chapters,
+                    updated_at: now,
+                },
+            );
+            changed += 1;
+        }
+        let known = state
+            .server_places
+            .entry(r.book_key.clone())
+            .or_insert((0, 0, 0));
+        *known = (*known).max(theirs);
+        if state
+            .book_cursor
+            .as_deref()
+            .is_none_or(|c| r.updated_at.as_str() > c)
+        {
+            state.book_cursor = Some(r.updated_at.clone());
+        }
+    }
+    changed
+}
+
+/// The books the device is further into than the server is known to be —
+/// the batch to push. `names` supplies each book's title and author by key
+/// (from the shelf scan) so the dashboard can name it; a book no longer on
+/// the shelf is still pushed, nameless.
+pub fn pending_place_pushes(
+    local: &BookPlaces,
+    names: &BTreeMap<String, (String, Option<String>)>,
+    state: &SyncState,
+) -> Vec<BookPlaceUpdate> {
+    local
+        .places
+        .iter()
+        .filter(|(k, p)| state.server_places.get(*k).is_none_or(|&s| p.place() > s))
+        .map(|(k, p)| {
+            let (title, author) = names
+                .get(k)
+                .map(|(t, a)| (Some(t.clone()), a.clone()))
+                .unwrap_or((None, None));
+            BookPlaceUpdate {
+                book_key: k.clone(),
+                chapter: p.chapter,
+                block: p.block,
+                line: p.line,
+                chapters: p.chapters,
+                title,
+                author,
+            }
+        })
+        .collect()
+}
+
 /// Orchestrates one reconcile against a [`ProgressTransport`].
 pub struct Syncer<T> {
     transport: T,
 }
 
-impl<T: ProgressTransport> Syncer<T> {
+impl<T> Syncer<T> {
     pub fn new(transport: T) -> Self {
         Self { transport }
     }
+}
 
+impl<T: ProgressTransport> Syncer<T> {
     /// Pull → merge (furthest-wins) → push the chapters we're ahead on. The
     /// local store and `state` are only mutated on success of each step; a
     /// transport error leaves the local store consistent (offline-first: the
@@ -169,6 +300,33 @@ impl<T: ProgressTransport> Syncer<T> {
                 state
                     .server_pages
                     .insert(u.chapter_key.clone(), u.current_page);
+            }
+        }
+        Ok(SyncOutcome {
+            pulled: remote.len(),
+            merged,
+            pushed: pending.len(),
+        })
+    }
+}
+
+impl<T: BookPlaceTransport> Syncer<T> {
+    /// Pull → merge (furthest-place-wins) → push the books we're further
+    /// into, with the same offline-first promises as [`Syncer::sync`].
+    pub fn sync_places(
+        &self,
+        local: &mut BookPlaces,
+        names: &BTreeMap<String, (String, Option<String>)>,
+        state: &mut SyncState,
+        now: u64,
+    ) -> Result<SyncOutcome> {
+        let remote = self.transport.pull_places(state.book_cursor.as_deref())?;
+        let merged = merge_remote_places(local, &remote, state, now);
+        let pending = pending_place_pushes(local, names, state);
+        if !pending.is_empty() {
+            self.transport.push_places(&pending)?;
+            for u in &pending {
+                state.server_places.insert(u.book_key.clone(), u.place());
             }
         }
         Ok(SyncOutcome {
@@ -215,6 +373,114 @@ mod tests {
             total_pages: total,
             updated_at: at.into(),
         }
+    }
+
+    struct FakePlaces {
+        to_pull: RefCell<Vec<RemoteBookPlace>>,
+        pushed: RefCell<Vec<BookPlaceUpdate>>,
+    }
+    impl BookPlaceTransport for FakePlaces {
+        fn pull_places(&self, _cursor: Option<&str>) -> Result<Vec<RemoteBookPlace>> {
+            Ok(std::mem::take(&mut *self.to_pull.borrow_mut()))
+        }
+        fn push_places(&self, updates: &[BookPlaceUpdate]) -> Result<()> {
+            self.pushed.borrow_mut().extend_from_slice(updates);
+            Ok(())
+        }
+    }
+
+    fn remote_place(key: &str, place: (usize, usize, usize), at: &str) -> RemoteBookPlace {
+        RemoteBookPlace {
+            book_key: key.into(),
+            chapter: place.0,
+            block: place.1,
+            line: place.2,
+            chapters: 20,
+            title: Some("Slaughterhouse-Five".into()),
+            author: None,
+            updated_at: at.into(),
+        }
+    }
+
+    fn local_place(place: (usize, usize, usize)) -> BookPlace {
+        BookPlace {
+            chapter: place.0,
+            block: place.1,
+            line: place.2,
+            chapters: 20,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_book_place_never_rewinds_and_the_further_side_is_pushed() {
+        let mut local = BookPlaces::default();
+        local.set("kv/sh5.epub", local_place((3, 10, 0)));
+        local.set("kv/cats.epub", local_place((0, 2, 1)));
+        let mut state = SyncState::default();
+        let names = BTreeMap::from([(
+            "kv/sh5.epub".to_string(),
+            (
+                "Slaughterhouse-Five".to_string(),
+                Some("Kurt Vonnegut".to_string()),
+            ),
+        )]);
+        let syncer = Syncer::new(FakePlaces {
+            to_pull: RefCell::new(vec![
+                // Behind on one book: ignored, and ours goes up.
+                remote_place("kv/sh5.epub", (3, 4, 0), "t1"),
+                // Same chapter, later paragraph on another: taken.
+                remote_place("kv/cats.epub", (0, 7, 2), "t2"),
+                // A book this device has never seen: recorded for later.
+                remote_place("kv/sirens.epub", (1, 0, 0), "t3"),
+            ]),
+            pushed: RefCell::new(Vec::new()),
+        });
+        let out = syncer
+            .sync_places(&mut local, &names, &mut state, 99)
+            .unwrap();
+        assert_eq!(
+            local.get("kv/sh5.epub").unwrap().place(),
+            (3, 10, 0),
+            "never rewinds"
+        );
+        assert_eq!(local.get("kv/cats.epub").unwrap().place(), (0, 7, 2));
+        assert_eq!(local.get("kv/cats.epub").unwrap().updated_at, 99);
+        assert_eq!(local.get("kv/sirens.epub").unwrap().place(), (1, 0, 0));
+        assert_eq!((out.pulled, out.merged, out.pushed), (3, 2, 1));
+        let pushed = syncer.transport.pushed.borrow();
+        assert_eq!(pushed.len(), 1, "only the book we are further into");
+        assert_eq!(pushed[0].book_key, "kv/sh5.epub");
+        assert_eq!(pushed[0].title.as_deref(), Some("Slaughterhouse-Five"));
+        assert_eq!(pushed[0].author.as_deref(), Some("Kurt Vonnegut"));
+        assert_eq!(state.book_cursor.as_deref(), Some("t3"));
+        drop(pushed);
+
+        // Idempotent: nothing moved, nothing goes up.
+        let out = syncer
+            .sync_places(&mut local, &names, &mut state, 100)
+            .unwrap();
+        assert_eq!(out.pushed, 0);
+        // Read on: only the delta.
+        local.set("kv/sh5.epub", local_place((4, 0, 0)));
+        let out = syncer
+            .sync_places(&mut local, &names, &mut state, 101)
+            .unwrap();
+        assert_eq!(out.pushed, 1);
+        assert_eq!(syncer.transport.pushed.borrow().last().unwrap().chapter, 4);
+    }
+
+    #[test]
+    fn a_pulled_place_is_not_pushed_straight_back() {
+        let mut local = BookPlaces::default();
+        let mut state = SyncState::default();
+        merge_remote_places(
+            &mut local,
+            &[remote_place("kv/sh5.epub", (2, 0, 0), "t1")],
+            &mut state,
+            5,
+        );
+        assert!(pending_place_pushes(&local, &BTreeMap::new(), &state).is_empty());
     }
 
     #[test]
