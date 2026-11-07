@@ -732,6 +732,28 @@ test("a file picked on the phone is uploaded, queued, and listed with its size",
   await expect.poll(() => storage.deleted.length).toBe(1);
 });
 
+test("a file name from the wild becomes an ASCII storage key; the real name stays on the row", async ({ page }) => {
+  await mockSends(page);
+  await mockCatalogs(page);
+  const storage = mockStorage(page);
+  await signedInOnStats(page);
+
+  // An em dash, curly apostrophe, semicolons, commas and double spaces —
+  // the shape of a real ebook file name. Supabase refuses this as a key.
+  const wild = "The Apothecary Diaries_ Volume 5 (Light Novel) — Natsu Hyuuga; 2022,2023 — Anna’s  Archive.epub";
+  await page.getByTestId("send-file").setInputFiles({ name: wild, mimeType: "application/epub+zip", buffer: EPUB_BYTES });
+
+  const item = page.getByTestId("send-item");
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toContainText("Natsu Hyuuga; 2022,2023 — Anna’s");
+  expect(storage.objects).toHaveLength(1);
+  const key = storage.objects[0].path;
+  expect(key).toMatch(/^[A-Za-z0-9._\/-]+$/);
+  expect(key.endsWith(".epub")).toBe(true);
+  // Non-ASCII is dropped (the curly apostrophe); punctuation runs collapse to one "_".
+  expect(key).toContain("The_Apothecary_Diaries_Volume_5_Light_Novel_Natsu_Hyuuga_2022_2023_Annas_Archive.epub");
+});
+
 test("a file that isn't what its extension says is refused on the phone, before any upload", async ({ page }) => {
   await mockSends(page);
   await mockCatalogs(page);
