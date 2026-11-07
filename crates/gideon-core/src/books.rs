@@ -179,12 +179,34 @@ pub struct BookPlace {
     pub updated_at: u64,
 }
 
+/// A page the reader marked: the paragraph and line at its top, and the
+/// first words on it so the list says more than a number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Bookmark {
+    pub chapter: usize,
+    pub block: usize,
+    #[serde(default)]
+    pub line: usize,
+    #[serde(default)]
+    pub snippet: String,
+}
+
+impl Bookmark {
+    /// The place this bookmark stands at, for ordering and matching.
+    pub fn place(&self) -> (usize, usize, usize) {
+        (self.chapter, self.block, self.line)
+    }
+}
+
 /// Every book's place, keyed by its path relative to the Books folder.
 /// Lives in a dotfile beside the books, which Nickel ignores.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BookPlaces {
     #[serde(default)]
     pub places: BTreeMap<String, BookPlace>,
+    /// Each book's bookmarks, in reading order.
+    #[serde(default)]
+    pub bookmarks: BTreeMap<String, Vec<Bookmark>>,
 }
 
 impl BookPlaces {
@@ -212,6 +234,29 @@ impl BookPlaces {
     pub fn set(&mut self, relative_path: &str, place: BookPlace) {
         self.places.insert(relative_path.to_string(), place);
     }
+
+    pub fn bookmarks(&self, relative_path: &str) -> &[Bookmark] {
+        self.bookmarks
+            .get(relative_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Add the bookmark, or remove it when one already stands at that
+    /// place. Returns whether it is now set. Kept in reading order.
+    pub fn toggle_bookmark(&mut self, relative_path: &str, bookmark: Bookmark) -> bool {
+        let list = self.bookmarks.entry(relative_path.to_string()).or_default();
+        if let Some(i) = list.iter().position(|b| b.place() == bookmark.place()) {
+            list.remove(i);
+            if list.is_empty() {
+                self.bookmarks.remove(relative_path);
+            }
+            return false;
+        }
+        let at = list.partition_point(|b| b.place() < bookmark.place());
+        list.insert(at, bookmark);
+        true
+    }
 }
 
 /// Delete a book and, when that leaves its author folder empty, the folder
@@ -219,7 +264,9 @@ impl BookPlaces {
 pub fn delete(root: &Path, book: &Book) -> std::io::Result<()> {
     std::fs::remove_file(&book.path)?;
     let mut places = BookPlaces::load(root);
-    if places.places.remove(&book.relative_path).is_some() {
+    let had_place = places.places.remove(&book.relative_path).is_some();
+    let had_marks = places.bookmarks.remove(&book.relative_path).is_some();
+    if had_place || had_marks {
         let _ = places.save(root);
     }
     if let Some(parent) = book.path.parent() {
@@ -353,6 +400,39 @@ mod tests {
         let one = scan(root).unwrap().remove(0);
         delete(root, &one).unwrap();
         assert!(BookPlaces::load(root).get("A/one.epub").is_none());
+    }
+
+    #[test]
+    fn bookmarks_toggle_in_reading_order_and_leave_with_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        epub(&root.join("A/one.epub"), "One", "A");
+        let mut places = BookPlaces::load(root);
+        let mark = |c, b| Bookmark {
+            chapter: c,
+            block: b,
+            line: 0,
+            snippet: format!("ch{c} b{b}"),
+        };
+        assert!(places.toggle_bookmark("A/one.epub", mark(2, 5)));
+        assert!(places.toggle_bookmark("A/one.epub", mark(0, 1)));
+        assert!(places.toggle_bookmark("A/one.epub", mark(2, 1)));
+        let order: Vec<_> = places
+            .bookmarks("A/one.epub")
+            .iter()
+            .map(Bookmark::place)
+            .collect();
+        assert_eq!(order, [(0, 1, 0), (2, 1, 0), (2, 5, 0)]);
+        assert!(
+            !places.toggle_bookmark("A/one.epub", mark(2, 1)),
+            "again removes it"
+        );
+        assert_eq!(places.bookmarks("A/one.epub").len(), 2);
+        places.save(root).unwrap();
+        assert_eq!(BookPlaces::load(root).bookmarks("A/one.epub").len(), 2);
+        let one = scan(root).unwrap().remove(0);
+        delete(root, &one).unwrap();
+        assert!(BookPlaces::load(root).bookmarks("A/one.epub").is_empty());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::zipread::ZipSource;
 use crate::{Error, Result};
 
 /// A book flattened to its reading order.
@@ -169,22 +170,24 @@ impl EpubText {
 /// EPUB at all (no container, no OPF); a chapter that will not parse
 /// yields what was read before the error rather than failing the book.
 pub fn load(path: &Path) -> Result<EpubText> {
-    let file = std::fs::File::open(path)?;
-    let archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+    let file = crate::zipread::SeekFile::open(path)?;
+    let source = ZipSource::open(file)
         .map_err(|e| Error::InvalidUpload(format!("not a readable ZIP: {e}")))?;
-    load_from(archive)
+    load_source(source)
 }
 
 /// [`load`] for an archive already open, so tests can feed bytes.
-pub fn load_from<R: Read + Seek>(mut archive: zip::ZipArchive<R>) -> Result<EpubText> {
-    let read = |archive: &mut zip::ZipArchive<R>, name: &str| -> Option<String> {
+pub fn load_from<R: Read + Seek>(archive: zip::ZipArchive<R>) -> Result<EpubText> {
+    load_source(ZipSource::Strict(archive))
+}
+
+/// [`load`] from either reader.
+pub fn load_source<R: Read + Seek>(mut archive: ZipSource<R>) -> Result<EpubText> {
+    let read = |archive: &mut ZipSource<R>, name: &str| -> Option<String> {
         let candidates = [name.to_string(), percent_decode(name)];
         for candidate in candidates {
-            if let Ok(mut entry) = archive.by_name(&candidate) {
-                let mut s = String::new();
-                if entry.read_to_string(&mut s).is_ok() {
-                    return Some(s);
-                }
+            if let Some(s) = archive.read_string(&candidate) {
+                return Some(s);
             }
         }
         None
@@ -242,8 +245,8 @@ pub fn load_from<R: Read + Seek>(mut archive: zip::ZipArchive<R>) -> Result<Epub
 /// one, else the EPUB 2 NCX; entries resolved to chapters, those pointing
 /// nowhere dropped, runs of one chapter collapsed to the first.
 fn load_toc<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    read: &dyn Fn(&mut zip::ZipArchive<R>, &str) -> Option<String>,
+    archive: &mut ZipSource<R>,
+    read: &dyn Fn(&mut ZipSource<R>, &str) -> Option<String>,
     package: &Package,
     opf_dir: &str,
     chapter_of: &[(String, usize)],
@@ -508,13 +511,11 @@ fn parse_package(xml: &str) -> Package {
 /// One file out of the EPUB, by zip entry name (as a [`Block::Image`]
 /// carries it). Tries the name as given and percent-decoded.
 pub fn read_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+    let file = crate::zipread::SeekFile::open(path)?;
+    let mut archive = ZipSource::open(file)
         .map_err(|e| Error::InvalidUpload(format!("not a readable ZIP: {e}")))?;
     for candidate in [name.to_string(), percent_decode(name)] {
-        if let Ok(mut entry) = archive.by_name(&candidate) {
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut bytes)?;
+        if let Some(bytes) = archive.read(&candidate) {
             return Ok(bytes);
         }
     }

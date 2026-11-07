@@ -444,6 +444,11 @@ enum Screen {
         current: usize,
         page: usize,
     },
+    /// The open book's bookmarks, pushed over its reader; a tap jumps there.
+    BookBookmarks {
+        entries: Vec<gideon_core::Bookmark>,
+        page: usize,
+    },
     Sources {
         rows: Vec<SourceRow>,
         page: usize,
@@ -2104,6 +2109,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 self.handle_tap(x, y)
             }
+            // A long press on a book page marks it (or unmarks it); the
+            // reading menu lists the marks.
+            Screen::BookReader { .. } if self.sheet.is_none() => self.toggle_bookmark(),
             _ => self.handle_tap(x, y),
         }
     }
@@ -2272,6 +2280,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
             Some(Screen::BookShelf { books, .. }) => books.len().div_ceil(per_page),
             Some(Screen::BookContents { entries, .. }) => entries.len().div_ceil(per_page),
+            Some(Screen::BookBookmarks { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
             Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
             Some(Screen::Popular { mangas, .. }) => mangas.len().div_ceil(per_page),
@@ -2305,6 +2314,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Screen::Library { page, .. }
                 | Screen::BookShelf { page, .. }
                 | Screen::BookContents { page, .. }
+                | Screen::BookBookmarks { page, .. }
                 | Screen::Sources { page, .. }
                 | Screen::SearchResults { page, .. }
                 | Screen::Popular { page, .. }
@@ -2328,6 +2338,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
             Screen::BookShelf { books, page } => (page, books.len().div_ceil(per_page)),
             Screen::BookContents { entries, page, .. } => (page, entries.len().div_ceil(per_page)),
+            Screen::BookBookmarks { entries, page } => (page, entries.len().div_ceil(per_page)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
             // +1 for the trailing "Search more sources" row.
             Screen::SearchResults { results, page, .. } => {
@@ -2577,6 +2588,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 "Reading".to_string(),
                 vec![
                     ("Contents".into(), "›".into(), false),
+                    ("Bookmarks".into(), "›".into(), false),
                     ("Larger text".into(), String::new(), false),
                     ("Smaller text".into(), String::new(), false),
                     ("Close book".into(), String::new(), false),
@@ -2966,9 +2978,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.sheet = None;
                 match index {
                     0 => self.open_book_contents()?,
-                    1 => self.resize_book_text(6)?,
-                    2 => self.resize_book_text(-6)?,
-                    3 => {
+                    1 => self.open_book_bookmarks()?,
+                    2 => self.resize_book_text(6)?,
+                    3 => self.resize_book_text(-6)?,
+                    4 => {
                         self.save_book_place();
                         return self.pop();
                     }
@@ -3389,7 +3402,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::BookContents { entries, page, .. } => {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(entry) = entries.get(index).cloned() {
-                    self.jump_to_chapter(entry.chapter)?;
+                    self.jump_to_place(entry.chapter, (0, 0))?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookBookmarks { entries, page } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(mark) = entries.get(index).cloned() {
+                    self.jump_to_place(mark.chapter, (mark.block, mark.line))?;
                 }
                 Ok(Flow::Continue)
             }
@@ -7751,6 +7771,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .collect();
                 compose_list(l, "Contents", &rows, *page, l.page_count(entries.len()))
             }
+            Screen::BookBookmarks { entries, page } => {
+                let rows: Vec<(String, bool)> = paged(entries, *page, per_page)
+                    .iter()
+                    .map(|b| (format!("{} · {}", b.chapter + 1, b.snippet), false))
+                    .collect();
+                compose_list(l, "Bookmarks", &rows, *page, l.page_count(entries.len()))
+            }
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -8206,10 +8233,80 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
-    /// Jump the reader beneath the contents list to the start of `chapter`,
-    /// and come back to it. The whole page changes: Full.
-    fn jump_to_chapter(&mut self, chapter: usize) -> Result<()> {
-        if matches!(self.stack.last(), Some(Screen::BookContents { .. })) {
+    /// The open book's bookmarks, over the reader; a book with none says
+    /// how to make one instead of showing an empty list.
+    fn open_book_bookmarks(&mut self) -> Result<()> {
+        let Some(Screen::BookReader { book, .. }) = self.stack.last() else {
+            return Ok(());
+        };
+        let entries = gideon_core::BookPlaces::load(&self.books_dir)
+            .bookmarks(&book.relative_path)
+            .to_vec();
+        if entries.is_empty() {
+            return self.push(Screen::Message {
+                title: "Bookmarks".to_string(),
+                body: "No bookmarks yet.\nPress and hold a page to mark it.".to_string(),
+            });
+        }
+        self.push(Screen::BookBookmarks { entries, page: 0 })
+    }
+
+    /// Mark the page on screen, or unmark it when it already is. The mark
+    /// is the page's top paragraph and line, with its first words for the
+    /// list. One partial repaint shows the corner mark and a banner.
+    fn toggle_bookmark(&mut self) -> Result<Flow> {
+        let Some(Screen::BookReader {
+            book,
+            chapter,
+            pages,
+            page,
+            ..
+        }) = self.stack.last()
+        else {
+            return Ok(Flow::Continue);
+        };
+        let Some(lines) = pages.get(*page) else {
+            return Ok(Flow::Continue);
+        };
+        let (block, line) = lines.first().map(BookLine::place).unwrap_or((0, 0));
+        let snippet: String = lines
+            .iter()
+            .find(|l| !l.text.is_empty())
+            .map(|l| l.text.chars().take(48).collect())
+            .unwrap_or_else(|| "[Illustration]".to_string());
+        let mark = gideon_core::Bookmark {
+            chapter: *chapter,
+            block,
+            line,
+            snippet,
+        };
+        let key = book.relative_path.clone();
+        let mut places = gideon_core::BookPlaces::load(&self.books_dir);
+        let set = places.toggle_bookmark(&key, mark);
+        if let Err(e) = places.save(&self.books_dir) {
+            eprintln!("gideon: couldn't save bookmarks: {e}");
+        }
+        self.book_banner = Some(
+            if set {
+                "Bookmarked"
+            } else {
+                "Bookmark removed"
+            }
+            .to_string(),
+        );
+        let result = self.render_current(RefreshMode::Partial);
+        self.book_banner = None;
+        result.map(|_| Flow::Continue)
+    }
+
+    /// Jump the reader beneath a list to `chapter`, at the page holding
+    /// `place` (paragraph, line), and come back to it. The whole page
+    /// changes: Full.
+    fn jump_to_place(&mut self, chapter: usize, place: (usize, usize)) -> Result<()> {
+        if matches!(
+            self.stack.last(),
+            Some(Screen::BookContents { .. } | Screen::BookBookmarks { .. })
+        ) {
             self.stack.pop();
         }
         let Some(Screen::BookReader { text, .. }) = self.stack.last() else {
@@ -8218,6 +8315,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let text = text.clone();
         let chapter = chapter.min(text.chapters.len().saturating_sub(1));
         let pages = std::sync::Arc::new(self.layout_book_chapter(&text, chapter));
+        let at = resume_page(&pages, place);
         if let Some(Screen::BookReader {
             chapter: c,
             pages: p,
@@ -8227,7 +8325,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         {
             *c = chapter;
             *p = pages;
-            *page = 0;
+            *page = at;
         }
         self.save_book_place();
         self.book_turns = 0;
@@ -8389,6 +8487,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let mut canvas = GrayPage::new_white(l.width, l.height);
         if let Some(banner) = &self.book_banner {
             crate::reader::draw_banner(&mut canvas, banner);
+        }
+        // A bookmarked page carries a dog-ear in the top-right corner: any
+        // mark whose place falls on this page, so the mark survives a text
+        // size change.
+        if let Some(lines) = pages.get(page) {
+            if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
+                let lo = (chapter, first.block, first.line);
+                let hi = (chapter, last.block, last.line);
+                let marked = gideon_core::BookPlaces::load(&self.books_dir)
+                    .bookmarks(&book.relative_path)
+                    .iter()
+                    .any(|b| (lo..=hi).contains(&b.place()));
+                if marked {
+                    draw_dog_ear(&mut canvas, l.pad * 3);
+                }
+            }
         }
         let mut y = top;
         for line in pages.get(page).map(|p| p.as_slice()).unwrap_or(&[]) {
@@ -9868,6 +9982,21 @@ fn rect_outline(canvas: &mut GrayPage, x: u32, y: u32, w: u32, h: u32, value: u8
             if xx < canvas.width {
                 canvas.pixels[(yy * canvas.width + xx) as usize] = value;
             }
+        }
+    }
+}
+
+/// A filled triangle in the top-right corner, `size` px on each edge: the
+/// bookmark mark. Solid black so it survives the colour filter and a
+/// partial refresh alike.
+fn draw_dog_ear(canvas: &mut GrayPage, size: u32) {
+    let size = size.min(canvas.width).min(canvas.height);
+    // Row dy runs from the hypotenuse to the right edge: the right angle
+    // sits in the corner.
+    for dy in 0..size {
+        for dx in dy..size {
+            let x = canvas.width - size + dx;
+            plot(canvas, x as i32, dy as i32, 0);
         }
     }
 }
