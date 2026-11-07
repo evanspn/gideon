@@ -6,9 +6,9 @@
 //! same [`Feed`] / [`Entry`] / [`Opened`] the OPDS screens already show, so
 //! the Books screens need no idea which kind of catalogue they are in:
 //!
-//! * the root, `https://archive.org/`, is a feed with one row, *Popular*,
-//!   and a search link — no network needed to show it;
-//! * an `advancedsearch.php` URL (Popular, or a search) is a page of books,
+//! * the root, `https://archive.org/`, is search and nothing else: a feed
+//!   with no rows and a search link — no network needed to show it;
+//! * an `advancedsearch.php` URL (a search) is a page of books,
 //!   one entry per item, paged with `next` like an OPDS feed;
 //! * opening a book fetches `/metadata/<identifier>` and hands back its
 //!   best EPUB, which then downloads through [`crate::opds::download_epub`]
@@ -55,7 +55,7 @@ pub fn is_archive_search(link: &SearchLink) -> bool {
 /// Fetch the feed at an archive.org `url`: the root, or a page of books.
 pub fn fetch_feed(fetcher: &dyn Fetcher, url: &Url) -> Result<Feed> {
     if url.path() != "/advancedsearch.php" {
-        return Ok(root(fetcher));
+        return Ok(root());
     }
     let body = fetcher.get(url)?;
     let mut page = archivist::parse_search(&body).map_err(|message| Error::ParseFeed {
@@ -70,10 +70,6 @@ pub fn fetch_feed(fetcher: &dyn Fetcher, url: &Url) -> Result<Feed> {
     } else {
         None
     };
-    let popular = client
-        .popular_url(page.page, page.rows)
-        .map(|u| u == *url)
-        .unwrap_or(false);
     let entries = page
         .hits
         .iter()
@@ -90,7 +86,7 @@ pub fn fetch_feed(fetcher: &dyn Fetcher, url: &Url) -> Result<Feed> {
         })
         .collect();
     Ok(Feed {
-        title: if popular { "Popular" } else { "Results" }.to_string(),
+        title: "Results".to_string(),
         entries,
         next,
         search: Some(search_link()),
@@ -141,17 +137,11 @@ pub fn open_entry(fetcher: &dyn Fetcher, entry: &Entry) -> Result<Opened> {
     }))
 }
 
-/// The root feed: Popular, and search.
-fn root(fetcher: &dyn Fetcher) -> Feed {
-    let popular = client(fetcher).popular_url(1, ROWS).ok();
+/// The root feed: search, and nothing to browse.
+fn root() -> Feed {
     Feed {
         title: "Internet Archive".to_string(),
-        entries: vec![Entry {
-            title: "Popular".to_string(),
-            detail: Some("The most downloaded free books.".to_string()),
-            epubs: Vec::new(),
-            feed: popular,
-        }],
+        entries: Vec::new(),
         next: None,
         search: Some(search_link()),
         epubs: Vec::new(),
@@ -272,13 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn the_root_needs_no_network_and_offers_popular_and_search() {
+    fn the_root_is_search_only_and_needs_no_network() {
         let feed = crate::catalog::fetch_feed(&FakeFetcher::new(), &root_url()).unwrap();
         assert_eq!(feed.title, "Internet Archive");
-        assert_eq!(feed.entries.len(), 1);
-        assert_eq!(feed.entries[0].title, "Popular");
-        let popular = feed.entries[0].feed.as_ref().unwrap();
-        assert_eq!(popular.path(), "/advancedsearch.php");
+        assert!(feed.entries.is_empty(), "nothing to browse, only search");
         assert!(is_archive_search(feed.search.as_ref().unwrap()));
     }
 

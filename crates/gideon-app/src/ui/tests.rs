@@ -9771,7 +9771,7 @@ mod books {
     }
 
     #[test]
-    fn the_internet_archive_root_offers_search_and_popular() {
+    fn the_internet_archive_is_search_only() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app(
             dir.path(),
@@ -9781,13 +9781,8 @@ mod books {
         app.run().unwrap();
         let (title, rows) = book_list(&app);
         assert_eq!(title, "Internet Archive");
-        assert_eq!(
-            rows,
-            [
-                "Search this catalogue",
-                "Popular — The most downloaded free books.",
-            ]
-        );
+        // Nothing to browse: search is the whole catalogue.
+        assert_eq!(rows, ["Search this catalogue"]);
     }
 
     #[test]
