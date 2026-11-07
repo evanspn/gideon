@@ -632,6 +632,31 @@ pub enum LibraryTab {
     Books,
 }
 
+/// What Today's Continue card resumes.
+#[derive(Debug, Clone)]
+enum ContinueTarget {
+    Manga(SeriesCard),
+    Book(gideon_core::Book, gideon_core::BookPlace),
+}
+
+/// One row of Today's "Waiting for you" list.
+#[derive(Debug, Clone)]
+enum WaitingRow {
+    /// A series with this many unread downloaded chapters.
+    Manga(SeriesCard, usize),
+    /// A book not yet finished in gideon's reader.
+    Book(gideon_core::Book),
+}
+
+impl WaitingRow {
+    fn title(&self) -> String {
+        match self {
+            WaitingRow::Manga(card, _) => card.title(),
+            WaitingRow::Book(book) => book.title.clone(),
+        }
+    }
+}
+
 /// One laid-out line of a book page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookLine {
@@ -3338,12 +3363,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // when you press it is the screen lying about what it is.
             Screen::Stats => {
                 if self.continue_card_hit(y) {
-                    if let Some(card) = self.continue_series_card() {
-                        return self.open_series_card(&card);
+                    match self.continue_target() {
+                        Some(ContinueTarget::Manga(card)) => return self.open_series_card(&card),
+                        Some(ContinueTarget::Book(book, _)) => {
+                            self.open_book_reader(book)?;
+                            return Ok(Flow::Continue);
+                        }
+                        None => {}
                     }
                 }
-                if let Some(card) = self.waiting_row_at(y) {
-                    return self.open_series_card(&card);
+                match self.waiting_row_at(y) {
+                    Some(WaitingRow::Manga(card, _)) => return self.open_series_card(&card),
+                    Some(WaitingRow::Book(book)) => {
+                        self.open_book_reader(book)?;
+                        return Ok(Flow::Continue);
+                    }
+                    None => {}
                 }
                 Ok(Flow::Continue)
             }
@@ -6791,8 +6826,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             );
             wy += head_h + l.pad;
             let mut layer = GrayPage::new_white(l.width, l.height);
-            for (card, unread) in &waiting {
-                let count = format!("{unread} unread");
+            for row in &waiting {
+                let (title, count) = match row {
+                    WaitingRow::Manga(card, unread) => (card.title(), format!("{unread} unread")),
+                    WaitingRow::Book(book) => (book.title.clone(), "book".to_string()),
+                };
                 let cw = measure_text(l.text_px * 0.72, &count, false);
                 let ty = wy + l.row_h.saturating_sub(l.text_px as u32) / 2;
                 draw_text(
@@ -6800,7 +6838,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     l.pad,
                     ty,
                     l.text_px * 0.85,
-                    &card.title(),
+                    &title,
                     inner.saturating_sub(cw + l.pad),
                     true,
                 );
@@ -6961,13 +6999,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// first, and how many each has waiting. Today's bottom third was empty
     /// while this — the answer to "what do I have on the device to read" —
     /// was only derivable by walking the library screen row by row.
-    fn waiting_rows(&self) -> Vec<(SeriesCard, usize)> {
-        let Ok(entries) = Library::new(&self.library_dir).scan() else {
-            return Vec::new();
-        };
+    fn waiting_rows(&self) -> Vec<WaitingRow> {
+        let entries = Library::new(&self.library_dir).scan().unwrap_or_default();
         let cards = group_library(entries);
-        let mut rows = self.with_progress(|_, store| {
-            let mut rows: Vec<(SeriesCard, usize, u64)> = cards
+        let mut rows: Vec<(WaitingRow, u64)> = self.with_progress(|_, store| {
+            cards
                 .into_iter()
                 .filter_map(|card| {
                     let unread = card
@@ -6976,21 +7012,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         .filter(|c| !store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
                         .count();
                     let when = card.latest_read_at(store);
-                    (unread > 0).then_some((card, unread, when))
+                    (unread > 0).then_some((WaitingRow::Manga(card, unread), when))
                 })
-                .collect();
-            // Most recently read first; a series never opened sorts last but
-            // still shows — it is exactly what a reader is looking for here.
-            rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.title().cmp(&b.0.title())));
-            rows
+                .collect()
         });
+        // Books are on the same list: one not finished is waiting too.
+        let places = gideon_core::BookPlaces::load(&self.books_dir);
+        for book in gideon_core::books::scan(&self.books_dir).unwrap_or_default() {
+            let place = places.get(&book.relative_path);
+            let finished = place.is_some_and(|p| p.chapters > 0 && p.chapter + 1 >= p.chapters);
+            if book.format == "epub" && !finished {
+                let when = place.map(|p| p.updated_at).unwrap_or(0);
+                rows.push((WaitingRow::Book(book), when));
+            }
+        }
+        // Most recently read first; a series never opened sorts last but
+        // still shows — it is exactly what a reader is looking for here.
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.title().cmp(&b.0.title())));
         rows.truncate(self.waiting_capacity());
-        rows.into_iter().map(|(c, n, _)| (c, n)).collect()
+        rows.into_iter().map(|(r, _)| r).collect()
     }
 
     /// The waiting-list series a tap at `y` lands on, if any. Walks the same
     /// geometry the compositor draws, one row at a time.
-    fn waiting_row_at(&self, y: u32) -> Option<SeriesCard> {
+    fn waiting_row_at(&self, y: u32) -> Option<WaitingRow> {
         let l = &self.layout;
         let head_h = l.row_h * 2 / 3;
         let top = self.waiting_top() + head_h + l.pad;
@@ -6998,7 +7043,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return None;
         }
         let index = ((y - top) / l.row_h.max(1)) as usize;
-        self.waiting_rows().into_iter().nth(index).map(|(c, _)| c)
+        self.waiting_rows().into_iter().nth(index)
     }
 
     /// How many waiting rows fit between the Continue card and the nav bar.
@@ -7023,13 +7068,61 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
+    /// The book last read in gideon's reader, with its place.
+    fn continue_book(&self) -> Option<(gideon_core::Book, gideon_core::BookPlace)> {
+        let places = gideon_core::BookPlaces::load(&self.books_dir);
+        let (key, place) = places
+            .places
+            .iter()
+            .filter(|(_, p)| p.updated_at > 0)
+            .max_by_key(|(_, p)| p.updated_at)?;
+        let book = gideon_core::books::scan(&self.books_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|b| b.relative_path == *key)?;
+        Some((book, *place))
+    }
+
+    /// What Continue resumes: whichever of the last manga and the last book
+    /// was in your hands more recently. Picking the device up to carry on a
+    /// novel and being offered a manga would be the screen lying.
+    fn continue_target(&self) -> Option<ContinueTarget> {
+        let manga = self.continue_series_card();
+        let manga_at = manga
+            .as_ref()
+            .map(|c| self.with_progress(|_, store| c.latest_read_at(store)))
+            .unwrap_or(0);
+        let book = self.continue_book();
+        let book_at = book.as_ref().map(|(_, p)| p.updated_at).unwrap_or(0);
+        match (manga, book) {
+            (Some(card), Some((book, place))) => Some(if manga_at >= book_at {
+                ContinueTarget::Manga(card)
+            } else {
+                ContinueTarget::Book(book, place)
+            }),
+            (Some(card), None) => Some(ContinueTarget::Manga(card)),
+            (None, Some((book, place))) => Some(ContinueTarget::Book(book, place)),
+            (None, None) => None,
+        }
+    }
+
     fn continue_card(&self) -> Option<(String, String, f32)> {
-        let cards = group_library(Library::new(&self.library_dir).scan().ok()?);
+        match self.continue_target()? {
+            ContinueTarget::Book(book, place) => {
+                let total = place.chapters.max(place.chapter + 1);
+                let pct = place.chapter as f32 / total as f32;
+                let where_at = match &book.author {
+                    Some(a) => format!("{a} — chapter {} of {total}", place.chapter + 1),
+                    None => format!("chapter {} of {total}", place.chapter + 1),
+                };
+                Some((book.title, where_at, pct))
+            }
+            ContinueTarget::Manga(card) => self.continue_card_manga(&card),
+        }
+    }
+
+    fn continue_card_manga(&self, card: &SeriesCard) -> Option<(String, String, f32)> {
         self.with_progress(|_, store| {
-            let card = cards
-                .iter()
-                .filter(|c| c.latest_read_at(store) > 0)
-                .max_by_key(|c| c.latest_read_at(store))?;
             let entry = card.resume_chapter(store);
             let progress = store.get(&entry.relative_path);
             let pct = progress
