@@ -20,7 +20,27 @@ pub struct EpubText {
     pub title: Option<String>,
     pub author: Option<String>,
     pub chapters: Vec<Chapter>,
+    /// The book's own table of contents (EPUB 3 nav, else EPUB 2 NCX),
+    /// each entry pointing at the chapter it opens. Empty when the book
+    /// has none; see [`EpubText::contents`] for what the reader shows.
+    pub toc: Vec<TocEntry>,
 }
+
+/// One line of the table of contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocEntry {
+    pub title: String,
+    /// Index into [`EpubText::chapters`].
+    pub chapter: usize,
+}
+
+/// Spine items this short (in blocks) that carry no heading are folded
+/// into the chapter before them while it is still under this size. The
+/// Internet Archive's generated EPUBs put every scanned page in its own
+/// file — 163 "chapters" of a paragraph each — and a book reads as one
+/// text, not as a page per chapter. A real chapter starts with a heading
+/// and stays its own.
+const FOLD_UNDER_BLOCKS: usize = 40;
 
 /// One spine item with something to read in it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -110,6 +130,35 @@ impl Block {
 }
 
 impl EpubText {
+    /// What the contents list shows: the book's own table of contents, or,
+    /// when it has none, the chapters that have a heading, or failing that
+    /// numbered chapters — there is always a way to jump.
+    pub fn contents(&self) -> Vec<TocEntry> {
+        if !self.toc.is_empty() {
+            return self.toc.clone();
+        }
+        let titled: Vec<TocEntry> = self
+            .chapters
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                c.title.as_ref().map(|t| TocEntry {
+                    title: t.clone(),
+                    chapter: i,
+                })
+            })
+            .collect();
+        if !titled.is_empty() {
+            return titled;
+        }
+        (0..self.chapters.len())
+            .map(|i| TocEntry {
+                title: format!("Chapter {}", i + 1),
+                chapter: i,
+            })
+            .collect()
+    }
+
     /// Total paragraphs across the book, for a rough "n% read".
     pub fn block_count(&self) -> usize {
         self.chapters.iter().map(|c| c.blocks.len()).sum()
@@ -152,7 +201,9 @@ pub fn load_from<R: Read + Seek>(mut archive: zip::ZipArchive<R>) -> Result<Epub
         Some(i) => &opf_path[..=i],
         None => "",
     };
-    let mut chapters = Vec::new();
+    let mut chapters: Vec<Chapter> = Vec::new();
+    // Which chapter each spine document ended up in (folded ones share).
+    let mut chapter_of: Vec<(String, usize)> = Vec::new();
     for href in package.spine_hrefs() {
         let full = normalize_path(&format!("{opf_dir}{href}"));
         let Some(html) = read(&mut archive, &full) else {
@@ -163,22 +214,222 @@ pub fn load_from<R: Read + Seek>(mut archive: zip::ZipArchive<R>) -> Result<Epub
             None => "",
         };
         let chapter = html_to_chapter_in(&html, doc_dir);
-        if !chapter.blocks.is_empty() {
-            chapters.push(chapter);
+        if chapter.blocks.is_empty() {
+            continue;
         }
+        let starts_with_heading = matches!(chapter.blocks.first(), Some(Block::Heading(_)));
+        match chapters.last_mut() {
+            Some(prev) if !starts_with_heading && prev.blocks.len() < FOLD_UNDER_BLOCKS => {
+                prev.blocks.extend(chapter.blocks);
+                if prev.title.is_none() {
+                    prev.title = chapter.title;
+                }
+            }
+            _ => chapters.push(chapter),
+        }
+        chapter_of.push((full, chapters.len() - 1));
     }
+    let toc = load_toc(&mut archive, &read, &package, opf_dir, &chapter_of);
     Ok(EpubText {
         title: meta.title,
         author: meta.author,
         chapters,
+        toc,
     })
+}
+
+/// The table of contents: the EPUB 3 nav document when the manifest marks
+/// one, else the EPUB 2 NCX; entries resolved to chapters, those pointing
+/// nowhere dropped, runs of one chapter collapsed to the first.
+fn load_toc<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    read: &dyn Fn(&mut zip::ZipArchive<R>, &str) -> Option<String>,
+    package: &Package,
+    opf_dir: &str,
+    chapter_of: &[(String, usize)],
+) -> Vec<TocEntry> {
+    let nav = package
+        .manifest
+        .iter()
+        .find(|m| m.properties.split_whitespace().any(|p| p == "nav"))
+        .map(|m| (m.href.clone(), true))
+        .or_else(|| {
+            package
+                .manifest
+                .iter()
+                .find(|m| {
+                    m.media.contains("dtbncx") || m.href.to_ascii_lowercase().ends_with(".ncx")
+                })
+                .map(|m| (m.href.clone(), false))
+        });
+    let Some((href, is_nav)) = nav else {
+        return Vec::new();
+    };
+    let full = normalize_path(&format!("{opf_dir}{href}"));
+    let Some(xml) = read(archive, &full) else {
+        return Vec::new();
+    };
+    let doc_dir = match full.rfind('/') {
+        Some(i) => &full[..=i],
+        None => "",
+    };
+    let raw = if is_nav {
+        parse_nav(&xml)
+    } else {
+        parse_ncx(&xml)
+    };
+    let mut out: Vec<TocEntry> = Vec::new();
+    for (title, target) in raw {
+        let target = normalize_path(&format!("{doc_dir}{target}"));
+        let Some(&(_, chapter)) = chapter_of
+            .iter()
+            .find(|(h, _)| *h == target || percent_decode(h) == percent_decode(&target))
+        else {
+            continue;
+        };
+        if out.last().is_some_and(|e| e.chapter == chapter) {
+            continue;
+        }
+        out.push(TocEntry { title, chapter });
+    }
+    out
+}
+
+/// `<nav epub:type="toc">` anchors, in document order: (label, href).
+/// Nesting is flattened; a book's parts and chapters read as one list.
+fn parse_nav(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut out = Vec::new();
+    let mut in_toc = false;
+    let mut nav_depth = 0usize;
+    let mut href: Option<String> = None;
+    let mut label = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"nav" => {
+                    nav_depth += 1;
+                    let kind = e.attributes().flatten().find_map(|a| {
+                        (a.key.local_name().as_ref() == b"type")
+                            .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+                            .flatten()
+                    });
+                    // The first nav is the toc when none says so.
+                    in_toc = kind
+                        .as_deref()
+                        .map(|k| k == "toc")
+                        .unwrap_or(out.is_empty());
+                }
+                b"a" if in_toc => {
+                    href = e.attributes().flatten().find_map(|a| {
+                        (a.key.local_name().as_ref() == b"href")
+                            .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+                            .flatten()
+                    });
+                    label.clear();
+                }
+                _ => {}
+            },
+            Ok(Event::Text(t)) => {
+                if href.is_some() {
+                    label.push_str(&decode_entities(&String::from_utf8_lossy(&t)));
+                }
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"a" => {
+                    if let Some(h) = href.take() {
+                        let text: String = label.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if !text.is_empty() {
+                            out.push((text, h));
+                        }
+                    }
+                }
+                b"nav" => {
+                    nav_depth = nav_depth.saturating_sub(1);
+                    if nav_depth == 0 {
+                        in_toc = false;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// NCX `<navPoint>`s in document order: (`<navLabel><text>`, `<content src>`).
+fn parse_ncx(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut out = Vec::new();
+    let mut in_text = false;
+    let mut label = String::new();
+    let content_src = |e: &quick_xml::events::BytesStart| -> Option<String> {
+        e.attributes().flatten().find_map(|a| {
+            (a.key.local_name().as_ref() == b"src")
+                .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+                .flatten()
+        })
+    };
+    let mut take_content = |src: Option<String>, label: &mut String| {
+        if let Some(src) = src {
+            let text: String = label.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !text.is_empty() {
+                out.push((text, src));
+            }
+        }
+    };
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"navPoint" => label.clear(),
+                b"text" => in_text = true,
+                b"content" => take_content(content_src(&e), &mut label),
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => {
+                if e.local_name().as_ref() == b"content" {
+                    take_content(content_src(&e), &mut label);
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_text {
+                    label.push_str(&decode_entities(&String::from_utf8_lossy(&t)));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.local_name().as_ref() == b"text" {
+                    in_text = false;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One `<item>` of the manifest.
+#[derive(Debug, Default, Clone)]
+struct ManifestItem {
+    id: String,
+    href: String,
+    media: String,
+    /// EPUB 3 `properties` ("nav", "cover-image", …).
+    properties: String,
 }
 
 /// The manifest and spine of an OPF: which documents, in what order.
 #[derive(Debug, Default)]
 struct Package {
-    /// id → (href, media-type)
-    manifest: Vec<(String, String, String)>,
+    manifest: Vec<ManifestItem>,
     spine: Vec<String>,
 }
 
@@ -196,16 +447,16 @@ impl Package {
         let mut out: Vec<String> = self
             .spine
             .iter()
-            .filter_map(|id| self.manifest.iter().find(|(mid, _, _)| mid == id))
-            .filter(|(_, href, media)| is_doc(media, href))
-            .map(|(_, href, _)| href.clone())
+            .filter_map(|id| self.manifest.iter().find(|m| m.id == *id))
+            .filter(|m| is_doc(&m.media, &m.href))
+            .map(|m| m.href.clone())
             .collect();
         if out.is_empty() {
             out = self
                 .manifest
                 .iter()
-                .filter(|(_, href, media)| is_doc(media, href))
-                .map(|(_, href, _)| href.clone())
+                .filter(|m| is_doc(&m.media, &m.href))
+                .map(|m| m.href.clone())
                 .collect();
         }
         out
@@ -231,8 +482,12 @@ fn parse_package(xml: &str) -> Package {
                 match e.local_name().as_ref() {
                     b"item" => {
                         if let (Some(id), Some(href)) = (attr(b"id"), attr(b"href")) {
-                            let media = attr(b"media-type").unwrap_or_default();
-                            package.manifest.push((id, href, media));
+                            package.manifest.push(ManifestItem {
+                                id,
+                                href,
+                                media: attr(b"media-type").unwrap_or_default(),
+                                properties: attr(b"properties").unwrap_or_default(),
+                            });
                         }
                     }
                     b"itemref" => {
@@ -741,6 +996,133 @@ mod tests {
             ]))]
         );
         assert_eq!(ch.blocks[0].text(), "So it goes. Thought. Both");
+    }
+
+    const NAV: &str = r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="Text/ch%202.xhtml">Two</a></li><li><a href="Text/ch1.xhtml#start">One &amp; only</a><ol><li><a href="Text/ch1.xhtml#later">deeper, same chapter</a></li></ol></li><li><a href="Text/missing.xhtml">Nowhere</a></li></ol></nav><nav epub:type="landmarks"><ol><li><a href="Text/ch1.xhtml">ignored</a></li></ol></nav></body></html>"#;
+
+    #[test]
+    fn the_nav_document_becomes_the_contents() {
+        let opf = OPF.replace(
+            "</manifest>",
+            r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest>"#,
+        );
+        let bytes = epub(&[
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", &opf),
+            ("OEBPS/nav.xhtml", NAV),
+            ("OEBPS/Text/ch1.xhtml", CH1),
+            ("OEBPS/Text/ch 2.xhtml", CH2),
+        ]);
+        let book = load_from(zip::ZipArchive::new(Cursor::new(bytes)).unwrap()).unwrap();
+        let toc: Vec<(&str, usize)> = book
+            .toc
+            .iter()
+            .map(|e| (e.title.as_str(), e.chapter))
+            .collect();
+        assert_eq!(
+            toc,
+            [("Two", 0), ("One & only", 1)],
+            "resolved to chapters, same-chapter run collapsed, dead link dropped, landmarks ignored"
+        );
+        assert_eq!(book.contents(), book.toc);
+    }
+
+    #[test]
+    fn an_ncx_is_read_when_there_is_no_nav() {
+        let opf = OPF.replace(
+            "</manifest>",
+            r#"<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest>"#,
+        );
+        let ncx = r#"<ncx><navMap><navPoint id="a"><navLabel><text>Chapter Two</text></navLabel><content src="Text/ch%202.xhtml"/></navPoint><navPoint id="b"><navLabel><text>Chapter One</text></navLabel><content src="Text/ch1.xhtml"/></navPoint></navMap></ncx>"#;
+        let bytes = epub(&[
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", &opf),
+            ("OEBPS/toc.ncx", ncx),
+            ("OEBPS/Text/ch1.xhtml", CH1),
+            ("OEBPS/Text/ch 2.xhtml", CH2),
+        ]);
+        let book = load_from(zip::ZipArchive::new(Cursor::new(bytes)).unwrap()).unwrap();
+        let toc: Vec<(&str, usize)> = book
+            .toc
+            .iter()
+            .map(|e| (e.title.as_str(), e.chapter))
+            .collect();
+        assert_eq!(toc, [("Chapter Two", 0), ("Chapter One", 1)]);
+    }
+
+    #[test]
+    fn without_a_toc_the_contents_are_the_headings_or_numbers() {
+        let bytes = epub(&[
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", OPF),
+            ("OEBPS/Text/ch1.xhtml", CH1),
+            ("OEBPS/Text/ch 2.xhtml", CH2),
+        ]);
+        let book = load_from(zip::ZipArchive::new(Cursor::new(bytes)).unwrap()).unwrap();
+        assert!(book.toc.is_empty());
+        let contents = book.contents();
+        let titles: Vec<&str> = contents.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, ["Two", "One"]);
+        let plain = EpubText {
+            chapters: vec![Chapter::default(), Chapter::default()],
+            ..Default::default()
+        };
+        let titles: Vec<String> = plain.contents().into_iter().map(|e| e.title).collect();
+        assert_eq!(titles, ["Chapter 1", "Chapter 2"]);
+    }
+
+    #[test]
+    fn page_per_file_scans_fold_into_chapters_but_headed_chapters_stay() {
+        // 12 one-paragraph files with no heading, then a headed chapter,
+        // then 2 more loose pages: 1 + 1 + (the 2 fold into the headed one).
+        let mut files: Vec<(String, String)> = vec![(
+            "META-INF/container.xml".into(),
+            CONTAINER.replace("OEBPS/content.opf", "content.opf"),
+        )];
+        let mut manifest = String::new();
+        let mut spine = String::new();
+        let mut add = |name: &str, body: &str| {
+            let id = name.replace('.', "_");
+            manifest.push_str(&format!(
+                r#"<item id="{id}" href="{name}" media-type="application/xhtml+xml"/>"#
+            ));
+            spine.push_str(&format!(r#"<itemref idref="{id}"/>"#));
+            files.push((
+                name.to_string(),
+                format!("<html><body>{body}</body></html>"),
+            ));
+        };
+        for i in 0..12 {
+            add(&format!("p{i}.xhtml"), &format!("<p>Scanned page {i}.</p>"));
+        }
+        add("c.xhtml", "<h1>Real chapter</h1><p>Starts here.</p>");
+        add("q1.xhtml", "<p>continues</p>");
+        add("q2.xhtml", "<p>and ends.</p>");
+        files.push((
+            "content.opf".into(),
+            format!("<package><manifest>{manifest}</manifest><spine>{spine}</spine></package>"),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let bytes = epub(&refs);
+        let book = load_from(zip::ZipArchive::new(Cursor::new(bytes)).unwrap()).unwrap();
+        assert_eq!(book.chapters.len(), 2);
+        assert_eq!(
+            book.chapters[0].blocks.len(),
+            12,
+            "the loose pages are one chapter"
+        );
+        assert_eq!(book.chapters[0].title, None);
+        assert_eq!(book.chapters[1].title.as_deref(), Some("Real chapter"));
+        assert_eq!(
+            book.chapters[1].blocks.len(),
+            4,
+            "the pages after it fold in"
+        );
+        let titles: Vec<String> = book.contents().into_iter().map(|e| e.title).collect();
+        assert_eq!(titles, ["Real chapter"]);
     }
 
     #[test]

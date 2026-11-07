@@ -9836,9 +9836,10 @@ mod library_tabs {
         UiEvent::Tap { x, y: H / 2 }
     }
 
-    /// Row `i` of the reading menu: 0 larger, 1 smaller, 2 close book, 3 close.
+    /// Row `i` of the reading menu: 0 contents, 1 larger, 2 smaller,
+    /// 3 close book, 4 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(4, i)
+        tap_modal_row(5, i)
     }
 
     /// Open the first book on the Books tab in gideon's reader.
@@ -10227,7 +10228,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(2)]);
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(3)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10249,7 +10250,7 @@ mod library_tabs {
 
         // Larger text: fewer lines per page, same paragraph on the page.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(4, 0)).unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(5, 1)).unwrap();
         let Screen::BookReader { pages, page, .. } = ui.screen() else {
             panic!("expected the reader");
         };
@@ -10456,5 +10457,51 @@ mod library_tabs {
         let mut plain = app(&lib, FakeGateway::default(), open_first_book());
         plain.run().unwrap();
         assert_ne!(styled, plain.display().buffer);
+    }
+
+    #[test]
+    fn contents_lists_the_chapters_and_a_tap_jumps_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let mut events = open_first_book();
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(0)]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Screen::BookContents {
+            entries, current, ..
+        } = ui.screen()
+        else {
+            panic!("expected the contents, got {:?}", ui.screen());
+        };
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["One", "Two"],
+            "no nav in the fixture: headings serve"
+        );
+        assert_eq!(*current, 0);
+        // Pushed as a list: Full, with a Back button (it is a child screen).
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        let mut events = open_first_book();
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(0), tap_row(1)]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Screen::BookReader {
+            chapter,
+            page,
+            pages,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the reader back, got {:?}", ui.screen());
+        };
+        assert_eq!((*chapter, *page), (1, 0));
+        assert_eq!(pages[0][0].text, "Two");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        let saved = gideon_core::BookPlaces::load(&books)
+            .get("Kurt Vonnegut/book-0001.epub")
+            .unwrap();
+        assert_eq!(saved.chapter, 1, "the jump is the new place");
     }
 }

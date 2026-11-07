@@ -68,15 +68,22 @@ def main() -> None:
         'xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0"><metadata>'
         "<dc:title>Slaughterhouse-Five</dc:title><dc:creator>Kurt Vonnegut</dc:creator>"
         "</metadata><manifest>"
+        '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
         '<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
         '<item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/>'
         '</manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>'
+    )
+    nav = (
+        '<html xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol>'
+        '<li><a href="ch1.xhtml">One</a></li><li><a href="ch2.xhtml">Two</a></li>'
+        "</ol></nav></body></html>"
     )
     epub_path = os.path.join(books_dir, "book-0001.epub")
     with zipfile.ZipFile(epub_path, "w") as z:
         z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         z.writestr("META-INF/container.xml", container)
         z.writestr("OEBPS/content.opf", opf)
+        z.writestr("OEBPS/nav.xhtml", nav)
         z.writestr(
             "OEBPS/ch1.xhtml",
             "<html><head><style>p{x:y}</style></head><body><h1>One</h1>"

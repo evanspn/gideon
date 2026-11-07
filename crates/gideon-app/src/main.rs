@@ -404,40 +404,47 @@ fn cmd_books(dir: PathBuf) -> Result<()> {
 }
 
 fn cmd_book(path: PathBuf) -> Result<()> {
+    use std::io::Write as _;
+
     let text = gideon_core::epub::load(&path)
         .with_context(|| format!("couldn't open {}", path.display()))?;
-    println!(
-        "{} — {}",
-        text.title.as_deref().unwrap_or("(untitled)"),
-        text.author.as_deref().unwrap_or("(unknown author)")
-    );
     let pictures = text
         .chapters
         .iter()
         .flat_map(|c| c.blocks.iter())
         .filter(|b| matches!(b, gideon_core::BookBlock::Image(_)))
         .count();
-    println!(
-        "{} chapter(s), {} paragraph(s), {} picture(s)\n",
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — {}\n",
+        text.title.as_deref().unwrap_or("(untitled)"),
+        text.author.as_deref().unwrap_or("(unknown author)")
+    ));
+    out.push_str(&format!(
+        "{} chapter(s), {} paragraph(s), {} picture(s), {} contents entr{}\n\n",
         text.chapters.len(),
         text.block_count() - pictures,
-        pictures
-    );
+        pictures,
+        text.toc.len(),
+        if text.toc.len() == 1 { "y" } else { "ies" }
+    ));
     for (i, chapter) in text.chapters.iter().enumerate() {
-        println!(
-            "  {:>3}. {} ({} paragraphs)",
+        out.push_str(&format!(
+            "  {:>3}. {} ({} paragraphs)\n",
             i + 1,
             chapter.title.as_deref().unwrap_or("(no heading)"),
             chapter.blocks.len()
-        );
+        ));
         if let Some(first) = chapter.blocks.iter().find_map(|b| match b {
             gideon_core::BookBlock::Paragraph(p) => Some(p.text()),
             _ => None,
         }) {
             let preview: String = first.chars().take(72).collect();
-            println!("       {preview}");
+            out.push_str(&format!("       {preview}\n"));
         }
     }
+    // A closed pipe (`| head`) is not an error worth a panic.
+    let _ = std::io::stdout().write_all(out.as_bytes());
     Ok(())
 }
 
