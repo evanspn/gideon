@@ -645,6 +645,28 @@ mod tests {
         assert!(!books.join("novel.epub").exists());
     }
 
+    /// The device's whole receive path on a real book from disk: what the
+    /// phone sends, the device must classify, name, place and then open.
+    /// Opt in with `GIDEON_PROBE_EPUB=<path to an .epub>`; silently passes
+    /// otherwise, since nobody's books are checked in.
+    #[test]
+    fn place_upload_accepts_a_real_epub_when_given_one() {
+        let Ok(path) = std::env::var("GIDEON_PROBE_EPUB") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("GIDEON_PROBE_EPUB must point at a readable file");
+        let dir = tempfile::tempdir().unwrap();
+        let manga = dir.path().join("Manga");
+        let books = dir.path().join("Books");
+        let dest = place_upload(&manga, &books, "sent-from-phone.epub", &bytes).unwrap();
+        assert!(dest.starts_with(&books), "{dest:?}");
+        assert_eq!(std::fs::read(&dest).unwrap().len(), bytes.len());
+        // And the reader can open what was placed.
+        let text = gideon_core::epub::load(&dest).unwrap();
+        assert!(!text.chapters.is_empty());
+        assert!(!gideon_core::books::scan(&books).unwrap().is_empty());
+    }
+
     #[test]
     fn books_dir_is_per_device_not_per_profile() {
         assert_eq!(

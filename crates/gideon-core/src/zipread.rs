@@ -287,39 +287,67 @@ mod tests {
     /// (sizes fit in 32 bits), and a full ZIP64 end record — the shape the
     /// strict reader refuses.
     fn sloppy_zip64(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        build_zip(entries, true, false, "")
+    }
+
+    /// `zip64`: full ZIP64 end records and a 32-byte ZIP64 extra on every
+    /// entry. `descriptors`: streaming-writer style — bit 3 set, sizes and
+    /// CRC zero in the local header, a data descriptor after the data (the
+    /// central directory still knows the sizes). `comment`: an archive
+    /// comment after the end record, which moves the end record away from
+    /// the end of the file.
+    fn build_zip(
+        entries: &[(&str, &[u8])],
+        zip64: bool,
+        descriptors: bool,
+        comment: &str,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         let mut central = Vec::new();
         for (name, body) in entries {
             let offset = out.len() as u32;
             let mut extra = Vec::new();
-            // 32 bytes, the way the .NET writer does it: sizes, offset,
-            // and a disk number padded out.
-            extra.extend_from_slice(&1u16.to_le_bytes());
-            extra.extend_from_slice(&32u16.to_le_bytes());
-            extra.extend_from_slice(&(body.len() as u64).to_le_bytes());
-            extra.extend_from_slice(&(body.len() as u64).to_le_bytes());
-            extra.extend_from_slice(&(offset as u64).to_le_bytes());
-            extra.extend_from_slice(&0u64.to_le_bytes());
+            if zip64 {
+                // 32 bytes, the way the .NET writer does it: sizes, offset,
+                // and a disk number padded out.
+                extra.extend_from_slice(&1u16.to_le_bytes());
+                extra.extend_from_slice(&32u16.to_le_bytes());
+                extra.extend_from_slice(&(body.len() as u64).to_le_bytes());
+                extra.extend_from_slice(&(body.len() as u64).to_le_bytes());
+                extra.extend_from_slice(&(offset as u64).to_le_bytes());
+                extra.extend_from_slice(&0u64.to_le_bytes());
+            }
             let crc = crc32(body);
+            let flags: u16 = if descriptors { 1 << 3 } else { 0 };
             // Local header.
             out.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
             out.extend_from_slice(&20u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes()); // stored
             out.extend_from_slice(&[0, 0, 0, 0]);
-            out.extend_from_slice(&crc.to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            if descriptors {
+                out.extend_from_slice(&[0; 12]);
+            } else {
+                out.extend_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            }
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
             out.extend_from_slice(&(extra.len() as u16).to_le_bytes());
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(&extra);
             out.extend_from_slice(body);
+            if descriptors {
+                out.extend_from_slice(&[0x50, 0x4b, 0x07, 0x08]);
+                out.extend_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            }
             // Central header.
             central.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
             central.extend_from_slice(&45u16.to_le_bytes());
             central.extend_from_slice(&45u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&flags.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&[0, 0, 0, 0]);
             central.extend_from_slice(&crc.to_le_bytes());
@@ -337,31 +365,41 @@ mod tests {
         }
         let cd_off = out.len() as u64;
         out.extend_from_slice(&central);
-        let z64_off = out.len() as u64;
-        // ZIP64 end record.
-        out.extend_from_slice(&[0x50, 0x4b, 0x06, 0x06]);
-        out.extend_from_slice(&44u64.to_le_bytes());
-        out.extend_from_slice(&45u16.to_le_bytes());
-        out.extend_from_slice(&45u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(central.len() as u64).to_le_bytes());
-        out.extend_from_slice(&cd_off.to_le_bytes());
-        // Locator.
-        out.extend_from_slice(&[0x50, 0x4b, 0x06, 0x07]);
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&z64_off.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes());
-        // Classic end record, all at the ceiling.
+        if zip64 {
+            let z64_off = out.len() as u64;
+            // ZIP64 end record.
+            out.extend_from_slice(&[0x50, 0x4b, 0x06, 0x06]);
+            out.extend_from_slice(&44u64.to_le_bytes());
+            out.extend_from_slice(&45u16.to_le_bytes());
+            out.extend_from_slice(&45u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(central.len() as u64).to_le_bytes());
+            out.extend_from_slice(&cd_off.to_le_bytes());
+            // Locator.
+            out.extend_from_slice(&[0x50, 0x4b, 0x06, 0x07]);
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&z64_off.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+        }
+        // Classic end record: all at the ceiling for ZIP64, real otherwise.
         out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
         out.extend_from_slice(&[0, 0, 0, 0]);
-        out.extend_from_slice(&0xFFFFu16.to_le_bytes());
-        out.extend_from_slice(&0xFFFFu16.to_le_bytes());
-        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        if zip64 {
+            out.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            out.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        } else {
+            out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(cd_off as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        out.extend_from_slice(comment.as_bytes());
         out
     }
 
@@ -417,6 +455,65 @@ mod tests {
         // The lenient reader handles the same deflated archive too.
         let mut lenient = LenientZip::open(Cursor::new(bytes)).unwrap();
         assert_eq!(lenient.read("a.txt").unwrap(), b"hello hello hello hello");
+    }
+
+    #[test]
+    fn streaming_writers_data_descriptors_and_archive_comments_read_too() {
+        // A streaming writer leaves sizes out of the local header; the
+        // lenient reader takes them from the central directory, which is
+        // the only place that ever knew.
+        let entries: &[(&str, &[u8])] = &[
+            ("mimetype", b"application/epub+zip"),
+            ("OEBPS/a.xhtml", b"<p>so it goes</p>"),
+        ];
+        for (zip64, descriptors, comment) in [
+            (false, true, ""),
+            (true, true, ""),
+            (false, false, "made with care"),
+            (true, false, "a comment after a ZIP64 end record"),
+            (true, true, "everything at once"),
+        ] {
+            let bytes = build_zip(entries, zip64, descriptors, comment);
+            let mut lenient = LenientZip::open(Cursor::new(bytes.clone())).unwrap_or_else(|e| {
+                panic!("zip64={zip64} desc={descriptors} comment={comment:?}: {e}")
+            });
+            assert_eq!(lenient.read("OEBPS/a.xhtml").unwrap(), b"<p>so it goes</p>");
+            let mut src = ZipSource::open(Cursor::new(bytes)).unwrap();
+            assert_eq!(src.read("mimetype").unwrap(), b"application/epub+zip");
+        }
+    }
+
+    #[test]
+    fn the_whole_book_path_accepts_a_sloppy_epub() {
+        // What the device does with a phone send, end to end: classify,
+        // name, open, read a page — on the shape that used to be refused.
+        let opf = br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Sloppy</dc:title><dc:creator>A</dc:creator></metadata><manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c"/></spine></package>"#;
+        let bytes = sloppy_zip64(&[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#),
+            ("content.opf", opf),
+            ("c.xhtml", b"<html><body><h1>One</h1><p>So it goes.</p></body></html>"),
+        ]);
+        assert_eq!(
+            crate::upload::classify("book.epub", &bytes).unwrap(),
+            crate::UploadKind::Epub
+        );
+        let meta = crate::upload::epub_meta(&bytes);
+        assert_eq!(meta.title.as_deref(), Some("Sloppy"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sloppy.epub");
+        std::fs::write(&path, &bytes).unwrap();
+        let text = crate::epub::load(&path).unwrap();
+        assert_eq!(text.chapters.len(), 1);
+        assert_eq!(text.chapters[0].title.as_deref(), Some("One"));
+        assert_eq!(
+            crate::epub::read_entry(&path, "mimetype").unwrap(),
+            b"application/epub+zip"
+        );
+        assert_eq!(
+            crate::upload::epub_meta_file(&path).title.as_deref(),
+            Some("Sloppy")
+        );
     }
 
     #[test]
