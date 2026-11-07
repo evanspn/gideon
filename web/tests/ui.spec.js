@@ -71,8 +71,17 @@ function mockSends(page, initial = []) {
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(items) });
     }
     if (req.method() === "POST") {
-      const { title } = JSON.parse(req.postData() || "{}");
-      const row = { id: `id-${++n}`, title, created_at: new Date().toISOString() };
+      const body = JSON.parse(req.postData() || "{}");
+      const row = {
+        id: `id-${++n}`,
+        title: body.title,
+        kind: body.kind || "title",
+        file_path: body.file_path || null,
+        file_size: body.file_size || null,
+        status: "pending",
+        error: null,
+        created_at: new Date().toISOString(),
+      };
       items = [row, ...items];
       return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify([row]) });
     }
@@ -97,6 +106,11 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/rest/v1/send_queue**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
+  // Default: no book catalogues and no uploads bucket — same reason.
+  await page.route("**/rest/v1/book_catalogs**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
+  await page.route("**/storage/v1/object/**", (route) => route.fulfill({ status: 404, body: "" }));
   // Default: no published chapter pages (library covers) — same reason. Reader
   // tests override this with their own routes (later registrations win).
   await page.route("**/rest/v1/chapter_pages**", (route) =>
@@ -627,4 +641,182 @@ test("library list view looks right", async ({ page }) => {
   await page.getByTestId("view-list").click();
   await expect(page.getByTestId("item").first()).toBeVisible();
   await expect(page).toHaveScreenshot("library-list.png", { maxDiffPixelRatio: 0.02 });
+});
+
+
+// --- Send a file from the phone ---------------------------------------------
+//
+// The file goes to the private uploads bucket, then a send_queue row points at
+// it; the Kobo fetches and places it on its next sync. Storage and the queue
+// are mocked at the HTTP boundary; validation runs for real on the bytes.
+
+function mockStorage(page) {
+  const objects = [];
+  const deleted = [];
+  page.route("**/storage/v1/object/kobo-uploads/**", async (route) => {
+    const req = route.request();
+    const path = decodeURIComponent(req.url().split("/kobo-uploads/")[1]);
+    if (req.method() === "POST") {
+      objects.push({ path, size: (req.postDataBuffer() || Buffer.alloc(0)).length, type: req.headers()["content-type"] });
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ Key: `kobo-uploads/${path}` }) });
+    }
+    if (req.method() === "DELETE") {
+      deleted.push(path);
+      return route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+    }
+    return route.fulfill({ status: 404, body: "" });
+  });
+  return { objects, deleted };
+}
+
+function mockCatalogs(page, initial = []) {
+  let items = initial.slice();
+  let n = initial.length;
+  page.route("**/rest/v1/book_catalogs**", (route) => {
+    const req = route.request();
+    if (req.method() === "GET") {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(items) });
+    }
+    if (req.method() === "POST") {
+      const body = JSON.parse(req.postData() || "{}");
+      if (items.some((c) => c.url === body.url)) {
+        return route.fulfill({ status: 409, contentType: "application/json", body: '{"message":"duplicate"}' });
+      }
+      const row = { id: `cat-${++n}`, name: body.name, url: body.url, created_at: new Date().toISOString() };
+      items = [...items, row];
+      return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify([row]) });
+    }
+    if (req.method() === "DELETE") {
+      const m = req.url().match(/id=eq\.([^&]+)/);
+      if (m) items = items.filter((x) => x.id !== decodeURIComponent(m[1]));
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ status: 200, body: "[]" });
+  });
+  return () => items;
+}
+
+const EPUB_BYTES = Buffer.from("PK\x03\x04 a tiny epub", "latin1");
+
+async function signedInOnStats(page) {
+  await mockProgress(page, ROWS);
+  await mockAuthOk(page);
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-stats").click();
+}
+
+test("a file picked on the phone is uploaded, queued, and listed with its size", async ({ page }) => {
+  await mockSends(page);
+  await mockCatalogs(page);
+  const storage = mockStorage(page);
+  await signedInOnStats(page);
+
+  await page.getByTestId("send-file").setInputFiles({ name: "Slaughterhouse-Five.epub", mimeType: "application/epub+zip", buffer: EPUB_BYTES });
+
+  const item = page.getByTestId("send-item");
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toContainText("Slaughterhouse-Five.epub");
+  await expect(item.first()).toContainText("KB");
+  await expect(item.first()).toHaveAttribute("data-kind", "file");
+
+  // The object went up under "<user>/<random>/<name>" — the shape the
+  // bucket's owner-only policies key on — before the queue row was written.
+  expect(storage.objects).toHaveLength(1);
+  expect(storage.objects[0].path).toMatch(/^[^/]+\/[^/]+\/Slaughterhouse-Five\.epub$/);
+  expect(storage.objects[0].size).toBe(EPUB_BYTES.length);
+
+  // Removing a file send also drops its object.
+  await page.getByTestId("send-remove").click();
+  await expect(item).toHaveCount(0);
+  await expect.poll(() => storage.deleted.length).toBe(1);
+});
+
+test("a file that isn't what its extension says is refused on the phone, before any upload", async ({ page }) => {
+  await mockSends(page);
+  await mockCatalogs(page);
+  const storage = mockStorage(page);
+  await signedInOnStats(page);
+
+  // An HTML error page saved as .epub (what a rate-limited download looks like).
+  await page.getByTestId("send-file").setInputFiles({ name: "book.epub", mimeType: "application/epub+zip", buffer: Buffer.from("<html>Too many requests</html>") });
+  await expect(page.getByTestId("send-note")).toContainText("named .epub but it isn't an EPUB");
+  // A PDF renamed .cbz: says what it actually is.
+  await page.getByTestId("send-file").setInputFiles({ name: "scan.cbz", mimeType: "application/octet-stream", buffer: Buffer.from("%PDF-1.7 ...") });
+  await expect(page.getByTestId("send-note")).toContainText("looks like a PDF");
+  // Wrong type altogether.
+  await page.getByTestId("send-file").setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("hi") });
+  await expect(page.getByTestId("send-note")).toContainText("Only .epub, .pdf and .cbz");
+
+  expect(storage.objects).toHaveLength(0);
+  await expect(page.getByTestId("send-item")).toHaveCount(0);
+});
+
+test("a file the Kobo refused stays listed with the reason until dismissed", async ({ page }) => {
+  await mockSends(page, [
+    {
+      id: "f1",
+      title: "volume.cbz",
+      kind: "file",
+      file_path: "u/r/volume.cbz",
+      file_size: 2048,
+      status: "failed",
+      error: "named .cbz but the contents are an EPUB",
+      created_at: new Date().toISOString(),
+    },
+  ]);
+  await mockCatalogs(page);
+  mockStorage(page);
+  await signedInOnStats(page);
+
+  const item = page.getByTestId("send-item");
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toHaveAttribute("data-status", "failed");
+  await expect(page.getByTestId("send-error")).toContainText("named .cbz but the contents are an EPUB");
+  await page.getByTestId("send-remove").click();
+  await expect(item).toHaveCount(0);
+});
+
+// --- Book catalogues --------------------------------------------------------
+
+test("adding a Calibre server by bare address normalises it to its OPDS root", async ({ page }) => {
+  await mockSends(page);
+  const catalogs = mockCatalogs(page);
+  await signedInOnStats(page);
+
+  await expect(page.getByTestId("catalog-item")).toHaveCount(0);
+  await page.getByTestId("catalog-name").fill("Home");
+  await page.getByTestId("catalog-url").fill("calibre.local:8080");
+  await page.getByTestId("catalog-add").click();
+
+  const item = page.getByTestId("catalog-item");
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toContainText("Home");
+  await expect(item.first()).toContainText("http://calibre.local:8080/opds");
+  expect(catalogs()[0].url).toBe("http://calibre.local:8080/opds");
+
+  // An explicit path is kept as typed; a duplicate is explained, not doubled.
+  await page.getByTestId("catalog-url").fill("https://books.example/feeds/root.atom");
+  await page.getByTestId("catalog-add").click();
+  await expect(item).toHaveCount(2);
+  await expect(item.nth(1)).toContainText("https://books.example/feeds/root.atom");
+  await page.getByTestId("catalog-url").fill("http://calibre.local:8080/opds");
+  await page.getByTestId("catalog-add").click();
+  await expect(page.getByTestId("catalog-note")).toContainText("already in the list");
+  await expect(item).toHaveCount(2);
+
+  // Remove.
+  await page.getByTestId("catalog-remove").first().click();
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toContainText("books.example");
+});
+
+test("a catalogue address that isn't one is refused in place", async ({ page }) => {
+  await mockSends(page);
+  mockCatalogs(page);
+  await signedInOnStats(page);
+  await page.getByTestId("catalog-url").fill("   ");
+  await page.getByTestId("catalog-add").click();
+  await expect(page.getByTestId("catalog-note")).toContainText("doesn't look like an address");
+  await expect(page.getByTestId("catalog-item")).toHaveCount(0);
 });

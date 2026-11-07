@@ -13,6 +13,7 @@ pub mod profile;
 pub mod series;
 pub mod settings;
 pub mod stats;
+pub mod upload;
 
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
@@ -25,5 +26,6 @@ pub use settings::{
     FINISHED_CLEANUP_STEPS,
 };
 pub use stats::{ReadingSpan, ReadingStats};
+pub use upload::{sanitize_filename, UploadKind, MAX_UPLOAD_BYTES};
 
 pub type Result<T> = std::result::Result<T, Error>;

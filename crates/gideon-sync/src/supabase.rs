@@ -18,6 +18,8 @@
 //! wrappers over them. Live round-trips live behind `#[ignore]` integration
 //! tests that only run when a project is configured.
 
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -70,7 +72,31 @@ impl SupabaseConfig {
     fn auth_url(&self, path: &str) -> String {
         format!("{}/auth/v1/{}", self.base(), path)
     }
+
+    /// An object in the private uploads bucket. Each path segment is
+    /// percent-encoded on its own: a file name from a phone has spaces and
+    /// worse, and the slashes between segments must stay slashes.
+    fn upload_url(&self, object_path: &str) -> String {
+        let encoded: Vec<String> = object_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(encode_query_value)
+            .collect();
+        format!(
+            "{}/storage/v1/object/{}/{}",
+            self.base(),
+            UPLOADS_BUCKET,
+            encoded.join("/")
+        )
+    }
 }
+
+/// The storage bucket the dashboard uploads files into (migration 0005).
+pub const UPLOADS_BUCKET: &str = "kobo-uploads";
+
+/// Downloads larger than this are refused before they are read: the bucket
+/// caps objects at 50 MB, so anything bigger is not something we uploaded.
+const MAX_UPLOAD_DOWNLOAD: u64 = 52 * 1024 * 1024;
 
 /// A signed-in session: the tokens and the identity they belong to. Persisted
 /// on-device (serde) so sign-in survives restarts; the access token is
@@ -139,18 +165,79 @@ fn parse_progress_rows(body: &str) -> Result<Vec<RemoteProgress>> {
         .collect())
 }
 
-/// One "send to Kobo" request the web enqueued: a title for the device to
-/// search for. Only a title crosses the wire (the web can't run the source
-/// search), plus the row id so the device can mark it opened.
+/// One "send to Kobo" request the web enqueued. Two kinds: a *title* for the
+/// device to search for (only a search term crosses the wire — the web can't
+/// run the source search), or a *file* the phone uploaded, which the device
+/// fetches from storage and places. Plus the row id so it can be marked
+/// opened. The file fields default so a cache written before files existed
+/// still reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendItem {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub kind: SendKind,
+    /// Storage object path (`<user>/<random>/<file name>`) for a file send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+}
+
+impl SendItem {
+    /// A title send, as the web has always made them.
+    pub fn title(id: &str, title: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            title: title.to_string(),
+            kind: SendKind::Title,
+            file_path: None,
+            file_size: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SendKind {
+    #[default]
+    Title,
+    File,
+}
+
+/// An OPDS catalogue typed on the phone (`book_catalogs`, migration 0005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCatalog {
+    pub name: String,
+    pub url: String,
 }
 
 /// PostgREST query for this user's pending sends, newest first.
 fn send_pull_query() -> &'static str {
-    "send_queue?status=eq.pending&select=id,title&order=created_at.desc"
+    "send_queue?status=eq.pending&select=id,title,kind,file_path,file_size&order=created_at.desc"
+}
+
+/// PostgREST query for this user's book catalogues, oldest first (the order
+/// they were added, which is the order they show on the device).
+fn catalogs_query() -> &'static str {
+    "book_catalogs?select=name,url&order=created_at.asc"
+}
+
+fn parse_catalog_rows(body: &str) -> Result<Vec<RemoteCatalog>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(body).map_err(transport_err)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let url = r["url"].as_str()?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            Some(RemoteCatalog {
+                name: r["name"].as_str().unwrap_or("").trim().to_string(),
+                url: url.to_string(),
+            })
+        })
+        .collect())
 }
 
 /// PostgREST filter selecting one send row by id (for the "opened" PATCH).
@@ -163,9 +250,23 @@ fn parse_send_rows(body: &str) -> Result<Vec<SendItem>> {
     Ok(rows
         .into_iter()
         .filter_map(|r| {
+            let kind = match r["kind"].as_str() {
+                Some("file") => SendKind::File,
+                // Absent (a project without migration 0005) or 'title'.
+                _ => SendKind::Title,
+            };
+            let file_path = r["file_path"].as_str().map(str::to_string);
+            // A file send with no object path can't be fetched; drop it
+            // rather than show a row that can never do anything.
+            if kind == SendKind::File && file_path.is_none() {
+                return None;
+            }
             Some(SendItem {
                 id: r["id"].as_str()?.to_string(),
                 title: r["title"].as_str()?.to_string(),
+                kind,
+                file_path,
+                file_size: r["file_size"].as_u64(),
             })
         })
         .collect())
@@ -310,6 +411,76 @@ impl SupabaseTransport {
         parse_send_rows(&body)
     }
 
+    /// Fetch an uploaded file's bytes from the private bucket. The owner's
+    /// token is what authorises it; the bucket serves nothing by URL.
+    pub fn download_upload(&self, object_path: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .agent
+            .get(&self.config.upload_url(object_path))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .call();
+        let resp = check_ok(resp)?;
+        if let Some(len) = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            if len > MAX_UPLOAD_DOWNLOAD {
+                return Err(Error::Transport(format!(
+                    "upload is {len} bytes, over the {MAX_UPLOAD_DOWNLOAD} byte limit"
+                )));
+            }
+        }
+        let mut bytes = Vec::new();
+        let mut reader = resp.into_reader();
+        std::io::Read::take(&mut *reader, MAX_UPLOAD_DOWNLOAD + 1)
+            .read_to_end(&mut bytes)
+            .map_err(transport_err)?;
+        if bytes.len() as u64 > MAX_UPLOAD_DOWNLOAD {
+            return Err(Error::Transport("upload is over the size limit".into()));
+        }
+        Ok(bytes)
+    }
+
+    /// Remove an uploaded file once it is safely on the device, so it stops
+    /// counting against the account's storage.
+    pub fn delete_upload(&self, object_path: &str) -> Result<()> {
+        let resp = self
+            .agent
+            .delete(&self.config.upload_url(object_path))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .call();
+        check_ok(resp)?;
+        Ok(())
+    }
+
+    /// The OPDS catalogues this account added on the phone, oldest first.
+    pub fn fetch_book_catalogs(&self) -> Result<Vec<RemoteCatalog>> {
+        let resp = self
+            .agent
+            .get(&self.config.rest_url(catalogs_query()))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .call();
+        let body = read_body(check_ok(resp)?)?;
+        parse_catalog_rows(&body)
+    }
+
+    /// Mark a file send `failed` with the reason, so the phone shows why it
+    /// never arrived instead of the row just disappearing.
+    pub fn mark_send_failed(&self, id: &str, error: &str) -> Result<()> {
+        let resp = self
+            .agent
+            .request("PATCH", &self.config.rest_url(&mark_opened_query(id)))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .send_json(json!({ "status": "failed", "error": error }));
+        check_ok(resp)?;
+        Ok(())
+    }
+
     /// Mark a send row `opened` so the device's notification badge clears and
     /// the title isn't offered again on the next sweep.
     pub fn mark_send_opened(&self, id: &str) -> Result<()> {
@@ -413,7 +584,7 @@ mod tests {
     fn send_pull_query_selects_pending_newest_first() {
         assert_eq!(
             send_pull_query(),
-            "send_queue?status=eq.pending&select=id,title&order=created_at.desc"
+            "send_queue?status=eq.pending&select=id,title,kind,file_path,file_size&order=created_at.desc"
         );
     }
 
@@ -423,18 +594,61 @@ mod tests {
         assert_eq!(
             parse_send_rows(body).unwrap(),
             vec![
-                SendItem {
-                    id: "abc".into(),
-                    title: "Berserk".into()
-                },
-                SendItem {
-                    id: "def".into(),
-                    title: "Naruto".into()
-                },
+                SendItem::title("abc", "Berserk"),
+                SendItem::title("def", "Naruto")
             ]
         );
         // A row missing a field is skipped, not a panic.
         assert!(parse_send_rows(r#"[{"id":"x"}]"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_send_rows_reads_file_sends_and_drops_pathless_ones() {
+        let body = r#"[
+            {"id":"f1","title":"Slaughterhouse-Five.epub","kind":"file","file_path":"u/r/Slaughterhouse-Five.epub","file_size":512000},
+            {"id":"t1","title":"Berserk","kind":"title","file_path":null,"file_size":null},
+            {"id":"bad","title":"ghost.epub","kind":"file","file_path":null}
+        ]"#;
+        let rows = parse_send_rows(body).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, SendKind::File);
+        assert_eq!(
+            rows[0].file_path.as_deref(),
+            Some("u/r/Slaughterhouse-Five.epub")
+        );
+        assert_eq!(rows[0].file_size, Some(512000));
+        assert_eq!(rows[1], SendItem::title("t1", "Berserk"));
+    }
+
+    #[test]
+    fn a_sends_cache_from_before_file_sends_still_reads() {
+        let old: Vec<SendItem> = serde_json::from_str(r#"[{"id":"a","title":"Berserk"}]"#).unwrap();
+        assert_eq!(old, vec![SendItem::title("a", "Berserk")]);
+    }
+
+    #[test]
+    fn upload_url_encodes_each_segment_and_keeps_the_slashes() {
+        let cfg = SupabaseConfig {
+            url: "https://x.supabase.co/".into(),
+            anon_key: "k".into(),
+        };
+        assert_eq!(
+            cfg.upload_url("uid-1/r2/My Book (final).epub"),
+            "https://x.supabase.co/storage/v1/object/kobo-uploads/uid-1/r2/My%20Book%20%28final%29.epub"
+        );
+    }
+
+    #[test]
+    fn catalog_rows_parse_and_skip_the_urlless() {
+        let body = r#"[{"name":"Home","url":"http://calibre.local:8080/opds"},{"name":"x","url":""},{"name":"","url":"https://b.test/opds"}]"#;
+        let rows = parse_catalog_rows(body).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Home");
+        assert_eq!(rows[1].url, "https://b.test/opds");
+        assert_eq!(
+            catalogs_query(),
+            "book_catalogs?select=name,url&order=created_at.asc"
+        );
     }
 
     #[test]

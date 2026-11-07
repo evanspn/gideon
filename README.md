@@ -37,11 +37,21 @@ The core pipeline works end to end:
   reading, with atomic writes, a configurable storage budget and
   least-recently-read eviction, plus a pre-download engine
 - **Books** — the Discover → Books card browses OPDS catalogues (Project
-  Gutenberg out of the box; add your own, e.g. a Calibre content server's
-  `/opds`, under `book_catalogs` in `settings.json`) and downloads EPUBs
-  into `/mnt/onboard/Books`, where the Kobo's own reader picks them up the
-  next time Nickel starts — which is what exiting gideon does. gideon does
-  not read EPUBs itself; Nickel already does that well.
+  Gutenberg out of the box) and downloads EPUBs into `/mnt/onboard/Books`,
+  where the Kobo's own reader picks them up the next time Nickel starts —
+  which is what exiting gideon does. gideon does not read EPUBs itself;
+  Nickel already does that well. Add your own catalogue — a Calibre content
+  server's address is enough, its OPDS feed is at `/opds` — under *Book
+  catalogues* on the web dashboard; it reaches the Kobo on its next sync.
+  (`book_catalogs` in `settings.json` still works for a device-only entry.)
+- **Send a file from your phone** — the dashboard's *Send to Kobo* panel
+  takes an EPUB, PDF or CBZ (up to 50 MB). It is checked on the phone (does
+  the file start like what its extension says?) and again on the device
+  (the ZIP is opened: EPUB container or comic pages), then placed where its
+  reader looks: EPUB/PDF in the Kobo's library for Nickel, CBZ in gideon's
+  manga library. A file the device refuses stays listed on the phone with
+  the reason. Files travel through a private, owner-scoped storage bucket
+  and are deleted once placed.
 - **Settings** — `settings.json` (source lists, languages, book catalogues,
   storage limit, pre-download count, auto-update), parsed leniently
 - **OTA updates** — `gideon update` checks GitHub releases, downloads the

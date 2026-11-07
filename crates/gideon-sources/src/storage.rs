@@ -162,21 +162,7 @@ fn collect_cbz(dir: &Path, out: &mut Vec<StoredChapter>) -> Result<()> {
 
 /// Make a string safe to use as a single FAT32-friendly file name component.
 pub fn sanitize(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
-    if trimmed.is_empty() {
-        "untitled".to_string()
-    } else {
-        // FAT32 name component limit is 255; stay well under it.
-        trimmed.chars().take(120).collect()
-    }
+    gideon_core::sanitize_filename(raw)
 }
 
 #[cfg(test)]

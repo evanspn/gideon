@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gideon_sync::account::Account;
-use gideon_sync::supabase::{SendItem, SupabaseConfig};
+use gideon_sync::supabase::{RemoteCatalog, SendItem, SupabaseConfig};
 
 use crate::ui::SourceGateway;
 
@@ -297,13 +297,128 @@ pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Se
         // Pull the "send to Kobo" queue and cache it locally so the Home
         // notification badge works offline (best-effort, like everything here).
         match account.fetch_sends(now()) {
-            Ok(sends) => write_sends_cache(&library_dir, &sends),
+            Ok(sends) => {
+                // Files the phone uploaded are placed right here, in the
+                // sweep: nobody should have to find and tap a row to get a
+                // book they already sent. What is left is what still needs
+                // the reader (titles to search) or a retry (a download that
+                // failed on the network).
+                let remaining = place_file_sends(&library_dir, &account, sends);
+                write_sends_cache(&library_dir, &remaining);
+            }
             Err(e) => eprintln!("sync: couldn't fetch sends ({e})"),
+        }
+        // The OPDS catalogues typed on the phone, cached for the Books screen.
+        match account.fetch_book_catalogs(now()) {
+            Ok(catalogs) => write_catalogs_cache(&library_dir, &catalogs),
+            Err(e) => eprintln!("sync: couldn't fetch book catalogues ({e})"),
         }
         if let Some(gateway) = gateway {
             publish_pages_sweep(&library_dir, gateway.as_ref(), &account, now());
         }
     });
+}
+
+/// Download, validate and place every `kind = file` send, returning the sends
+/// that remain pending for the UI: all title sends, plus any file send whose
+/// download failed on the network (left pending server-side too, so the next
+/// sweep retries it). A file that downloads but is not what it claims is
+/// marked `failed` with the reason — that goes back to the phone, where the
+/// person who sent it can see it — and its object is deleted. A placed file
+/// is marked opened and its object deleted so it stops costing storage.
+fn place_file_sends(library_dir: &Path, account: &Account, sends: Vec<SendItem>) -> Vec<SendItem> {
+    use gideon_sync::supabase::SendKind;
+    let books_dir = crate::ui::books_dir_for(library_dir);
+    let mut remaining = Vec::with_capacity(sends.len());
+    for send in sends {
+        if send.kind != SendKind::File {
+            remaining.push(send);
+            continue;
+        }
+        let Some(path) = send.file_path.clone() else {
+            remaining.push(send);
+            continue;
+        };
+        let bytes = match account.download_upload(now(), &path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Network or auth: not the file's fault. Keep it for next time.
+                eprintln!("sync: couldn't download \"{}\" ({e})", send.title);
+                remaining.push(send);
+                continue;
+            }
+        };
+        match place_upload(library_dir, &books_dir, &send.title, &bytes) {
+            Ok(dest) => {
+                eprintln!("sync: saved \"{}\" to {}", send.title, dest.display());
+                if let Err(e) = account.mark_send_opened(now(), &send.id) {
+                    eprintln!("sync: couldn't mark \"{}\" opened ({e})", send.title);
+                    // Server still says pending: it would be downloaded and
+                    // placed again next sweep (an idempotent overwrite), so
+                    // don't also show it as waiting.
+                }
+            }
+            Err(reason) => {
+                eprintln!("sync: refused \"{}\": {reason}", send.title);
+                if let Err(e) = account.mark_send_failed(now(), &send.id, &reason) {
+                    eprintln!("sync: couldn't report the failure ({e})");
+                    remaining.push(send.clone());
+                }
+            }
+        }
+        // Either way the object has served its purpose. Best-effort: a
+        // leftover costs storage, not correctness.
+        if let Err(e) = account.delete_upload(now(), &path) {
+            eprintln!("sync: couldn't delete upload {path} ({e})");
+        }
+    }
+    remaining
+}
+
+/// Validate `bytes` as the file `name` claims to be and write it where its
+/// reader will find it. The error is the reason shown on the phone.
+fn place_upload(
+    library_dir: &Path,
+    books_dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::result::Result<PathBuf, String> {
+    let kind = gideon_core::upload::classify(name, bytes).map_err(|e| e.to_string())?;
+    let dest = gideon_core::upload::destination(kind, books_dir, library_dir, name);
+    gideon_core::upload::place(&dest, bytes)
+        .map_err(|e| format!("couldn't write the file: {e}"))?;
+    Ok(dest)
+}
+
+/// Local cache of the OPDS catalogues added on the phone; the Books screen
+/// merges it with the device's own `book_catalogs` setting.
+const CATALOGS_CACHE_FILE: &str = "catalogs.json";
+
+fn write_catalogs_cache(library_dir: &Path, catalogs: &[RemoteCatalog]) {
+    let path = gideon_dir(library_dir).join(CATALOGS_CACHE_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(catalogs) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// The catalogues the last sweep saw on the phone (empty if none / never
+/// synced), as settings-shaped entries.
+pub fn cached_catalogs(library_dir: &Path) -> Vec<gideon_core::BookCatalog> {
+    let remote: Vec<RemoteCatalog> =
+        std::fs::read(gideon_dir(library_dir).join(CATALOGS_CACHE_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+    remote
+        .into_iter()
+        .map(|c| gideon_core::BookCatalog {
+            name: c.name,
+            url: c.url,
+        })
+        .collect()
 }
 
 /// Local cache of the pending "send to Kobo" queue, beside the sync
@@ -473,6 +588,69 @@ mod tests {
             start.elapsed()
         );
         assert!(!has_unpushed(dir.path()));
+    }
+
+    #[test]
+    fn place_upload_validates_then_writes_where_the_reader_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        let manga = dir.path().join("Manga");
+        let books = crate::ui::books_dir_for(&manga);
+        assert_eq!(books, dir.path().join("Books"));
+
+        // A real (tiny) CBZ lands in the manga library as a one-chapter series.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("001.png", opts).unwrap();
+            std::io::Write::write_all(&mut w, b"\x89PNG").unwrap();
+            w.finish().unwrap();
+        }
+        let cbz = buf.into_inner();
+        let dest = place_upload(&manga, &books, "Berserk v01.cbz", &cbz).unwrap();
+        assert_eq!(dest, manga.join("Berserk v01").join("Berserk v01.cbz"));
+        assert_eq!(std::fs::read(&dest).unwrap(), cbz);
+
+        // A PDF goes to Books, for Nickel.
+        let dest = place_upload(&manga, &books, "paper.pdf", b"%PDF-1.7").unwrap();
+        assert_eq!(dest, books.join("paper.pdf"));
+
+        // A lie is refused with the reason the phone will show, and nothing
+        // is written anywhere.
+        let err = place_upload(&manga, &books, "novel.epub", &cbz).unwrap_err();
+        assert!(err.contains("named .epub"), "{err}");
+        assert!(!books.join("novel.epub").exists());
+    }
+
+    #[test]
+    fn books_dir_is_per_device_not_per_profile() {
+        assert_eq!(
+            crate::ui::books_dir_for(Path::new("/mnt/onboard/Manga")),
+            Path::new("/mnt/onboard/Books")
+        );
+        // A profile library is a subfolder of the root; books still go
+        // beside the ROOT, where Nickel (which has no profiles) looks.
+        assert_eq!(
+            crate::ui::books_dir_for(Path::new("/mnt/onboard/Manga/@alice")),
+            Path::new("/mnt/onboard/Books")
+        );
+    }
+
+    #[test]
+    fn cached_catalogs_read_what_the_sweep_wrote_and_tolerate_nothing_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cached_catalogs(dir.path()).is_empty());
+        write_catalogs_cache(
+            dir.path(),
+            &[RemoteCatalog {
+                name: "Home".into(),
+                url: "http://calibre.local:8080/opds".into(),
+            }],
+        );
+        let got = cached_catalogs(dir.path());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label(), "Home");
+        assert_eq!(got[0].url, "http://calibre.local:8080/opds");
     }
 
     #[test]

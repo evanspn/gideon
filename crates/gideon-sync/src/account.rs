@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use gideon_core::ProgressStore;
 
-use crate::supabase::{AuthClient, SendItem, Session, SupabaseConfig, SupabaseTransport};
+use crate::supabase::{
+    AuthClient, RemoteCatalog, SendItem, Session, SupabaseConfig, SupabaseTransport,
+};
 use crate::{Result, SyncOutcome, SyncState, Syncer};
 
 const SESSION_FILE: &str = "sync_session.json";
@@ -216,6 +218,34 @@ impl Account {
         let session = self.ensure_fresh_session(now)?;
         let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
         transport.fetch_pending_sends()
+    }
+
+    /// The bytes of a file the phone uploaded (a `kind = file` send).
+    pub fn download_upload(&self, now: u64, object_path: &str) -> Result<Vec<u8>> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.download_upload(object_path)
+    }
+
+    /// Delete an uploaded file once it is on the device.
+    pub fn delete_upload(&self, now: u64, object_path: &str) -> Result<()> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.delete_upload(object_path)
+    }
+
+    /// The OPDS catalogues added on the phone, oldest first.
+    pub fn fetch_book_catalogs(&self, now: u64) -> Result<Vec<RemoteCatalog>> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.fetch_book_catalogs()
+    }
+
+    /// Mark a file send failed, with the reason the phone should show.
+    pub fn mark_send_failed(&self, now: u64, id: &str, error: &str) -> Result<()> {
+        let session = self.ensure_fresh_session(now)?;
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token);
+        transport.mark_send_failed(id, error)
     }
 
     /// Mark a send as opened (the device has shown/handled it) so it clears from
