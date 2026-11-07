@@ -11,7 +11,15 @@ set -euo pipefail
 
 KOBO_BIN=$1
 PLAIN_BIN=$2
-RUN="qemu-arm-static"
+# qemu-user-static ships qemu-arm-static; on Ubuntu 26.04 runners that package
+# is virtual and qemu-user-binfmt ships plain qemu-arm instead. Either runs our
+# musl-static binaries. (binfmt registration would make "$KOBO_BIN" alone work
+# too, but naming the emulator keeps the failure mode obvious.)
+RUN=$(command -v qemu-arm-static || command -v qemu-arm || true)
+if [ -z "$RUN" ]; then
+    echo "FAIL: no qemu-arm emulator installed (need qemu-user-static or qemu-user-binfmt)" >&2
+    exit 1
+fi
 
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT

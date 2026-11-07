@@ -119,9 +119,12 @@ jobs:
       - name: Install QEMU
         timeout-minutes: 6
         run: |
+          # qemu-user-static is a virtual package on Ubuntu 26.04 runners,
+          # provided by qemu-user-binfmt; try the real name, then the provider.
           for attempt in 1 2 3; do
             if timeout 60 sudo apt-get update \
-              && timeout 60 sudo apt-get install -y qemu-user-static; then
+              && { timeout 60 sudo apt-get install -y qemu-user-static \
+                   || timeout 60 sudo apt-get install -y qemu-user-binfmt; }; then
               exit 0
             fi
             echo "apt attempt $attempt failed; retrying" >&2

@@ -38,8 +38,15 @@ jobs:
         with:
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-latest moved to Ubuntu 26.04, where qemu-user-static is a
+      # virtual package ("no installation candidate") provided by
+      # qemu-user-binfmt. Ask for the real name first (older images), then the
+      # provider; ci/qemu_integration.sh finds whichever qemu-arm that gives.
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static \
+            || sudo apt-get install -y qemu-user-binfmt
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
