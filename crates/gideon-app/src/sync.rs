@@ -348,6 +348,22 @@ fn place_file_sends(library_dir: &Path, account: &Account, sends: Vec<SendItem>)
                 continue;
             }
         };
+        // The row says how big the file is. Fewer bytes than that is a
+        // download that was cut short, not a bad file: keep the send (and
+        // its object) and try again next sweep, rather than refusing a book
+        // that is fine and deleting it.
+        if let Some(expected) = send.file_size {
+            if bytes.len() as u64 != expected {
+                eprintln!(
+                    "sync: \"{}\" arrived as {} of {} bytes; retrying next sync",
+                    send.title,
+                    bytes.len(),
+                    expected
+                );
+                remaining.push(send);
+                continue;
+            }
+        }
         match place_upload(library_dir, &books_dir, &send.title, &bytes) {
             Ok(dest) => {
                 eprintln!("sync: saved \"{}\" to {}", send.title, dest.display());
@@ -383,10 +399,17 @@ fn place_upload(
     name: &str,
     bytes: &[u8],
 ) -> std::result::Result<PathBuf, String> {
-    let kind = gideon_core::upload::classify(name, bytes).map_err(|e| e.to_string())?;
-    let dest = gideon_core::upload::destination(kind, books_dir, library_dir, name);
-    gideon_core::upload::place(&dest, bytes)
-        .map_err(|e| format!("couldn't write the file: {e}"))?;
+    use gideon_core::upload::{self, UploadKind};
+    let kind = upload::classify(name, bytes).map_err(|e| e.to_string())?;
+    // Name it from what it says about itself, not from the file name a
+    // download site gave it; the name is only the fallback.
+    let meta = match kind {
+        UploadKind::Epub => upload::epub_meta(bytes),
+        UploadKind::Cbz => upload::cbz_meta(bytes),
+        UploadKind::Pdf => upload::BookMeta::default(),
+    };
+    let dest = upload::destination_named(kind, books_dir, library_dir, name, &meta);
+    upload::place(&dest, bytes).map_err(|e| format!("couldn't write the file: {e}"))?;
     Ok(dest)
 }
 
@@ -613,7 +636,7 @@ mod tests {
 
         // A PDF goes to Books, for Nickel.
         let dest = place_upload(&manga, &books, "paper.pdf", b"%PDF-1.7").unwrap();
-        assert_eq!(dest, books.join("paper.pdf"));
+        assert_eq!(dest, books.join("Unknown author").join("paper.pdf"));
 
         // A lie is refused with the reason the phone will show, and nothing
         // is written anywhere.

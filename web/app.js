@@ -257,7 +257,25 @@ async function validateUpload(file) {
         : "something else";
     throw new Error(`That's named .${ext} but it isn't ${kind.what} — it looks like ${actually}.`);
   }
+  // A ZIP ends with an end-of-central-directory record (PK\x05\x06, within
+  // the last 64 KB + 22 bytes). Without it the file is damaged or was never
+  // fully downloaded to this phone — and the Kobo would refuse it after a
+  // whole upload and a sync. Say so here, in a second.
+  if (ext !== "pdf" && !(await hasZipEnd(file))) {
+    throw new Error(
+      `That ${kind.what} is damaged or incomplete (no end-of-archive record) — it won't open anywhere. Re-download it on this phone and try again.`
+    );
+  }
   return ext;
+}
+
+async function hasZipEnd(file) {
+  const tailLen = Math.min(file.size, 65557 + 22);
+  const tail = new Uint8Array(await file.slice(file.size - tailLen, file.size).arrayBuffer());
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) return true;
+  }
+  return false;
 }
 
 // Storage object keys are not file names: Supabase rejects anything outside
@@ -297,6 +315,17 @@ async function enqueueFile(file) {
       up.status === 401
         ? "Session expired — sign in again"
         : `Couldn't upload (${detail.message || detail.error || up.status})`
+    );
+  }
+  // Trust, but verify: ask storage how big the object it holds is. A phone
+  // that hands the browser a file it hasn't finished fetching (iCloud, a
+  // sync folder) uploads a stub, and the Kobo would be the first to notice.
+  const stored = await authedStorage(objectPath, { method: "HEAD" }).catch(() => null);
+  const storedLen = stored && stored.ok ? Number(stored.headers.get("content-length")) : NaN;
+  if (Number.isFinite(storedLen) && storedLen !== file.size) {
+    authedStorage(objectPath, { method: "DELETE" }).catch(() => {});
+    throw new Error(
+      `The upload was cut short (${fmtBytes(storedLen)} of ${fmtBytes(file.size)} arrived). Make sure the file is fully downloaded to this phone, then try again.`
     );
   }
   const res = await authedFetch("send_queue", {
