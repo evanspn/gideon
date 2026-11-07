@@ -16,6 +16,7 @@ pub mod series;
 pub mod settings;
 pub mod stats;
 pub mod upload;
+pub mod zipread;
 
 pub use books::{Book, BookPlace, BookPlaces, Bookmark};
 pub use cbz::CbzDocument;

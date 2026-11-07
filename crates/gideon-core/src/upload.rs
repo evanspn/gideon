@@ -18,6 +18,7 @@
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
+use crate::zipread::ZipSource;
 use crate::{Error, Result};
 
 /// Image extensions that make a ZIP a comic — the same set [`crate::cbz`]
@@ -96,12 +97,15 @@ pub fn classify(file_name: &str, bytes: &[u8]) -> Result<UploadKind> {
 /// A ZIP is an EPUB when it carries EPUB's container structure, a CBZ when
 /// it holds page images, and neither otherwise.
 fn classify_zip(bytes: &[u8]) -> Result<UploadKind> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
+    // Strict first, lenient second: a book from the wild often carries
+    // ZIP64 extras the strict reader refuses while every other reader —
+    // Python's, the Kobo's own — takes it in its stride (see zipread).
+    let mut archive = ZipSource::open(Cursor::new(bytes)).map_err(|e| {
         let text = e.to_string();
         // The end-of-central-directory record is the last thing in a ZIP;
         // its absence means the file stops early — damaged at the source, or
         // cut short on its way here. Say that, not the parser's acronym.
-        if text.contains("EOCD") {
+        if text.contains("end-of-central-directory") || text.contains("EOCD") {
             Error::InvalidUpload(
                 "the archive is damaged or incomplete (no end-of-archive record)".into(),
             )
@@ -112,17 +116,14 @@ fn classify_zip(bytes: &[u8]) -> Result<UploadKind> {
     let mut has_container = false;
     let mut epub_mimetype = false;
     let mut pages = 0usize;
-    for i in 0..archive.len() {
-        let Ok(mut entry) = archive.by_index(i) else {
-            continue;
-        };
-        let name = entry.name().to_string();
+    for name in archive.names() {
         if name == "META-INF/container.xml" {
             has_container = true;
         } else if name == "mimetype" {
-            let mut s = String::new();
-            if entry.read_to_string(&mut s).is_ok() && s.trim() == "application/epub+zip" {
-                epub_mimetype = true;
+            if let Some(s) = archive.read_string("mimetype") {
+                if s.trim() == "application/epub+zip" {
+                    epub_mimetype = true;
+                }
             }
         } else if is_page_name(&name) {
             pages += 1;
@@ -174,7 +175,7 @@ pub struct BookMeta {
 /// never an error, since the file already validated as an EPUB and a name
 /// is the one thing we can always fall back on.
 pub fn epub_meta(bytes: &[u8]) -> BookMeta {
-    let Ok(archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+    let Ok(archive) = ZipSource::open(Cursor::new(bytes)) else {
         return BookMeta::default();
     };
     epub_meta_from(archive)
@@ -184,22 +185,18 @@ pub fn epub_meta(bytes: &[u8]) -> BookMeta {
 /// entries it needs — a 200 MB novel must not be pulled into memory just to
 /// learn its title.
 pub fn epub_meta_file(path: &Path) -> BookMeta {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = crate::zipread::SeekFile::open(path) else {
         return BookMeta::default();
     };
-    let Ok(archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+    let Ok(archive) = ZipSource::open(file) else {
         return BookMeta::default();
     };
     epub_meta_from(archive)
 }
 
-fn epub_meta_from<R: Read + std::io::Seek>(mut archive: zip::ZipArchive<R>) -> BookMeta {
-    let read = |archive: &mut zip::ZipArchive<R>, name: &str| -> Option<String> {
-        let mut entry = archive.by_name(name).ok()?;
-        let mut s = String::new();
-        entry.read_to_string(&mut s).ok()?;
-        Some(s)
-    };
+fn epub_meta_from<R: Read + std::io::Seek>(mut archive: ZipSource<R>) -> BookMeta {
+    let read =
+        |archive: &mut ZipSource<R>, name: &str| -> Option<String> { archive.read_string(name) };
     let Some(container) = read(&mut archive, "META-INF/container.xml") else {
         return BookMeta::default();
     };

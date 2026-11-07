@@ -25,7 +25,8 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = { version = "2", features = ["serde"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "6", default-features = false, features = ["deflate"] }
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 quick-xml = "0.37"
 # Bundled webpki roots (not the device's native cert store): the Kobo's on-disk
