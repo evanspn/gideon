@@ -35,9 +35,10 @@ pub struct Chapter {
 pub enum Block {
     Heading(String),
     Paragraph(String),
-    /// A picture lived here. The reader says so rather than silently
-    /// dropping it: a light novel's illustrations are part of the book.
-    Image,
+    /// A picture: the zip entry it lives at, resolved from the chapter's
+    /// own folder. A light novel's illustrations are part of the book; the
+    /// reader draws them in place ([`read_entry`] fetches the bytes).
+    Image(String),
 }
 
 impl EpubText {
@@ -89,7 +90,11 @@ pub fn load_from<R: Read + Seek>(mut archive: zip::ZipArchive<R>) -> Result<Epub
         let Some(html) = read(&mut archive, &full) else {
             continue;
         };
-        let chapter = html_to_chapter(&html);
+        let doc_dir = match full.rfind('/') {
+            Some(i) => &full[..=i],
+            None => "",
+        };
+        let chapter = html_to_chapter_in(&html, doc_dir);
         if !chapter.blocks.is_empty() {
             chapters.push(chapter);
         }
@@ -177,9 +182,40 @@ fn parse_package(xml: &str) -> Package {
     package
 }
 
+/// One file out of the EPUB, by zip entry name (as a [`Block::Image`]
+/// carries it). Tries the name as given and percent-decoded.
+pub fn read_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| Error::InvalidUpload(format!("not a readable ZIP: {e}")))?;
+    for candidate in [name.to_string(), percent_decode(name)] {
+        if let Ok(mut entry) = archive.by_name(&candidate) {
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut bytes)?;
+            return Ok(bytes);
+        }
+    }
+    Err(Error::InvalidUpload(format!("no entry {name} in the EPUB")))
+}
+
+/// Width and height of an encoded image, from its header alone.
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 /// Flatten one XHTML document to blocks: the text of block-level elements,
-/// whitespace collapsed, head/style/script skipped, images marked.
+/// whitespace collapsed, head/style/script skipped, images kept by path.
 pub fn html_to_chapter(html: &str) -> Chapter {
+    html_to_chapter_in(html, "")
+}
+
+/// [`html_to_chapter`] with the document's folder inside the zip, so an
+/// image's relative `src` resolves to its entry.
+pub fn html_to_chapter_in(html: &str, doc_dir: &str) -> Chapter {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(html);
     reader.config_mut().trim_text(false);
@@ -213,16 +249,39 @@ pub fn html_to_chapter(html: &str) -> Chapter {
         }
     }
 
+    let image_of = |e: &quick_xml::events::BytesStart| -> Option<String> {
+        let src = e.attributes().flatten().find_map(|a| {
+            let key = a.key.local_name();
+            (key.as_ref() == b"src" || key.as_ref() == b"href")
+                .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+                .flatten()
+        })?;
+        let src = src.trim();
+        if src.is_empty() || src.starts_with("data:") || src.contains("://") {
+            return None;
+        }
+        Some(normalize_path(&format!("{doc_dir}{src}")))
+    };
+    let mut svg_image: Option<String> = None;
+
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
+                if skip_depth > 0 && name == b"image" {
+                    // An <svg><image href=…/> wrapper around a picture: the
+                    // picture is what we keep.
+                    if svg_image.is_none() {
+                        svg_image = image_of(&e);
+                    }
+                    continue;
+                }
                 if matches!(name, b"head" | b"style" | b"script" | b"svg" | b"title") {
                     skip_depth += 1;
                     if name == b"svg" {
                         flush(&mut current, heading_depth > 0, &mut blocks, &mut title);
-                        blocks.push(Block::Image);
+                        svg_image = None;
                     }
                     continue;
                 }
@@ -237,20 +296,27 @@ pub fn html_to_chapter(html: &str) -> Chapter {
                 }
                 if name == b"img" || name == b"image" {
                     flush(&mut current, heading_depth > 0, &mut blocks, &mut title);
-                    blocks.push(Block::Image);
+                    if let Some(src) = image_of(&e) {
+                        blocks.push(Block::Image(src));
+                    }
                 }
             }
             Ok(Event::Empty(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
                 if skip_depth > 0 {
+                    if name == b"image" && svg_image.is_none() {
+                        svg_image = image_of(&e);
+                    }
                     continue;
                 }
                 if name == b"br" {
                     flush(&mut current, heading_depth > 0, &mut blocks, &mut title);
                 } else if name == b"img" || name == b"image" {
                     flush(&mut current, heading_depth > 0, &mut blocks, &mut title);
-                    blocks.push(Block::Image);
+                    if let Some(src) = image_of(&e) {
+                        blocks.push(Block::Image(src));
+                    }
                 } else if is_block(name) {
                     flush(&mut current, heading_depth > 0, &mut blocks, &mut title);
                 }
@@ -260,6 +326,11 @@ pub fn html_to_chapter(html: &str) -> Chapter {
                 let name = name.as_ref();
                 if matches!(name, b"head" | b"style" | b"script" | b"svg" | b"title") {
                     skip_depth = skip_depth.saturating_sub(1);
+                    if name == b"svg" {
+                        if let Some(src) = svg_image.take() {
+                            blocks.push(Block::Image(src));
+                        }
+                    }
                     continue;
                 }
                 if skip_depth > 0 {
@@ -458,6 +529,7 @@ mod tests {
    in time.
 </p>
 <div><img src="../Images/p.jpg" alt=""/></div>
+<div><svg xmlns="http://www.w3.org/2000/svg"><image xlink:href="../Images/cover.jpg"/></svg></div>
 <p>So it goes.<br/>Second line &mdash; dash &#8212; too &#x2014; &amp; done.</p>
 </body></html>"#;
 
@@ -499,7 +571,8 @@ mod tests {
                         .into()
                 ),
                 Block::Paragraph("Billy Pilgrim has come unstuck in time.".into()),
-                Block::Image,
+                Block::Image("OEBPS/Images/p.jpg".into()),
+                Block::Image("OEBPS/Images/cover.jpg".into()),
                 Block::Paragraph("So it goes.".into()),
                 Block::Paragraph("Second line — dash — too — & done.".into()),
             ]
@@ -527,6 +600,33 @@ mod tests {
     fn not_an_epub_is_an_error_not_a_panic() {
         let bytes = epub(&[("hello.txt", "x")]);
         assert!(load_from(zip::ZipArchive::new(Cursor::new(bytes)).unwrap()).is_err());
+    }
+
+    #[test]
+    fn an_image_entry_reads_back_and_measures() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = {
+            let img = image::GrayImage::from_pixel(7, 5, image::Luma([0u8]));
+            let mut buf = Cursor::new(Vec::new());
+            image::DynamicImage::ImageLuma8(img)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            buf.into_inner()
+        };
+        let path = dir.path().join("b.epub");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("OEBPS/Images/p 1.png", opts).unwrap();
+            zip.write_all(&png).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = read_entry(&path, "OEBPS/Images/p%201.png").unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(image_dimensions(&bytes), Some((7, 5)));
+        assert!(read_entry(&path, "nope.png").is_err());
+        assert_eq!(image_dimensions(b"not an image"), None);
     }
 
     #[test]

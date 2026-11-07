@@ -84,8 +84,12 @@ def main() -> None:
         )
         z.writestr(
             "OEBPS/ch2.xhtml",
-            "<html><body><h1>Two</h1><p>Listen: Billy Pilgrim has come unstuck in time.</p></body></html>",
+            "<html><body><h1>Two</h1><p>Listen: Billy Pilgrim has come unstuck in time.</p>"
+            '<img src="Images/plate.png" alt="plate"/></body></html>',
         )
+        # An illustration, so the reader's image path is exercised on the
+        # target too (decoded, scaled, drawn).
+        z.writestr("OEBPS/Images/plate.png", png(120, 80, 64))
     print(f"fixture written to {epub_path}")
 
 

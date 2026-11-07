@@ -9774,6 +9774,32 @@ mod library_tabs {
         zip.finish().unwrap();
     }
 
+    /// An EPUB whose one chapter is a paragraph, a picture, a paragraph.
+    /// The picture is `w × h`, solid dark grey, so its pixels are unmistakable.
+    fn make_illustrated_epub(path: &Path, w: u32, h: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        zip.write_all(br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Pictures</dc:title><dc:creator>A</dc:creator></metadata><manifest><item id="c" href="Text/c.xhtml" media-type="application/xhtml+xml"/><item id="p" href="Images/p.png" media-type="image/png"/></manifest><spine><itemref idref="c"/></spine></package>"#).unwrap();
+        zip.start_file("OEBPS/Text/c.xhtml", opts).unwrap();
+        zip.write_all(br#"<html><body><p>Before the picture.</p><img src="../Images/p.png"/><p>After the picture.</p></body></html>"#).unwrap();
+        zip.start_file("OEBPS/Images/p.png", opts).unwrap();
+        let img = image::GrayImage::from_pixel(w, h, image::Luma([40u8]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
+        zip.finish().unwrap();
+    }
+
     /// Tap the "Books" tab in the Library's title bar.
     fn tap_books_tab() -> UiEvent {
         let l = layout();
@@ -10306,5 +10332,78 @@ mod library_tabs {
         assert_eq!(*page, 0, "slides and swipes do not turn pages");
         // Each change repainted the page with its banner, without a flash.
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+    }
+
+    #[test]
+    fn an_epub_illustration_is_drawn_in_place_scaled_to_the_text_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        // Wider than the column and squat: scaled down to the column width.
+        make_illustrated_epub(&lib.join("Books/A/pic.epub"), 4000, 1000);
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        let page0 = &pages[0];
+        let img_line = page0
+            .iter()
+            .find(|l| l.image.is_some())
+            .expect("the picture is a line on the first page");
+        let img = img_line.image.as_ref().unwrap();
+        let (_, margin, max_w, top, line_h, _) = ui.book_page_metrics();
+        assert_eq!(img.width, max_w, "fits the text column");
+        assert_eq!(img.height, max_w / 4, "aspect kept");
+        assert_eq!(img.rows, (img.height as usize).div_ceil(line_h as usize));
+        assert!(
+            !page0.iter().any(|l| l.text == "[Illustration]"),
+            "no placeholder when the picture can be drawn"
+        );
+        assert_eq!(page0[0].text, "Before the picture.");
+        assert!(page0.iter().any(|l| l.text == "After the picture."));
+
+        // Its pixels are on the panel where the layout put it: rows above
+        // the image line count one line each (the paragraph, then the blank
+        // separator).
+        let rows_before = page0.iter().take_while(|l| l.image.is_none()).count() as u32;
+        let y = top + rows_before * line_h + img.height / 2;
+        let x = margin + max_w / 2;
+        assert!(
+            ui.display().pixel(x, y) < 0x60,
+            "dark picture pixel at ({x},{y})"
+        );
+        assert!(
+            ui.display().pixel(x, top + 2) > 0xf0,
+            "text row above stays white"
+        );
+    }
+
+    #[test]
+    fn a_tall_illustration_takes_its_own_page_rather_than_being_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        // Taller than a page: capped to the page height, placed after the
+        // paragraph page, alone.
+        make_illustrated_epub(&lib.join("Books/A/tall.epub"), 600, 6000);
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        let (_, _, _, _, line_h, lines) = ui.book_page_metrics();
+        assert!(pages.len() >= 2);
+        assert!(
+            pages[0].iter().all(|l| l.image.is_none()),
+            "page 1 is the text before"
+        );
+        let img = pages[1][0]
+            .image
+            .as_ref()
+            .expect("page 2 opens with the picture");
+        assert_eq!(img.height, lines as u32 * line_h, "capped at a page");
+        assert_eq!(img.rows, lines);
+        assert_eq!(pages[1].len(), 1, "nothing shares the page with it");
     }
 }
