@@ -720,7 +720,7 @@ fn blit_page<D: Display>(display: &mut D, page: &PageBuf, offset_y: u32) -> Resu
 }
 
 /// Draw a white banner strip with `text` along the top of `page`.
-fn draw_banner(page: &mut GrayPage, text: &str) {
+pub(crate) fn draw_banner(page: &mut GrayPage, text: &str) {
     use gideon_render::text::draw_text;
 
     let banner_h = 56.min(page.height);

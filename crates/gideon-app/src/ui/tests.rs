@@ -8913,7 +8913,8 @@ fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
     // in flight. Every report moves the lamp; nothing waits for the lift.
     let start = (at(10), slider_row(0));
     for stop in [30, 60, 90] {
-        app.drag_menu(start.0, start.1, at(stop), start.1).unwrap();
+        app.drag_menu(start.0, start.1, at(stop), start.1, false)
+            .unwrap();
         assert_eq!(
             levels.borrow().0,
             stop as u8,
@@ -8923,7 +8924,8 @@ fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
 
     // Now scrub back the other way without lifting — the same drag, reversing.
     let before = app.display().flushes.len();
-    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    app.drag_menu(start.0, start.1, at(40), start.1, false)
+        .unwrap();
     assert_eq!(levels.borrow().0, 40, "dragging back down lowers it");
     assert_eq!(
         app.display().flushes[before..],
@@ -8935,12 +8937,13 @@ fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
     // panel reports motion far faster than e-ink can repaint, and a scrub that
     // spent a refresh per report would lag behind the finger.
     let before = app.display().flushes.len();
-    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    app.drag_menu(start.0, start.1, at(40), start.1, false)
+        .unwrap();
     assert_eq!(app.display().flushes[before..], [], "no change, no repaint");
 
     // Vertical drift off the row keeps scrubbing the slider it started on —
     // it must not hand the drag to the row below.
-    app.drag_menu(start.0, start.1, at(80), slider_row(1))
+    app.drag_menu(start.0, start.1, at(80), slider_row(1), false)
         .unwrap();
     assert_eq!(levels.borrow().0, 80, "brightness kept the drag");
     assert_eq!(levels.borrow().1, 0, "warmth was never touched");
@@ -8972,7 +8975,8 @@ fn a_drag_that_starts_off_the_sliders_leaves_the_sheet_alone() {
         (sheet.grid.y + sheet.grid.cell_h / 2, "on a tile"),
         (sheet.actions_top + l.row_h / 2, "on an action row"),
     ] {
-        app.drag_menu(l.pad, y0, l.width - l.pad, y0).unwrap();
+        app.drag_menu(l.pad, y0, l.width - l.pad, y0, false)
+            .unwrap();
         assert_eq!(*levels.borrow(), untouched, "the lamp moved from {what}");
         assert!(app.sheet().is_some(), "the sheet closed from {what}");
     }
@@ -10248,5 +10252,59 @@ mod library_tabs {
             labels,
             ["Read in the Kobo reader", "Delete this book", "Close"]
         );
+    }
+
+    #[test]
+    fn the_book_reader_has_the_lamp_edge_slides_like_a_kindle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let (levels, log, lights) = lights_recording();
+        let drag_to = |y1: u32| UiEvent::Drag {
+            x0: W - 5,
+            y0: H - 100,
+            x1: W - 5,
+            y1,
+        };
+        let mut events = open_first_book();
+        events.extend([
+            // Up the right edge in two reports, then lift: 20 → 45 → 70, and
+            // the release at the same spot does not add again.
+            drag_to(H - 100 - H / 4),
+            drag_to(H - 100 - H / 2),
+            UiEvent::Swipe {
+                x0: W - 5,
+                y0: H - 100,
+                x1: W - 5,
+                y1: H - 100 - H / 2,
+            },
+            // Up the left edge: night light.
+            UiEvent::Swipe {
+                x0: 5,
+                y0: H - 100,
+                x1: 5,
+                y1: H - 100 - H / 4,
+            },
+            // A mid-screen drag is nothing: no page turn, no lamp.
+            UiEvent::Swipe {
+                x0: W / 2,
+                y0: H / 2,
+                x1: W / 2,
+                y1: H / 4,
+            },
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        ui.run().unwrap();
+        assert_eq!(*levels.borrow(), (70, 25));
+        assert_eq!(
+            *log.borrow(),
+            vec![Lamp::Brightness(45), Lamp::Brightness(70), Lamp::Warmth(25)],
+            "the lamp followed the finger and the lift added nothing"
+        );
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("still reading");
+        };
+        assert_eq!(*page, 0, "slides and swipes do not turn pages");
+        // Each change repainted the page with its banner, without a flash.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
     }
 }

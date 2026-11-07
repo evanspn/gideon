@@ -947,6 +947,13 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// partially in a loop, so every `full_refresh_interval` turns it
     /// flashes to clear ghosting (docs/REFRESH.md).
     book_turns: u32,
+    /// The lamp level an edge slide in the book reader started from; the
+    /// slide's delta is always applied to this, never accumulated. Cleared
+    /// when the finger lifts.
+    book_slide_base: Option<u8>,
+    /// A one-repaint banner over the book page ("Brightness 45%"), wiped
+    /// by the next repaint like the manga reader's.
+    book_banner: Option<String>,
     /// Active profile name (settings.json `active_profile`).
     active_profile: String,
     layout: UiLayout,
@@ -1085,6 +1092,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             books_dir: books_dir_for(&library_dir),
             library_tab: LibraryTab::Manga,
             book_turns: 0,
+            book_slide_base: None,
+            book_banner: None,
             library_dir,
             active_profile: "default".to_string(),
             layout,
@@ -1413,10 +1422,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 // Edge slides only matter in the reader; elsewhere the only
                 // thing that takes a drag is a slider being scrubbed, live
                 // while the finger moves and exactly where it lifts.
-                Ok(UiEvent::Drag { x0, y0, x1, y1 } | UiEvent::Swipe { x0, y0, x1, y1 }) => {
+                Ok(event @ (UiEvent::Drag { .. } | UiEvent::Swipe { .. })) => {
+                    let (released, (x0, y0, x1, y1)) = match event {
+                        UiEvent::Drag { x0, y0, x1, y1 } => (false, (x0, y0, x1, y1)),
+                        UiEvent::Swipe { x0, y0, x1, y1 } => (true, (x0, y0, x1, y1)),
+                        _ => unreachable!(),
+                    };
                     let (x0, y0) = self.map_menu_point(x0, y0);
                     let (x1, y1) = self.map_menu_point(x1, y1);
-                    match self.drag_menu(x0, y0, x1, y1) {
+                    match self.drag_menu(x0, y0, x1, y1, released) {
                         Ok(Flow::Quit(exit)) => return Ok(exit),
                         Ok(Flow::Continue) => {}
                         Err(e) => self.show_error(&e)?,
@@ -2846,11 +2860,76 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// where the finger STARTED: once you are scrubbing, drifting up or down
     /// off the row must not hand the drag to the slider next door, and must
     /// not dismiss the sheet either.
-    fn drag_menu(&mut self, _x0: u32, y0: u32, x1: u32, _y1: u32) -> Result<Flow> {
+    fn drag_menu(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, released: bool) -> Result<Flow> {
         if let Some(row) = self.quick_slider_at(y0) {
             self.scrub_quick_slider(row, x1)?;
+            return Ok(Flow::Continue);
+        }
+        // The book reader has the manga reader's lamp controls: a slide up
+        // the right edge brightens, up the left edge warms. Reading in bed
+        // is where the frontlight gets adjusted, and that is a reader, not a
+        // menu.
+        if matches!(self.stack.last(), Some(Screen::BookReader { .. })) && self.sheet.is_none() {
+            self.book_edge_slide(x0, y0, x1, y1, released)?;
         }
         Ok(Flow::Continue)
+    }
+
+    /// Apply an edge slide over the book page to the frontlight, live, with
+    /// a banner naming the level. Measured from where the finger started
+    /// and applied to the level it started at, so repeated reports of one
+    /// drag never run away (see the manga reader's slide_base).
+    fn book_edge_slide(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        released: bool,
+    ) -> Result<()> {
+        let l = &self.layout;
+        let slid = reader_edge_slide(x0, y0, x1, y1, l.width, l.height, 0);
+        let base_before = if released {
+            self.book_slide_base.take()
+        } else {
+            self.book_slide_base
+        };
+        let Some((lamp, delta)) = slid else {
+            return Ok(());
+        };
+        let Some(lights) = self.lights.as_mut() else {
+            return Ok(());
+        };
+        let base = base_before.unwrap_or_else(|| match lamp {
+            EdgeLamp::Brightness => lights.brightness(),
+            EdgeLamp::Warmth => lights.warmth(),
+        });
+        if !released {
+            self.book_slide_base = Some(base);
+        }
+        let new = (base as i32 + delta).clamp(0, 100) as u8;
+        let banner = match lamp {
+            EdgeLamp::Brightness => {
+                if new == lights.brightness() {
+                    return Ok(());
+                }
+                lights.set_brightness(new);
+                format!("Brightness {new}%")
+            }
+            EdgeLamp::Warmth => {
+                if new == lights.warmth() {
+                    return Ok(());
+                }
+                lights.set_warmth(new);
+                format!("Night light {new}%")
+            }
+        };
+        // The banner rides one partial repaint of the page and is gone on
+        // the next, like the manga reader's.
+        self.book_banner = Some(banner);
+        let result = self.render_current(RefreshMode::Partial);
+        self.book_banner = None;
+        result
     }
 
     /// Act on a tap in the quick-settings sheet: a tile cycles its value, the
@@ -7964,6 +8043,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let l = &self.layout;
         let (px, margin, max_w, top, line_h, _) = self.book_page_metrics();
         let mut canvas = GrayPage::new_white(l.width, l.height);
+        if let Some(banner) = &self.book_banner {
+            crate::reader::draw_banner(&mut canvas, banner);
+        }
         let mut y = top;
         for line in pages.get(page).map(|p| p.as_slice()).unwrap_or(&[]) {
             if !line.text.is_empty() {
