@@ -9842,10 +9842,16 @@ mod library_tabs {
         UiEvent::Tap { x, y: H / 2 }
     }
 
-    /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 larger,
-    /// 3 smaller, 4 close book, 5 close.
+    /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 text,
+    /// 3 close book, 4 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(6, i)
+        tap_modal_row(5, i)
+    }
+
+    /// The y of row `i` of the Text sheet: 0 size, 1 line spacing,
+    /// 2 margins, 3 close.
+    fn text_row_y(i: usize) -> u32 {
+        tap_modal_row_y(4, i)
     }
 
     /// Open the first book on the Books tab in gideon's reader.
@@ -10234,7 +10240,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(4)]);
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(3)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10254,15 +10260,105 @@ mod library_tabs {
             "resumed at the paragraph, not page 1"
         );
 
-        // Larger text: fewer lines per page, same paragraph on the page.
+        // Larger text (Text › Size): same paragraph stays on the page, the
+        // sheet stays up, and the whole page re-flowed, so a Full.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(6, 2)).unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookText)));
+        ui.tap_sheet(W / 2, text_row_y(0)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookText)), "sheet stays up");
         let Screen::BookReader { pages, page, .. } = ui.screen() else {
             panic!("expected the reader");
         };
         assert!(pages[*page].iter().any(|l| l.block == top_block));
         assert_eq!(ui.load_settings().book_text_px, 50);
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn the_text_sheet_cycles_size_spacing_and_margins_and_they_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let settings_dir = dir.path().join("data");
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book())
+            .with_settings_dir(settings_dir.clone());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        let normal_lines = pages[0].len();
+        let normal_width = ui.book_page_metrics().2;
+
+        // The menu's Text row opens the sheet over the unchanged page: no flash.
+        ui.handle_tap(W / 2, H / 2).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
+        ui.handle_tap(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookText)));
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        let (title, rows) = ui.sheet_rows();
+        assert_eq!(title, "Text");
+        let labels: Vec<(&str, &str)> = rows.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
+        assert_eq!(
+            labels,
+            [
+                ("Size", "44 px"),
+                ("Line spacing", "Normal"),
+                ("Margins", "Normal"),
+                ("Close", "")
+            ]
+        );
+
+        // Line spacing: normal → loose puts fewer lines on the page.
+        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        assert_eq!(ui.load_settings().book_line_spacing, "loose");
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert!(
+            pages[0].len() < normal_lines,
+            "{} < {normal_lines}",
+            pages[0].len()
+        );
+        assert_eq!(ui.sheet_rows().1[1].1, "Loose");
+        // … and wraps round: loose → tight → normal.
+        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        assert_eq!(ui.load_settings().book_line_spacing, "tight");
+        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        assert_eq!(ui.load_settings().book_line_spacing, "normal");
+
+        // Margins: normal → wide narrows the text column.
+        ui.handle_tap(W / 2, text_row_y(2)).unwrap();
+        assert_eq!(ui.load_settings().book_margins, "wide");
+        assert!(ui.book_page_metrics().2 < normal_width);
+        assert_eq!(ui.sheet_rows().1[2].1, "Wide");
+
+        // Size steps through the tiles and wraps from the largest.
+        for expected in [50, 56, 64, 72, 32] {
+            ui.handle_tap(W / 2, text_row_y(0)).unwrap();
+            assert_eq!(ui.load_settings().book_text_px, expected);
+        }
+        assert_eq!(ui.sheet_rows().1[0].1, "32 px");
+
+        // Close: the page is revealed whole, so a flash.
+        ui.handle_tap(W / 2, text_row_y(3)).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // Everything survives a restart, on the device's settings.json.
+        let saved = gideon_core::Settings::load(&settings_dir).unwrap();
+        assert_eq!(
+            (
+                saved.book_text_px,
+                saved.book_line_spacing.as_str(),
+                saved.book_margins.as_str()
+            ),
+            (32, "normal", "wide")
+        );
+        let mut again =
+            app(&lib, FakeGateway::default(), open_first_book()).with_settings_dir(settings_dir);
+        again.run().unwrap();
+        assert_eq!(again.book_page_metrics().0, 32.0);
+        assert!(again.book_page_metrics().2 < normal_width);
     }
 
     #[test]
@@ -10526,7 +10622,7 @@ mod library_tabs {
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::Back),
-            tap_reading_row(4),
+            tap_reading_row(3),
             tap_today(),
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10616,7 +10712,7 @@ mod library_tabs {
         ui.turn_book_page(-1).unwrap();
         ui.turn_book_page(-1).unwrap();
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(6, 1)).unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(5, 1)).unwrap();
         let Screen::BookBookmarks { entries, .. } = ui.screen() else {
             panic!("expected the bookmarks, got {:?}", ui.screen());
         };
@@ -10634,7 +10730,7 @@ mod library_tabs {
         let mut fresh = app(&lib2, FakeGateway::default(), open_first_book());
         fresh.run().unwrap();
         fresh.sheet = Some(Sheet::BookReading);
-        fresh.tap_sheet(W / 2, tap_modal_row_y(6, 1)).unwrap();
+        fresh.tap_sheet(W / 2, tap_modal_row_y(5, 1)).unwrap();
         assert!(matches!(fresh.screen(), Screen::Message { .. }));
     }
 }
