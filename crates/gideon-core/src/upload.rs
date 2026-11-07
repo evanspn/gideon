@@ -174,10 +174,27 @@ pub struct BookMeta {
 /// never an error, since the file already validated as an EPUB and a name
 /// is the one thing we can always fall back on.
 pub fn epub_meta(bytes: &[u8]) -> BookMeta {
-    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+    let Ok(archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         return BookMeta::default();
     };
-    let read = |archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str| -> Option<String> {
+    epub_meta_from(archive)
+}
+
+/// [`epub_meta`] for a file already on disk, reading only the two small
+/// entries it needs — a 200 MB novel must not be pulled into memory just to
+/// learn its title.
+pub fn epub_meta_file(path: &Path) -> BookMeta {
+    let Ok(file) = std::fs::File::open(path) else {
+        return BookMeta::default();
+    };
+    let Ok(archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+        return BookMeta::default();
+    };
+    epub_meta_from(archive)
+}
+
+fn epub_meta_from<R: Read + std::io::Seek>(mut archive: zip::ZipArchive<R>) -> BookMeta {
+    let read = |archive: &mut zip::ZipArchive<R>, name: &str| -> Option<String> {
         let mut entry = archive.by_name(name).ok()?;
         let mut s = String::new();
         entry.read_to_string(&mut s).ok()?;

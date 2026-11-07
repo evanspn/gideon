@@ -4,7 +4,8 @@
 Usage: make_fixture.py <output-dir>
 
 Creates <output-dir>/Sample Manga/vol1.cbz with three solid-gray PNG pages
-(named so natural sorting matters) and a ComicInfo.xml.
+(named so natural sorting matters) and a ComicInfo.xml, plus a minimal EPUB
+beside the library at <output-dir>/../Books/Kurt Vonnegut/book-0001.epub.
 """
 
 import os
@@ -49,6 +50,32 @@ def main() -> None:
             z.writestr(f"page{page_number}.png", png(60, 90, gray))
 
     print(f"fixture written to {manga_dir}/vol1.cbz")
+
+    # A book beside the manga: Books/<Author>/<Title>.epub, the layout gideon
+    # writes for OPDS downloads and phone sends. Its metadata names it; the
+    # file name deliberately does not, so a title in the output proves the
+    # EPUB was actually opened and its OPF read on the target architecture.
+    books_dir = os.path.join(os.path.dirname(out_dir.rstrip("/")), "Books", "Kurt Vonnegut")
+    os.makedirs(books_dir, exist_ok=True)
+    container = (
+        '<?xml version="1.0"?><container version="1.0" '
+        'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+        '<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
+        "</rootfiles></container>"
+    )
+    opf = (
+        '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0"><metadata>'
+        "<dc:title>Slaughterhouse-Five</dc:title><dc:creator>Kurt Vonnegut</dc:creator>"
+        "</metadata></package>"
+    )
+    epub_path = os.path.join(books_dir, "book-0001.epub")
+    with zipfile.ZipFile(epub_path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml", container)
+        z.writestr("OEBPS/content.opf", opf)
+        z.writestr("OEBPS/ch1.xhtml", "<html><body><p>So it goes.</p></body></html>")
+    print(f"fixture written to {epub_path}")
 
 
 if __name__ == "__main__":
