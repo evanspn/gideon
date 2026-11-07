@@ -8556,7 +8556,13 @@ fn todays_waiting_list_shows_unread_series_and_opens_them() {
     probe.goto_root(Screen::Stats).unwrap();
 
     let rows = probe.waiting_rows();
-    let listed: Vec<(String, usize)> = rows.iter().map(|(c, n)| (c.title(), *n)).collect();
+    let listed: Vec<(String, usize)> = rows
+        .iter()
+        .map(|r| match r {
+            WaitingRow::Manga(c, n) => (c.title(), *n),
+            WaitingRow::Book(b) => (b.title.clone(), 0),
+        })
+        .collect();
     assert_eq!(
         listed,
         vec![("Berserk".to_string(), 2), ("Frieren".to_string(), 2)],
@@ -8567,11 +8573,11 @@ fn todays_waiting_list_shows_unread_series_and_opens_them() {
     let l = layout();
     let head_h = l.row_h * 2 / 3;
     let top = probe.waiting_top() + head_h + l.pad;
-    for (i, (card, _)) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let y = top + i as u32 * l.row_h + l.row_h / 2;
         assert_eq!(
             probe.waiting_row_at(y).map(|c| c.title()),
-            Some(card.title()),
+            Some(row.title()),
             "row {i} must hit the series drawn there"
         );
     }
@@ -10503,5 +10509,61 @@ mod library_tabs {
             .get("Kurt Vonnegut/book-0001.epub")
             .unwrap();
         assert_eq!(saved.chapter, 1, "the jump is the new place");
+    }
+
+    #[test]
+    fn today_continues_a_book_and_lists_unstarted_books_as_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        make_epub(
+            &books.join("Natsu Hyuuga/book-0002.epub"),
+            "The Apothecary Diaries, Vol. 1",
+            "Natsu Hyuuga",
+        );
+        // Read two pages of the novel, close it, go to Today.
+        let mut events = open_first_book();
+        events.extend([
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::Back),
+            tap_reading_row(3),
+            tap_today(),
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::Stats));
+        let (title, where_at, pct) = ui.continue_card().expect("a book was read");
+        assert_eq!(title, "Slaughterhouse-Five");
+        assert_eq!(where_at, "Kurt Vonnegut — chapter 1 of 2");
+        assert_eq!(pct, 0.0, "still in the first chapter");
+
+        // Waiting: the unread manga and both books (neither finished),
+        // the one being read first.
+        let titles: Vec<String> = ui.waiting_rows().iter().map(|r| r.title()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Slaughterhouse-Five",
+                "Series",
+                "The Apothecary Diaries, Vol. 1"
+            ]
+        );
+
+        // Tapping Continue opens the reader at the saved page.
+        let l = layout();
+        let top = ui.continue_card_top();
+        ui.handle_tap(l.width / 2, top + l.row_h / 2).unwrap();
+        let Screen::BookReader { book, page, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        assert_eq!(book.title, "Slaughterhouse-Five");
+        assert_eq!(*page, 2);
+
+        // A manga read more recently than the book wins the card back.
+        let now = now_unix();
+        write_progress(&lib, &[("Series/vol1.cbz", 1, 2, now + 5)]);
+        ui.invalidate_progress_cache();
+        let (title, _, _) = ui.continue_card().unwrap();
+        assert_eq!(title, "Series");
     }
 }
