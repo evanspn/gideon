@@ -149,6 +149,49 @@ fn describe(root: &Path, path: &Path, format: &'static str) -> Book {
     }
 }
 
+/// The light-novel series a volume title belongs to, and its number:
+/// "The Apothecary Diaries, Vol. 5" → ("The Apothecary Diaries", 5). Reads
+/// the common spellings — "Vol. 5", "Vol 5", "Volume 5", "v05", "#5",
+/// "Book 5" — at the end of the title or before a ": subtitle". `None`
+/// for a title with no volume number.
+pub fn series_of(title: &str) -> Option<(String, u32)> {
+    let main = title.split(" (").next().unwrap_or(title).trim();
+    let lower = main.to_ascii_lowercase();
+    let markers = ["volume", "vol.", "vol", "book", "#", "v"];
+    for marker in markers {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(marker) {
+            let at = from + rel;
+            from = at + 1;
+            let before = &main[..at];
+            let boundary =
+                before.is_empty() || before.ends_with([' ', ',', '-', '–', ':']) || marker == "#";
+            if !boundary {
+                continue;
+            }
+            let rest = main[at + marker.len()..].trim_start_matches([' ', '.']);
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() || digits.len() > 4 {
+                continue;
+            }
+            let after = &rest[digits.len()..];
+            // The number must end the title or lead into a subtitle.
+            if !(after.is_empty() || after.starts_with([':', ' ', ',', '-', '–'])) {
+                continue;
+            }
+            if marker == "v" && !before.ends_with(' ') {
+                continue;
+            }
+            let series = before.trim_end_matches([' ', ',', '-', '–', ':']).trim();
+            if series.is_empty() {
+                return None;
+            }
+            return digits.parse().ok().map(|n| (series.to_string(), n));
+        }
+    }
+    None
+}
+
 /// The author a wild file name carries: the second " -- " segment of
 /// "Title -- Author -- Publisher, Year -- …". Only a fallback for a loose
 /// file with no metadata and no author folder; `None` when the name has no
@@ -476,5 +519,40 @@ mod tests {
         delete(root, three).unwrap();
         assert!(root.join("B/two.epub").exists());
         assert!(root.join("B").exists(), "a folder with books left stays");
+    }
+
+    #[test]
+    fn series_titles_split_into_series_and_volume() {
+        for (title, expected) in [
+            (
+                "The Apothecary Diaries, Vol. 5",
+                Some(("The Apothecary Diaries", 5)),
+            ),
+            (
+                "The Apothecary Diaries Vol 12",
+                Some(("The Apothecary Diaries", 12)),
+            ),
+            (
+                "Spice and Wolf, Volume 3: The Wolf and the Amber Melancholy",
+                Some(("Spice and Wolf", 3)),
+            ),
+            ("Overlord v01", Some(("Overlord", 1))),
+            (
+                "Mushoku Tensei #7 (Light Novel)",
+                Some(("Mushoku Tensei", 7)),
+            ),
+            ("The Wheel of Time, Book 2", Some(("The Wheel of Time", 2))),
+            ("Slaughterhouse-Five", None),
+            ("Volunteer Nation", None),
+            ("Vivaldi", None),
+            ("Catch-22", None),
+        ] {
+            let got = series_of(title);
+            assert_eq!(
+                got.as_ref().map(|(s, n)| (s.as_str(), *n)),
+                expected,
+                "{title}"
+            );
+        }
     }
 }

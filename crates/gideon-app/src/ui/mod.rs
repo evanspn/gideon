@@ -20,6 +20,112 @@ fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
     choices[at.map_or(0, |i| (i + 1) % choices.len())].clone()
 }
 
+/// One card on the Books tab: a book, or the volumes of a series.
+#[derive(Debug, Clone, PartialEq)]
+struct BookCard {
+    title: String,
+    author: Option<String>,
+    /// The books behind the card, volumes in number order.
+    books: Vec<gideon_core::Book>,
+    /// Chapters read over chapters in the book, for the most recently read
+    /// book of the card; `None` when none of them has been opened.
+    progress: Option<f32>,
+    /// When the card was last read (0: never).
+    last_read: u64,
+}
+
+/// Group a shelf into cards. Volumes whose titles parse to the same series
+/// (`books::series_of`) share a card titled "Series, Vol. a–b"; everything
+/// else is its own card. Most recently read first; unread cards after, in
+/// the shelf's title order.
+fn book_cards(books: &[gideon_core::Book], places: &gideon_core::BookPlaces) -> Vec<BookCard> {
+    let progress_of = |b: &gideon_core::Book| -> (Option<f32>, u64) {
+        match places.get(&b.relative_path) {
+            Some(p) if p.chapters > 0 => (
+                Some((p.chapter as f32 / p.chapters as f32).clamp(0.0, 1.0)),
+                p.updated_at,
+            ),
+            Some(p) => (Some(0.0), p.updated_at),
+            None => (None, 0),
+        }
+    };
+    let mut cards: Vec<BookCard> = Vec::new();
+    // Series name → index into `cards`, plus each volume's number for order.
+    let mut series_at: std::collections::BTreeMap<String, (usize, Vec<u32>)> =
+        std::collections::BTreeMap::new();
+    for book in books {
+        let (progress, read_at) = progress_of(book);
+        match gideon_core::books::series_of(&book.title) {
+            Some((series, n)) => {
+                let key = format!(
+                    "{}\u{0}{}",
+                    series.to_lowercase(),
+                    book.author.as_deref().unwrap_or("").to_lowercase()
+                );
+                match series_at.get_mut(&key) {
+                    Some((i, numbers)) => {
+                        let card = &mut cards[*i];
+                        let at = numbers.partition_point(|&m| m <= n);
+                        numbers.insert(at, n);
+                        card.books.insert(at, book.clone());
+                        if read_at >= card.last_read && read_at > 0 {
+                            card.last_read = read_at;
+                            card.progress = progress;
+                        }
+                    }
+                    None => {
+                        series_at.insert(key, (cards.len(), vec![n]));
+                        cards.push(BookCard {
+                            title: series,
+                            author: book.author.clone(),
+                            books: vec![book.clone()],
+                            progress,
+                            last_read: read_at,
+                        });
+                    }
+                }
+            }
+            None => cards.push(BookCard {
+                title: book.title.clone(),
+                author: book.author.clone(),
+                books: vec![book.clone()],
+                progress,
+                last_read: read_at,
+            }),
+        }
+    }
+    for (series, (i, numbers)) in &series_at {
+        let _ = series;
+        let card = &mut cards[*i];
+        if card.books.len() == 1 {
+            // A lone volume is just a book.
+            card.title = card.books[0].title.clone();
+        } else if let (Some(lo), Some(hi)) = (numbers.first(), numbers.last()) {
+            card.title = format!("{}, Vol. {lo}–{hi}", card.title);
+        }
+    }
+    // Recently read first; then the shelf's own (title) order, which the
+    // stable sort keeps.
+    cards.sort_by_key(|c| std::cmp::Reverse(c.last_read));
+    cards
+}
+
+/// A book's list row: its label, "· PDF" for what the Kobo reader must
+/// open, and how far in the reader is.
+fn book_row_label(book: &gideon_core::Book, places: &gideon_core::BookPlaces) -> String {
+    let mut label = book.label();
+    if book.format == "pdf" {
+        label.push_str(" · PDF");
+    }
+    if let Some(p) = places.get(&book.relative_path) {
+        if p.chapters > 0 {
+            let pct = (p.chapter as f32 / p.chapters as f32 * 100.0).round() as u32;
+            label.push_str(&format!(" · {pct}%"));
+        }
+    }
+    label
+}
+
 fn bookmark_banner(set: bool) -> &'static str {
     if set {
         "Bookmarked"
@@ -498,6 +604,13 @@ enum Screen {
     /// ones the Kobo's own reader opens. A sibling of the manga Library (the
     /// same nav destination, one tab strip apart), not a child screen.
     BookShelf {
+        books: Vec<gideon_core::Book>,
+        page: usize,
+    },
+    /// The volumes of one light-novel series, from a series card on the
+    /// Books tab: a plain list, a row per volume.
+    BookSeries {
+        title: String,
         books: Vec<gideon_core::Book>,
         page: usize,
     },
@@ -1936,13 +2049,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// disk scan, keeping the shelf page (clamped). Cheap and only runs when the
     /// Library is actually showing.
     fn refresh_library_in_place(&mut self) -> Result<()> {
-        if let Some(Screen::BookShelf { books, page }) = self.stack.last_mut() {
+        if matches!(self.stack.last(), Some(Screen::BookShelf { .. })) {
             // A sync sweep may have placed a sent book while the shelf sat
             // on screen; rescan so it shows without leaving the tab.
             let fresh = gideon_core::books::scan(&self.books_dir).unwrap_or_default();
-            let per_page = self.layout.rows_per_page().max(1);
-            *page = (*page).min(fresh.len().div_ceil(per_page).saturating_sub(1));
-            *books = fresh;
+            let last = self
+                .book_cards(&fresh)
+                .len()
+                .div_ceil(self.books_page_capacity())
+                .saturating_sub(1);
+            if let Some(Screen::BookShelf { books, page }) = self.stack.last_mut() {
+                *books = fresh;
+                *page = (*page).min(last);
+            }
             return Ok(());
         }
         if !matches!(self.stack.last(), Some(Screen::Library { .. })) {
@@ -2073,8 +2192,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.open_library_tab(LibraryTab::Manga)?;
                     } else if x >= books.0 && x < books.1 {
                         self.open_library_tab(LibraryTab::Books)?;
-                    } else if matches!(self.screen(), Screen::Library { .. }) {
-                        // Elsewhere on the manga tab's title bar toggles between
+                    } else {
+                        // Elsewhere on either tab's title bar toggles between
                         // the cover shelf and the dense metadata list. Two views
                         // of one library: art to browse by, data to decide by.
                         self.toggle_library_view()?;
@@ -2359,7 +2478,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let shelf_capacity = self.library_page_capacity();
         match self.stack.last() {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
-            Some(Screen::BookShelf { books, .. }) => books.len().div_ceil(per_page),
+            Some(Screen::BookShelf { books, .. }) => self
+                .book_cards(books)
+                .len()
+                .div_ceil(self.books_page_capacity()),
+            Some(Screen::BookSeries { books, .. }) => books.len().div_ceil(per_page),
             Some(Screen::BookContents { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::BookBookmarks { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
@@ -2412,12 +2535,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn move_page(&mut self, mv: PageMove) -> Result<()> {
         let per_page = self.layout.rows_per_page();
         let shelf_capacity = self.library_page_capacity();
+        let book_pages = match self.stack.last() {
+            Some(Screen::BookShelf { books, .. }) => self
+                .book_cards(books)
+                .len()
+                .div_ceil(self.books_page_capacity()),
+            _ => 1,
+        };
         let Some(screen) = self.stack.last_mut() else {
             return Ok(());
         };
         let (page, count) = match screen {
             Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
-            Screen::BookShelf { books, page } => (page, books.len().div_ceil(per_page)),
+            Screen::BookShelf { page, .. } => (page, book_pages),
+            Screen::BookSeries { books, page, .. } => (page, books.len().div_ceil(per_page)),
             Screen::BookContents { entries, page, .. } => (page, entries.len().div_ceil(per_page)),
             Screen::BookBookmarks { entries, page } => (page, entries.len().div_ceil(per_page)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
@@ -3615,11 +3746,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Screen::BookShelf { books, page } => {
+                let cards = self.book_cards(&books);
+                let card = if self.load_settings().library_view == "list" {
+                    cards.get(page * self.layout.rows_per_page() + row).cloned()
+                } else {
+                    self.book_cell_at(&cards, page, x, y)
+                };
+                if let Some(card) = card {
+                    self.open_book_card(card)?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookSeries { books, page, .. } => {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(book) = books.get(index).cloned() {
                     self.sheet = Some(Sheet::BookFile { book });
-                    // The row you tapped stays on screen behind the sheet;
-                    // only the strip it covers repaints. See docs/REFRESH.md.
                     self.render_current(RefreshMode::Partial)?;
                 }
                 Ok(Flow::Continue)
@@ -7956,6 +8097,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             ),
             Screen::Library { items, page } => self.compose_library(items, *page)?,
             Screen::BookShelf { books, page } => self.compose_book_shelf(books, *page),
+            Screen::BookSeries { title, books, page } => {
+                let places = gideon_core::BookPlaces::load(&self.books_dir);
+                let rows: Vec<(String, bool)> = paged(books, *page, per_page)
+                    .iter()
+                    .map(|b| (book_row_label(b, &places), false))
+                    .collect();
+                compose_list(l, title, &rows, *page, l.page_count(books.len()))
+            }
             Screen::BookReader {
                 book,
                 text,
@@ -8949,8 +9098,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Grayscale like every list; the colour path wraps it for the nav bar.
     fn compose_book_shelf(&self, books: &[gideon_core::Book], page: usize) -> GrayPage {
         let l = &self.layout;
-        let per_page = l.rows_per_page().max(1);
-        let page_count = books.len().div_ceil(per_page).max(1);
+        let cards = self.book_cards(books);
+        let per_page = self.books_page_capacity();
+        let page_count = cards.len().div_ceil(per_page).max(1);
         let nav = self.screen_has_nav();
         let mut canvas = compose_chrome_paged(l, "", page, page_count, !nav, 0, !nav);
         draw_library_tabs(&mut canvas, l, LibraryTab::Books);
@@ -8974,14 +9124,40 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             return canvas;
         }
-        for (i, book) in paged(books, page, per_page).iter().enumerate() {
+        if self.load_settings().library_view != "list" {
+            // The cover shelf, as the manga tab draws it.
+            let shelf = self.shelf_layout();
+            let cell = (
+                shelf.cell_width(),
+                shelf
+                    .cell_height()
+                    .saturating_sub(shelf.title_height + shelf.progress_bar_height),
+            );
+            let entries: Vec<ShelfEntry> = paged(&cards, page, per_page)
+                .iter()
+                .map(|card| ShelfEntry {
+                    cover: self.book_cover(card, cell, per_page),
+                    title: card.title.clone(),
+                    progress: card.progress,
+                })
+                .collect();
+            let grid = compose_shelf(&entries, &shelf);
+            copy_into(&mut canvas, &grid, 0, l.content_top());
+            return canvas;
+        }
+        let places = gideon_core::BookPlaces::load(&self.books_dir);
+        for (i, card) in paged(&cards, page, per_page).iter().enumerate() {
             let top = l.row_top(i);
-            // EPUB is the norm on this shelf; a PDF is worth a word, since
-            // the Kobo reader treats the two quite differently.
-            let row_label = if book.format == "pdf" {
-                format!("{} · PDF", book.label())
-            } else {
-                book.label()
+            let row_label = match card.books.as_slice() {
+                [book] => book_row_label(book, &places),
+                volumes => {
+                    let mut label = card.title.clone();
+                    if let Some(a) = &card.author {
+                        label.push_str(&format!(" — {a}"));
+                    }
+                    label.push_str(&format!(" · {} volumes", volumes.len()));
+                    label
+                }
             };
             draw_text(
                 &mut canvas,
@@ -8995,6 +9171,128 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             hline(&mut canvas, top + l.row_h - 1, 200);
         }
         canvas
+    }
+
+    /// How many cards a Books page holds in the active view.
+    fn books_page_capacity(&self) -> usize {
+        if self.load_settings().library_view == "list" {
+            self.layout.rows_per_page()
+        } else {
+            self.shelf_layout().capacity()
+        }
+        .max(1)
+    }
+
+    /// The Books tab's cards: volumes of one series under one card, the
+    /// rest one card each, the most recently read first and the unread in
+    /// title order after them.
+    fn book_cards(&self, books: &[gideon_core::Book]) -> Vec<BookCard> {
+        book_cards(books, &gideon_core::BookPlaces::load(&self.books_dir))
+    }
+
+    /// The card whose shelf cell contains the tap, if any.
+    fn book_cell_at(&self, cards: &[BookCard], page: usize, x: u32, y: u32) -> Option<BookCard> {
+        let shelf = self.shelf_layout();
+        let capacity = shelf.capacity().max(1);
+        let local_y = y.checked_sub(self.layout.content_top())?;
+        let visible = cards.len().saturating_sub(page * capacity).min(capacity);
+        (0..visible).find_map(|cell| {
+            let (cx, cy) = shelf.cell_origin(cell);
+            (x >= cx
+                && x < cx + shelf.cell_width()
+                && local_y >= cy
+                && local_y < cy + shelf.cell_height())
+            .then(|| cards[page * capacity + cell].clone())
+        })
+    }
+
+    /// A tapped card: one book raises its sheet over the shelf (the shelf
+    /// has not moved: Partial); a series pushes its volume list (Full).
+    fn open_book_card(&mut self, card: BookCard) -> Result<()> {
+        match card.books.as_slice() {
+            [book] => {
+                self.sheet = Some(Sheet::BookFile { book: book.clone() });
+                self.render_current(RefreshMode::Partial)
+            }
+            _ => self.push(Screen::BookSeries {
+                title: card.title.clone(),
+                books: card.books.clone(),
+                page: 0,
+            }),
+        }
+    }
+
+    /// The card's cover at cell size: the EPUB's cover picture, decoded once
+    /// into a `.cover.jpg` beside the book (Nickel ignores dotfiles) and
+    /// thumbnailed through the shelf's cover cache; a plain card when the
+    /// book has none. A series shows its first volume's cover.
+    fn book_cover(
+        &self,
+        card: &BookCard,
+        cell: (u32, u32),
+        capacity: usize,
+    ) -> image::DynamicImage {
+        let Some(book) = card.books.first() else {
+            return placeholder_cover();
+        };
+        let Some(dir) = book.path.parent() else {
+            return placeholder_cover();
+        };
+        let stem = book
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cover_path = dir.join(format!(".{stem}.cover.jpg"));
+        if !cover_path.exists() {
+            if book.format != "epub" {
+                return placeholder_cover();
+            }
+            let Some(decoded) = gideon_core::epub::cover_image(&book.path)
+                .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            else {
+                return placeholder_cover();
+            };
+            // Keep the cache small: the shelf never shows more than a cell.
+            let small = decoded.resize(
+                cell.0 * 2,
+                cell.1 * 2,
+                image::imageops::FilterType::Triangle,
+            );
+            if small.to_rgb8().save(&cover_path).is_err() {
+                return small.resize(cell.0, cell.1, image::imageops::FilterType::Triangle);
+            }
+        }
+        let mtime = std::fs::metadata(&cover_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let mut cache = self.cover_cache.borrow_mut();
+        cache.tick += 1;
+        let tick = cache.tick;
+        let key = (cover_path, mtime, cell);
+        if let Some((stamp, image)) = cache.entries.get_mut(&key) {
+            *stamp = tick;
+            return image.clone();
+        }
+        match image::open(&key.0).ok() {
+            Some(image) => {
+                let thumb = image.resize(cell.0, cell.1, image::imageops::FilterType::Triangle);
+                while cache.entries.len() >= 2 * capacity.max(1) {
+                    let Some(oldest) = cache
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, (stamp, _))| *stamp)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    cache.entries.remove(&oldest);
+                }
+                cache.entries.insert(key, (tick, thumb.clone()));
+                thumb
+            }
+            None => placeholder_cover(),
+        }
     }
 
     /// The series cover art for a library entry (fetched at download time).

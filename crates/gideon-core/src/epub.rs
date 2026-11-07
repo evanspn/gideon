@@ -508,6 +508,96 @@ fn parse_package(xml: &str) -> Package {
     package
 }
 
+/// The book's cover picture, encoded as the EPUB carries it: the manifest
+/// item marked `cover-image` (EPUB 3), else the one `<meta name="cover">`
+/// names (EPUB 2), else an image whose name says "cover", else the first
+/// image in the manifest. `None` when the book has no picture at all.
+pub fn cover_image(path: &Path) -> Option<Vec<u8>> {
+    let file = crate::zipread::SeekFile::open(path).ok()?;
+    let mut archive = ZipSource::open(file).ok()?;
+    let read = |archive: &mut ZipSource<_>, name: &str| -> Option<String> {
+        for candidate in [name.to_string(), percent_decode(name)] {
+            if let Some(s) = archive.read_string(&candidate) {
+                return Some(s);
+            }
+        }
+        None
+    };
+    let container = read(&mut archive, "META-INF/container.xml")?;
+    let opf_path = crate::upload::opf_path_from_container(&container)?;
+    let opf = read(&mut archive, &opf_path)?;
+    let href = cover_href(&opf)?;
+    let opf_dir = match opf_path.rfind('/') {
+        Some(i) => &opf_path[..=i],
+        None => "",
+    };
+    let full = normalize_path(&format!("{opf_dir}{href}"));
+    for candidate in [full.clone(), percent_decode(&full)] {
+        if let Some(bytes) = archive.read(&candidate) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// The manifest href of the cover picture named by an OPF, by the rules of
+/// [`cover_image`].
+fn cover_href(opf: &str) -> Option<String> {
+    let package = parse_package(opf);
+    let is_image = |m: &ManifestItem| {
+        m.media.starts_with("image/") || {
+            let h = m.href.to_ascii_lowercase();
+            [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+                .iter()
+                .any(|ext| h.ends_with(ext))
+        }
+    };
+    if let Some(m) = package
+        .manifest
+        .iter()
+        .find(|m| m.properties.split_whitespace().any(|p| p == "cover-image"))
+    {
+        return Some(m.href.clone());
+    }
+    if let Some(id) = cover_meta_id(opf) {
+        if let Some(m) = package.manifest.iter().find(|m| m.id == id && is_image(m)) {
+            return Some(m.href.clone());
+        }
+    }
+    package
+        .manifest
+        .iter()
+        .find(|m| is_image(m) && m.href.to_ascii_lowercase().contains("cover"))
+        .or_else(|| package.manifest.iter().find(|m| is_image(m)))
+        .map(|m| m.href.clone())
+}
+
+/// The `content` of `<meta name="cover" content="…"/>`, EPUB 2's way of
+/// pointing at the cover's manifest id.
+fn cover_meta_id(opf: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(opf);
+    reader.config_mut().check_end_names = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.local_name().as_ref() == b"meta" => {
+                let attr = |name: &[u8]| -> Option<String> {
+                    e.attributes().flatten().find_map(|a| {
+                        (a.key.local_name().as_ref() == name)
+                            .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+                            .flatten()
+                    })
+                };
+                if attr(b"name").as_deref() == Some("cover") {
+                    return attr(b"content").filter(|c| !c.trim().is_empty());
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
 /// One file out of the EPUB, by zip entry name (as a [`Block::Image`]
 /// carries it). Tries the name as given and percent-decoded.
 pub fn read_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
@@ -1194,5 +1284,38 @@ mod tests {
         );
         assert_eq!(percent_decode("ch%202.xhtml"), "ch 2.xhtml");
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn the_cover_is_found_by_property_meta_name_or_first_image() {
+        let epub3 = r#"<package><manifest><item id="x" href="Images/other.png" media-type="image/png"/><item id="c" href="Images/front.jpg" media-type="image/jpeg" properties="cover-image"/></manifest></package>"#;
+        assert_eq!(cover_href(epub3).as_deref(), Some("Images/front.jpg"));
+        let epub2 = r#"<package><metadata><meta name="cover" content="cov"/></metadata><manifest><item id="x" href="a.png" media-type="image/png"/><item id="cov" href="Images/c.jpg" media-type="image/jpeg"/></manifest></package>"#;
+        assert_eq!(cover_href(epub2).as_deref(), Some("Images/c.jpg"));
+        let named = r#"<package><manifest><item id="x" href="a.png" media-type="image/png"/><item id="y" href="Cover.jpeg" media-type="image/jpeg"/></manifest></package>"#;
+        assert_eq!(cover_href(named).as_deref(), Some("Cover.jpeg"));
+        let first = r#"<package><manifest><item id="t" href="c.xhtml" media-type="application/xhtml+xml"/><item id="x" href="a.png" media-type="image/png"/></manifest></package>"#;
+        assert_eq!(cover_href(first).as_deref(), Some("a.png"));
+        let none = r#"<package><manifest><item id="t" href="c.xhtml" media-type="application/xhtml+xml"/></manifest></package>"#;
+        assert_eq!(cover_href(none), None);
+    }
+
+    #[test]
+    fn cover_image_reads_the_bytes_relative_to_the_opf() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.epub");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#).unwrap();
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        zip.write_all(br#"<package><manifest><item id="c" href="Images/cover.png" media-type="image/png" properties="cover-image"/></manifest></package>"#).unwrap();
+        zip.start_file("OEBPS/Images/cover.png", opts).unwrap();
+        zip.write_all(b"\x89PNG fake").unwrap();
+        zip.finish().unwrap();
+        assert_eq!(cover_image(&path).unwrap(), b"\x89PNG fake");
+        assert!(cover_image(&dir.path().join("missing.epub")).is_none());
     }
 }
