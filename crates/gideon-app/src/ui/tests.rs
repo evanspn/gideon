@@ -9842,10 +9842,10 @@ mod library_tabs {
         UiEvent::Tap { x, y: H / 2 }
     }
 
-    /// Row `i` of the reading menu: 0 contents, 1 larger, 2 smaller,
-    /// 3 close book, 4 close.
+    /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 larger,
+    /// 3 smaller, 4 close book, 5 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(5, i)
+        tap_modal_row(6, i)
     }
 
     /// Open the first book on the Books tab in gideon's reader.
@@ -10234,7 +10234,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(3)]);
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(4)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10256,7 +10256,7 @@ mod library_tabs {
 
         // Larger text: fewer lines per page, same paragraph on the page.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(5, 1)).unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(6, 2)).unwrap();
         let Screen::BookReader { pages, page, .. } = ui.screen() else {
             panic!("expected the reader");
         };
@@ -10526,7 +10526,7 @@ mod library_tabs {
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::Back),
-            tap_reading_row(3),
+            tap_reading_row(4),
             tap_today(),
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10565,5 +10565,76 @@ mod library_tabs {
         ui.invalidate_progress_cache();
         let (title, _, _) = ui.continue_card().unwrap();
         assert_eq!(title, "Series");
+    }
+
+    #[test]
+    fn a_long_press_bookmarks_the_page_and_the_list_jumps_back_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let l = layout();
+        let hold = UiEvent::LongPress {
+            x: l.width / 2,
+            y: l.height / 2,
+        };
+        // Page 3, hold: bookmarked, with a dog-ear and a banner, partially.
+        let mut events = open_first_book();
+        events.extend([
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::NextPage),
+            hold,
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let marks = gideon_core::BookPlaces::load(&books);
+        let marks = marks.bookmarks("Kurt Vonnegut/book-0001.epub");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].chapter, 0);
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("still reading");
+        };
+        assert_eq!(*page, 2);
+        // The snippet is the page's first words, even mid-paragraph.
+        assert_eq!(
+            marks[0].snippet,
+            pages[2][0].text.chars().take(48).collect::<String>()
+        );
+        assert_eq!(marks[0].block, pages[2][0].block);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(ui.display().pixel(W - 2, 1) < 0x40, "dog-ear in the corner");
+        assert!(ui.display().pixel(1, 1) > 0xf0, "only the corner");
+
+        // Hold again: gone, corner white.
+        ui.handle_long_press(l.width / 2, l.height / 2).unwrap();
+        assert!(gideon_core::BookPlaces::load(&books)
+            .bookmarks("Kurt Vonnegut/book-0001.epub")
+            .is_empty());
+        assert!(ui.display().pixel(W - 2, 1) > 0xf0);
+
+        // Mark page 3 again, go to page 1, open Bookmarks, tap the mark:
+        // back on page 3.
+        ui.handle_long_press(l.width / 2, l.height / 2).unwrap();
+        ui.turn_book_page(-1).unwrap();
+        ui.turn_book_page(-1).unwrap();
+        ui.sheet = Some(Sheet::BookReading);
+        ui.tap_sheet(W / 2, tap_modal_row_y(6, 1)).unwrap();
+        let Screen::BookBookmarks { entries, .. } = ui.screen() else {
+            panic!("expected the bookmarks, got {:?}", ui.screen());
+        };
+        assert_eq!(entries.len(), 1);
+        ui.handle_tap(W / 2, l.row_top(0) + l.row_h / 2).unwrap();
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("expected the reader back");
+        };
+        assert_eq!(*page, 2);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // A book with no marks: the menu says how, instead of an empty list.
+        let other = tempfile::tempdir().unwrap();
+        let (lib2, _) = novel(other.path());
+        let mut fresh = app(&lib2, FakeGateway::default(), open_first_book());
+        fresh.run().unwrap();
+        fresh.sheet = Some(Sheet::BookReading);
+        fresh.tap_sheet(W / 2, tap_modal_row_y(6, 1)).unwrap();
+        assert!(matches!(fresh.screen(), Screen::Message { .. }));
     }
 }

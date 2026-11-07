@@ -17,7 +17,7 @@ pub mod settings;
 pub mod stats;
 pub mod upload;
 
-pub use books::{Book, BookPlace, BookPlaces};
+pub use books::{Book, BookPlace, BookPlaces, Bookmark};
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
 pub use epub::{Block as BookBlock, EpubText, Rich, Span};
