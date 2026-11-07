@@ -302,19 +302,12 @@ impl<F: Fetcher> Client<F> {
         Ok(page)
     }
 
-    /// The most downloaded free books, page by page: a "popular" shelf.
-    pub fn popular(&self, page: u32, rows: u32) -> Result<SearchPage> {
-        let opts = SearchOptions {
-            rows,
-            page,
-            sort: Sort::Downloads,
-            anywhere: true,
-            allow_pdf_only: false,
-        };
-        // An empty scope matches everything; the filters do the work.
-        let url = {
-            let mut url = self.base.join("/advancedsearch.php")?;
+    /// The URL of one page of the "popular" shelf.
+    pub fn popular_url(&self, page: u32, rows: u32) -> Result<Url> {
+        let mut url = self.base.join("/advancedsearch.php")?;
+        {
             let mut qs = url.query_pairs_mut();
+            // An empty scope matches everything; the filters do the work.
             qs.append_pair(
                 "q",
                 "mediatype:texts AND format:epub AND -collection:inlibrary AND -access-restricted-item:true AND language:(eng OR English)",
@@ -330,13 +323,17 @@ impl<F: Fetcher> Client<F> {
             ] {
                 qs.append_pair("fl[]", field);
             }
-            qs.append_pair("sort[]", opts.sort.param());
+            qs.append_pair("sort[]", Sort::Downloads.param());
             qs.append_pair("rows", &rows.max(1).to_string());
             qs.append_pair("page", &page.max(1).to_string());
             qs.append_pair("output", "json");
-            drop(qs);
-            url
-        };
+        }
+        Ok(url)
+    }
+
+    /// The most downloaded free books, page by page: a "popular" shelf.
+    pub fn popular(&self, page: u32, rows: u32) -> Result<SearchPage> {
+        let url = self.popular_url(page, rows)?;
         let body = self.fetcher.get(&url)?;
         let mut out = parse_search(&body).map_err(|message| Error::Parse {
             url: url.to_string(),

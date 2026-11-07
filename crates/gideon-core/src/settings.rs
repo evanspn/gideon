@@ -260,6 +260,16 @@ impl BookCatalog {
         }]
     }
 
+    /// The Internet Archive, built in beside the configured catalogues (the
+    /// device always offers it; see the gateway's `book_catalogs`). Its URL
+    /// is the root `gideon_sources::archive` answers for.
+    pub fn internet_archive() -> BookCatalog {
+        BookCatalog {
+            name: "Internet Archive".to_string(),
+            url: "https://archive.org/".to_string(),
+        }
+    }
+
     /// The row label: the name, or the host when the name was left blank.
     pub fn label(&self) -> String {
         if !self.name.trim().is_empty() {

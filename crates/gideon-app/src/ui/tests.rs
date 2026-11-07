@@ -187,19 +187,19 @@ impl SourceGateway for FakeGateway {
     }
 
     fn book_feed(&self, url: &url::Url) -> Result<BookFeed> {
-        Ok(gideon_sources::opds::fetch_feed(&self.web, url)?)
+        Ok(gideon_sources::catalog::fetch_feed(&self.web, url)?)
     }
 
     fn book_next_page(&self, feed: &BookFeed) -> Result<Option<BookFeed>> {
-        Ok(gideon_sources::opds::fetch_next(&self.web, feed)?)
+        Ok(gideon_sources::catalog::fetch_next(&self.web, feed)?)
     }
 
     fn book_search(&self, search: &SearchLink, query: &str) -> Result<Option<BookFeed>> {
-        Ok(gideon_sources::opds::search(&self.web, search, query)?)
+        Ok(gideon_sources::catalog::search(&self.web, search, query)?)
     }
 
     fn book_open(&self, entry: &BookEntry) -> Result<BookOpened> {
-        Ok(gideon_sources::opds::open_entry(&self.web, entry)?)
+        Ok(gideon_sources::catalog::open_entry(&self.web, entry)?)
     }
 
     fn book_download(
@@ -9724,6 +9724,144 @@ mod books {
         }
         out.sort();
         out
+    }
+
+    // --- Internet Archive (archivist, not OPDS) ---
+
+    /// archive.org's search JSON for "frankenstein": one book with an EPUB,
+    /// one scan with only a PDF (which must not be offered).
+    const IA_SEARCH: &str = r#"{"response":{"numFound":2,"start":0,"docs":[
+        {"identifier":"frankenstein00shel","title":"Frankenstein","creator":"Mary Wollstonecraft Shelley","year":1818,"downloads":900,"format":["EPUB","Text PDF"]},
+        {"identifier":"frankenstein-scan","title":"Frankenstein (scan)","creator":"Shelley","downloads":3,"format":["Text PDF"]}
+    ]}}"#;
+    const IA_ITEM: &str = r#"{"metadata":{"identifier":"frankenstein00shel","title":"Frankenstein","creator":"Mary Wollstonecraft Shelley"},
+        "files":[{"name":"frankenstein00shel.epub","format":"EPUB","size":"2048"},{"name":"frankenstein00shel.pdf","format":"Text PDF","size":"9000"}]}"#;
+
+    /// Gutenberg as configured, plus the Internet Archive the real gateway
+    /// always adds, with archive.org's answers canned on the same fake web.
+    fn with_internet_archive() -> FakeGateway {
+        let mut gateway = gutenberg_only();
+        super::super::gateway::with_internet_archive(&mut gateway.catalogs);
+        let search = gideon_sources::archive::search_url("frankenstein").unwrap();
+        gateway.web = gateway
+            .web
+            .with(search.as_str(), IA_SEARCH)
+            .with("https://archive.org/metadata/frankenstein00shel", IA_ITEM)
+            .with(
+                "https://archive.org/download/frankenstein00shel/frankenstein00shel.epub",
+                EPUB,
+            );
+        gateway
+    }
+
+    #[test]
+    fn the_internet_archive_is_built_in_beside_the_configured_catalogues() {
+        let mut catalogs = vec![gideon_core::BookCatalog {
+            name: "Project Gutenberg".into(),
+            url: GUTENBERG.into(),
+        }];
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        let labels: Vec<String> = catalogs.iter().map(|c| c.label()).collect();
+        assert_eq!(labels, ["Project Gutenberg", "Internet Archive"]);
+        // Already there (typed in by hand, under another name): not twice.
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        catalogs[1].name = "IA".into();
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        assert_eq!(catalogs.len(), 2);
+    }
+
+    #[test]
+    fn the_internet_archive_root_offers_search_and_popular() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(
+            dir.path(),
+            with_internet_archive(),
+            vec![nav_discover(), tap_books(), tap_row(1)],
+        );
+        app.run().unwrap();
+        let (title, rows) = book_list(&app);
+        assert_eq!(title, "Internet Archive");
+        assert_eq!(
+            rows,
+            [
+                "Search this catalogue",
+                "Popular — The most downloaded free books.",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_internet_archive_search_downloads_into_the_books_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        // Books -> Internet Archive (row 1) -> "Search this catalogue" ->
+        // type "frankenstein" -> Search.
+        let mut events = vec![nav_discover(), tap_books(), tap_row(1), tap_row(0)];
+        events.extend("frankenstein".chars().map(|c| tap_key(Key::Char(c))));
+        events.push(tap_key(Key::Search));
+        let mut ui = app(dir.path(), with_internet_archive(), events);
+        ui.run().unwrap();
+
+        // The PDF-only scan is not offered: a reader can't open it here.
+        let (_, rows) = book_list(&ui);
+        assert_eq!(
+            rows,
+            [
+                "Search this catalogue",
+                "Frankenstein — Mary Wollstonecraft Shelley",
+            ]
+        );
+
+        // Same path again, then tap the book (row 1, after the search row).
+        let mut events = vec![nav_discover(), tap_books(), tap_row(1), tap_row(0)];
+        events.extend("frankenstein".chars().map(|c| tap_key(Key::Char(c))));
+        events.push(tap_key(Key::Search));
+        events.push(tap_row(1));
+        let mut app = app(dir.path(), with_internet_archive(), events);
+        app.run().unwrap();
+        let Screen::Message { title, body } = app.screen() else {
+            panic!("expected the saved message, got {:?}", app.screen());
+        };
+        assert_eq!(title, "Books");
+        assert!(body.starts_with("Saved Frankenstein"), "{body}");
+
+        let saved = walk(&dir.path().join("Books"));
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert!(
+            saved[0].ends_with("Mary Wollstonecraft Shelley/Frankenstein.epub"),
+            "{saved:?}"
+        );
+        assert_eq!(std::fs::read(&saved[0]).unwrap(), EPUB);
+
+        // And the Library's Books tab lists it.
+        let l = layout();
+        let [_, books_tab] = library_tab_zones(&l);
+        let mut shelf = app_with_events(
+            dir.path(),
+            vec![
+                tap_nav(0),
+                UiEvent::Tap {
+                    x: (books_tab.0 + books_tab.1) / 2,
+                    y: l.title_h / 2,
+                },
+            ],
+        );
+        shelf.run().unwrap();
+        let Screen::BookShelf { books, .. } = shelf.screen() else {
+            panic!("expected the Books tab, got {:?}", shelf.screen());
+        };
+        assert_eq!(books.len(), 1);
+        assert!(
+            books[0].label().contains("Frankenstein"),
+            "{}",
+            books[0].label()
+        );
+    }
+
+    fn app_with_events(
+        dir: &Path,
+        events: Vec<UiEvent>,
+    ) -> UiApp<MemoryDisplay, FakeInput, FakeGateway> {
+        app(dir, FakeGateway::default(), events)
     }
 }
 

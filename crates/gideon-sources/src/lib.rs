@@ -7,6 +7,8 @@
 //! or GitHub Pages) — describing installable manga sources. gideon ships
 //! with a default list preinstalled and lets users add their own.
 
+pub mod archive;
+pub mod catalog;
 pub mod cleanup;
 pub mod download;
 pub mod fetch;
