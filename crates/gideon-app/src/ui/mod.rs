@@ -166,6 +166,12 @@ enum Sheet {
         series_dir: String,
         scope: DeleteScope,
     },
+    /// What a tap on a Books-tab row offers. gideon cannot open an EPUB
+    /// itself, so the first row hands the device back to Nickel, whose
+    /// reader can; the rest is housekeeping.
+    BookFile { book: gideon_core::Book },
+    /// Confirmation before a book is deleted.
+    ConfirmDeleteBook { book: gideon_core::Book },
 }
 
 /// What a settings row does when tapped. The grouped list is built once and
@@ -412,6 +418,13 @@ enum Screen {
         items: Vec<SeriesCard>,
         page: usize,
     },
+    /// The Library's Books tab: the EPUBs and PDFs in the Books folder, the
+    /// ones the Kobo's own reader opens. A sibling of the manga Library (the
+    /// same nav destination, one tab strip apart), not a child screen.
+    BookShelf {
+        books: Vec<gideon_core::Book>,
+        page: usize,
+    },
     Sources {
         rows: Vec<SourceRow>,
         page: usize,
@@ -590,6 +603,22 @@ pub enum Exit {
 enum Flow {
     Continue,
     Quit(Exit),
+}
+
+/// Which half of the Library is showing. Manga is what gideon reads; Books
+/// is what it hands to the Kobo's reader. One destination, two shelves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryTab {
+    Manga,
+    Books,
+}
+
+/// The screen a headless render starts on (`browse --screenshot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartScreen {
+    Today,
+    Library,
+    Books,
 }
 
 /// What a confirmed delete removes.
@@ -772,6 +801,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Nickel picks them up on its next start, which is what exiting gideon
     /// does, so the download message says exactly that.
     books_dir: PathBuf,
+    /// The Library tab last shown, so the nav tab brings you back to the
+    /// shelf you were on.
+    library_tab: LibraryTab,
     /// Active profile name (settings.json `active_profile`).
     active_profile: String,
     layout: UiLayout,
@@ -908,6 +940,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             gateway,
             base_library: library_dir.clone(),
             books_dir: books_dir_for(&library_dir),
+            library_tab: LibraryTab::Manga,
             library_dir,
             active_profile: "default".to_string(),
             layout,
@@ -946,6 +979,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     /// Where downloaded books go, overriding the default beside the library.
+    /// Start on a given screen instead of the default. Used by the headless
+    /// screenshot path to render a screen other than the first one.
+    pub fn with_start(mut self, start: StartScreen) -> Self {
+        self.stack.truncate(1);
+        self.stack[0] = match start {
+            StartScreen::Today => Screen::Stats,
+            StartScreen::Library => Screen::Library {
+                items: self.scan_library_items().unwrap_or_default(),
+                page: 0,
+            },
+            StartScreen::Books => {
+                self.library_tab = LibraryTab::Books;
+                Screen::BookShelf {
+                    books: gideon_core::books::scan(&self.books_dir).unwrap_or_default(),
+                    page: 0,
+                }
+            }
+        };
+        self
+    }
+
     pub fn with_books_dir(mut self, dir: PathBuf) -> Self {
         self.books_dir = dir;
         self
@@ -1426,6 +1480,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// disk scan, keeping the shelf page (clamped). Cheap and only runs when the
     /// Library is actually showing.
     fn refresh_library_in_place(&mut self) -> Result<()> {
+        if let Some(Screen::BookShelf { books, page }) = self.stack.last_mut() {
+            // A sync sweep may have placed a sent book while the shelf sat
+            // on screen; rescan so it shows without leaving the tab.
+            let fresh = gideon_core::books::scan(&self.books_dir).unwrap_or_default();
+            let per_page = self.layout.rows_per_page().max(1);
+            *page = (*page).min(fresh.len().div_ceil(per_page).saturating_sub(1));
+            *books = fresh;
+            return Ok(());
+        }
         if !matches!(self.stack.last(), Some(Screen::Library { .. })) {
             return Ok(());
         }
@@ -1530,11 +1593,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         // half: tapping it opens the profile picker.
                         self.open_profile_menu()?;
                     }
-                } else if matches!(self.screen(), Screen::Library { .. }) {
-                    // The Library title bar toggles between the cover shelf
-                    // and the dense metadata list. Two views of one library:
-                    // art to browse by, data to decide by.
-                    self.toggle_library_view()?;
+                } else if matches!(
+                    self.screen(),
+                    Screen::Library { .. } | Screen::BookShelf { .. }
+                ) {
+                    // The Library's title bar is its tab strip: Manga | Books.
+                    let [manga, books] = library_tab_zones(&self.layout);
+                    if x >= manga.0 && x < manga.1 {
+                        self.open_library_tab(LibraryTab::Manga)?;
+                    } else if x >= books.0 && x < books.1 {
+                        self.open_library_tab(LibraryTab::Books)?;
+                    } else if matches!(self.screen(), Screen::Library { .. }) {
+                        // Elsewhere on the manga tab's title bar toggles between
+                        // the cover shelf and the dense metadata list. Two views
+                        // of one library: art to browse by, data to decide by.
+                        self.toggle_library_view()?;
+                    }
                 }
                 Ok(Flow::Continue)
             }
@@ -1809,6 +1883,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let shelf_capacity = self.library_page_capacity();
         match self.stack.last() {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
+            Some(Screen::BookShelf { books, .. }) => books.len().div_ceil(per_page),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
             Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
             Some(Screen::Popular { mangas, .. }) => mangas.len().div_ceil(per_page),
@@ -1837,6 +1912,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         match self.stack.last() {
             Some(
                 Screen::Library { page, .. }
+                | Screen::BookShelf { page, .. }
                 | Screen::Sources { page, .. }
                 | Screen::SearchResults { page, .. }
                 | Screen::Popular { page, .. }
@@ -1858,6 +1934,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         };
         let (page, count) = match screen {
             Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
+            Screen::BookShelf { books, page } => (page, books.len().div_ceil(per_page)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
             // +1 for the trailing "Search more sources" row.
             Screen::SearchResults { results, page, .. } => {
@@ -1919,7 +1996,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Library -> Settings -> Library does not leave a trail to unwind.
         self.stack.truncate(1);
         match zone {
-            0 => self.open_library()?,
+            0 => self.open_library_tab(self.library_tab)?,
             1 => {
                 self.stack[0] = Screen::Stats;
                 self.render_current(RefreshMode::Full)?;
@@ -2102,6 +2179,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ],
                 )
             }
+            Some(Sheet::BookFile { ref book }) => (
+                book.title.clone(),
+                vec![
+                    (
+                        "Read in the Kobo reader".into(),
+                        "closes gideon".into(),
+                        false,
+                    ),
+                    ("Delete this book".into(), String::new(), false),
+                    ("Close".into(), String::new(), true),
+                ],
+            ),
+            Some(Sheet::ConfirmDeleteBook { ref book }) => (
+                format!("Delete \"{}\"?", book.title),
+                vec![
+                    ("Delete this book".into(), String::new(), false),
+                    ("Cancel".into(), String::new(), true),
+                ],
+            ),
             Some(Sheet::ConfirmDelete {
                 ref entry,
                 ref series_dir,
@@ -2446,6 +2542,36 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
+            Some(Sheet::BookFile { book }) => match index {
+                // gideon has no EPUB reader; the Kobo does. Closing hands the
+                // device back to Nickel, which indexes the Books folder on
+                // start, so the book is on its home screen when it comes up.
+                0 => Ok(Flow::Quit(Exit::Close)),
+                1 => {
+                    self.sheet = Some(Sheet::ConfirmDeleteBook { book });
+                    // One sheet replaces another over the same screen: the
+                    // strip repaints, nothing underneath it does.
+                    self.render_current(RefreshMode::Partial)?;
+                    Ok(Flow::Continue)
+                }
+                _ => {
+                    self.sheet = None;
+                    self.render_current(RefreshMode::Full)?;
+                    Ok(Flow::Continue)
+                }
+            },
+            Some(Sheet::ConfirmDeleteBook { book }) => {
+                self.sheet = None;
+                if index == 0 {
+                    gideon_core::books::delete(&self.books_dir, &book)
+                        .with_context(|| format!("couldn't delete {}", book.path.display()))?;
+                    self.refresh_library_in_place()?;
+                }
+                // The sheet closing reveals what it covered: Full, as every
+                // sheet dismissal here.
+                self.render_current(RefreshMode::Full)?;
+                Ok(Flow::Continue)
+            }
             // Closing restores whatever the sheet was covering, so it earns a
             // flash: a partial would leave the panel to reconstruct a region
             // it has been holding stale, which is where REAGL residue shows.
@@ -2676,7 +2802,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.stack.len() == 1
             && matches!(
                 self.stack.last(),
-                Some(Screen::Library { .. } | Screen::Stats | Screen::Home | Screen::Settings)
+                Some(
+                    Screen::Library { .. }
+                        | Screen::BookShelf { .. }
+                        | Screen::Stats
+                        | Screen::Home
+                        | Screen::Settings
+                )
             )
     }
 
@@ -2690,6 +2822,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 label: "Library",
                 active: is(Screen::Library {
                     items: Vec::new(),
+                    page: 0,
+                }) || is(Screen::BookShelf {
+                    books: Vec::new(),
                     page: 0,
                 }),
             },
@@ -2757,6 +2892,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Screen::Library { items, page } => self.tap_library_cell(&items, page, x, y),
+            Screen::BookShelf { books, page } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(book) = books.get(index).cloned() {
+                    self.sheet = Some(Sheet::BookFile { book });
+                    // The row you tapped stays on screen behind the sheet;
+                    // only the strip it covers repaints. See docs/REFRESH.md.
+                    self.render_current(RefreshMode::Partial)?;
+                }
+                Ok(Flow::Continue)
+            }
             Screen::Sources { rows, page } => {
                 let index = page * self.layout.rows_per_page() + row;
                 match rows.get(index).cloned() {
@@ -3136,6 +3281,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // Back button and the paging buttons in the bottom strip and took
         // the nav bar away entirely, so the tab you just tapped vanished.
         self.goto_root(Screen::Library { items, page: 0 })
+    }
+
+    /// Show one tab of the Library. Opening a tab re-reads its folder, so a
+    /// book that arrived on the last sync is there the moment you look.
+    fn open_library_tab(&mut self, tab: LibraryTab) -> Result<()> {
+        self.library_tab = tab;
+        match tab {
+            LibraryTab::Manga => self.open_library(),
+            LibraryTab::Books => {
+                let books = gideon_core::books::scan(&self.books_dir).with_context(|| {
+                    format!(
+                        "couldn't read the Books folder {}",
+                        self.books_dir.display()
+                    )
+                })?;
+                self.goto_root(Screen::BookShelf { books, page: 0 })
+            }
+        }
     }
 
     /// Look up MyAnimeList metadata, in the background, for series in the
@@ -5899,6 +6062,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Home)) {
             return Ok(Some(self.compose_discover()));
         }
+        if let Some(Screen::BookShelf { books, page }) = self.stack.last() {
+            // Like the shelf: a root destination draws its nav bar in RGB.
+            let l = &self.layout;
+            let mut canvas = RgbPage::from_gray(&self.compose_book_shelf(books, *page));
+            if self.screen_has_nav() {
+                let theme = widgets::Theme::from_setting(&self.load_settings().color_profile);
+                widgets::draw_nav_bar(
+                    &mut canvas,
+                    0,
+                    l.height.saturating_sub(l.nav_h),
+                    l.width,
+                    l.nav_h,
+                    &self.nav_items(),
+                    l.text_px,
+                    &theme,
+                );
+            }
+            return Ok(Some(canvas));
+        }
         let Some(Screen::Library { items, page }) = self.stack.last() else {
             return Ok(None);
         };
@@ -5920,7 +6102,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // A screen with the nav bar must not also put paging buttons in the
         // bottom strip — they land underneath the tabs. Paging lives in the
         // title bar's "‹ 2/3 ›" instead (see `title_pager_zones`).
-        let chrome = compose_chrome_paged(l, "Library", *page, page_count, !nav, 0, !nav);
+        let mut chrome = compose_chrome_paged(l, "", *page, page_count, !nav, 0, !nav);
+        draw_library_tabs(&mut chrome, l, LibraryTab::Manga);
         let grid = compose_shelf_rgb(&self.shelf_entries_for_page(items, *page, &shelf), &shelf);
         let mut canvas = RgbPage::from_gray(&chrome);
         copy_into_rgb(&mut canvas, &grid, 0, l.content_top());
@@ -6425,9 +6608,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // A top-level destination draws the nav bar in that strip, so the
         // chrome must not also put a Back button there.
         let nav = self.screen_has_nav();
-        let mut canvas = RgbPage::from_gray(&compose_chrome_paged(
-            l, "Library", page, page_count, !nav, 0, !nav,
-        ));
+        let mut chrome = compose_chrome_paged(l, "", page, page_count, !nav, 0, !nav);
+        draw_library_tabs(&mut chrome, l, LibraryTab::Manga);
+        let mut canvas = RgbPage::from_gray(&chrome);
         let row_h = self.list_row_height();
 
         self.with_progress(|app, store| {
@@ -6989,6 +7172,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.keyboard_shift,
             ),
             Screen::Library { items, page } => self.compose_library(items, *page)?,
+            Screen::BookShelf { books, page } => self.compose_book_shelf(books, *page),
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -7323,7 +7507,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let page_count = items.len().div_ceil(capacity).max(1);
 
         let nav = self.screen_has_nav();
-        let mut canvas = compose_chrome_paged(l, "Library", page, page_count, !nav, 0, !nav);
+        let mut canvas = compose_chrome_paged(l, "", page, page_count, !nav, 0, !nav);
+        draw_library_tabs(&mut canvas, l, LibraryTab::Manga);
         if items.is_empty() {
             draw_text(
                 &mut canvas,
@@ -7349,6 +7534,58 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let grid = compose_shelf(&self.shelf_entries_for_page(items, page, &shelf), &shelf);
         copy_into(&mut canvas, &grid, 0, l.content_top());
         Ok(canvas)
+    }
+
+    /// The Books tab: one row per book, "Title — Author", in title order.
+    /// Grayscale like every list; the colour path wraps it for the nav bar.
+    fn compose_book_shelf(&self, books: &[gideon_core::Book], page: usize) -> GrayPage {
+        let l = &self.layout;
+        let per_page = l.rows_per_page().max(1);
+        let page_count = books.len().div_ceil(per_page).max(1);
+        let nav = self.screen_has_nav();
+        let mut canvas = compose_chrome_paged(l, "", page, page_count, !nav, 0, !nav);
+        draw_library_tabs(&mut canvas, l, LibraryTab::Books);
+        if books.is_empty() {
+            for (i, line) in [
+                "No books yet — download one via Discover › Books,",
+                "or send an EPUB or PDF from the phone app.",
+            ]
+            .iter()
+            .enumerate()
+            {
+                draw_text(
+                    &mut canvas,
+                    l.pad,
+                    l.row_top(i) + (l.row_h - l.text_px as u32) / 2,
+                    l.text_px,
+                    line,
+                    l.width - 2 * l.pad,
+                    false,
+                );
+            }
+            return canvas;
+        }
+        for (i, book) in paged(books, page, per_page).iter().enumerate() {
+            let top = l.row_top(i);
+            // EPUB is the norm on this shelf; a PDF is worth a word, since
+            // the Kobo reader treats the two quite differently.
+            let row_label = if book.format == "pdf" {
+                format!("{} · PDF", book.label())
+            } else {
+                book.label()
+            };
+            draw_text(
+                &mut canvas,
+                l.pad,
+                top + (l.row_h - l.text_px as u32) / 2,
+                l.text_px,
+                &row_label,
+                l.width - 2 * l.pad,
+                false,
+            );
+            hline(&mut canvas, top + l.row_h - 1, 200);
+        }
+        canvas
     }
 
     /// The series cover art for a library entry (fetched at download time).
@@ -7802,6 +8039,46 @@ fn page_label(page: usize, page_count: usize) -> String {
 /// One function for drawing and for hit-testing, because a chevron you can
 /// see but not hit is worse than no chevron. The zones are a full title-bar
 /// height wide so they are finger-sized rather than glyph-sized.
+/// The Library's two tabs, as `(x0, x1)` tap zones in the title bar:
+/// "Manga" then "Books", each padded to a finger's width. Shared by the
+/// drawing and the hit test so the two can never drift apart.
+fn library_tab_zones(l: &UiLayout) -> [(u32, u32); 2] {
+    let gap = l.pad * 2;
+    let manga_w = measure_text(l.text_px, "Manga", true) + gap;
+    let books_w = measure_text(l.text_px, "Books", true) + gap;
+    let manga = (0, l.pad + manga_w);
+    let books = (manga.1, manga.1 + books_w);
+    [manga, books]
+}
+
+/// Draw the Manga | Books tab strip into a title bar composed with an empty
+/// title. The active tab is bold with a thick bar beneath it; the other is
+/// plain. Two cues, because the colour layer is not one of them: this strip
+/// has to read on a grey panel.
+fn draw_library_tabs(canvas: &mut GrayPage, l: &UiLayout, active: LibraryTab) {
+    let zones = library_tab_zones(l);
+    let text_y = l.title_h.saturating_sub(l.text_px as u32 + 4) / 2;
+    let bar_h = (l.pad / 2).max(3);
+    let bar_y = l.title_h.saturating_sub(bar_h + 2);
+    for (i, (label, tab)) in [("Manga", LibraryTab::Manga), ("Books", LibraryTab::Books)]
+        .iter()
+        .enumerate()
+    {
+        let on = *tab == active;
+        let (x0, x1) = zones[i];
+        let x = if i == 0 { l.pad } else { x0 + l.pad };
+        let w = measure_text(l.text_px, label, true);
+        draw_text(canvas, x, text_y, l.text_px, label, w, on);
+        if on {
+            for y in bar_y..bar_y + bar_h {
+                for px in x..(x + w).min(x1).min(l.width) {
+                    plot(canvas, px as i32, y as i32, 0);
+                }
+            }
+        }
+    }
+}
+
 fn title_pager_zones(
     l: &UiLayout,
     page: usize,

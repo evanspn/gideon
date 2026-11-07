@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Integration tests for the real armv7 Kobo binary, executed under QEMU
 # user-mode emulation. Verifies the actual target-architecture code paths:
-# zip parsing, image decode, dithering, library scanning and progress
-# persistence — plus that the e-ink backend fails gracefully off-device.
+# zip parsing, image decode, dithering, library and book-shelf scanning and
+# progress persistence — plus that the e-ink backend fails gracefully off-device.
 #
 # Usage: qemu_integration.sh <kobo-binary> <plain-binary>
 #   kobo-binary  — built with --features gideon-app/kobo (framebuffer backend)
@@ -62,6 +62,27 @@ $RUN "$KOBO_BIN" library "$FIRSTBOOT" | grep -q "Library initialized" \
 [ -d "$FIRSTBOOT" ] || fail "library directory was not created"
 $RUN "$KOBO_BIN" library "$FIRSTBOOT" | grep -q "No CBZ files found" \
     || fail "second boot with empty library should report no CBZ files"
+
+echo "==> [kobo binary] books: the Library's Books tab lists an EPUB by its own metadata"
+BOOKS=$($RUN "$KOBO_BIN" books "$WORKDIR/Books")
+echo "$BOOKS" | grep -F "1 book(s)" >/dev/null || fail "expected one book on the shelf: $BOOKS"
+# The file is named book-0001.epub: the title and author can only have come
+# from the OPF inside it.
+echo "$BOOKS" | grep -F "Slaughterhouse-Five — Kurt Vonnegut" >/dev/null \
+    || fail "book title/author not read from EPUB metadata: $BOOKS"
+$RUN "$KOBO_BIN" books "$WORKDIR/nope/Books" | grep -F "No books" >/dev/null \
+    || fail "a missing Books folder should be an empty shelf, not an error"
+
+echo "==> [kobo binary] browse --screenshot: Library renders both tabs headlessly"
+$RUN "$KOBO_BIN" browse --library "$WORKDIR/manga" --screenshot "$WORKDIR/library.png" --screen library
+$RUN "$KOBO_BIN" browse --library "$WORKDIR/manga" --screenshot "$WORKDIR/books.png" --screen books
+for shot in library books; do
+    [ -s "$WORKDIR/$shot.png" ] || fail "$shot screenshot is empty"
+    head -c 8 "$WORKDIR/$shot.png" | grep -F "PNG" >/dev/null || fail "$shot screenshot is not a PNG"
+done
+# Two tabs, two different frames: if the Books tab drew the manga shelf (or
+# vice versa) the files would be byte-identical.
+cmp -s "$WORKDIR/library.png" "$WORKDIR/books.png" && fail "Manga and Books tabs rendered identically"
 
 echo "==> [plain binary] full read loop with progress persistence"
 $RUN "$PLAIN_BIN" library "$WORKDIR/manga" >/dev/null

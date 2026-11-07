@@ -73,6 +73,12 @@ enum Command {
     /// Scan a library directory for CBZ files and show progress.
     Library { dir: PathBuf },
 
+    /// List the books (EPUB/PDF) on the shelf the Library's Books tab shows.
+    Books {
+        /// The Books folder (/mnt/onboard/Books on a Kobo).
+        dir: PathBuf,
+    },
+
     /// List manga sources available from configured source lists.
     Sources {
         /// Additional source list URLs (on top of the preinstalled ones).
@@ -124,10 +130,13 @@ enum Command {
         /// Library directory.
         #[arg(long, default_value = "/mnt/onboard/Manga")]
         library: PathBuf,
-        /// Render the home screen to a PNG and exit (headless desktop
+        /// Render a screen to a PNG and exit (headless desktop
         /// verification; no device needed).
         #[arg(long)]
         screenshot: Option<PathBuf>,
+        /// Which screen `--screenshot` renders: today, library or books.
+        #[arg(long, default_value = "library")]
+        screen: String,
     },
 
     /// Open a CBZ for reading.
@@ -232,10 +241,12 @@ fn main() -> Result<()> {
             } => manga::cmd_manga_download(&data_dir(), &source, &manga_id, &chapter_id, &library),
         },
         Command::Update { check, major } => cmd_update(check, major),
+        Command::Books { dir } => cmd_books(dir),
         Command::Browse {
             library,
             screenshot,
-        } => cmd_browse(library, screenshot),
+            screen,
+        } => cmd_browse(library, screenshot, &screen),
         Command::Read {
             path,
             progress_file,
@@ -363,6 +374,25 @@ fn cmd_library(dir: PathBuf) -> Result<()> {
             }
             None => println!("  [ new ] {}", entry.relative_path),
         }
+    }
+    Ok(())
+}
+
+fn cmd_books(dir: PathBuf) -> Result<()> {
+    let books = gideon_core::books::scan(&dir)
+        .with_context(|| format!("couldn't read the Books folder {}", dir.display()))?;
+    if books.is_empty() {
+        println!("No books in {}.", dir.display());
+        return Ok(());
+    }
+    println!("{} book(s) in {}\n", books.len(), dir.display());
+    for book in books {
+        println!(
+            "  [{:>4}] {} ({})",
+            book.format,
+            book.label(),
+            book.relative_path
+        );
     }
     Ok(())
 }
@@ -565,10 +595,17 @@ fn cmd_update(check_only: bool, allow_major: bool) -> Result<()> {
     Ok(())
 }
 
-/// Render the browse home screen headlessly to a PNG (desktop builds and
-/// CI smoke tests).
-fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
+/// Render one browse screen headlessly to a PNG (desktop builds and CI
+/// smoke tests).
+fn browse_screenshot(library: PathBuf, out: PathBuf, screen: &str) -> Result<()> {
     use gideon_device::{Display as _, FakeInput, MemoryDisplay};
+
+    let start = match screen {
+        "today" => ui::StartScreen::Today,
+        "library" | "manga" => ui::StartScreen::Library,
+        "books" => ui::StartScreen::Books,
+        other => anyhow::bail!("unknown screen {other:?}: expected today, library or books"),
+    };
 
     let display = MemoryDisplay::new(1072, 1448);
     let input = FakeInput::new(Vec::new());
@@ -576,7 +613,8 @@ fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
     let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
     let mut app = ui::UiApp::new(display, input, gateway, library.clone())
         .with_books_dir(ui::books_dir_for(&library))
-        .with_profile(&settings.active_profile);
+        .with_profile(&settings.active_profile)
+        .with_start(start);
     app.render_once()?;
 
     let display = app.display();
@@ -584,18 +622,18 @@ fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
         image::GrayImage::from_raw(display.width(), display.height(), display.buffer.clone())
             .context("screen buffer has unexpected size")?;
     gray.save(&out)?;
-    println!("Rendered home screen to {}", out.display());
+    println!("Rendered the {screen} screen to {}", out.display());
     Ok(())
 }
 
 #[cfg(feature = "kobo")]
-fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
+fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>, screen: &str) -> Result<()> {
     use gideon_device::kobo::KoboDisplay;
     use gideon_device::kobo_input::KoboTouch;
     use gideon_device::{Display as _, TouchTransform};
 
     if let Some(out) = screenshot {
-        return browse_screenshot(library, out);
+        return browse_screenshot(library, out, screen);
     }
 
     // Capture the executable path FIRST, before anything else can run: an
@@ -824,9 +862,9 @@ fn show_fatal_on_display(display: &mut impl gideon_device::Display, message: &st
 }
 
 #[cfg(not(feature = "kobo"))]
-fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
+fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>, screen: &str) -> Result<()> {
     match screenshot {
-        Some(out) => browse_screenshot(library, out),
+        Some(out) => browse_screenshot(library, out, screen),
         None => {
             println!(
                 "gideon browse drives the e-ink display and touch screen, which need \
