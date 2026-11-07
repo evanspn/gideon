@@ -41,19 +41,21 @@ use crate::reader::Reader;
 /// Reading stats used to sit here too, back when this screen was the whole
 /// menu; they are nav-bar destinations now, and listing them here as well
 /// made the tab bar look like decoration over a menu that still ran the app.
-const HOME_ROWS: [&str; 4] = [
+const HOME_ROWS: [&str; 5] = [
     "Search all sources",
     "Browse sources",
     "Popular manga",
+    "Books",
     "Check for updates",
 ];
 /// The line under each Discover card. Four destinations on a panel this size
 /// are cards, not a list: a list of four leaves two thirds of the screen
 /// white and makes each choice look like an afterthought.
-const HOME_DETAILS: [&str; 4] = [
+const HOME_DETAILS: [&str; 5] = [
     "one query, every installed source",
     "install, update and browse",
     "what is trending right now",
+    "novels for the Kobo's own reader",
     "download the newest gideon",
 ];
 /// A tappable top row shown on Home ONLY when offline (device only): a manual
@@ -448,6 +450,25 @@ enum Screen {
         mangas: Vec<MangaEntry>,
         page: usize,
     },
+    /// Books (Home card): the configured OPDS catalogues, one row each.
+    /// Skipped entirely when there is exactly one — the common setup — in
+    /// which case the card opens that catalogue directly.
+    Books {
+        catalogs: Vec<gateway::BookCatalog>,
+    },
+    /// One OPDS feed: a catalogue root, a sub-catalogue, or search results.
+    /// Rows are [`book_rows`]: an optional "Search this catalogue", the
+    /// entries, and an optional "More…" that pulls the next page in place.
+    BookList {
+        title: String,
+        feed: gateway::BookFeed,
+        page: usize,
+    },
+    /// On-screen keyboard for searching one catalogue.
+    BookSearch {
+        search: gateway::SearchLink,
+        query: String,
+    },
     MangaList {
         source: SourceEntry,
         listing: String,
@@ -745,6 +766,12 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// The library ROOT passed at startup; profile dirs hang off it (the
     /// "default" profile IS the root).
     base_library: PathBuf,
+    /// Where downloaded EPUBs go. NOT inside the manga library: books are
+    /// for the Kobo's own reader, so they land where Nickel indexes — a
+    /// `Books` folder beside the manga one (`/mnt/onboard/Books` on device).
+    /// Nickel picks them up on its next start, which is what exiting gideon
+    /// does, so the download message says exactly that.
+    books_dir: PathBuf,
     /// Active profile name (settings.json `active_profile`).
     active_profile: String,
     layout: UiLayout,
@@ -880,6 +907,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             input,
             gateway,
             base_library: library_dir.clone(),
+            books_dir: books_dir_for(&library_dir),
             library_dir,
             active_profile: "default".to_string(),
             layout,
@@ -915,6 +943,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             lookahead: None,
             recent_searches: Vec::new(),
         }
+    }
+
+    /// Where downloaded books go, overriding the default beside the library.
+    pub fn with_books_dir(mut self, dir: PathBuf) -> Self {
+        self.books_dir = dir;
+        self
     }
 
     /// Start in this profile (resolved from settings.json at startup):
@@ -1777,6 +1811,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
             Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
+            Some(Screen::Popular { mangas, .. }) => mangas.len().div_ceil(per_page),
+            Some(Screen::Books { catalogs }) => catalogs.len().div_ceil(per_page),
+            Some(Screen::BookList { feed, .. }) => book_rows(feed).len().div_ceil(per_page),
             Some(Screen::MangaList { mangas, .. }) => mangas.len().div_ceil(per_page),
             Some(Screen::ChapterList { chapters, .. }) => chapters.len().div_ceil(per_page),
             Some(Screen::DownloadedChapters { entries, .. }) => entries.len().div_ceil(per_page),
@@ -1803,6 +1840,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 | Screen::Sources { page, .. }
                 | Screen::SearchResults { page, .. }
                 | Screen::Popular { page, .. }
+                | Screen::BookList { page, .. }
                 | Screen::MangaList { page, .. }
                 | Screen::ChapterList { page, .. }
                 | Screen::DownloadedChapters { page, .. },
@@ -1826,6 +1864,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 (page, (results.len() + 1).div_ceil(per_page))
             }
             Screen::Popular { mangas, page } => (page, mangas.len().div_ceil(per_page)),
+            Screen::BookList { feed, page, .. } => (page, book_rows(feed).len().div_ceil(per_page)),
             Screen::MangaList { mangas, page, .. } => (page, mangas.len().div_ceil(per_page)),
             Screen::ChapterList { chapters, page, .. } => (page, chapters.len().div_ceil(per_page)),
             Screen::DownloadedChapters { entries, page, .. } => {
@@ -2697,7 +2736,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     0 => self.open_global_search()?,
                     1 => self.open_sources()?,
                     2 => self.open_popular()?,
-                    3 => self.check_updates()?,
+                    3 => self.open_books()?,
+                    4 => self.check_updates()?,
                     _ => {}
                 }
                 Ok(Flow::Continue)
@@ -2781,6 +2821,39 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // it. The results land on top of this tab; Back returns.
                     self.run_global_search(&manga.title)?;
                 }
+                Ok(Flow::Continue)
+            }
+            Screen::Books { catalogs } => {
+                if let Some(catalog) = catalogs.get(row).cloned() {
+                    self.open_book_catalog(&catalog)?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookList { feed, page, .. } => {
+                let index = page * self.layout.rows_per_page() + row;
+                match book_rows(&feed).get(index).cloned() {
+                    Some(BookRow::Search) => {
+                        if let Some(search) = feed.search.clone() {
+                            self.keyboard_paints = 0;
+                            self.keyboard_shift = false;
+                            self.push(Screen::BookSearch {
+                                search,
+                                query: String::new(),
+                            })?;
+                        }
+                    }
+                    Some(BookRow::Entry(i)) => {
+                        if let Some(entry) = feed.entries.get(i).cloned() {
+                            self.open_book_entry(&entry)?;
+                        }
+                    }
+                    Some(BookRow::More) => self.load_more_books()?,
+                    None => {}
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookSearch { search, query } => {
+                self.tap_book_search(&search, &query, x, y)?;
                 Ok(Flow::Continue)
             }
             Screen::MangaList {
@@ -3540,6 +3613,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             device.active_profile = settings.active_profile.clone();
             device.source_lists = settings.source_lists.clone();
             device.languages = settings.languages.clone();
+            device.book_catalogs = settings.book_catalogs.clone();
             device.storage_size_limit = settings.storage_size_limit;
             device.auto_check_updates = settings.auto_check_updates;
             device.color_post_process = settings.color_post_process.clone();
@@ -3661,6 +3735,211 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // The library that was on screen just moved — start over from Home.
         self.stack.truncate(1);
         self.render_current(RefreshMode::Full)
+    }
+
+    // --- books ---
+
+    /// The Books card. One configured catalogue — the common setup — opens
+    /// straight into it; several list first; none explains how to add one,
+    /// because an empty list screen with no hint is a dead end.
+    fn open_books(&mut self) -> Result<()> {
+        let mut catalogs = self.gateway.book_catalogs();
+        if catalogs.is_empty() {
+            return self.push(Screen::Message {
+                title: "Books".to_string(),
+                body: "No book catalogues are set up.\n\
+                       Add one under \"book_catalogs\" in settings.json —\n\
+                       a Calibre content server's /opds address works."
+                    .to_string(),
+            });
+        }
+        if catalogs.len() == 1 {
+            let only = catalogs.remove(0);
+            return self.open_book_catalog(&only);
+        }
+        self.push(Screen::Books { catalogs })
+    }
+
+    fn open_book_catalog(&mut self, catalog: &gateway::BookCatalog) -> Result<()> {
+        let url = match url::Url::parse(&catalog.url) {
+            Ok(url) => url,
+            Err(e) => {
+                return self.push(Screen::Message {
+                    title: catalog.label(),
+                    body: format!("That catalogue's address isn't a URL:\n{e}"),
+                })
+            }
+        };
+        self.open_book_feed(&catalog.label(), &url)
+    }
+
+    /// Fetch a feed and list it. `ensure_online()` runs first, so a failure
+    /// here is the catalogue itself, and the message says so.
+    fn open_book_feed(&mut self, title: &str, url: &url::Url) -> Result<()> {
+        self.ensure_online()?;
+        self.show_status(&[&format!("Loading {title}…")])?;
+        match self.gateway.book_feed(url) {
+            Ok(feed) => self.push(Screen::BookList {
+                title: title.to_string(),
+                feed,
+                page: 0,
+            }),
+            Err(e) => {
+                eprintln!("gideon: book feed {url} failed: {e:#}");
+                self.push(Screen::Message {
+                    title: title.to_string(),
+                    body: format!("Couldn't open this catalogue:\n{e:#}"),
+                })
+            }
+        }
+    }
+
+    /// Tap on an entry: a sub-catalogue lists, a book downloads. Which it is
+    /// may take a fetch to find out (Gutenberg's rows are stubs).
+    fn open_book_entry(&mut self, entry: &gateway::BookEntry) -> Result<()> {
+        self.ensure_online()?;
+        self.show_status(&[&format!("Opening {}…", entry.title)])?;
+        match self.gateway.book_open(entry) {
+            Ok(gateway::BookOpened::Feed(feed)) => self.push(Screen::BookList {
+                title: entry.title.clone(),
+                feed,
+                page: 0,
+            }),
+            Ok(gateway::BookOpened::Book(epub)) => self.download_book(entry, &epub),
+            Err(e) => {
+                eprintln!("gideon: opening book entry failed: {e:#}");
+                self.push(Screen::Message {
+                    title: entry.title.clone(),
+                    body: format!("Couldn't open this:\n{e:#}"),
+                })
+            }
+        }
+    }
+
+    /// Download a book into the Kobo's library. The success message has to
+    /// say when it will be visible, because the answer is "not yet": Nickel
+    /// indexes new files when it starts, and it starts when gideon exits.
+    fn download_book(
+        &mut self,
+        entry: &gateway::BookEntry,
+        epub: &gateway::EpubLink,
+    ) -> Result<()> {
+        self.show_status(&["Downloading", &entry.title, "…"])?;
+        let result = self.gateway.book_download(
+            &epub.url,
+            &self.books_dir,
+            entry.detail.as_deref(),
+            &entry.title,
+        );
+        match result {
+            Ok((_, true)) => self.push(Screen::Message {
+                title: "Books".to_string(),
+                body: format!("{} is already on your Kobo.", entry.title),
+            }),
+            Ok((_, false)) => self.push(Screen::Message {
+                title: "Books".to_string(),
+                body: format!(
+                    "Saved {}.\n\nIt will appear in your Kobo library\nafter you exit gideon.",
+                    entry.title
+                ),
+            }),
+            Err(e) => {
+                eprintln!("gideon: book download failed: {e:#}");
+                self.push(Screen::Message {
+                    title: entry.title.clone(),
+                    body: format!("Couldn't download this book:\n{e:#}"),
+                })
+            }
+        }
+    }
+
+    /// "More…": fetch the next page and extend the list in place, so what
+    /// was already read stays where it was.
+    fn load_more_books(&mut self) -> Result<()> {
+        let Some(Screen::BookList { feed, .. }) = self.stack.last() else {
+            return Ok(());
+        };
+        let current = feed.clone();
+        self.ensure_online()?;
+        self.show_status(&["Loading more…"])?;
+        match self.gateway.book_next_page(&current) {
+            Ok(Some(next)) => {
+                if let Some(Screen::BookList { feed, .. }) = self.stack.last_mut() {
+                    feed.entries.extend(next.entries);
+                    feed.next = next.next;
+                }
+                self.render_current(RefreshMode::Full)
+            }
+            Ok(None) => {
+                if let Some(Screen::BookList { feed, .. }) = self.stack.last_mut() {
+                    feed.next = None;
+                }
+                self.render_current(RefreshMode::Full)
+            }
+            Err(e) => {
+                eprintln!("gideon: next page failed: {e:#}");
+                self.push(Screen::Message {
+                    title: "Books".to_string(),
+                    body: format!("Couldn't load more:\n{e:#}"),
+                })
+            }
+        }
+    }
+
+    /// Handle a tap on the book-search keyboard: edit the query in place, or
+    /// (action key) run it against the catalogue.
+    fn tap_book_search(
+        &mut self,
+        search: &gateway::SearchLink,
+        query: &str,
+        x: u32,
+        y: u32,
+    ) -> Result<()> {
+        let key = self.layout.key_at(x, y);
+        if key == Some(Key::Search) {
+            let trimmed = query.trim().to_string();
+            if !trimmed.is_empty() {
+                self.run_book_search(search, &trimmed)?;
+            }
+            return Ok(());
+        }
+        if self.toggle_shift_if_pressed(key)? {
+            return Ok(());
+        }
+        if let Some(q) = key.and_then(|key| apply_key_edit(query, key, self.keyboard_shift)) {
+            if let Some(Screen::BookSearch { query, .. }) = self.stack.last_mut() {
+                *query = q;
+            }
+            self.keyboard_repaint()?;
+        }
+        Ok(())
+    }
+
+    fn run_book_search(&mut self, search: &gateway::SearchLink, query: &str) -> Result<()> {
+        self.ensure_online()?;
+        self.show_status(&[&format!("Searching for \"{query}\"…")])?;
+        match self.gateway.book_search(search, query) {
+            Ok(Some(feed)) if feed.entries.is_empty() => self.push(Screen::Message {
+                title: format!("\"{query}\""),
+                body: "Nothing found in this catalogue.".to_string(),
+            }),
+            Ok(Some(feed)) => self.push(Screen::BookList {
+                title: format!("\"{query}\""),
+                feed,
+                page: 0,
+            }),
+            Ok(None) => self.push(Screen::Message {
+                title: "Search".to_string(),
+                body: "This catalogue doesn't offer search.".to_string(),
+            }),
+            Err(e) => {
+                eprintln!("gideon: book search failed: {e:#}");
+                self.push(Screen::Message {
+                    title: format!("\"{query}\""),
+                    body: format!("Search failed:\n{e:#}"),
+                })
+            }
+        }
     }
 
     /// Open the "Popular manga" tab: MyAnimeList's popular ranking. It's a
@@ -6746,6 +7025,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .collect();
                 compose_list(l, "Popular manga", &rows, *page, l.page_count(mangas.len()))
             }
+            Screen::Books { catalogs } => {
+                let rows: Vec<(String, bool)> =
+                    catalogs.iter().map(|c| (c.label(), true)).collect();
+                compose_list(l, "Books", &rows, 0, 1)
+            }
+            Screen::BookList { title, feed, page } => {
+                let all = book_rows(feed);
+                let rows: Vec<(String, bool)> = paged(&all, *page, per_page)
+                    .iter()
+                    .map(|r| match r {
+                        BookRow::Search => ("Search this catalogue".to_string(), true),
+                        BookRow::Entry(i) => (feed.entries[*i].label(), false),
+                        BookRow::More => ("More…".to_string(), true),
+                    })
+                    .collect();
+                compose_list(l, title, &rows, *page, l.page_count(all.len()))
+            }
+            Screen::BookSearch { query, .. } => {
+                compose_keyboard(l, "Search books", query, "Search", self.keyboard_shift)
+            }
             Screen::MangaList {
                 source,
                 listing,
@@ -7613,6 +7912,44 @@ fn compose_chrome_paged(
 }
 
 /// A list screen: chrome + one text row per entry, with separators.
+/// One row of a [`Screen::BookList`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BookRow {
+    /// "Search this catalogue" — only when the feed says it can be searched.
+    Search,
+    /// `feed.entries[i]`.
+    Entry(usize),
+    /// "More…" — only when the feed has a next page.
+    More,
+}
+
+/// The rows a feed shows, in order. One function for both the painter and
+/// the tap map, so they cannot disagree about which row is which.
+fn book_rows(feed: &gateway::BookFeed) -> Vec<BookRow> {
+    let mut rows = Vec::with_capacity(feed.entries.len() + 2);
+    if feed.search.is_some() {
+        rows.push(BookRow::Search);
+    }
+    rows.extend((0..feed.entries.len()).map(BookRow::Entry));
+    if feed.next.is_some() {
+        rows.push(BookRow::More);
+    }
+    rows
+}
+
+/// Where books go: a `Books` folder beside the manga library
+/// (`/mnt/onboard/Manga` → `/mnt/onboard/Books`), which is inside the
+/// Kobo's own library root so Nickel finds them. A library with no parent
+/// (a bare root) keeps them under itself. `main` passes this explicitly so
+/// the on-device path is visible where the library path is chosen.
+pub fn books_dir_for(library: &Path) -> PathBuf {
+    library
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("Books"))
+        .unwrap_or_else(|| library.join("Books"))
+}
+
 fn compose_list(
     l: &UiLayout,
     title: &str,

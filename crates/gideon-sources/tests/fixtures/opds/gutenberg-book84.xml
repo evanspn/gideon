@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:relevance="http://a9.com/-/opensearch/extensions/relevance/1.0/">
+<id>http://www.gutenberg.org/ebooks/84.opds</id>
+<updated>2026-11-07T03:34:52Z</updated>
+<title>Frankenstein; or, The modern Prometheus by Mary Wollstonecraft Shelley</title>
+<subtitle>Free eBooks since 1971.</subtitle>
+<author>
+<name>Project Gutenberg</name>
+<uri>https://www.gutenberg.org</uri>
+<email>webmaster@gutenberg.org</email>
+</author>
+<icon>https://www.gutenberg.org/gutenberg/favicon.ico</icon>
+<link rel="search" type="application/opensearchdescription+xml" title="Project Gutenberg Catalog Search" href="https://www.gutenberg.org/catalog/osd-books.xml"/>
+<link rel="self" title="This Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks/84.opds"/>
+<link rel="alternate" type="text/html" title="HTML Page" href="/ebooks/84"/>
+<link rel="start" title="Start Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks.opds/"/>
+<opensearch:itemsPerPage>25</opensearch:itemsPerPage>
+<opensearch:startIndex>1</opensearch:startIndex>
+<entry>
+<updated>2026-11-07T03:34:52Z</updated>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="xhtml">
+<div xmlns="http://www.w3.org/1999/xhtml">
+<p>This edition had all images removed.</p>
+<p>
+Title:
+Frankenstein; or, The modern Prometheus
+</p>
+<p>
+Note:
+Wikipedia page about this book: https:<a href="//en.wikipedia.org/wiki/Frankenstein">//en.wikipedia.org/wiki/Frankenstein</a>
+</p>
+<p>
+Note:
+There are improved editions of this title, eBook <a href="/ebooks/41445.bibrec.mobile">#41445</a> (1818 ed.) and <a href="/ebooks/42324.bibrec.mobile">#42324</a> (1831 ed.).
+</p>
+<p>
+Credits:
+Judith Boss, Christy Phillips, Lynn Hanninen and David Meltzer. HTML version by Al Haines.<br />Further corrections by Menno de Leeuw.
+</p>
+<p>
+Summary:
+"Frankenstein; Or, The Modern Prometheus" by Mary Wollstonecraft Shelley is a Gothic novel published in 1818. It tells the story of Victor Frankenstein, a young scientist who creates a living creature from assembled body parts in an unorthodox experiment. When the creature awakens, Victor flees in horror, abandoning his creation. The conscious being must navigate a world that fears him, learning language and seeking connection, only to face repeated rejection. Embittered and alone, the creature confronts his creator with a desperate request that will set both on a dark path of vengeance and tragedy. (This is an automatically generated summary.)
+</p>
+<p>
+Reading Level:
+Reading ease score: 65.0 (8th &amp; 9th grade). Neither easy nor difficult to read.
+</p>
+<p>Author: Shelley, Mary Wollstonecraft, 1797-1851</p>
+<p>EBook No.: 84</p>
+<p>Published: Oct 1, 1993</p>
+<p>Downloads: 204188</p>
+<p>Language: English</p>
+<p>Subject: Science fiction</p><p>Subject: Horror tales</p><p>Subject: Gothic fiction</p><p>Subject: Scientists -- Fiction</p><p>Subject: Monsters -- Fiction</p><p>Subject: Frankenstein, Victor (Fictitious character) -- Fiction</p><p>Subject: Frankenstein's monster (Fictitious character) -- Fiction</p>
+<p>LoCC: Language and Literatures: English literature</p>
+<p>Category: Text</p>
+<p>Rights: Public domain in the USA.</p>
+</div>
+</content>
+<id>urn:gutenberg:84:2</id>
+<published>1993-10-01T00:00:00+00:00</published>
+<rights>Public domain in the USA.</rights>
+<author>
+<name>Shelley, Mary Wollstonecraft</name>
+</author>
+<category scheme="http://purl.org/dc/terms/LCSH" term="Science fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Horror tales"/><category scheme="http://purl.org/dc/terms/LCSH" term="Gothic fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Scientists -- Fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Monsters -- Fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Frankenstein, Victor (Fictitious character) -- Fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Frankenstein's monster (Fictitious character) -- Fiction"/>
+<category scheme="http://purl.org/dc/terms/LCC" term="PR" label="Language and Literatures: English literature"/>
+<category scheme="http://purl.org/dc/terms/DCMIType" term="Text"/>
+<dcterms:language>en</dcterms:language>
+<relevance:score>1</relevance:score>
+<link type="application/epub+zip" rel="http://opds-spec.org/acquisition" title="EPUB (older e-readers, no images)" length="294175" href="https://www.gutenberg.org/ebooks/84.epub.noimages"/>
+<link type="application/x-mobipocket-ebook" rel="http://opds-spec.org/acquisition" title="Kindle (no images)" length="448898" href="https://www.gutenberg.org/ebooks/84.kindle.noimages"/>
+<link type="image/jpeg" rel="http://opds-spec.org/image" href="https://www.gutenberg.org/cache/epub/84/pg84.cover.medium.jpg"/>
+<link type="image/jpeg" rel="http://opds-spec.org/image/thumbnail" href="https://www.gutenberg.org/cache/epub/84/pg84.cover.small.jpg"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/author/61.opds" title="By Shelley, Mary Wollstonecraft…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/36.opds" title="On Science fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/1222.opds" title="On Horror tales…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2586.opds" title="On Gothic fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2665.opds" title="On Scientists -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2666.opds" title="On Monsters -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2667.opds" title="On Frankenstein, Victor (Fictitious character) -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/18502.opds" title="On Frankenstein's monster (Fictitious character) -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/62.opds" title="In Precursors of Science Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/39.opds" title="In Gothic Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/49.opds" title="In Movie Books…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/403.opds" title="In Science Fiction by Women…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/638.opds" title="In Category: Science-Fiction &amp; Fantasy…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/645.opds" title="In Category: Novels…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/649.opds" title="In Category: Classics of Literature…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/653.opds" title="In Category: British Literature…"/>
+</entry>
+<entry>
+<updated>2026-11-07T03:34:52Z</updated>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="xhtml">
+<div xmlns="http://www.w3.org/1999/xhtml">
+<p>This edition has images.</p>
+<p>
+Title:
+Frankenstein; or, The modern Prometheus
+</p>
+<p>
+Note:
+Wikipedia page about this book: https:<a href="//en.wikipedia.org/wiki/Frankenstein">//en.wikipedia.org/wiki/Frankenstein</a>
+</p>
+<p>
+Note:
+There are improved editions of this title, eBook <a href="/ebooks/41445.bibrec.mobile">#41445</a> (1818 ed.) and <a href="/ebooks/42324.bibrec.mobile">#42324</a> (1831 ed.).
+</p>
+<p>
+Credits:
+Judith Boss, Christy Phillips, Lynn Hanninen and David Meltzer. HTML version by Al Haines.<br />Further corrections by Menno de Leeuw.
+</p>
+<p>
+Summary:
+"Frankenstein; Or, The Modern Prometheus" by Mary Wollstonecraft Shelley is a Gothic novel published in 1818. It tells the story of Victor Frankenstein, a young scientist who creates a living creature from assembled body parts in an unorthodox experiment. When the creature awakens, Victor flees in horror, abandoning his creation. The conscious being must navigate a world that fears him, learning language and seeking connection, only to face repeated rejection. Embittered and alone, the creature confronts his creator with a desperate request that will set both on a dark path of vengeance and tragedy. (This is an automatically generated summary.)
+</p>
+<p>
+Reading Level:
+Reading ease score: 65.0 (8th &amp; 9th grade). Neither easy nor difficult to read.
+</p>
+<p>Author: Shelley, Mary Wollstonecraft, 1797-1851</p>
+<p>EBook No.: 84</p>
+<p>Published: Oct 1, 1993</p>
+<p>Downloads: 204188</p>
+<p>Language: English</p>
+<p>Subject: Science fiction</p><p>Subject: Horror tales</p><p>Subject: Gothic fiction</p><p>Subject: Scientists -- Fiction</p><p>Subject: Monsters -- Fiction</p><p>Subject: Frankenstein, Victor (Fictitious character) -- Fiction</p><p>Subject: Frankenstein's monster (Fictitious character) -- Fiction</p>
+<p>LoCC: Language and Literatures: English literature</p>
+<p>Category: Text</p>
+<p>Rights: Public domain in the USA.</p>
+</div>
+</content>
+<id>urn:gutenberg:84:3</id>
+<published>1993-10-01T00:00:00+00:00</published>
+<rights>Public domain in the USA.</rights>
+<author>
+<name>Shelley, Mary Wollstonecraft</name>
+</author>
+<category scheme="http://purl.org/dc/terms/LCSH" term="Science fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Horror tales"/><category scheme="http://purl.org/dc/terms/LCSH" term="Gothic fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Scientists -- Fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Monsters -- Fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Frankenstein, Victor (Fictitious character) -- Fiction"/><category scheme="http://purl.org/dc/terms/LCSH" term="Frankenstein's monster (Fictitious character) -- Fiction"/>
+<category scheme="http://purl.org/dc/terms/LCC" term="PR" label="Language and Literatures: English literature"/>
+<category scheme="http://purl.org/dc/terms/DCMIType" term="Text"/>
+<dcterms:language>en</dcterms:language>
+<relevance:score>1</relevance:score>
+<link type="application/epub+zip" rel="http://opds-spec.org/acquisition" title="EPUB3 (E-readers incl. Send-to-Kindle)" length="440131" href="https://www.gutenberg.org/ebooks/84.epub3.images"/>
+<link type="application/epub+zip" rel="http://opds-spec.org/acquisition" title="EPUB (older e-readers)" length="439444" href="https://www.gutenberg.org/ebooks/84.epub.images"/>
+<link type="application/x-mobipocket-ebook" rel="http://opds-spec.org/acquisition" title="Kindles (kf8)" length="547590" href="https://www.gutenberg.org/ebooks/84.kf8.images"/>
+<link type="application/x-mobipocket-ebook" rel="http://opds-spec.org/acquisition" title="Older Kindles" length="519544" href="https://www.gutenberg.org/ebooks/84.kindle.images"/>
+<link type="image/jpeg" rel="http://opds-spec.org/image" href="https://www.gutenberg.org/cache/epub/84/pg84.cover.medium.jpg"/>
+<link type="image/jpeg" rel="http://opds-spec.org/image/thumbnail" href="https://www.gutenberg.org/cache/epub/84/pg84.cover.small.jpg"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/author/61.opds" title="By Shelley, Mary Wollstonecraft…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/36.opds" title="On Science fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/1222.opds" title="On Horror tales…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2586.opds" title="On Gothic fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2665.opds" title="On Scientists -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2666.opds" title="On Monsters -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/2667.opds" title="On Frankenstein, Victor (Fictitious character) -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/subject/18502.opds" title="On Frankenstein's monster (Fictitious character) -- Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/62.opds" title="In Precursors of Science Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/39.opds" title="In Gothic Fiction…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/49.opds" title="In Movie Books…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/403.opds" title="In Science Fiction by Women…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/638.opds" title="In Category: Science-Fiction &amp; Fantasy…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/645.opds" title="In Category: Novels…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/649.opds" title="In Category: Classics of Literature…"/>
+<link type="application/atom+xml;profile=opds-catalog" rel="related" href="/ebooks/bookshelf/653.opds" title="In Category: British Literature…"/>
+</entry>
+</feed>

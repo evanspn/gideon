@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use gideon_core::ProgressStore;
 use gideon_device::{FakeInput, MemoryDisplay, RefreshMode, UiEvent};
 
+use super::gateway::{BookEntry, BookFeed, BookOpened, SearchLink};
 use super::*;
 
 // --- fixtures ---
@@ -65,6 +66,12 @@ struct FakeGateway {
     covers: std::cell::Cell<usize>,
     /// Source ids passed to `uninstall_source`, in order.
     uninstalled: RefCell<Vec<String>>,
+    /// OPDS catalogues the Books card shows.
+    catalogs: Vec<gideon_core::BookCatalog>,
+    /// Canned HTTP bodies the book methods run the REAL OPDS client over —
+    /// feeds, OpenSearch descriptions and EPUB bytes by exact URL — so a UI
+    /// test exercises parse → open → download end to end, offline.
+    web: gideon_sources::FakeFetcher,
 }
 
 impl Default for FakeGateway {
@@ -86,6 +93,8 @@ impl Default for FakeGateway {
             installs: std::cell::Cell::new(0),
             covers: std::cell::Cell::new(0),
             uninstalled: RefCell::new(Vec::new()),
+            catalogs: Vec::new(),
+            web: gideon_sources::FakeFetcher::new(),
         }
     }
 }
@@ -173,6 +182,38 @@ impl SourceGateway for FakeGateway {
         Ok("Updated to 9.9.9.".to_string())
     }
 
+    fn book_catalogs(&self) -> Vec<gideon_core::BookCatalog> {
+        self.catalogs.clone()
+    }
+
+    fn book_feed(&self, url: &url::Url) -> Result<BookFeed> {
+        Ok(gideon_sources::opds::fetch_feed(&self.web, url)?)
+    }
+
+    fn book_next_page(&self, feed: &BookFeed) -> Result<Option<BookFeed>> {
+        Ok(gideon_sources::opds::fetch_next(&self.web, feed)?)
+    }
+
+    fn book_search(&self, search: &SearchLink, query: &str) -> Result<Option<BookFeed>> {
+        Ok(gideon_sources::opds::search(&self.web, search, query)?)
+    }
+
+    fn book_open(&self, entry: &BookEntry) -> Result<BookOpened> {
+        Ok(gideon_sources::opds::open_entry(&self.web, entry)?)
+    }
+
+    fn book_download(
+        &self,
+        epub: &url::Url,
+        books_dir: &Path,
+        author: Option<&str>,
+        title: &str,
+    ) -> Result<(PathBuf, bool)> {
+        Ok(gideon_sources::opds::download_epub(
+            &self.web, epub, books_dir, author, title,
+        )?)
+    }
+
     fn check_updates(&self) -> Result<super::gateway::UpdateCheck> {
         Ok(super::gateway::UpdateCheck {
             message: self.update_message.clone(),
@@ -205,6 +246,9 @@ fn app(
         gateway,
         library.to_path_buf(),
     )
+    // Beside the library would be the tempdir's parent — /tmp — so books go
+    // under the test's own directory instead.
+    .with_books_dir(library.join("Books"))
 }
 
 fn layout() -> UiLayout {
@@ -402,9 +446,10 @@ fn tap_card(i: usize) -> UiEvent {
     let gap = l.pad / 2;
     let top = l.content_top() + gap;
     let avail = l.nav_top().saturating_sub(top + gap);
-    // Mirrors `discover_grid`: cards are laid out for the count on screen,
-    // which is four, or five when the offline reconnect card is showing.
-    let rows = 2u32;
+    // Mirrors `discover_grid`: cards are laid out for the count on screen —
+    // HOME_ROWS, plus one when the offline reconnect card is showing (which
+    // lands in the same row count).
+    let rows = (HOME_ROWS.len() as u32).div_ceil(2);
     let cell_h = (avail.saturating_sub(gap * (rows - 1)) / rows).clamp(l.row_h, l.row_h * 5 / 2);
     let grid = gideon_render::widgets::GridLayout::new(
         l.pad,
@@ -2245,7 +2290,7 @@ fn check_updates_shows_message_screen() {
         update_message: "gideon 0.1.0 is up to date.".into(),
         ..FakeGateway::default()
     };
-    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(3)]);
+    let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_card(4)]);
     app.run().unwrap();
 
     let Screen::Message { title, body } = app.screen() else {
@@ -5658,13 +5703,13 @@ fn update_prompt_installs_on_tap() {
         update_message: "Update available: 0.0.0 -> 9.9.9.".into(),
         ..FakeGateway::default()
     };
-    // Home row 4 = "Check for updates" -> prompt; content tap installs,
+    // Home card 5 = "Check for updates" -> prompt; content tap installs,
     // and a successful install restarts the app in place so the new
     // binary is live immediately.
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_card(3), tap_row(0)],
+        vec![nav_discover(), tap_card(4), tap_row(0)],
     );
     assert_eq!(app.run().unwrap(), Exit::Restart);
     assert_eq!(
@@ -7132,7 +7177,7 @@ fn update_prompt_back_declines() {
     let mut app = app(
         dir.path(),
         gateway,
-        vec![nav_discover(), tap_card(3), tap_back()],
+        vec![nav_discover(), tap_card(4), tap_back()],
     );
     app.run().unwrap();
     assert_eq!(app.gateway().installs.get(), 0, "back should not install");
@@ -8613,10 +8658,14 @@ fn discover_cards_are_a_grid_and_each_one_opens_its_own_destination() {
     probe.goto_root(Screen::Home).unwrap();
 
     let cards = probe.discover_cards();
-    assert_eq!(cards.len(), 4, "online, the four destinations");
+    assert_eq!(cards.len(), 5, "online, the five destinations");
     let grid = probe.discover_grid(cards.len());
     assert!(grid.cell(1).0 > grid.cell(0).0, "two columns");
-    assert!(grid.cell(2).1 > grid.cell(0).1, "two rows");
+    assert!(grid.cell(2).1 > grid.cell(0).1, "stacked rows");
+    assert!(
+        grid.cell(4).1 > grid.cell(2).1,
+        "the odd fifth card gets its own row"
+    );
 
     // The gutter between the columns is not a card: a tap there does nothing
     // rather than activating whichever neighbour rounding lands on.
@@ -8626,8 +8675,15 @@ fn discover_cards_are_a_grid_and_each_one_opens_its_own_destination() {
     assert_eq!(grid.hit(cx + cw + 1, cy + ch / 2, cards.len()), None);
     assert!(cy + ch <= l.nav_top(), "cards stay clear of the nav bar");
 
-    // Each card lands on its own screen.
-    for (i, want) in [(0usize, "search"), (1, "sources"), (2, "popular")] {
+    // Each card lands on its own screen. With no catalogues and no update
+    // the last two land on explanatory messages, told apart by title.
+    for (i, want) in [
+        (0usize, "search"),
+        (1, "sources"),
+        (2, "popular"),
+        (3, "books"),
+        (4, "updates"),
+    ] {
         let mut card_app = app(
             dir.path(),
             source_gateway(),
@@ -8637,7 +8693,10 @@ fn discover_cards_are_a_grid_and_each_one_opens_its_own_destination() {
         let landed = match card_app.screen() {
             Screen::Search { .. } | Screen::RecentSearches { .. } => "search",
             Screen::Sources { .. } => "sources",
-            Screen::MangaList { .. } | Screen::Message { .. } => "popular",
+            Screen::MangaList { .. } => "popular",
+            Screen::Message { title, .. } if title == "Books" => "books",
+            Screen::Message { title, .. } if title == "Updates" => "updates",
+            Screen::Message { .. } => "popular",
             other => panic!("card {i} landed on {other:?}"),
         };
         assert_eq!(landed, want, "card {i}");
@@ -9255,4 +9314,341 @@ fn tap_latency_bench() {
         "BENCH taps={n} total={total:?} per_tap={:?} flushes={flushes} full={full}",
         total / n as u32
     );
+}
+
+// --- Books (OPDS) -----------------------------------------------------------
+//
+// The gateway runs the real OPDS client over captured Gutenberg feeds and a
+// hand-written Calibre one, so these cover the whole path from the Home card
+// to an EPUB on disk — the only fake is the network.
+
+mod books {
+    use super::*;
+
+    const ROOT: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/gutenberg-root.xml");
+    const SEARCH: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/gutenberg-search.xml");
+    const POPULAR: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/gutenberg-popular.xml");
+    const BOOK84: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/gutenberg-book84.xml");
+    const OSD: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/gutenberg-osd.xml");
+    const CALIBRE_ROOT: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/calibre-root.xml");
+    const CALIBRE_NEWEST: &[u8] =
+        include_bytes!("../../../gideon-sources/tests/fixtures/opds/calibre-newest.xml");
+
+    const GUTENBERG: &str = "https://www.gutenberg.org/ebooks.opds/";
+    const EPUB: &[u8] = b"PK\x03\x04 a tiny epub";
+
+    fn gutenberg_only() -> FakeGateway {
+        FakeGateway {
+            catalogs: vec![gideon_core::BookCatalog {
+                name: "Project Gutenberg".into(),
+                url: GUTENBERG.into(),
+            }],
+            web: gideon_sources::FakeFetcher::new()
+                .with(GUTENBERG, ROOT)
+                .with("https://www.gutenberg.org/ebooks/search.opds/?sort_order=downloads", POPULAR)
+                .with("https://www.gutenberg.org/ebooks/search.opds/?sort_order=downloads&start_index=26", POPULAR)
+                .with("https://www.gutenberg.org/ebooks/84.opds", BOOK84)
+                .with("https://www.gutenberg.org/ebooks/84.epub3.images", EPUB)
+                .with("https://www.gutenberg.org/catalog/osd-books.xml", OSD)
+                .with("http://m.gutenberg.org/ebooks/search.opds/?query=frankenstein", SEARCH),
+            ..FakeGateway::default()
+        }
+    }
+
+    /// Home -> Books. Books is card 3 (fourth card).
+    fn tap_books() -> UiEvent {
+        tap_card(3)
+    }
+
+    /// The list rows of the current BookList, as the painter labels them.
+    fn book_list(app: &UiApp<MemoryDisplay, FakeInput, FakeGateway>) -> (String, Vec<String>) {
+        let Screen::BookList { title, feed, .. } = app.screen() else {
+            panic!("expected a book list, got {:?}", app.screen());
+        };
+        let rows = book_rows(feed)
+            .into_iter()
+            .map(|r| match r {
+                BookRow::Search => "Search this catalogue".to_string(),
+                BookRow::Entry(i) => feed.entries[i].label(),
+                BookRow::More => "More…".to_string(),
+            })
+            .collect();
+        (title.clone(), rows)
+    }
+
+    #[test]
+    fn one_catalogue_opens_straight_from_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(
+            dir.path(),
+            gutenberg_only(),
+            vec![nav_discover(), tap_books()],
+        );
+        app.run().unwrap();
+        let (title, rows) = book_list(&app);
+        assert_eq!(title, "Project Gutenberg");
+        // Gutenberg offers search, so the first row is the search row, then
+        // its sections with their one-line blurbs; no "More" because the
+        // root isn't paged.
+        assert_eq!(
+            rows,
+            [
+                "Search this catalogue",
+                "Popular — Our most popular books.",
+                "Latest — Our latest releases.",
+                "Random — Random books.",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_catalogues_explains_how_to_add_one_instead_of_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(
+            dir.path(),
+            FakeGateway::default(),
+            vec![nav_discover(), tap_books()],
+        );
+        app.run().unwrap();
+        let Screen::Message { title, body } = app.screen() else {
+            panic!("expected a hint, got {:?}", app.screen());
+        };
+        assert_eq!(title, "Books");
+        assert!(body.contains("book_catalogs"), "{body}");
+        assert!(body.contains("settings.json"), "{body}");
+    }
+
+    #[test]
+    fn several_catalogues_list_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gateway = gutenberg_only();
+        gateway.catalogs.push(gideon_core::BookCatalog {
+            name: String::new(),
+            url: "http://calibre.local:8080/opds".into(),
+        });
+        gateway.web = gateway
+            .web
+            .with("http://calibre.local:8080/opds", CALIBRE_ROOT);
+        let mut app = app(
+            dir.path(),
+            gateway,
+            vec![nav_discover(), tap_books(), tap_row(1)],
+        );
+        app.run().unwrap();
+        // Row 1 was the unnamed Calibre server, labelled by its host.
+        let (title, rows) = book_list(&app);
+        assert_eq!(title, "calibre.local");
+        assert!(rows.iter().any(|r| r.starts_with("Newest — ")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_gutenberg_stub_downloads_the_illustrated_epub_into_the_kobo_library() {
+        let dir = tempfile::tempdir().unwrap();
+        // Books -> "Popular" (row 1, after the search row) -> first book.
+        let mut app = app(
+            dir.path(),
+            gutenberg_only(),
+            vec![nav_discover(), tap_books(), tap_row(1), tap_row(2)],
+        );
+        app.run().unwrap();
+
+        // The popular list's row 2 is its second entry (row 0 = search,
+        // row 1 = first entry): Frankenstein, a stub that needed a second
+        // fetch to find its EPUB links.
+        let Screen::Message { title, body } = app.screen() else {
+            panic!("expected the saved message, got {:?}", app.screen());
+        };
+        assert_eq!(title, "Books");
+        assert!(body.starts_with("Saved Frankenstein"), "{body}");
+        // The one line that matters: when they will actually see it.
+        assert!(body.contains("after you exit gideon"), "{body}");
+
+        // On disk, beside the manga library as Author/Title.epub, NOT inside
+        // the manga library where gideon's own scan would ignore it.
+        let books = dir.path().join("Books");
+        let saved: Vec<PathBuf> = walk(&books);
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        let path = &saved[0];
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("epub"));
+        assert!(
+            path.to_string_lossy()
+                .contains("Mary Wollstonecraft Shelley"),
+            "{path:?}"
+        );
+        assert!(path.to_string_lossy().contains("Frankenstein"), "{path:?}");
+        assert_eq!(std::fs::read(path).unwrap(), EPUB);
+        assert!(
+            gideon_core::Library::new(dir.path())
+                .scan()
+                .unwrap()
+                .is_empty(),
+            "not a manga"
+        );
+    }
+
+    #[test]
+    fn a_book_already_on_the_kobo_says_so_and_fetches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir
+            .path()
+            .join("Books/Mary Wollstonecraft Shelley/Frankenstein; or, The modern Prometheus.epub");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, b"PK already here").unwrap();
+        let mut gateway = gutenberg_only();
+        // No EPUB body canned: a fetch would fail, so success proves no fetch.
+        gateway.web = gideon_sources::FakeFetcher::new()
+            .with(GUTENBERG, ROOT)
+            .with(
+                "https://www.gutenberg.org/ebooks/search.opds/?sort_order=downloads",
+                POPULAR,
+            )
+            .with("https://www.gutenberg.org/ebooks/84.opds", BOOK84);
+        let mut app = app(
+            dir.path(),
+            gateway,
+            vec![nav_discover(), tap_books(), tap_row(1), tap_row(2)],
+        );
+        app.run().unwrap();
+        let Screen::Message { body, .. } = app.screen() else {
+            panic!("expected a message, got {:?}", app.screen());
+        };
+        assert!(body.contains("already on your Kobo"), "{body}");
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"PK already here",
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn more_appends_the_next_page_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = app(
+            dir.path(),
+            gutenberg_only(),
+            vec![nav_discover(), tap_books(), tap_row(1)],
+        );
+        first.run().unwrap();
+        let (_, rows) = book_list(&first);
+        assert_eq!(rows.last().map(String::as_str), Some("More…"));
+        let before = rows.len();
+        let more_row = before - 1;
+
+        // The More row is on the last page of the list; jump there and tap it.
+        let per_page = layout().rows_per_page();
+        let last_page = (before - 1) / per_page;
+        let mut events: Vec<UiEvent> = vec![nav_discover(), tap_books(), tap_row(1)];
+        for _ in 0..last_page {
+            events.push(tap_nav_next());
+        }
+        events.push(tap_row(more_row - last_page * per_page));
+        let mut again = app(dir.path(), gutenberg_only(), events);
+        again.run().unwrap();
+        let (_, rows) = book_list(&again);
+        // Same canned page again, so twice the entries — still one More row,
+        // still a list (not a message), still the same screen.
+        assert_eq!(rows.len(), before * 2 - 2, "{}", rows.len());
+        assert_eq!(rows.last().map(String::as_str), Some("More…"));
+    }
+
+    #[test]
+    fn search_goes_through_opensearch_and_lists_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = vec![nav_discover(), tap_books(), tap_row(0)];
+        for ch in "frankenstein".chars() {
+            events.push(tap_key(Key::Char(ch)));
+        }
+        events.push(tap_key(Key::Search));
+        let mut app = app(dir.path(), gutenberg_only(), events);
+        app.run().unwrap();
+        let (title, rows) = book_list(&app);
+        assert_eq!(title, "\"frankenstein\"");
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("Frankenstein; or, The modern Prometheus — Mary")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_catalogue_that_cannot_be_reached_explains_rather_than_erroring_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = FakeGateway {
+            catalogs: vec![gideon_core::BookCatalog {
+                name: "Home".into(),
+                url: "http://calibre.local:8080/opds".into(),
+            }],
+            ..FakeGateway::default() // nothing canned: every fetch fails
+        };
+        let mut app = app(dir.path(), gateway, vec![nav_discover(), tap_books()]);
+        app.run().unwrap();
+        let Screen::Message { title, body } = app.screen() else {
+            panic!("expected a message, got {:?}", app.screen());
+        };
+        assert_eq!(title, "Home");
+        assert!(body.starts_with("Couldn't open this catalogue"), "{body}");
+    }
+
+    #[test]
+    fn calibre_books_download_directly_without_a_second_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = FakeGateway {
+            catalogs: vec![gideon_core::BookCatalog {
+                name: "Home".into(),
+                url: "http://calibre.local:8080/opds".into(),
+            }],
+            web: gideon_sources::FakeFetcher::new()
+                .with("http://calibre.local:8080/opds", CALIBRE_ROOT)
+                .with(
+                    "http://calibre.local:8080/opds/navcatalog/4f6e6577657374",
+                    CALIBRE_NEWEST,
+                )
+                .with("http://calibre.local:8080/get/epub/12/calibre", EPUB),
+            ..FakeGateway::default()
+        };
+        // Root: [search, By Newest, Newest, By Author]; "Newest" is row 2.
+        // Newest: [search, Apothecary, Slaughterhouse, More]; row 1 = the book.
+        let mut app = app(
+            dir.path(),
+            gateway,
+            vec![nav_discover(), tap_books(), tap_row(2), tap_row(1)],
+        );
+        app.run().unwrap();
+        let Screen::Message { body, .. } = app.screen() else {
+            panic!("expected the saved message, got {:?}", app.screen());
+        };
+        assert!(
+            body.starts_with("Saved The Apothecary Diaries: Volume 1"),
+            "{body}"
+        );
+        let saved = walk(&dir.path().join("Books"));
+        assert_eq!(saved.len(), 1);
+        assert!(
+            saved[0].ends_with("Natsu Hyuuga, Touko Shino/The Apothecary Diaries_ Volume 1.epub"),
+            "{:?}",
+            saved[0]
+        );
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 }

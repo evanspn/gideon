@@ -11,16 +11,18 @@ pub mod cleanup;
 pub mod download;
 pub mod fetch;
 pub mod list;
+pub mod opds;
 pub mod storage;
 pub mod update;
 
 pub use cleanup::{plan_finished_cleanup, run_finished_cleanup, CleanupCandidate, CleanupSummary};
 pub use download::pages_to_cbz;
-pub use fetch::{Fetcher, UreqFetcher};
+pub use fetch::{FakeFetcher, Fetcher, UreqFetcher};
 pub use list::{
     parse_source_list, resolve_icon_url, resolve_package_url, SourceInformation, SourceLists,
     DEFAULT_SOURCE_LISTS,
 };
+pub use opds::{Entry as BookEntry, EpubLink, Feed as BookFeed, Opened as BookOpened, SearchLink};
 pub use storage::ChapterStorage;
 pub use update::{apply_staged, check_update, stage_update, ReleaseInfo, DEFAULT_UPDATE_REPO};
 
@@ -37,6 +39,13 @@ pub enum Error {
 
     #[error("failed to parse source list at {url}: {message}")]
     ParseList { url: String, message: String },
+
+    /// An OPDS catalogue answered with something that is not a feed — a
+    /// login page, an HTML error, a different format. Named separately from
+    /// a source-list failure so the Books screen can say "that catalogue"
+    /// rather than "that source list".
+    #[error("failed to read catalogue at {url}: {message}")]
+    ParseFeed { url: String, message: String },
 
     #[error("source '{0}' not found in any configured source list")]
     SourceNotFound(String),

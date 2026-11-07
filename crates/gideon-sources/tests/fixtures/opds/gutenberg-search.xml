@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:relevance="http://a9.com/-/opensearch/extensions/relevance/1.0/">
+<id>http://www.gutenberg.org/ebooks/search.opds/?query=frankenstein</id>
+<updated>2026-11-07T03:34:19Z</updated>
+<title>Books: frankenstein</title>
+<subtitle>Free eBooks since 1971.</subtitle>
+<author>
+<name>Project Gutenberg</name>
+<uri>https://www.gutenberg.org</uri>
+<email>webmaster@gutenberg.org</email>
+</author>
+<icon>https://www.gutenberg.org/gutenberg/favicon.ico</icon>
+<link rel="search" type="application/opensearchdescription+xml" title="Project Gutenberg Catalog Search" href="https://www.gutenberg.org/catalog/osd-books.xml"/>
+<link rel="self" title="This Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks/search.opds/?query=frankenstein"/>
+<link rel="alternate" type="text/html" title="HTML Page" href="/ebooks/search/?query=frankenstein"/>
+<link rel="start" title="Start Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks.opds/"/>
+<opensearch:itemsPerPage>25</opensearch:itemsPerPage>
+<opensearch:startIndex>1</opensearch:startIndex>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/authors/search.opds/?query=frankenstein</id>
+<title>Authors</title>
+<content type="text">One author name matches your search.</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/authors/search.opds/?query=frankenstein"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/subjects/search.opds/?query=frankenstein</id>
+<title>Subjects</title>
+<content type="text">2 subject headings match your search.</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/subjects/search.opds/?query=frankenstein"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/84.opds</id>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/84.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/41445.opds</id>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/41445.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/42324.opds</id>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/42324.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/20038.opds</id>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/20038.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/6542.opds</id>
+<title>Frankenstein</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/6542.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/62404.opds</id>
+<title>Frankenstein, ou le Prométhée moderne Volume 1 (of 3) (French)</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/62404.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/11659.opds</id>
+<title>The World's Greatest Books — Volume 08 — Fiction</title>
+<content type="text">1058 downloads</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/11659.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/62405.opds</id>
+<title>Frankenstein, ou le Prométhée moderne Volume 2 (of 3) (French)</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/62405.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/62406.opds</id>
+<title>Frankenstein, ou le Prométhée moderne Volume 3 (of 3) (French)</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/62406.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:19Z</updated>
+<id>https://www.gutenberg.org/ebooks/10414.opds</id>
+<title>I Love You, California</title>
+<content type="text">153 downloads</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/10414.opds"/>
+
+</entry>
+</feed>
