@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:relevance="http://a9.com/-/opensearch/extensions/relevance/1.0/">
+<id>http://www.gutenberg.org/ebooks/search.opds/?sort_order=downloads</id>
+<updated>2026-11-07T03:34:20Z</updated>
+<title>All Books</title>
+<subtitle>Free eBooks since 1971.</subtitle>
+<author>
+<name>Project Gutenberg</name>
+<uri>https://www.gutenberg.org</uri>
+<email>webmaster@gutenberg.org</email>
+</author>
+<icon>https://www.gutenberg.org/gutenberg/favicon.ico</icon>
+<link rel="search" type="application/opensearchdescription+xml" title="Project Gutenberg Catalog Search" href="https://www.gutenberg.org/catalog/osd-books.xml"/>
+<link rel="self" title="This Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks/search.opds/?sort_order=downloads"/>
+<link rel="alternate" type="text/html" title="HTML Page" href="/ebooks/search/?sort_order=downloads"/>
+<link rel="start" title="Start Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks.opds/"/>
+<link rel="next" title="Next Page" type="application/atom+xml;profile=opds-catalog" href="/ebooks/search.opds/?sort_order=downloads&amp;start_index=26"/>
+<opensearch:itemsPerPage>25</opensearch:itemsPerPage>
+<opensearch:startIndex>1</opensearch:startIndex>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1342.opds</id>
+<title>Pride and Prejudice</title>
+<content type="text">Jane Austen</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1342.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/84.opds</id>
+<title>Frankenstein; or, The modern Prometheus</title>
+<content type="text">Mary Wollstonecraft Shelley</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/84.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/2701.opds</id>
+<title>Moby Dick; Or, The Whale</title>
+<content type="text">Herman Melville</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/2701.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/11.opds</id>
+<title>Alice's Adventures in Wonderland</title>
+<content type="text">Lewis Carroll</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/11.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1661.opds</id>
+<title>The Adventures of Sherlock Holmes</title>
+<content type="text">Arthur Conan Doyle</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1661.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/345.opds</id>
+<title>Dracula</title>
+<content type="text">Bram Stoker</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/345.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/100.opds</id>
+<title>The Complete Works of William Shakespeare</title>
+<content type="text">William Shakespeare</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/100.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/98.opds</id>
+<title>A Tale of Two Cities</title>
+<content type="text">Charles Dickens</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/98.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1513.opds</id>
+<title>Romeo and Juliet</title>
+<content type="text">William Shakespeare</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1513.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/37683.opds</id>
+<title>Chambers's Twentieth Century Dictionary (part 1 of 4: A-D)</title>
+<content type="text">68795 downloads</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/37683.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/145.opds</id>
+<title>Middlemarch</title>
+<content type="text">George Eliot</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/145.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/174.opds</id>
+<title>The Picture of Dorian Gray</title>
+<content type="text">Oscar Wilde</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/174.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/43.opds</id>
+<title>The strange case of Dr. Jekyll and Mr. Hyde</title>
+<content type="text">Robert Louis Stevenson</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/43.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1260.opds</id>
+<title>Jane Eyre: An Autobiography</title>
+<content type="text">Charlotte Brontë</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1260.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/64317.opds</id>
+<title>The Great Gatsby</title>
+<content type="text">F. Scott Fitzgerald</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/64317.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1232.opds</id>
+<title>The Prince</title>
+<content type="text">Niccolò Machiavelli</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1232.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/2554.opds</id>
+<title>Crime and Punishment</title>
+<content type="text">Fyodor Dostoyevsky</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/2554.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/5200.opds</id>
+<title>Metamorphosis</title>
+<content type="text">Franz Kafka</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/5200.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/41.opds</id>
+<title>The Legend of Sleepy Hollow</title>
+<content type="text">Washington Irving</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/41.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/205.opds</id>
+<title>Walden, and On The Duty Of Civil Disobedience</title>
+<content type="text">Henry David Thoreau</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/205.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1400.opds</id>
+<title>Great Expectations</title>
+<content type="text">Charles Dickens</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1400.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/2680.opds</id>
+<title>Meditations</title>
+<content type="text">Emperor of Rome Marcus Aurelius</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/2680.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1952.opds</id>
+<title>The Yellow Wallpaper</title>
+<content type="text">Charlotte Perkins Gilman</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1952.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/1184.opds</id>
+<title>The Count of Monte Cristo</title>
+<content type="text">Alexandre Dumas and Auguste Maquet</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/1184.opds"/>
+
+</entry>
+<entry>
+<updated>2026-11-07T03:34:20Z</updated>
+<id>https://www.gutenberg.org/ebooks/2641.opds</id>
+<title>A Room with a View</title>
+<content type="text">E. M. Forster</content>
+<link type="application/atom+xml;profile=opds-catalog" rel="subsection" href="/ebooks/2641.opds"/>
+
+</entry>
+</feed>

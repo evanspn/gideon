@@ -36,8 +36,14 @@ The core pipeline works end to end:
 - **Chapter downloads** — fetched pages are packed into `.cbz` for offline
   reading, with atomic writes, a configurable storage budget and
   least-recently-read eviction, plus a pre-download engine
-- **Settings** — `settings.json` (source lists, languages, storage limit,
-  pre-download count, auto-update), parsed leniently
+- **Books** — the Discover → Books card browses OPDS catalogues (Project
+  Gutenberg out of the box; add your own, e.g. a Calibre content server's
+  `/opds`, under `book_catalogs` in `settings.json`) and downloads EPUBs
+  into `/mnt/onboard/Books`, where the Kobo's own reader picks them up the
+  next time Nickel starts — which is what exiting gideon does. gideon does
+  not read EPUBs itself; Nickel already does that well.
+- **Settings** — `settings.json` (source lists, languages, book catalogues,
+  storage limit, pre-download count, auto-update), parsed leniently
 - **OTA updates** — `gideon update` checks GitHub releases, downloads the
   bundle and swaps the binary atomically with a rollback copy
 - **Library cover view** — `gideon shelf` renders a cover grid with

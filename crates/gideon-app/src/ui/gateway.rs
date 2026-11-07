@@ -14,9 +14,14 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use gideon_aidoku::source::Source;
-use gideon_sources::UreqFetcher;
+use gideon_sources::opds;
+use gideon_sources::{Fetcher, UreqFetcher};
+use url::Url;
 
 use crate::manga;
+
+pub use gideon_core::BookCatalog;
+pub use gideon_sources::{BookEntry, BookFeed, BookOpened, EpubLink, SearchLink};
 
 /// A source as shown in the Sources screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +150,51 @@ pub trait SourceGateway {
         None
     }
 
+    // --- books (OPDS catalogues) ---
+    //
+    // Books are not manga: they come from OPDS catalogues rather than Aidoku
+    // sources, and they are not read here — an EPUB is dropped into the
+    // Kobo's own library for Nickel to index and read after gideon exits.
+    // Every method has a default so gateways that know nothing about books
+    // (tests for other screens) keep compiling.
+
+    /// The configured OPDS catalogues, in display order.
+    fn book_catalogs(&self) -> Vec<BookCatalog> {
+        Vec::new()
+    }
+
+    /// Fetch and parse the feed at `url`.
+    fn book_feed(&self, _url: &Url) -> Result<BookFeed> {
+        Err(anyhow::anyhow!("books are not supported by this gateway"))
+    }
+
+    /// The page after `feed`, if it has one.
+    fn book_next_page(&self, _feed: &BookFeed) -> Result<Option<BookFeed>> {
+        Ok(None)
+    }
+
+    /// Search a catalogue. `Ok(None)` when it cannot be searched.
+    fn book_search(&self, _search: &SearchLink, _query: &str) -> Result<Option<BookFeed>> {
+        Ok(None)
+    }
+
+    /// Open an entry: the book behind it, or the sub-catalogue it lists.
+    fn book_open(&self, _entry: &BookEntry) -> Result<BookOpened> {
+        Err(anyhow::anyhow!("books are not supported by this gateway"))
+    }
+
+    /// Download `epub` under `books_dir` as `Author/Title.epub`. Returns the
+    /// path and whether the file was already there (nothing fetched).
+    fn book_download(
+        &self,
+        _epub: &Url,
+        _books_dir: &Path,
+        _author: Option<&str>,
+        _title: &str,
+    ) -> Result<(PathBuf, bool)> {
+        Err(anyhow::anyhow!("books are not supported by this gateway"))
+    }
+
     /// Check for app updates.
     fn check_updates(&self) -> Result<UpdateCheck>;
 
@@ -248,6 +298,41 @@ impl SourceGateway for AidokuGateway {
     fn install_source(&self, source_id: &str) -> Result<()> {
         manga::install_source(&self.data_dir, source_id)?;
         Ok(())
+    }
+
+    fn book_catalogs(&self) -> Vec<BookCatalog> {
+        gideon_core::Settings::load(&self.data_dir)
+            .unwrap_or_default()
+            .book_catalogs
+    }
+
+    fn book_feed(&self, url: &Url) -> Result<BookFeed> {
+        Ok(opds::fetch_feed(&UreqFetcher::new(), url)?)
+    }
+
+    fn book_next_page(&self, feed: &BookFeed) -> Result<Option<BookFeed>> {
+        Ok(opds::fetch_next(&UreqFetcher::new(), feed)?)
+    }
+
+    fn book_search(&self, search: &SearchLink, query: &str) -> Result<Option<BookFeed>> {
+        Ok(opds::search(&UreqFetcher::new(), search, query)?)
+    }
+
+    fn book_open(&self, entry: &BookEntry) -> Result<BookOpened> {
+        Ok(opds::open_entry(&UreqFetcher::new(), entry)?)
+    }
+
+    fn book_download(
+        &self,
+        epub: &Url,
+        books_dir: &Path,
+        author: Option<&str>,
+        title: &str,
+    ) -> Result<(PathBuf, bool)> {
+        let fetcher: &dyn Fetcher = &UreqFetcher::new();
+        Ok(opds::download_epub(
+            fetcher, epub, books_dir, author, title,
+        )?)
     }
 
     fn uninstall_source(&self, source_id: &str) -> Result<()> {

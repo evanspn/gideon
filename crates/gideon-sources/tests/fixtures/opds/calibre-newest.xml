@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/terms/" xmlns:opds="http://opds-spec.org/2010/catalog">
+  <title>Newest</title>
+  <author><name>calibre</name><uri>https://calibre-ebook.com</uri></author>
+  <id>calibre-navcatalog:4f6e6577657374</id>
+  <updated>2026-11-06T19:02:11+00:00</updated>
+  <link rel="search" title="Search" type="application/atom+xml" href="/opds/search/{searchTerms}"/>
+  <link rel="self" href="/opds/navcatalog/4f6e6577657374" type="application/atom+xml"/>
+  <link rel="start" href="/opds" type="application/atom+xml"/>
+  <link rel="up" href="/opds" type="application/atom+xml"/>
+  <link rel="next" href="/opds/navcatalog/4f6e6577657374?offset=25" type="application/atom+xml"/>
+  <entry>
+    <title>The Apothecary Diaries: Volume 1</title>
+    <author><name>Natsu Hyuuga</name></author>
+    <author><name>Touko Shino</name></author>
+    <id>urn:uuid:7a1d7c1e-0001</id>
+    <updated>2026-11-01T10:00:00+00:00</updated>
+    <dc:language>eng</dc:language>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">Maomao, an apothecary's daughter, is kidnapped and sold into the rear palace…</div></content>
+    <link type="image/jpeg" href="/get/cover/12/calibre" rel="http://opds-spec.org/cover"/>
+    <link type="image/jpeg" href="/get/thumb/12/calibre" rel="http://opds-spec.org/thumbnail"/>
+    <link type="application/epub+zip" href="/get/epub/12/calibre" rel="http://opds-spec.org/acquisition" length="2345678" mtime="2026-11-01T10:00:00+00:00"/>
+  </entry>
+  <entry>
+    <title>Slaughterhouse-Five</title>
+    <author><name>Kurt Vonnegut</name></author>
+    <id>urn:uuid:7a1d7c1e-0002</id>
+    <updated>2026-10-30T10:00:00+00:00</updated>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">So it goes.</div></content>
+    <link type="application/epub+zip" href="/get/epub/7/calibre" rel="http://opds-spec.org/acquisition" length="512000"/>
+    <link type="application/pdf" href="/get/pdf/7/calibre" rel="http://opds-spec.org/acquisition" length="2048000"/>
+  </entry>
+</feed>

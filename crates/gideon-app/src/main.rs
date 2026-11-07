@@ -574,8 +574,9 @@ fn browse_screenshot(library: PathBuf, out: PathBuf) -> Result<()> {
     let input = FakeInput::new(Vec::new());
     let gateway = ui::AidokuGateway::new(data_dir());
     let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
-    let mut app =
-        ui::UiApp::new(display, input, gateway, library).with_profile(&settings.active_profile);
+    let mut app = ui::UiApp::new(display, input, gateway, library.clone())
+        .with_books_dir(ui::books_dir_for(&library))
+        .with_profile(&settings.active_profile);
     app.render_once()?;
 
     let display = app.display();
@@ -682,7 +683,8 @@ fn cmd_browse(library: PathBuf, screenshot: Option<PathBuf>) -> Result<()> {
     display.set_color_post_process(gideon_device::ColorPostProcess::from_setting(
         &saved.color_post_process,
     ));
-    let result = ui::UiApp::new(display, input, gateway, library)
+    let result = ui::UiApp::new(display, input, gateway, library.clone())
+        .with_books_dir(ui::books_dir_for(&library))
         .with_profile(&saved.active_profile)
         .with_reader_settings(fit, rotation)
         .with_sleeper(sleeper)

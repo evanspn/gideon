@@ -1250,6 +1250,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "url",
  "zip 2.4.2",
 ]
 
@@ -1278,6 +1279,7 @@ version = "1.0.0"
 dependencies = [
  "filetime",
  "gideon-core",
+ "quick-xml",
  "rustls",
  "rustls-native-certs 0.7.3",
  "serde",

@@ -85,6 +85,23 @@ pub struct Settings {
     /// through a series.
     pub languages: Vec<String>,
 
+    /// OPDS catalogues the Books screen browses, in display order. Device-
+    /// global for the same reason `source_lists` is: a catalogue is a place
+    /// books come from, not a reader's taste.
+    ///
+    /// Defaults to Project Gutenberg alone. Standard Ebooks puts its feed
+    /// behind a Patrons Circle login and Feedbooks' public catalogue is gone,
+    /// so it is the one open catalogue that actually answers. A reader's own
+    /// library — a Calibre content server speaks OPDS at `/opds` — is added
+    /// here by hand in settings.json; typing a URL on an e-ink keyboard is
+    /// not a thing anyone should have to do.
+    ///
+    /// Parsed leniently: an entry missing its URL is dropped rather than
+    /// failing the whole file, and an explicit `[]` means "no catalogues"
+    /// (the screen then says how to add one) rather than the default.
+    #[serde(deserialize_with = "lenient_book_catalogs")]
+    pub book_catalogs: Vec<BookCatalog>,
+
     /// Profiles: each profile sees its own library subdirectory. The
     /// "default" profile uses the library root (existing books stay
     /// visible); any other profile lives in `<library>/@<name>`. Parsed
@@ -218,11 +235,75 @@ pub struct Settings {
     pub finished_cleanup_hours: u32,
 }
 
+/// One OPDS catalogue on the Books screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookCatalog {
+    /// What the row says. Falls back to the URL's host when empty.
+    #[serde(default)]
+    pub name: String,
+    /// The catalogue's root feed.
+    pub url: String,
+}
+
+impl BookCatalog {
+    /// The catalogue(s) a fresh install browses.
+    pub fn defaults() -> Vec<BookCatalog> {
+        vec![BookCatalog {
+            name: "Project Gutenberg".to_string(),
+            url: "https://www.gutenberg.org/ebooks.opds/".to_string(),
+        }]
+    }
+
+    /// The row label: the name, or the host when the name was left blank.
+    pub fn label(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.trim().to_string();
+        }
+        url::Url::parse(&self.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| self.url.clone())
+    }
+}
+
+/// `book_catalogs`: a list of `{name, url}`; entries that are not objects
+/// with a non-empty string `url` are dropped. A wrong-typed field falls back
+/// to the defaults. An explicit empty list is kept as empty.
+fn lenient_book_catalogs<'de, D>(d: D) -> std::result::Result<Vec<BookCatalog>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: serde_json::Value = Deserialize::deserialize(d)?;
+    let Some(items) = raw.as_array() else {
+        return Ok(BookCatalog::defaults());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let url = item.get("url")?.as_str()?.trim();
+            if url.is_empty() || url::Url::parse(url).is_err() {
+                return None;
+            }
+            let name = item
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Some(BookCatalog {
+                name,
+                url: url.to_string(),
+            })
+        })
+        .collect())
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             source_lists: Vec::new(),
             languages: vec!["en".to_string()],
+            book_catalogs: BookCatalog::defaults(),
             profiles: vec!["default".to_string()],
             active_profile: "default".to_string(),
             storage_size_limit: StorageSize(DEFAULT_STORAGE_LIMIT_BYTES),
@@ -1024,6 +1105,10 @@ mod tests {
         let s = Settings {
             source_lists: vec!["https://example.com/index.json".into()],
             languages: vec!["en".into(), "es".into()],
+            book_catalogs: vec![BookCatalog {
+                name: "Home".into(),
+                url: "http://calibre.local:8080/opds".into(),
+            }],
             profiles: vec!["default".into(), "alex".into()],
             active_profile: "alex".into(),
             storage_size_limit: StorageSize(500 * 1024 * 1024),
@@ -1048,6 +1133,73 @@ mod tests {
 
         let loaded = Settings::load(dir.path()).unwrap();
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn a_fresh_install_browses_project_gutenberg() {
+        let s = Settings::default();
+        assert_eq!(s.book_catalogs.len(), 1);
+        assert_eq!(s.book_catalogs[0].label(), "Project Gutenberg");
+        assert_eq!(
+            s.book_catalogs[0].url,
+            "https://www.gutenberg.org/ebooks.opds/"
+        );
+    }
+
+    #[test]
+    fn book_catalogs_parse_leniently() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hand-added Calibre server with no name, a junk entry, a bad URL
+        // and a missing url: only the usable ones survive, labelled by host.
+        std::fs::write(
+            Settings::path(dir.path()),
+            r#"{"book_catalogs": [
+                {"url": "http://calibre.local:8080/opds"},
+                {"name": "Named", "url": "https://books.example/opds"},
+                "junk", 7, {"name": "no url"}, {"url": "not a url"}, {"url": ""}
+            ]}"#,
+        )
+        .unwrap();
+        let s = Settings::load(dir.path()).unwrap();
+        let labels: Vec<String> = s.book_catalogs.iter().map(BookCatalog::label).collect();
+        assert_eq!(labels, vec!["calibre.local", "Named"]);
+
+        // An explicit empty list is "no catalogues", not the default.
+        std::fs::write(Settings::path(dir.path()), r#"{"book_catalogs": []}"#).unwrap();
+        assert!(Settings::load(dir.path()).unwrap().book_catalogs.is_empty());
+
+        // A wrong type falls back to the default rather than an empty screen.
+        std::fs::write(
+            Settings::path(dir.path()),
+            r#"{"book_catalogs": "gutenberg"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).unwrap().book_catalogs,
+            BookCatalog::defaults()
+        );
+
+        // Missing entirely: the default.
+        std::fs::write(Settings::path(dir.path()), r#"{}"#).unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).unwrap().book_catalogs,
+            BookCatalog::defaults()
+        );
+    }
+
+    #[test]
+    fn book_catalogs_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.book_catalogs.push(BookCatalog {
+            name: "Home".into(),
+            url: "http://calibre.local:8080/opds".into(),
+        });
+        s.save(dir.path()).unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).unwrap().book_catalogs,
+            s.book_catalogs
+        );
     }
 
     /// A fresh install filters the source catalogue to English. Without a
@@ -1205,6 +1357,10 @@ mod tests {
         Settings {
             source_lists: vec!["https://example.com/index.json".into()],
             languages: vec!["en".into()],
+            book_catalogs: vec![BookCatalog {
+                name: "Home".into(),
+                url: "http://calibre.local:8080/opds".into(),
+            }],
             profiles: vec!["default".into(), "alex".into()],
             active_profile: "alex".into(),
             storage_size_limit: StorageSize(500 * 1024 * 1024),
@@ -1369,6 +1525,7 @@ mod tests {
 
         assert_eq!(merged.source_lists, device.source_lists);
         assert_eq!(merged.languages, device.languages);
+        assert_eq!(merged.book_catalogs, device.book_catalogs);
         assert_eq!(merged.profiles, device.profiles);
         assert_eq!(merged.active_profile, device.active_profile);
         assert_eq!(merged.storage_size_limit, device.storage_size_limit);
