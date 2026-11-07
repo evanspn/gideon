@@ -665,9 +665,12 @@ fn browse_screenshot(library: PathBuf, out: PathBuf, screen: &str) -> Result<()>
     let input = FakeInput::new(Vec::new());
     let gateway = ui::AidokuGateway::new(data_dir());
     let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
+    // The settings dir too, so a screenshot shows the views the device's
+    // settings pick (the Library's shelf or list, the reader's typography).
     let mut app = ui::UiApp::new(display, input, gateway, library.clone())
         .with_books_dir(ui::books_dir_for(&library))
         .with_profile(&settings.active_profile)
+        .with_settings_dir(data_dir())
         .with_start(start);
     app.render_once()?;
 
