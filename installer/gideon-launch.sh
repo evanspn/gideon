@@ -152,8 +152,20 @@ done
 # does exactly this).
 rm -f /tmp/nickel-hardware-status
 
+# gideon turns the panel upright for itself and puts it back when it
+# closes; remember Nickel's rotation here too, so a gideon that died
+# without cleaning up (a crash, a kill) still hands Nickel a framebuffer it
+# can draw on. Nickel restarted in place on a rotated panel comes up with
+# every menu sideways or torn — a reboot used to hide this.
+FB_ROTATE=/sys/class/graphics/fb0/rotate
+NICKEL_ROTATE=$(cat "$FB_ROTATE" 2>/dev/null)
+
 /mnt/onboard/.adds/gideon/bin/gideon browse --library /mnt/onboard/Manga \
     >>/mnt/onboard/.adds/gideon/browse.log 2>&1
+
+if [ -n "$NICKEL_ROTATE" ] && [ "$(cat "$FB_ROTATE" 2>/dev/null)" != "$NICKEL_ROTATE" ]; then
+    echo "$NICKEL_ROTATE" >"$FB_ROTATE" 2>/dev/null
+fi
 
 # Bluetooth is deliberately NOT touched here. The rfkill soft-block that
 # briefly lived at this spot (PR #121, for the exit-with-BT-connected
