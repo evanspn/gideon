@@ -431,7 +431,7 @@ fn cmd_book(path: PathBuf) -> Result<()> {
             chapter.blocks.len()
         );
         if let Some(first) = chapter.blocks.iter().find_map(|b| match b {
-            gideon_core::BookBlock::Paragraph(p) => Some(p),
+            gideon_core::BookBlock::Paragraph(p) => Some(p.text()),
             _ => None,
         }) {
             let preview: String = first.chars().take(72).collect();

@@ -10406,4 +10406,55 @@ mod library_tabs {
         assert_eq!(img.rows, lines);
         assert_eq!(pages[1].len(), 1, "nothing shares the page with it");
     }
+
+    #[test]
+    fn emphasis_is_kept_as_styled_runs_and_drawn_leaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        make_epub_with(
+            &lib.join("Books/A/em.epub"),
+            "Em",
+            "A",
+            &[("One", &["So <i>it</i> <b>goes</b>."])],
+        );
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        let line = pages[0]
+            .iter()
+            .find(|l| l.text == "So it goes.")
+            .expect("the paragraph is one line, styling dropped from `text`");
+        let runs: Vec<(&str, bool, bool)> = line
+            .spans
+            .iter()
+            .map(|s| (s.text.as_str(), s.italic, s.bold))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("So ", false, false),
+                ("it ", true, false),
+                ("goes", false, true),
+                (".", false, false),
+            ]
+        );
+        // A heading's runs are all bold, whatever the markup said.
+        assert!(pages[0][0].bold && pages[0][0].spans.iter().all(|s| s.bold));
+
+        // The drawn page differs from the same text drawn plain: the lean and
+        // the weight are on the panel, not only in the data.
+        let styled = ui.display().buffer.clone();
+        make_epub_with(
+            &lib.join("Books/A/em.epub"),
+            "Em",
+            "A",
+            &[("One", &["So it goes."])],
+        );
+        let mut plain = app(&lib, FakeGateway::default(), open_first_book());
+        plain.run().unwrap();
+        assert_ne!(styled, plain.display().buffer);
+    }
 }

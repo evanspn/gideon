@@ -628,7 +628,11 @@ pub enum LibraryTab {
 /// One laid-out line of a book page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookLine {
+    /// The line's text, styling dropped (what tests and search read).
     pub text: String,
+    /// The same text as styled runs, concatenating to `text`.
+    pub spans: Vec<BookSpan>,
+    /// A heading line: every run drawn bold.
     pub bold: bool,
     /// Which block of the chapter this line came from, so the reading
     /// place survives a text-size change (pages move; paragraphs do not).
@@ -638,6 +642,23 @@ pub struct BookLine {
     /// A picture occupying this line and the `rows - 1` after it, scaled
     /// to `width × height` pixels. `text` is empty on such a line.
     pub image: Option<BookImage>,
+}
+
+/// A run of one style within a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookSpan {
+    pub text: String,
+    pub italic: bool,
+    pub bold: bool,
+}
+
+impl BookSpan {
+    fn style(&self) -> gideon_render::text::TextStyle {
+        gideon_render::text::TextStyle {
+            bold: self.bold,
+            italic: self.italic,
+        }
+    }
 }
 
 /// An illustration placed on a page.
@@ -692,15 +713,16 @@ pub fn paginate_chapter_with(
         if !lines.is_empty() {
             lines.push(BookLine {
                 text: String::new(),
+                spans: Vec::new(),
                 bold: false,
                 block: i,
                 line: 0,
                 image: None,
             });
         }
-        let (text, bold) = match block {
-            BookBlock::Heading(t) => (t.as_str(), true),
-            BookBlock::Paragraph(t) => (t.as_str(), false),
+        let (rich, bold) = match block {
+            BookBlock::Heading(t) => (t.clone(), true),
+            BookBlock::Paragraph(t) => (t.clone(), false),
             BookBlock::Image(href) => match dims(href).filter(|(w, h)| *w > 0 && *h > 0) {
                 Some((iw, ih)) => {
                     // Fit the width, then the page height, keeping the
@@ -714,6 +736,7 @@ pub fn paginate_chapter_with(
                     let rows = (h.div_ceil(line_h) as usize).clamp(1, per_page);
                     lines.push(BookLine {
                         text: String::new(),
+                        spans: Vec::new(),
                         bold: false,
                         block: i,
                         line: 0,
@@ -726,12 +749,13 @@ pub fn paginate_chapter_with(
                     });
                     continue;
                 }
-                None => ("[Illustration]", false),
+                None => (gideon_core::Rich::from("[Illustration]"), false),
             },
         };
-        for (n, wrapped) in wrap_words(px, text, max_w, bold).into_iter().enumerate() {
+        for (n, spans) in wrap_spans(px, &rich, max_w, bold).into_iter().enumerate() {
             lines.push(BookLine {
-                text: wrapped,
+                text: spans.iter().map(|s| s.text.as_str()).collect(),
+                spans,
                 bold,
                 block: i,
                 line: n,
@@ -765,40 +789,111 @@ pub fn paginate_chapter_with(
     pages
 }
 
-/// Word-wrap `text` to `max_w` at `px`. A single word wider than the line
-/// is broken at a character boundary rather than overflowing (e.g. a URL).
-fn wrap_words(px: f32, text: &str, max_w: u32, bold: bool) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        if measure_text(px, &candidate, bold) <= max_w {
-            current = candidate;
-            continue;
-        }
-        if !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
-        }
-        // The word alone: fits, or has to be split.
-        if measure_text(px, word, bold) <= max_w {
-            current = word.to_string();
-        } else {
-            let mut piece = String::new();
-            for ch in word.chars() {
-                let mut next = piece.clone();
-                next.push(ch);
-                if measure_text(px, &next, bold) > max_w && !piece.is_empty() {
-                    lines.push(std::mem::take(&mut piece));
-                    piece.push(ch);
-                } else {
-                    piece = next;
+/// Word-wrap styled text to `max_w` at `px`, keeping each word's runs.
+/// A word is the fragments between spaces, which may change style
+/// mid-word ("<b>goes</b>." is one word of two runs). `heading` draws every
+/// run bold. A word wider than the line is split at a character boundary.
+fn wrap_spans(px: f32, rich: &gideon_core::Rich, max_w: u32, heading: bool) -> Vec<Vec<BookSpan>> {
+    use gideon_render::text::measure_text_styled;
+    // Words as lists of fragments.
+    let mut words: Vec<Vec<BookSpan>> = Vec::new();
+    let mut word: Vec<BookSpan> = Vec::new();
+    for span in &rich.spans {
+        let frag_style = (span.italic, span.bold || heading);
+        let mut piece = String::new();
+        for ch in span.text.chars() {
+            if ch == ' ' || ch == '\u{a0}' {
+                if !piece.is_empty() {
+                    word.push(BookSpan {
+                        text: std::mem::take(&mut piece),
+                        italic: frag_style.0,
+                        bold: frag_style.1,
+                    });
                 }
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                piece.push(ch);
             }
-            current = piece;
+        }
+        if !piece.is_empty() {
+            word.push(BookSpan {
+                text: piece,
+                italic: frag_style.0,
+                bold: frag_style.1,
+            });
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    let width_of = |frags: &[BookSpan]| -> u32 {
+        frags
+            .iter()
+            .map(|f| measure_text_styled(px, &f.text, f.style()))
+            .sum()
+    };
+    let space_w = measure_text(px, " ", heading).max(1);
+
+    let mut lines: Vec<Vec<BookSpan>> = Vec::new();
+    let mut current: Vec<BookSpan> = Vec::new();
+    let mut current_w = 0u32;
+    let push_frags = |current: &mut Vec<BookSpan>, frags: &[BookSpan]| {
+        for f in frags {
+            match current.last_mut() {
+                Some(last) if last.italic == f.italic && last.bold == f.bold => {
+                    last.text.push_str(&f.text)
+                }
+                _ => current.push(f.clone()),
+            }
+        }
+    };
+    let add_space = |current: &mut Vec<BookSpan>| {
+        if let Some(last) = current.last_mut() {
+            last.text.push(' ');
+        }
+    };
+    for frags in words {
+        let w = width_of(&frags);
+        if current.is_empty() {
+            if w <= max_w {
+                push_frags(&mut current, &frags);
+                current_w = w;
+                continue;
+            }
+        } else if current_w + space_w + w <= max_w {
+            add_space(&mut current);
+            push_frags(&mut current, &frags);
+            current_w += space_w + w;
+            continue;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current_w = 0;
+            if w <= max_w {
+                push_frags(&mut current, &frags);
+                current_w = w;
+                continue;
+            }
+        }
+        // A word wider than the line: split it character by character,
+        // fragment styles kept.
+        for f in &frags {
+            for ch in f.text.chars() {
+                let one = BookSpan {
+                    text: ch.to_string(),
+                    italic: f.italic,
+                    bold: f.bold,
+                };
+                let cw = measure_text_styled(px, &one.text, one.style());
+                if current_w + cw > max_w && !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    current_w = 0;
+                }
+                push_frags(&mut current, std::slice::from_ref(&one));
+                current_w += cw;
+            }
         }
     }
     if !current.is_empty() || lines.is_empty() {
@@ -8151,7 +8246,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 continue;
             }
             if !line.text.is_empty() {
-                draw_text(&mut canvas, margin, y, px, &line.text, max_w, line.bold);
+                let mut x = margin;
+                let right = margin + max_w;
+                for span in &line.spans {
+                    if x >= right {
+                        break;
+                    }
+                    gideon_render::text::draw_text_styled(
+                        &mut canvas,
+                        x,
+                        y,
+                        px,
+                        &span.text,
+                        right - x,
+                        span.style(),
+                    );
+                    // Advance by the run's own width, not the italic
+                    // overhang, so runs sit flush like one line of type.
+                    x += measure_text(px, &span.text, span.bold);
+                }
             }
             y += line_h;
         }
