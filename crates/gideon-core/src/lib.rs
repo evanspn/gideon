@@ -20,7 +20,7 @@ pub mod upload;
 pub use books::{Book, BookPlace, BookPlaces};
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
-pub use epub::{Block as BookBlock, EpubText};
+pub use epub::{Block as BookBlock, EpubText, Rich, Span};
 pub use error::Error;
 pub use library::{Library, LibraryEntry, ProgressStore, ReadingProgress};
 pub use profile::DEFAULT_PROFILE;

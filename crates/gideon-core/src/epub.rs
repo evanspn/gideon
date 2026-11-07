@@ -30,15 +30,83 @@ pub struct Chapter {
     pub blocks: Vec<Block>,
 }
 
+/// A run of text in one style.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Span {
+    pub text: String,
+    pub italic: bool,
+    pub bold: bool,
+}
+
+/// Styled text: runs of plain, italic and bold. Most paragraphs are one
+/// plain run; emphasis is the exception that carries meaning (a thought, a
+/// title, a stressed word), which is why it is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Rich {
+    pub spans: Vec<Span>,
+}
+
+impl Rich {
+    /// The text with its styling dropped.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.iter().all(|s| s.text.is_empty())
+    }
+
+    /// Build from `(text, italic, bold)` runs.
+    pub fn styled(runs: &[(&str, bool, bool)]) -> Rich {
+        Rich {
+            spans: runs
+                .iter()
+                .map(|(t, i, b)| Span {
+                    text: t.to_string(),
+                    italic: *i,
+                    bold: *b,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&str> for Rich {
+    fn from(text: &str) -> Self {
+        Rich {
+            spans: vec![Span {
+                text: text.to_string(),
+                ..Default::default()
+            }],
+        }
+    }
+}
+
+impl From<String> for Rich {
+    fn from(text: String) -> Self {
+        Rich::from(text.as_str())
+    }
+}
+
 /// A unit of text that starts on its own line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
-    Heading(String),
-    Paragraph(String),
+    Heading(Rich),
+    Paragraph(Rich),
     /// A picture: the zip entry it lives at, resolved from the chapter's
     /// own folder. A light novel's illustrations are part of the book; the
     /// reader draws them in place ([`read_entry`] fetches the bytes).
     Image(String),
+}
+
+impl Block {
+    /// The block's text without styling; empty for a picture.
+    pub fn text(&self) -> String {
+        match self {
+            Block::Heading(r) | Block::Paragraph(r) => r.text(),
+            Block::Image(_) => String::new(),
+        }
+    }
 }
 
 impl EpubText {
@@ -223,29 +291,30 @@ pub fn html_to_chapter_in(html: &str, doc_dir: &str) -> Chapter {
     reader.config_mut().expand_empty_elements = false;
 
     let mut blocks: Vec<Block> = Vec::new();
-    let mut current = String::new();
+    let mut current: Vec<Span> = Vec::new();
     let mut heading_depth = 0usize;
+    let mut italic_depth = 0usize;
+    let mut bold_depth = 0usize;
     let mut skip_depth = 0usize;
     let mut title: Option<String> = None;
 
     fn flush(
-        current: &mut String,
+        current: &mut Vec<Span>,
         heading: bool,
         blocks: &mut Vec<Block>,
         title: &mut Option<String>,
     ) {
-        let text: String = current.split_whitespace().collect::<Vec<_>>().join(" ");
-        current.clear();
-        if text.is_empty() {
+        let rich = collapse(std::mem::take(current));
+        if rich.is_empty() {
             return;
         }
         if heading {
             if title.is_none() {
-                *title = Some(text.clone());
+                *title = Some(rich.text());
             }
-            blocks.push(Block::Heading(text));
+            blocks.push(Block::Heading(rich));
         } else {
-            blocks.push(Block::Paragraph(text));
+            blocks.push(Block::Paragraph(rich));
         }
     }
 
@@ -293,6 +362,12 @@ pub fn html_to_chapter_in(html: &str, doc_dir: &str) -> Chapter {
                 }
                 if is_heading(name) {
                     heading_depth += 1;
+                }
+                if is_italic(name) {
+                    italic_depth += 1;
+                }
+                if is_bold(name) {
+                    bold_depth += 1;
                 }
                 if name == b"img" || name == b"image" {
                     flush(&mut current, heading_depth > 0, &mut blocks, &mut title);
@@ -342,17 +417,31 @@ pub fn html_to_chapter_in(html: &str, doc_dir: &str) -> Chapter {
                 if is_heading(name) {
                     heading_depth = heading_depth.saturating_sub(1);
                 }
+                if is_italic(name) {
+                    italic_depth = italic_depth.saturating_sub(1);
+                }
+                if is_bold(name) {
+                    bold_depth = bold_depth.saturating_sub(1);
+                }
             }
             Ok(Event::Text(t)) => {
                 if skip_depth > 0 {
                     continue;
                 }
                 let raw = String::from_utf8_lossy(&t);
-                current.push_str(&decode_entities(&raw));
+                current.push(Span {
+                    text: decode_entities(&raw),
+                    italic: italic_depth > 0,
+                    bold: bold_depth > 0,
+                });
             }
             Ok(Event::CData(t)) => {
                 if skip_depth == 0 {
-                    current.push_str(&String::from_utf8_lossy(&t));
+                    current.push(Span {
+                        text: String::from_utf8_lossy(&t).into_owned(),
+                        italic: italic_depth > 0,
+                        bold: bold_depth > 0,
+                    });
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -365,6 +454,56 @@ pub fn html_to_chapter_in(html: &str, doc_dir: &str) -> Chapter {
 
 fn is_heading(name: &[u8]) -> bool {
     matches!(name, b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6")
+}
+
+fn is_italic(name: &[u8]) -> bool {
+    matches!(name, b"i" | b"em" | b"cite" | b"dfn" | b"var")
+}
+
+fn is_bold(name: &[u8]) -> bool {
+    matches!(name, b"b" | b"strong")
+}
+
+/// Collapse whitespace the way a browser would — runs become one space,
+/// across span boundaries too — merge neighbouring runs of one style, and
+/// trim the ends of the paragraph.
+fn collapse(spans: Vec<Span>) -> Rich {
+    let mut out: Vec<Span> = Vec::new();
+    let mut pending_space = false;
+    let mut at_start = true;
+    for span in spans {
+        for ch in span.text.chars() {
+            if ch.is_whitespace() {
+                pending_space = !at_start;
+                continue;
+            }
+            let same_style = out
+                .last()
+                .is_some_and(|l| l.italic == span.italic && l.bold == span.bold);
+            if !same_style {
+                // A space between styles goes with the run before it.
+                if pending_space {
+                    if let Some(last) = out.last_mut() {
+                        last.text.push(' ');
+                    }
+                    pending_space = false;
+                }
+                out.push(Span {
+                    text: String::new(),
+                    italic: span.italic,
+                    bold: span.bold,
+                });
+            }
+            let last = out.last_mut().expect("pushed above");
+            if pending_space {
+                last.text.push(' ');
+                pending_space = false;
+            }
+            last.text.push(ch);
+            at_start = false;
+        }
+    }
+    Rich { spans: out }
 }
 
 fn is_block(name: &[u8]) -> bool {
@@ -565,11 +704,17 @@ mod tests {
             one.blocks,
             [
                 Block::Heading("One".into()),
-                // A no-break space is just a space to a flowed page.
-                Block::Paragraph(
-                    "All this happened, more or less. The war parts, anyway, are pretty much true."
-                        .into()
-                ),
+                // A no-break space is just a space to a flowed page; the
+                // <i>more</i> is its own run.
+                Block::Paragraph(Rich::styled(&[
+                    ("All this happened, ", false, false),
+                    ("more ", true, false),
+                    (
+                        "or less. The war parts, anyway, are pretty much true.",
+                        false,
+                        false
+                    ),
+                ])),
                 Block::Paragraph("Billy Pilgrim has come unstuck in time.".into()),
                 Block::Image("OEBPS/Images/p.jpg".into()),
                 Block::Image("OEBPS/Images/cover.jpg".into()),
@@ -577,6 +722,25 @@ mod tests {
                 Block::Paragraph("Second line — dash — too — & done.".into()),
             ]
         );
+    }
+
+    #[test]
+    fn emphasis_becomes_styled_runs_with_browser_whitespace() {
+        let ch = html_to_chapter(
+            "<p>  So <i>it</i> <b>goes</b>.  <em>Thought.</em>\n <strong><i>Both</i></strong></p>",
+        );
+        assert_eq!(
+            ch.blocks,
+            [Block::Paragraph(Rich::styled(&[
+                ("So ", false, false),
+                ("it ", true, false),
+                ("goes", false, true),
+                (". ", false, false),
+                ("Thought. ", true, false),
+                ("Both", true, true),
+            ]))]
+        );
+        assert_eq!(ch.blocks[0].text(), "So it goes. Thought. Both");
     }
 
     #[test]
