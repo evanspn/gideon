@@ -260,13 +260,32 @@ async function validateUpload(file) {
   return ext;
 }
 
+// Storage object keys are not file names: Supabase rejects anything outside
+// ASCII letters, digits and a short list of punctuation ("Invalid key"), and
+// an ebook's file name from the wild has em dashes, curly quotes and worse.
+// The key is an ASCII slug of the name, kept short; the REAL name travels in
+// the queue row's title, which is what the Kobo names the file from.
+function storageSafeName(name) {
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase().replace(/[^a-z0-9]/g, "") : "";
+  let stem = (dot > 0 ? name.slice(0, dot) : name)
+    .normalize("NFKD")
+    .replace(/[^\x20-\x7e]/g, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .replace(/^[._-]+|[._-]+$/g, "");
+  if (!stem) stem = "file";
+  stem = stem.slice(0, 100);
+  return ext ? `${stem}.${ext}` : stem;
+}
+
 // Upload a file and queue it for the Kobo. The object goes up first; if the
 // queue row then fails, the object is removed so nothing is left paying for
 // storage with no row pointing at it.
 async function enqueueFile(file) {
   await validateUpload(file);
   const uid = sessionUserId() || "me";
-  const objectPath = `${uid}/${crypto.randomUUID()}/${file.name}`;
+  const objectPath = `${uid}/${crypto.randomUUID()}/${storageSafeName(file.name)}`;
   const up = await authedStorage(objectPath, {
     method: "POST",
     headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
