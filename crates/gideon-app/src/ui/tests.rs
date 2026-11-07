@@ -7036,10 +7036,7 @@ fn today_shows_a_bluetooth_glyph_only_when_a_remote_is_connected() {
 fn seed_sends(library_dir: &Path, items: &[(&str, &str)]) {
     let sends: Vec<gideon_sync::supabase::SendItem> = items
         .iter()
-        .map(|(id, title)| gideon_sync::supabase::SendItem {
-            id: (*id).to_string(),
-            title: (*title).to_string(),
-        })
+        .map(|(id, title)| gideon_sync::supabase::SendItem::title(id, title))
         .collect();
     let dir = library_dir.join(".gideon");
     std::fs::create_dir_all(&dir).unwrap();
@@ -9422,6 +9419,72 @@ mod books {
         assert_eq!(title, "Books");
         assert!(body.contains("book_catalogs"), "{body}");
         assert!(body.contains("settings.json"), "{body}");
+    }
+
+    #[test]
+    fn catalogues_typed_on_the_phone_join_the_list_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        // The sync sweep's cache: the user's Calibre, plus Gutenberg again
+        // (they added it on the phone too) which must not show twice.
+        let cache = dir.path().join(".gideon");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("catalogs.json"),
+            r#"[{"name":"Home","url":"http://calibre.local:8080/opds"},{"name":"PG","url":"https://www.gutenberg.org/ebooks.opds/"}]"#,
+        )
+        .unwrap();
+        let mut app = app(
+            dir.path(),
+            gutenberg_only(),
+            vec![nav_discover(), tap_books()],
+        );
+        app.run().unwrap();
+        let Screen::Books { catalogs } = app.screen() else {
+            panic!("expected the catalogue list, got {:?}", app.screen());
+        };
+        let labels: Vec<String> = catalogs.iter().map(|c| c.label()).collect();
+        assert_eq!(labels, ["Project Gutenberg", "Home"]);
+    }
+
+    #[test]
+    fn a_file_send_waiting_on_a_retry_is_listed_but_not_a_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let sends = vec![
+            gideon_sync::supabase::SendItem::title("t1", "Berserk"),
+            gideon_sync::supabase::SendItem {
+                id: "f1".into(),
+                title: "Slaughterhouse-Five.epub".into(),
+                kind: gideon_sync::supabase::SendKind::File,
+                file_path: Some("u/r/Slaughterhouse-Five.epub".into()),
+                file_size: Some(512000),
+            },
+        ];
+        let cache = dir.path().join(".gideon");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("sends.json"),
+            serde_json::to_vec(&sends).unwrap(),
+        )
+        .unwrap();
+        // Tapping the file row must not start a source search for an EPUB.
+        // (The bell sits one title-bar height left of the power zone.)
+        let l = layout();
+        let bell = UiEvent::Tap {
+            x: l.width - l.title_h - l.title_h / 2,
+            y: 1,
+        };
+        let mut app = app(
+            dir.path(),
+            search_gateway(),
+            vec![tap_today(), bell, tap_row(1)],
+        );
+        app.run().unwrap();
+        assert!(
+            matches!(app.screen(), Screen::SentList { .. }),
+            "stayed on the list, got {:?}",
+            app.screen()
+        );
+        assert!(app.gateway().searches.borrow().is_empty(), "no search ran");
     }
 
     #[test]

@@ -34,4 +34,10 @@ pub enum Error {
 
     #[error("failed to parse progress store: {0}")]
     ProgressStore(#[from] serde_json::Error),
+
+    /// A file sent from the phone that isn't what it claims (or isn't an
+    /// EPUB/PDF/CBZ at all). The message is shown to the person who sent it,
+    /// so it names the mismatch in their terms.
+    #[error("{0}")]
+    InvalidUpload(String),
 }

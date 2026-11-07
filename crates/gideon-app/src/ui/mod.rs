@@ -3073,6 +3073,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             },
             Screen::SentList { items } => {
                 if let Some(item) = items.get(row).cloned() {
+                    // A file send still listed is one whose download failed on
+                    // the network; the next sync retries it. Nothing to tap.
+                    if item.kind == gideon_sync::supabase::SendKind::File {
+                        return Ok(Flow::Continue);
+                    }
                     // Mark it handled (server + local cache) so the bell clears,
                     // then run the on-device search for the title — the reader
                     // picks the right match on the results screen and adds it.
@@ -3744,6 +3749,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// because an empty list screen with no hint is a dead end.
     fn open_books(&mut self) -> Result<()> {
         let mut catalogs = self.gateway.book_catalogs();
+        // Catalogues typed on the phone arrive through sync; the device's own
+        // list (Project Gutenberg by default) stays. Same URL twice is one.
+        for remote in crate::sync::cached_catalogs(&self.library_dir) {
+            if !catalogs.iter().any(|c| c.url.trim() == remote.url.trim()) {
+                catalogs.push(remote);
+            }
+        }
         if catalogs.is_empty() {
             return self.push(Screen::Message {
                 title: "Books".to_string(),
@@ -6938,8 +6950,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Power", &rows, 0, 1)
             }
             Screen::SentList { items } => {
-                let rows: Vec<(String, bool)> =
-                    items.iter().map(|s| (s.title.clone(), true)).collect();
+                let rows: Vec<(String, bool)> = items
+                    .iter()
+                    .map(|s| match s.kind {
+                        gideon_sync::supabase::SendKind::Title => (s.title.clone(), true),
+                        gideon_sync::supabase::SendKind::File => {
+                            (format!("{} — arrives on next sync", s.title), false)
+                        }
+                    })
+                    .collect();
                 compose_list(l, "Sent to you — tap to find & add", &rows, 0, 1)
             }
             Screen::WifiList { networks } => {
@@ -7943,11 +7962,16 @@ fn book_rows(feed: &gateway::BookFeed) -> Vec<BookRow> {
 /// (a bare root) keeps them under itself. `main` passes this explicitly so
 /// the on-device path is visible where the library path is chosen.
 pub fn books_dir_for(library: &Path) -> PathBuf {
-    library
-        .parent()
+    // A profile's library is `<root>/@name`; books are per device, not per
+    // reader (Nickel has no profiles), so step up to the root first.
+    let root = match library.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.starts_with('@') => library.parent().unwrap_or(library),
+        _ => library,
+    };
+    root.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("Books"))
-        .unwrap_or_else(|| library.join("Books"))
+        .unwrap_or_else(|| root.join("Books"))
 }
 
 fn compose_list(

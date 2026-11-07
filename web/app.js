@@ -38,8 +38,24 @@ function sessionFrom(data, email) {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
     email: data.user?.email || email,
+    user_id: data.user?.id || null,
     expires_at: Math.floor(Date.now() / 1000) + (data.expires_in || 3600),
   };
+}
+
+// The signed-in user's id: stored at sign-in, else read out of the access
+// token's `sub` claim (sessions saved before user_id existed). Uploads live
+// under "<user id>/…" in storage, and the bucket's policies compare that
+// first path segment with auth.uid() — so this has to be the real one.
+function sessionUserId(session = state.session) {
+  if (session?.user_id) return session.user_id;
+  try {
+    const payload = session.access_token.split(".")[1];
+    const json = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+    return JSON.parse(json).sub || null;
+  } catch {
+    return null;
+  }
 }
 
 async function authPost(path, body) {
@@ -182,11 +198,168 @@ async function deleteSeries(session, series) {
 // defaults to auth.uid() on insert).
 
 async function fetchSends() {
+  // Pending AND failed: a file the device refused stays listed with its
+  // reason until the sender dismisses it — the row vanishing is not feedback.
   const res = await authedFetch(
-    "send_queue?status=eq.pending&select=id,title,cover_url,created_at&order=created_at.desc"
+    "send_queue?status=in.(pending,failed)&select=id,title,cover_url,created_at,kind,file_path,file_size,status,error&order=created_at.desc"
   );
   if (!res.ok) return [];
   return res.json();
+}
+
+// Authenticated call against the uploads bucket, with the same one-shot
+// refresh-retry as authedFetch. `objectPath` is "<user id>/<random>/<name>".
+async function authedStorage(objectPath, opts = {}, retry = true) {
+  const session = state.session;
+  const encoded = objectPath.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${UPLOADS_BUCKET}/${encoded}`, {
+    ...opts,
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401 && retry && session.refresh_token) {
+    const next = await refreshSession(session).catch(() => null);
+    if (next) return authedStorage(objectPath, opts, false);
+  }
+  return res;
+}
+
+const UPLOADS_BUCKET = "kobo-uploads";
+const UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+
+// What the phone checks before uploading. The device checks the bytes again
+// (and more deeply — it opens the ZIP); this is so the common mistakes fail in
+// a second on the phone instead of after a 40 MB upload and a sync.
+const UPLOAD_KINDS = {
+  epub: { magic: [0x50, 0x4b, 0x03, 0x04], what: "an EPUB" },
+  cbz: { magic: [0x50, 0x4b, 0x03, 0x04], what: "a comic archive" },
+  pdf: { magic: [0x25, 0x50, 0x44, 0x46, 0x2d], what: "a PDF" },
+};
+
+async function validateUpload(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  const kind = UPLOAD_KINDS[ext];
+  if (!kind) throw new Error("Only .epub, .pdf and .cbz files can be sent.");
+  if (file.size === 0) throw new Error("That file is empty.");
+  if (file.size > UPLOAD_MAX_BYTES) {
+    throw new Error(`That file is ${Math.round(file.size / 1048576)} MB; the limit is 50 MB.`);
+  }
+  const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+  const looksLike = (magic) => magic.every((b, i) => head[i] === b);
+  if (!looksLike(kind.magic)) {
+    const actually = looksLike(UPLOAD_KINDS.pdf.magic)
+      ? "a PDF"
+      : looksLike(UPLOAD_KINDS.epub.magic)
+        ? "a ZIP (EPUB or CBZ)"
+        : "something else";
+    throw new Error(`That's named .${ext} but it isn't ${kind.what} — it looks like ${actually}.`);
+  }
+  return ext;
+}
+
+// Upload a file and queue it for the Kobo. The object goes up first; if the
+// queue row then fails, the object is removed so nothing is left paying for
+// storage with no row pointing at it.
+async function enqueueFile(file) {
+  await validateUpload(file);
+  const uid = sessionUserId() || "me";
+  const objectPath = `${uid}/${crypto.randomUUID()}/${file.name}`;
+  const up = await authedStorage(objectPath, {
+    method: "POST",
+    headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
+    body: file,
+  });
+  if (!up.ok) {
+    const detail = await up.json().catch(() => ({}));
+    throw new Error(
+      up.status === 401
+        ? "Session expired — sign in again"
+        : `Couldn't upload (${detail.message || detail.error || up.status})`
+    );
+  }
+  const res = await authedFetch("send_queue", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Prefer: "return=representation" },
+    body: JSON.stringify({ title: file.name, kind: "file", file_path: objectPath, file_size: file.size }),
+  });
+  if (!res.ok) {
+    authedStorage(objectPath, { method: "DELETE" }).catch(() => {});
+    throw new Error(res.status === 401 ? "Session expired — sign in again" : `Couldn't queue the file (${res.status})`);
+  }
+  return res.json();
+}
+
+const fmtBytes = (n) =>
+  n == null ? "" : n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+
+// --- Book catalogues (OPDS) ---------------------------------------------------
+//
+// Typed once on the phone, synced to the Kobo: the device merges these with
+// its own list (Project Gutenberg out of the box). A Calibre content server
+// speaks OPDS at /opds, which is the whole reason this exists.
+
+async function fetchCatalogs() {
+  const res = await authedFetch("book_catalogs?select=id,name,url,created_at&order=created_at.asc");
+  if (!res.ok) return [];
+  return res.json();
+}
+async function addCatalog(name, url) {
+  const res = await authedFetch("book_catalogs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Prefer: "return=representation" },
+    body: JSON.stringify({ name, url }),
+  });
+  if (!res.ok) {
+    if (res.status === 409) throw new Error("That catalogue is already in the list.");
+    throw new Error(res.status === 401 ? "Session expired — sign in again" : `Couldn't add it (${res.status})`);
+  }
+  return res.json();
+}
+async function deleteCatalog(id) {
+  return authedFetch(`book_catalogs?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+// Normalise what someone types for a catalogue: a bare host gets http://, a
+// Calibre server address without /opds gets it (that IS its OPDS root).
+function normalizeCatalogUrl(raw) {
+  let s = raw.trim();
+  if (!s) return null;
+  if (!/^https?:\/\//i.test(s)) s = `http://${s}`;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.pathname === "/" || u.pathname === "") u.pathname = "/opds";
+  return u.toString();
+}
+
+function catalogPanelHtml(catalogs) {
+  const list = catalogs.length
+    ? `<div class="sends">${catalogs
+        .map(
+          (c) => `
+        <div class="send-row" data-testid="catalog-item">
+          <span class="send-title"><b>${esc(c.name || new URL(c.url).host)}</b> <span class="muted">${esc(c.url)}</span></span>
+          <button class="send-x" data-id="${esc(c.id)}" data-testid="catalog-remove" aria-label="remove">×</button>
+        </div>`
+        )
+        .join("")}</div>`
+    : `<p class="send-hint">Add a book catalogue and it appears under Books on your Kobo. A Calibre content server's address works as-is (its OPDS feed is at /opds). Project Gutenberg is there already.</p>`;
+  return `<section class="panel send-panel" data-testid="catalog-panel">
+    <div class="section-label">Book catalogues</div>
+    <form class="send-form catalog-form" id="catalog-form">
+      <input type="text" id="catalog-name" data-testid="catalog-name" placeholder="Name (e.g. Home)" maxlength="120" autocomplete="off" />
+      <input type="text" id="catalog-url" data-testid="catalog-url" placeholder="http://calibre.local:8080" maxlength="2048" autocomplete="off" inputmode="url" />
+      <button class="primary" type="submit" data-testid="catalog-add">Add</button>
+    </form>
+    <div class="note send-note" id="catalog-note" data-testid="catalog-note"></div>
+    ${list}
+  </section>`;
 }
 async function enqueueSend(title, coverUrl) {
   const res = await authedFetch("send_queue", {
@@ -1870,26 +2043,39 @@ function recentHtml(groups) {
 }
 
 // Enqueue-a-title panel + the list of what's still waiting on the device.
+function sendRowHtml(s) {
+  const isFile = s.kind === "file";
+  const failed = s.status === "failed";
+  const meta = failed
+    ? `<span class="send-fail" data-testid="send-error">${esc(s.error || "the Kobo couldn't save it")}</span>`
+    : isFile
+      ? `<span class="ago">${esc(fmtBytes(s.file_size))} · ${esc(timeAgo(s.created_at))}</span>`
+      : `<span class="ago">${esc(timeAgo(s.created_at))}</span>`;
+  return `
+        <div class="send-row${failed ? " send-failed" : ""}" data-testid="send-item" data-kind="${esc(s.kind || "title")}"${failed ? ' data-status="failed"' : ""}>
+          ${s.cover_url ? `<img class="send-cover" src="${esc(s.cover_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : ""}
+          ${isFile ? `<span class="send-icon" aria-hidden="true">📄</span>` : ""}
+          <span class="send-title">${esc(s.title)}${failed ? "<br/>" : ""}${failed ? meta : ""}</span>
+          ${failed ? "" : meta}
+          <button class="send-x" data-id="${esc(s.id)}" data-path="${esc(s.file_path || "")}" data-testid="send-remove" aria-label="remove">×</button>
+        </div>`;
+}
+
 function sendPanelHtml(sends) {
   const list = sends.length
-    ? `<div class="sends">${sends
-        .map(
-          (s) => `
-        <div class="send-row" data-testid="send-item">
-          ${s.cover_url ? `<img class="send-cover" src="${esc(s.cover_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : ""}
-          <span class="send-title">${esc(s.title)}</span>
-          <span class="ago">${esc(timeAgo(s.created_at))}</span>
-          <button class="send-x" data-id="${esc(s.id)}" data-testid="send-remove" aria-label="remove">×</button>
-        </div>`
-        )
-        .join("")}</div>`
-    : `<p class="send-hint">Send a manga to your Kobo: type a title and it shows up on the device as a notification — tap it there to search your sources and add it.</p>`;
+    ? `<div class="sends">${sends.map(sendRowHtml).join("")}</div>`
+    : `<p class="send-hint">Send a manga to your Kobo: type a title and it shows up on the device as a notification — tap it there to search your sources and add it. Or send a file from this phone: an EPUB or PDF lands in the Kobo's own library, a CBZ in gideon's.</p>`;
   return `<section class="panel send-panel">
     <div class="section-label">Send to Kobo</div>
     <form class="send-form" id="send-form">
       <input type="text" id="send-title" data-testid="send-input" placeholder="Manga title…" maxlength="512" autocomplete="off" />
       <button class="primary" type="submit" data-testid="send-btn">Send</button>
     </form>
+    <div class="send-upload">
+      <input type="file" id="send-file" data-testid="send-file" accept=".epub,.pdf,.cbz,application/epub+zip,application/pdf" hidden />
+      <button class="ghost" type="button" id="send-file-btn" data-testid="send-file-btn">Send a file from this phone…</button>
+      <span class="send-hint inline">EPUB, PDF or CBZ, up to 50 MB</span>
+    </div>
     <div class="note send-note" id="send-note" data-testid="send-note"></div>
     ${list}
   </section>`;
@@ -1983,6 +2169,7 @@ function viewToday(stats, groups, covers, rows) {
 
 function viewStats(stats, groups, sends) {
   return `${sendPanelHtml(sends)}
+    ${catalogPanelHtml(state.catalogs || [])}
     ${statTilesHtml(stats)}
     <section class="panel">
       <div class="section-label">Reading activity</div>
@@ -2689,11 +2876,69 @@ function renderDashboard(email, rows) {
       }
     });
   }
+  const fileInput = document.getElementById("send-file");
+  const fileBtn = document.getElementById("send-file-btn");
+  if (fileInput && fileBtn) {
+    fileBtn.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const note = document.getElementById("send-note");
+      fileBtn.disabled = true;
+      note.textContent = `Uploading ${file.name}…`;
+      try {
+        const [row] = await enqueueFile(file);
+        if (row) state.sends = [row, ...state.sends];
+        renderDashboard(email, rows);
+      } catch (err) {
+        fileBtn.disabled = false;
+        fileInput.value = "";
+        note.textContent = err.message || "Couldn't send the file — try again.";
+      }
+    });
+  }
   for (const btn of app.querySelectorAll('[data-testid="send-remove"]')) {
     btn.addEventListener("click", async () => {
       const id = btn.getAttribute("data-id");
+      const path = btn.getAttribute("data-path");
       deleteSend(id).catch(() => {});
+      // A file send owns a storage object; drop it too (best-effort — the
+      // device deletes it itself once it has placed the file).
+      if (path) authedStorage(path, { method: "DELETE" }).catch(() => {});
       state.sends = state.sends.filter((s) => s.id !== id);
+      renderDashboard(email, rows);
+    });
+  }
+  const catalogForm = document.getElementById("catalog-form");
+  if (catalogForm) {
+    catalogForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const nameEl = document.getElementById("catalog-name");
+      const urlEl = document.getElementById("catalog-url");
+      const note = document.getElementById("catalog-note");
+      const btn = catalogForm.querySelector("button");
+      const url = normalizeCatalogUrl(urlEl.value);
+      if (!url) {
+        note.textContent = "That doesn't look like an address — try something like http://calibre.local:8080";
+        return;
+      }
+      btn.disabled = true;
+      note.textContent = "";
+      try {
+        const [row] = await addCatalog(nameEl.value.trim(), url);
+        if (row) state.catalogs = [...(state.catalogs || []), row];
+        renderDashboard(email, rows);
+      } catch (err) {
+        btn.disabled = false;
+        note.textContent = err.message || "Couldn't add it — try again.";
+      }
+    });
+  }
+  for (const btn of app.querySelectorAll('[data-testid="catalog-remove"]')) {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-id");
+      deleteCatalog(id).catch(() => {});
+      state.catalogs = (state.catalogs || []).filter((c) => c.id !== id);
       renderDashboard(email, rows);
     });
   }
@@ -3065,6 +3310,7 @@ async function showDashboard(session) {
     for (const r of rows) state.resume[r.chapter_key] = r.current_page;
     state.rows = rows;
     state.sends = await fetchSends().catch(() => []);
+    state.catalogs = await fetchCatalogs().catch(() => []);
     // Covers for the library shelf (best-effort decor).
     state.covers = coverBySeries(await fetchAllChapterPages().catch(() => []));
     renderDashboard(email, rows);
