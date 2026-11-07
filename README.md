@@ -41,9 +41,12 @@ The core pipeline works end to end:
   where the Kobo's own reader picks them up the next time Nickel starts —
   which is what exiting gideon does. The Library has two tabs, **Manga**
   and **Books**: the Books tab lists everything in that folder by its own
-  title and author, and tapping a book offers *Read in the Kobo reader*
-  (closes gideon) or *Delete*. gideon does not read EPUBs itself; Nickel
-  already does that well. Add your own catalogue — a Calibre content
+  title and author. Tap a book and *Read* opens it in gideon's own reader —
+  the EPUB's chapters flowed as text, pages turned by tap, bezel button or
+  remote, text size from the middle-tap menu, your place kept by paragraph
+  — so reading a novel does not mean leaving the app. *Read in the Kobo
+  reader* (closes gideon) is still there for PDFs and for books that are
+  pictures rather than text. Add your own catalogue — a Calibre content
   server's address is enough, its OPDS feed is at `/opds` — under *Book
   catalogues* on the web dashboard; it reaches the Kobo on its next sync.
   (`book_catalogs` in `settings.json` still works for a device-only entry.)

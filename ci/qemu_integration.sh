@@ -73,10 +73,20 @@ echo "$BOOKS" | grep -F "Slaughterhouse-Five — Kurt Vonnegut" >/dev/null \
 $RUN "$KOBO_BIN" books "$WORKDIR/nope/Books" | grep -F "No books" >/dev/null \
     || fail "a missing Books folder should be an empty shelf, not an error"
 
+echo "==> [kobo binary] book: the reader flattens an EPUB's spine to chapters and paragraphs"
+BOOK=$($RUN "$KOBO_BIN" book "$WORKDIR/Books/Kurt Vonnegut/book-0001.epub")
+echo "$BOOK" | grep -F "Slaughterhouse-Five — Kurt Vonnegut" >/dev/null || fail "book title line missing: $BOOK"
+echo "$BOOK" | grep -F "2 chapter(s), 5 paragraph(s)" >/dev/null || fail "chapter/paragraph count wrong: $BOOK"
+# Spine order, headings as chapter titles, CSS text not mistaken for prose.
+echo "$BOOK" | tr '\n' ' ' | grep -E "1\. One .*All this happened.*2\. Two .*Listen" >/dev/null \
+    || fail "chapters not in spine order with their first paragraphs: $BOOK"
+echo "$BOOK" | grep -F "x:y" >/dev/null && fail "stylesheet text leaked into the book"
+
 echo "==> [kobo binary] browse --screenshot: Library renders both tabs headlessly"
 $RUN "$KOBO_BIN" browse --library "$WORKDIR/manga" --screenshot "$WORKDIR/library.png" --screen library
 $RUN "$KOBO_BIN" browse --library "$WORKDIR/manga" --screenshot "$WORKDIR/books.png" --screen books
-for shot in library books; do
+$RUN "$KOBO_BIN" browse --library "$WORKDIR/manga" --screenshot "$WORKDIR/reader.png" --screen reader
+for shot in library books reader; do
     [ -s "$WORKDIR/$shot.png" ] || fail "$shot screenshot is empty"
     head -c 8 "$WORKDIR/$shot.png" | grep -F "PNG" >/dev/null || fail "$shot screenshot is not a PNG"
 done

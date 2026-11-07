@@ -284,12 +284,17 @@ fn tap_today() -> UiEvent {
 /// bottom and `sheet_height` is a title row plus one row each, so the
 /// geometry follows from the row count alone.
 fn tap_modal_row(rows: u32, i: usize) -> UiEvent {
-    let l = layout();
-    let top = H - (rows + 1) * l.row_h;
     UiEvent::Tap {
         x: W / 2,
-        y: top + l.row_h + i as u32 * l.row_h + l.row_h / 2,
+        y: tap_modal_row_y(rows, i),
     }
+}
+
+/// The y of row `i` of a `rows`-row sheet.
+fn tap_modal_row_y(rows: u32, i: usize) -> u32 {
+    let l = layout();
+    let top = H - (rows + 1) * l.row_h;
+    top + l.row_h + i as u32 * l.row_h + l.row_h / 2
 }
 
 /// Tap row `i` of the book sheet a long press on a library card opens:
@@ -8908,7 +8913,8 @@ fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
     // in flight. Every report moves the lamp; nothing waits for the lift.
     let start = (at(10), slider_row(0));
     for stop in [30, 60, 90] {
-        app.drag_menu(start.0, start.1, at(stop), start.1).unwrap();
+        app.drag_menu(start.0, start.1, at(stop), start.1, false)
+            .unwrap();
         assert_eq!(
             levels.borrow().0,
             stop as u8,
@@ -8918,7 +8924,8 @@ fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
 
     // Now scrub back the other way without lifting — the same drag, reversing.
     let before = app.display().flushes.len();
-    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    app.drag_menu(start.0, start.1, at(40), start.1, false)
+        .unwrap();
     assert_eq!(levels.borrow().0, 40, "dragging back down lowers it");
     assert_eq!(
         app.display().flushes[before..],
@@ -8930,12 +8937,13 @@ fn a_slider_scrubs_from_wherever_the_finger_lands_and_goes_both_ways() {
     // panel reports motion far faster than e-ink can repaint, and a scrub that
     // spent a refresh per report would lag behind the finger.
     let before = app.display().flushes.len();
-    app.drag_menu(start.0, start.1, at(40), start.1).unwrap();
+    app.drag_menu(start.0, start.1, at(40), start.1, false)
+        .unwrap();
     assert_eq!(app.display().flushes[before..], [], "no change, no repaint");
 
     // Vertical drift off the row keeps scrubbing the slider it started on —
     // it must not hand the drag to the row below.
-    app.drag_menu(start.0, start.1, at(80), slider_row(1))
+    app.drag_menu(start.0, start.1, at(80), slider_row(1), false)
         .unwrap();
     assert_eq!(levels.borrow().0, 80, "brightness kept the drag");
     assert_eq!(levels.borrow().1, 0, "warmth was never touched");
@@ -8967,7 +8975,8 @@ fn a_drag_that_starts_off_the_sliders_leaves_the_sheet_alone() {
         (sheet.grid.y + sheet.grid.cell_h / 2, "on a tile"),
         (sheet.actions_top + l.row_h / 2, "on an action row"),
     ] {
-        app.drag_menu(l.pad, y0, l.width - l.pad, y0).unwrap();
+        app.drag_menu(l.pad, y0, l.width - l.pad, y0, false)
+            .unwrap();
         assert_eq!(*levels.borrow(), untouched, "the lamp moved from {what}");
         assert!(app.sheet().is_some(), "the sheet closed from {what}");
     }
@@ -9725,6 +9734,12 @@ mod library_tabs {
 
     /// A minimal EPUB whose OPF names it; the file name does not.
     fn make_epub(path: &Path, title: &str, author: &str) {
+        make_epub_with(path, title, author, &[("One", &["So it goes."])]);
+    }
+
+    /// A readable EPUB: each chapter is a heading and its paragraphs, in a
+    /// spine in that order.
+    fn make_epub_with(path: &Path, title: &str, author: &str, chapters: &[(&str, &[&str])]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -9734,12 +9749,28 @@ mod library_tabs {
             br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#,
         )
         .unwrap();
+        let mut manifest = String::new();
+        let mut spine = String::new();
+        for i in 0..chapters.len() {
+            manifest.push_str(&format!(
+                r#"<item id="c{i}" href="c{i}.xhtml" media-type="application/xhtml+xml"/>"#
+            ));
+            spine.push_str(&format!(r#"<itemref idref="c{i}"/>"#));
+        }
         zip.start_file("content.opf", opts).unwrap();
         write!(
             zip,
-            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata></package>"#
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
         )
         .unwrap();
+        for (i, (heading, paras)) in chapters.iter().enumerate() {
+            zip.start_file(format!("c{i}.xhtml"), opts).unwrap();
+            write!(zip, "<html><body><h1>{heading}</h1>").unwrap();
+            for p in paras.iter() {
+                write!(zip, "<p>{p}</p>").unwrap();
+            }
+            write!(zip, "</body></html>").unwrap();
+        }
         zip.finish().unwrap();
     }
 
@@ -9763,9 +9794,58 @@ mod library_tabs {
         }
     }
 
-    /// Row `i` of the three-row book sheet: 0 read in Kobo, 1 delete, 2 close.
+    /// Row `i` of an EPUB's four-row book sheet: 0 read here, 1 read in
+    /// Kobo, 2 delete, 3 close.
     fn tap_book_file_row(i: usize) -> UiEvent {
-        tap_modal_row(3, i)
+        tap_modal_row(4, i)
+    }
+
+    /// A tap in the reader: left third back, middle menu, right third next.
+    fn tap_reader(zone: ReaderZone) -> UiEvent {
+        let x = match zone {
+            ReaderZone::PrevPage => W / 6,
+            ReaderZone::Back => W / 2,
+            ReaderZone::NextPage => W * 5 / 6,
+        };
+        UiEvent::Tap { x, y: H / 2 }
+    }
+
+    /// Row `i` of the reading menu: 0 larger, 1 smaller, 2 close book, 3 close.
+    fn tap_reading_row(i: usize) -> UiEvent {
+        tap_modal_row(4, i)
+    }
+
+    /// Open the first book on the Books tab in gideon's reader.
+    fn open_first_book() -> Vec<UiEvent> {
+        vec![
+            tap_nav(0),
+            tap_books_tab(),
+            tap_row(0),
+            tap_book_file_row(0),
+        ]
+    }
+
+    /// A novel long enough to span pages and chapters.
+    fn novel(dir: &Path) -> (PathBuf, PathBuf) {
+        let lib = dir.join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let books = lib.join("Books");
+        let long: Vec<String> = (0..60)
+            .map(|i| {
+                format!(
+                    "Paragraph {i}: Billy Pilgrim has come unstuck in time, and so it goes, \
+                     again and again, across every page of this chapter."
+                )
+            })
+            .collect();
+        let long_refs: Vec<&str> = long.iter().map(String::as_str).collect();
+        make_epub_with(
+            &books.join("Kurt Vonnegut/book-0001.epub"),
+            "Slaughterhouse-Five",
+            "Kurt Vonnegut",
+            &[("One", &long_refs), ("Two", &["Listen:", "Short chapter."])],
+        );
+        (lib, books)
     }
 
     fn shelf(dir: &Path) -> (PathBuf, PathBuf) {
@@ -9891,7 +9971,7 @@ mod library_tabs {
     }
 
     #[test]
-    fn tapping_a_book_offers_the_kobo_reader_and_reading_closes_gideon() {
+    fn the_kobo_reader_row_closes_gideon() {
         let dir = tempfile::tempdir().unwrap();
         let (lib, _) = shelf(dir.path());
         let events = vec![tap_nav(0), tap_books_tab(), tap_row(0)];
@@ -9908,7 +9988,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(0),
+            tap_book_file_row(1),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
         let exit = ui.run().unwrap();
@@ -9929,7 +10009,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(1),
+            tap_book_file_row(2),
             tap_modal_row(2, 1),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -9942,7 +10022,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(1),
+            tap_book_file_row(2),
             tap_modal_row(2, 0),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -9973,5 +10053,258 @@ mod library_tabs {
         assert!(matches!(ui.screen(), Screen::Library { .. }));
         // The list is the default, so one toggle lands on the cover shelf.
         assert_eq!(ui.load_settings().library_view, "shelf");
+    }
+
+    // --- reading in gideon ---
+
+    #[test]
+    fn read_opens_the_book_in_gideon_and_turns_pages_partially() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader {
+            text,
+            chapter,
+            pages,
+            page,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        assert_eq!(text.chapters.len(), 2);
+        assert_eq!((*chapter, *page), (0, 0));
+        assert!(
+            pages.len() > 1,
+            "sixty paragraphs span pages: {}",
+            pages.len()
+        );
+        assert_eq!(pages[0][0].text, "One");
+        assert!(pages[0][0].bold, "the heading is bold");
+        assert!(pages[0].iter().any(|l| l.text.starts_with("Paragraph 0:")));
+        // Opening is a push: Full. The page is text only, no chrome.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert!(
+            ui.display().pixel(5, 5) > 0xf0,
+            "no title bar: the page is the book"
+        );
+
+        // Turn forward: Partial, no flash for a page of text.
+        let mut events = open_first_book();
+        events.push(tap_reader(ReaderZone::NextPage));
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert_eq!(*page, 1);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+    }
+
+    #[test]
+    fn page_turn_buttons_and_the_remote_turn_book_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let mut events = open_first_book();
+        events.extend([UiEvent::PageForward, UiEvent::RemoteNext, UiEvent::PageBack]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert_eq!(*page, 1);
+    }
+
+    #[test]
+    fn turning_past_a_chapter_crosses_into_the_next_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        let n = pages.len();
+        for _ in 0..n {
+            ui.turn_book_page(1).unwrap();
+        }
+        let Screen::BookReader {
+            chapter,
+            page,
+            pages,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the reader");
+        };
+        assert_eq!(
+            (*chapter, *page),
+            (1, 0),
+            "one past the last page is the next chapter"
+        );
+        assert_eq!(pages[0][0].text, "Two");
+        // The end of the book is a wall, not a crash.
+        ui.turn_book_page(1).unwrap();
+        ui.turn_book_page(1).unwrap();
+        let Screen::BookReader { chapter, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert_eq!(*chapter, 1);
+        // Back across the boundary lands on the previous chapter's last page.
+        ui.turn_book_page(-1).unwrap();
+        let Screen::BookReader {
+            chapter,
+            page,
+            pages,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the reader");
+        };
+        assert_eq!((*chapter, *page), (0, pages.len() - 1));
+    }
+
+    #[test]
+    fn the_reader_flashes_every_n_turns_to_clear_ghosting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let before = ui.display().flushes.len();
+        for _ in 0..8 {
+            ui.turn_book_page(1).unwrap();
+        }
+        let turns = &ui.display().flushes[before..];
+        assert_eq!(turns.len(), 8);
+        assert!(turns[..7].iter().all(|m| *m == RefreshMode::Partial));
+        assert_eq!(turns[7], RefreshMode::Full, "the eighth turn flashes");
+    }
+
+    #[test]
+    fn the_place_is_kept_and_resumed_by_paragraph_across_a_text_size_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        ui.turn_book_page(1).unwrap();
+        ui.turn_book_page(1).unwrap();
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        let top_block = pages[*page][0].block;
+        assert!(top_block > 0);
+        let saved = gideon_core::BookPlaces::load(&books)
+            .get("Kurt Vonnegut/book-0001.epub")
+            .expect("place saved on every turn");
+        assert_eq!((saved.chapter, saved.block), (0, top_block));
+
+        // Close via the menu, reopen: same paragraph at the top.
+        let mut events = open_first_book();
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(2)]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(
+            matches!(ui.screen(), Screen::BookShelf { .. }),
+            "Close book returns to the shelf"
+        );
+
+        // A settings dir, so the text size has somewhere to persist.
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book())
+            .with_settings_dir(dir.path().join("data"));
+        ui.run().unwrap();
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert_eq!(
+            pages[*page][0].block, top_block,
+            "resumed at the paragraph, not page 1"
+        );
+
+        // Larger text: fewer lines per page, same paragraph on the page.
+        ui.sheet = Some(Sheet::BookReading);
+        ui.tap_sheet(W / 2, tap_modal_row_y(4, 0)).unwrap();
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert!(pages[*page].iter().any(|l| l.block == top_block));
+        assert_eq!(ui.load_settings().book_text_px, 50);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn a_pdf_offers_only_the_kobo_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let books = lib.join("Books");
+        std::fs::create_dir_all(books.join("Someone")).unwrap();
+        std::fs::write(books.join("Someone/paper.pdf"), b"%PDF-1.4").unwrap();
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab(), tap_row(0)],
+        );
+        ui.run().unwrap();
+        let (_, rows) = ui.sheet_rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Read in the Kobo reader", "Delete this book", "Close"]
+        );
+    }
+
+    #[test]
+    fn the_book_reader_has_the_lamp_edge_slides_like_a_kindle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let (levels, log, lights) = lights_recording();
+        let drag_to = |y1: u32| UiEvent::Drag {
+            x0: W - 5,
+            y0: H - 100,
+            x1: W - 5,
+            y1,
+        };
+        let mut events = open_first_book();
+        events.extend([
+            // Up the right edge in two reports, then lift: 20 → 45 → 70, and
+            // the release at the same spot does not add again.
+            drag_to(H - 100 - H / 4),
+            drag_to(H - 100 - H / 2),
+            UiEvent::Swipe {
+                x0: W - 5,
+                y0: H - 100,
+                x1: W - 5,
+                y1: H - 100 - H / 2,
+            },
+            // Up the left edge: night light.
+            UiEvent::Swipe {
+                x0: 5,
+                y0: H - 100,
+                x1: 5,
+                y1: H - 100 - H / 4,
+            },
+            // A mid-screen drag is nothing: no page turn, no lamp.
+            UiEvent::Swipe {
+                x0: W / 2,
+                y0: H / 2,
+                x1: W / 2,
+                y1: H / 4,
+            },
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        ui.run().unwrap();
+        assert_eq!(*levels.borrow(), (70, 25));
+        assert_eq!(
+            *log.borrow(),
+            vec![Lamp::Brightness(45), Lamp::Brightness(70), Lamp::Warmth(25)],
+            "the lamp followed the finger and the lift added nothing"
+        );
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("still reading");
+        };
+        assert_eq!(*page, 0, "slides and swipes do not turn pages");
+        // Each change repainted the page with its banner, without a flash.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
     }
 }

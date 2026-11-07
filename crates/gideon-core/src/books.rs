@@ -6,7 +6,10 @@
 //! scan, so a book you just sent is visible where you went looking for it,
 //! not only after a reboot into the stock home screen.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use crate::natsort::natural_cmp;
 use crate::upload::{epub_meta_file, nice_name};
@@ -158,10 +161,67 @@ fn file_name_author(file_name: &str) -> Option<String> {
     looks_like_name.then(|| second.to_string())
 }
 
+/// Where the reader left off in a book: a chapter and a paragraph in it.
+/// Paragraph, not page — pages depend on the text size, and changing it
+/// must not lose the place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BookPlace {
+    pub chapter: usize,
+    pub block: usize,
+    /// The wrapped line within the paragraph at the top of the page: a long
+    /// paragraph spans pages, and this says which of them.
+    #[serde(default)]
+    pub line: usize,
+    /// Chapters in the book when the place was saved, for "n% read".
+    #[serde(default)]
+    pub chapters: usize,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Every book's place, keyed by its path relative to the Books folder.
+/// Lives in a dotfile beside the books, which Nickel ignores.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BookPlaces {
+    #[serde(default)]
+    pub places: BTreeMap<String, BookPlace>,
+}
+
+impl BookPlaces {
+    pub const FILE: &'static str = ".gideon-places.json";
+
+    pub fn load(books_dir: &Path) -> Self {
+        std::fs::read(books_dir.join(Self::FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, books_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(books_dir)?;
+        let path = books_dir.join(Self::FILE);
+        let tmp = books_dir.join(".gideon-places.json.part");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap_or_default())?;
+        std::fs::rename(tmp, path)
+    }
+
+    pub fn get(&self, relative_path: &str) -> Option<BookPlace> {
+        self.places.get(relative_path).copied()
+    }
+
+    pub fn set(&mut self, relative_path: &str, place: BookPlace) {
+        self.places.insert(relative_path.to_string(), place);
+    }
+}
+
 /// Delete a book and, when that leaves its author folder empty, the folder
 /// — so the shelf never shows a nameless author with nothing under them.
 pub fn delete(root: &Path, book: &Book) -> std::io::Result<()> {
     std::fs::remove_file(&book.path)?;
+    let mut places = BookPlaces::load(root);
+    if places.places.remove(&book.relative_path).is_some() {
+        let _ = places.save(root);
+    }
     if let Some(parent) = book.path.parent() {
         if parent != root
             && std::fs::read_dir(parent)
@@ -268,6 +328,31 @@ mod tests {
         let by_title = |t: &str| books.iter().find(|b| b.title == t).unwrap().author.clone();
         assert_eq!(by_title("Plain Title"), None);
         assert_eq!(by_title("Dated"), None, "a year is not an author");
+    }
+
+    #[test]
+    fn places_round_trip_and_follow_a_deleted_book_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        epub(&root.join("A/one.epub"), "One", "A");
+        let mut places = BookPlaces::load(root);
+        places.set(
+            "A/one.epub",
+            BookPlace {
+                chapter: 3,
+                block: 12,
+                line: 0,
+                chapters: 20,
+                updated_at: 1,
+            },
+        );
+        places.save(root).unwrap();
+        assert_eq!(BookPlaces::load(root).get("A/one.epub").unwrap().block, 12);
+        // The dotfile is not a book.
+        assert_eq!(scan(root).unwrap().len(), 1);
+        let one = scan(root).unwrap().remove(0);
+        delete(root, &one).unwrap();
+        assert!(BookPlaces::load(root).get("A/one.epub").is_none());
     }
 
     #[test]

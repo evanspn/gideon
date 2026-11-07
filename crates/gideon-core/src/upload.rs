@@ -213,7 +213,7 @@ fn epub_meta_from<R: Read + std::io::Seek>(mut archive: zip::ZipArchive<R>) -> B
 }
 
 /// The `full-path` of the first `<rootfile>` in container.xml.
-fn opf_path_from_container(xml: &str) -> Option<String> {
+pub(crate) fn opf_path_from_container(xml: &str) -> Option<String> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -233,7 +233,7 @@ fn opf_path_from_container(xml: &str) -> Option<String> {
 }
 
 /// `dc:title` (the first) and every `dc:creator` (joined) from an OPF.
-fn opf_meta(xml: &str) -> BookMeta {
+pub(crate) fn opf_meta(xml: &str) -> BookMeta {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);

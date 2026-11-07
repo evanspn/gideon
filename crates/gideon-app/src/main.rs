@@ -79,6 +79,10 @@ enum Command {
         dir: PathBuf,
     },
 
+    /// Show what gideon's reader makes of an EPUB: its chapters and the
+    /// opening lines of each.
+    Book { path: PathBuf },
+
     /// List manga sources available from configured source lists.
     Sources {
         /// Additional source list URLs (on top of the preinstalled ones).
@@ -134,7 +138,8 @@ enum Command {
         /// verification; no device needed).
         #[arg(long)]
         screenshot: Option<PathBuf>,
-        /// Which screen `--screenshot` renders: today, library or books.
+        /// Which screen `--screenshot` renders: today, library, books, or
+        /// reader (the first EPUB on the shelf, open at its first page).
         #[arg(long, default_value = "library")]
         screen: String,
     },
@@ -242,6 +247,7 @@ fn main() -> Result<()> {
         },
         Command::Update { check, major } => cmd_update(check, major),
         Command::Books { dir } => cmd_books(dir),
+        Command::Book { path } => cmd_book(path),
         Command::Browse {
             library,
             screenshot,
@@ -393,6 +399,37 @@ fn cmd_books(dir: PathBuf) -> Result<()> {
             book.label(),
             book.relative_path
         );
+    }
+    Ok(())
+}
+
+fn cmd_book(path: PathBuf) -> Result<()> {
+    let text = gideon_core::epub::load(&path)
+        .with_context(|| format!("couldn't open {}", path.display()))?;
+    println!(
+        "{} — {}",
+        text.title.as_deref().unwrap_or("(untitled)"),
+        text.author.as_deref().unwrap_or("(unknown author)")
+    );
+    println!(
+        "{} chapter(s), {} paragraph(s)\n",
+        text.chapters.len(),
+        text.block_count()
+    );
+    for (i, chapter) in text.chapters.iter().enumerate() {
+        println!(
+            "  {:>3}. {} ({} paragraphs)",
+            i + 1,
+            chapter.title.as_deref().unwrap_or("(no heading)"),
+            chapter.blocks.len()
+        );
+        if let Some(first) = chapter.blocks.iter().find_map(|b| match b {
+            gideon_core::BookBlock::Paragraph(p) => Some(p),
+            _ => None,
+        }) {
+            let preview: String = first.chars().take(72).collect();
+            println!("       {preview}");
+        }
     }
     Ok(())
 }
@@ -604,7 +641,10 @@ fn browse_screenshot(library: PathBuf, out: PathBuf, screen: &str) -> Result<()>
         "today" => ui::StartScreen::Today,
         "library" | "manga" => ui::StartScreen::Library,
         "books" => ui::StartScreen::Books,
-        other => anyhow::bail!("unknown screen {other:?}: expected today, library or books"),
+        "reader" => ui::StartScreen::Reader,
+        other => {
+            anyhow::bail!("unknown screen {other:?}: expected today, library, books or reader")
+        }
     };
 
     let display = MemoryDisplay::new(1072, 1448);
