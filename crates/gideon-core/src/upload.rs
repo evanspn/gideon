@@ -96,8 +96,19 @@ pub fn classify(file_name: &str, bytes: &[u8]) -> Result<UploadKind> {
 /// A ZIP is an EPUB when it carries EPUB's container structure, a CBZ when
 /// it holds page images, and neither otherwise.
 fn classify_zip(bytes: &[u8]) -> Result<UploadKind> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| Error::InvalidUpload(format!("not a readable ZIP: {e}")))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
+        let text = e.to_string();
+        // The end-of-central-directory record is the last thing in a ZIP;
+        // its absence means the file stops early — damaged at the source, or
+        // cut short on its way here. Say that, not the parser's acronym.
+        if text.contains("EOCD") {
+            Error::InvalidUpload(
+                "the archive is damaged or incomplete (no end-of-archive record)".into(),
+            )
+        } else {
+            Error::InvalidUpload(format!("not a readable ZIP: {text}"))
+        }
+    })?;
     let mut has_container = false;
     let mut epub_mimetype = false;
     let mut pages = 0usize;
@@ -487,8 +498,17 @@ mod tests {
         assert!(err.contains("neither an EPUB nor a comic"), "{err}");
         // Empty.
         assert!(classify("x.pdf", b"").is_err());
-        // Starts like a ZIP but isn't one.
-        assert!(classify("x.cbz", b"PK\x03\x04garbage").is_err());
+        // Starts like a ZIP but isn't one: a truncated archive, in the words
+        // the phone should show.
+        let err = classify("x.cbz", b"PK\x03\x04garbage")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("damaged or incomplete"), "{err}");
+        // A real archive with its tail chopped off says the same.
+        let mut cut = cbz();
+        cut.truncate(cut.len() - 30);
+        let err = classify("x.cbz", &cut).unwrap_err().to_string();
+        assert!(err.contains("damaged or incomplete"), "{err}");
     }
 
     #[test]

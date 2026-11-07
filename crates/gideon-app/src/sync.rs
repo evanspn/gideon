@@ -348,6 +348,22 @@ fn place_file_sends(library_dir: &Path, account: &Account, sends: Vec<SendItem>)
                 continue;
             }
         };
+        // The row says how big the file is. Fewer bytes than that is a
+        // download that was cut short, not a bad file: keep the send (and
+        // its object) and try again next sweep, rather than refusing a book
+        // that is fine and deleting it.
+        if let Some(expected) = send.file_size {
+            if bytes.len() as u64 != expected {
+                eprintln!(
+                    "sync: \"{}\" arrived as {} of {} bytes; retrying next sync",
+                    send.title,
+                    bytes.len(),
+                    expected
+                );
+                remaining.push(send);
+                continue;
+            }
+        }
         match place_upload(library_dir, &books_dir, &send.title, &bytes) {
             Ok(dest) => {
                 eprintln!("sync: saved \"{}\" to {}", send.title, dest.display());

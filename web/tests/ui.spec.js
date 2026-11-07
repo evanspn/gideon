@@ -653,6 +653,7 @@ test("library list view looks right", async ({ page }) => {
 function mockStorage(page) {
   const objects = [];
   const deleted = [];
+  const storage = { objects, deleted, reportSize: null };
   page.route("**/storage/v1/object/kobo-uploads/**", async (route) => {
     const req = route.request();
     const path = decodeURIComponent(req.url().split("/kobo-uploads/")[1]);
@@ -660,13 +661,20 @@ function mockStorage(page) {
       objects.push({ path, size: (req.postDataBuffer() || Buffer.alloc(0)).length, type: req.headers()["content-type"] });
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ Key: `kobo-uploads/${path}` }) });
     }
+    if (req.method() === "HEAD") {
+      const obj = objects.find((o) => o.path === path);
+      if (!obj) return route.fulfill({ status: 404, body: "" });
+      // A test can make storage report a short object to model a cut-short upload.
+      const size = typeof storage.reportSize === "number" ? storage.reportSize : obj.size;
+      return route.fulfill({ status: 200, headers: { "content-length": String(size) }, body: "" });
+    }
     if (req.method() === "DELETE") {
       deleted.push(path);
       return route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
     }
     return route.fulfill({ status: 404, body: "" });
   });
-  return { objects, deleted };
+  return storage;
 }
 
 function mockCatalogs(page, initial = []) {
@@ -696,7 +704,14 @@ function mockCatalogs(page, initial = []) {
   return () => items;
 }
 
-const EPUB_BYTES = Buffer.from("PK\x03\x04 a tiny epub", "latin1");
+// A ZIP's bare bones: a local header up front and the end-of-central-directory
+// record (PK\x05\x06 + 18 bytes) at the end, which is what a damaged or
+// half-downloaded archive lacks.
+const EPUB_BYTES = Buffer.concat([
+  Buffer.from("PK\x03\x04 a tiny epub ", "latin1"),
+  Buffer.from("PK\x05\x06", "latin1"),
+  Buffer.alloc(18),
+]);
 
 async function signedInOnStats(page) {
   await mockProgress(page, ROWS);
@@ -772,6 +787,30 @@ test("a file that isn't what its extension says is refused on the phone, before 
 
   expect(storage.objects).toHaveLength(0);
   await expect(page.getByTestId("send-item")).toHaveCount(0);
+});
+
+test("a ZIP with no end-of-archive record is refused on the phone as damaged", async ({ page }) => {
+  await mockSends(page);
+  await mockCatalogs(page);
+  const storage = mockStorage(page);
+  await signedInOnStats(page);
+  // Starts like a ZIP, never ends like one: what a half-downloaded EPUB is.
+  await page.getByTestId("send-file").setInputFiles({ name: "cut.epub", mimeType: "application/epub+zip", buffer: Buffer.from("PK\x03\x04 and then nothing", "latin1") });
+  await expect(page.getByTestId("send-note")).toContainText("damaged or incomplete");
+  expect(storage.objects).toHaveLength(0);
+  await expect(page.getByTestId("send-item")).toHaveCount(0);
+});
+
+test("an upload that arrives short is deleted and reported, never queued", async ({ page }) => {
+  await mockSends(page);
+  await mockCatalogs(page);
+  const storage = mockStorage(page);
+  storage.reportSize = 10; // storage says it holds 10 bytes of a bigger file
+  await signedInOnStats(page);
+  await page.getByTestId("send-file").setInputFiles({ name: "book.epub", mimeType: "application/epub+zip", buffer: EPUB_BYTES });
+  await expect(page.getByTestId("send-note")).toContainText("cut short");
+  await expect(page.getByTestId("send-item")).toHaveCount(0);
+  await expect.poll(() => storage.deleted.length).toBe(1);
 });
 
 test("a file the Kobo refused stays listed with the reason until dismissed", async ({ page }) => {
