@@ -125,7 +125,7 @@ pub fn has_unpushed(library_dir: &Path) -> bool {
     let Some(account) = account(library_dir) else {
         return false;
     };
-    account.has_unpushed()
+    account.has_unpushed() || account.has_unpushed_places(&crate::ui::books_dir_for(library_dir))
 }
 
 /// Flush reading progress before the device suspends.
@@ -287,6 +287,16 @@ pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Se
                         "sync: merged {} pulled row(s), pushed {}",
                         outcome.merged, outcome.pushed
                     );
+                }
+                // Book places ride the same sweep. Best-effort: a project
+                // without migration 0007 answers 404 and the manga sync above
+                // still counts.
+                match account.sync_places(now(), &crate::ui::books_dir_for(&library_dir)) {
+                    Ok(o) if o.merged > 0 || o.pushed > 0 => {
+                        eprintln!("sync: books — merged {}, pushed {}", o.merged, o.pushed)
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("sync: couldn't sync book places ({e})"),
                 }
             }
             None => {

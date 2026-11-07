@@ -23,7 +23,10 @@ use std::io::Read;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{Error, ProgressTransport, ProgressUpdate, RemoteProgress, Result};
+use crate::{
+    BookPlaceTransport, BookPlaceUpdate, Error, ProgressTransport, ProgressUpdate, RemoteBookPlace,
+    RemoteProgress, Result,
+};
 
 /// Clock skew allowance: refresh an access token this many seconds before it
 /// actually expires, so a request never goes out with a just-expired token.
@@ -283,6 +286,53 @@ fn pull_query(cursor: Option<&str>) -> String {
     }
 }
 
+/// The PostgREST query for a book-places pull, paged like `pull_query`.
+fn pull_places_query(cursor: Option<&str>) -> String {
+    let select = "book_places?select=book_key,chapter,block,line,chapters,title,author,updated_at&order=updated_at.asc";
+    match cursor {
+        Some(c) => format!("{select}&updated_at=gt.{}", encode_query_value(c)),
+        None => select.to_string(),
+    }
+}
+
+fn parse_place_rows(body: &str) -> Result<Vec<RemoteBookPlace>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(body).map_err(transport_err)?;
+    let text = |v: &serde_json::Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(RemoteBookPlace {
+                book_key: r["book_key"].as_str()?.to_string(),
+                chapter: r["chapter"].as_u64().unwrap_or(0) as usize,
+                block: r["block"].as_u64().unwrap_or(0) as usize,
+                line: r["line"].as_u64().unwrap_or(0) as usize,
+                chapters: r["chapters"].as_u64().unwrap_or(0) as usize,
+                title: text(&r["title"]),
+                author: text(&r["author"]),
+                updated_at: r["updated_at"].as_str()?.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// The JSON body for one `upsert_book_place` RPC call.
+fn upsert_place_body(update: &BookPlaceUpdate) -> serde_json::Value {
+    json!({
+        "p_book_key": update.book_key,
+        "p_chapter": update.chapter,
+        "p_block": update.block,
+        "p_line": update.line,
+        "p_chapters": update.chapters,
+        "p_title": update.title,
+        "p_author": update.author,
+    })
+}
+
 /// Minimal percent-encoding for a query value (timestamps contain `:` and `+`).
 fn encode_query_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -526,6 +576,33 @@ impl ProgressTransport for SupabaseTransport {
     }
 }
 
+impl BookPlaceTransport for SupabaseTransport {
+    fn pull_places(&self, cursor: Option<&str>) -> Result<Vec<RemoteBookPlace>> {
+        let resp = self
+            .agent
+            .get(&self.config.rest_url(&pull_places_query(cursor)))
+            .set("apikey", &self.config.anon_key)
+            .set("Authorization", &self.auth_header())
+            .call();
+        let body = read_body(check_ok(resp)?)?;
+        parse_place_rows(&body)
+    }
+
+    fn push_places(&self, updates: &[BookPlaceUpdate]) -> Result<()> {
+        for update in updates {
+            let resp = self
+                .agent
+                .post(&self.config.rest_url("rpc/upsert_book_place"))
+                .set("apikey", &self.config.anon_key)
+                .set("Authorization", &self.auth_header())
+                .set("Content-Type", "application/json")
+                .send_json(upsert_place_body(update));
+            check_ok(resp)?;
+        }
+        Ok(())
+    }
+}
+
 /// Turn a `ureq` result into an error on any non-2xx status, attaching the
 /// server's message so auth/permission failures are legible.
 fn check_ok(resp: std::result::Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
@@ -565,6 +642,45 @@ mod tests {
             c.auth_url("verify"),
             "https://proj.supabase.co/auth/v1/verify"
         );
+    }
+
+    #[test]
+    fn book_place_rows_and_bodies_round_trip() {
+        assert_eq!(
+            pull_places_query(Some("2026-03-09T10:00:00+00:00")),
+            "book_places?select=book_key,chapter,block,line,chapters,title,author,updated_at&order=updated_at.asc&updated_at=gt.2026-03-09T10%3A00%3A00%2B00%3A00"
+        );
+        let rows = parse_place_rows(
+            r#"[{"book_key":"kv/sh5.epub","chapter":3,"block":10,"line":1,"chapters":20,"title":"Slaughterhouse-Five","author":"  ","updated_at":"t1"},
+                {"chapter":1,"updated_at":"t2"}]"#,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "a row without a key is dropped");
+        assert_eq!(rows[0].book_key, "kv/sh5.epub");
+        assert_eq!(
+            (
+                rows[0].chapter,
+                rows[0].block,
+                rows[0].line,
+                rows[0].chapters
+            ),
+            (3, 10, 1, 20)
+        );
+        assert_eq!(rows[0].title.as_deref(), Some("Slaughterhouse-Five"));
+        assert_eq!(rows[0].author, None, "blank author reads as none");
+        let body = upsert_place_body(&BookPlaceUpdate {
+            book_key: "kv/sh5.epub".into(),
+            chapter: 3,
+            block: 10,
+            line: 1,
+            chapters: 20,
+            title: Some("Slaughterhouse-Five".into()),
+            author: None,
+        });
+        assert_eq!(body["p_book_key"], "kv/sh5.epub");
+        assert_eq!(body["p_line"], 1);
+        assert_eq!(body["p_title"], "Slaughterhouse-Five");
+        assert!(body["p_author"].is_null());
     }
 
     #[test]
