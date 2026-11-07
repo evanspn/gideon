@@ -411,10 +411,17 @@ fn cmd_book(path: PathBuf) -> Result<()> {
         text.title.as_deref().unwrap_or("(untitled)"),
         text.author.as_deref().unwrap_or("(unknown author)")
     );
+    let pictures = text
+        .chapters
+        .iter()
+        .flat_map(|c| c.blocks.iter())
+        .filter(|b| matches!(b, gideon_core::BookBlock::Image(_)))
+        .count();
     println!(
-        "{} chapter(s), {} paragraph(s)\n",
+        "{} chapter(s), {} paragraph(s), {} picture(s)\n",
         text.chapters.len(),
-        text.block_count()
+        text.block_count() - pictures,
+        pictures
     );
     for (i, chapter) in text.chapters.iter().enumerate() {
         println!(

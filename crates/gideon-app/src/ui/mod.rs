@@ -635,6 +635,20 @@ pub struct BookLine {
     pub block: usize,
     /// Which wrapped line of that block this is.
     pub line: usize,
+    /// A picture occupying this line and the `rows - 1` after it, scaled
+    /// to `width × height` pixels. `text` is empty on such a line.
+    pub image: Option<BookImage>,
+}
+
+/// An illustration placed on a page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookImage {
+    /// Zip entry inside the EPUB.
+    pub href: String,
+    pub width: u32,
+    pub height: u32,
+    /// Text lines the picture stands in for.
+    pub rows: usize,
 }
 
 impl BookLine {
@@ -656,50 +670,93 @@ fn resume_page(pages: &[Vec<BookLine>], place: (usize, usize)) -> usize {
 
 /// Flow one chapter into pages of `lines_per_page` lines at `px`, wrapping
 /// words to `max_w`. A heading is bold; blocks are separated by a blank
-/// line that is dropped at the top of a page; an illustration becomes a
-/// one-line note, since gideon's reader shows text.
-pub fn paginate_chapter(
+/// line that is dropped at the top of a page. `dims` gives an image's pixel size
+/// by href (`None` = unreadable, shown as a one-line note). A picture is
+/// scaled to the text width, capped at a page, and takes as many rows as
+/// its height covers at `line_h`; one that does not fit in what is left of
+/// a page starts the next one rather than being split.
+pub fn paginate_chapter_with(
     chapter: &gideon_core::epub::Chapter,
     px: f32,
     max_w: u32,
     lines_per_page: usize,
+    line_h: u32,
+    dims: &dyn Fn(&str) -> Option<(u32, u32)>,
 ) -> Vec<Vec<BookLine>> {
     use gideon_core::BookBlock;
     let per_page = lines_per_page.max(1);
+    let line_h = line_h.max(1);
+    let page_h = per_page as u32 * line_h;
     let mut lines: Vec<BookLine> = Vec::new();
     for (i, block) in chapter.blocks.iter().enumerate() {
-        let (text, bold) = match block {
-            BookBlock::Heading(t) => (t.as_str(), true),
-            BookBlock::Paragraph(t) => (t.as_str(), false),
-            BookBlock::Image => ("[Illustration]", false),
-        };
         if !lines.is_empty() {
             lines.push(BookLine {
                 text: String::new(),
                 bold: false,
                 block: i,
                 line: 0,
+                image: None,
             });
         }
+        let (text, bold) = match block {
+            BookBlock::Heading(t) => (t.as_str(), true),
+            BookBlock::Paragraph(t) => (t.as_str(), false),
+            BookBlock::Image(href) => match dims(href).filter(|(w, h)| *w > 0 && *h > 0) {
+                Some((iw, ih)) => {
+                    // Fit the width, then the page height, keeping the
+                    // aspect ratio either way.
+                    let mut w = max_w.max(1).min(iw.max(1));
+                    let mut h = (w as u64 * ih as u64 / iw.max(1) as u64).max(1) as u32;
+                    if h > page_h {
+                        h = page_h;
+                        w = (h as u64 * iw as u64 / ih.max(1) as u64).max(1) as u32;
+                    }
+                    let rows = (h.div_ceil(line_h) as usize).clamp(1, per_page);
+                    lines.push(BookLine {
+                        text: String::new(),
+                        bold: false,
+                        block: i,
+                        line: 0,
+                        image: Some(BookImage {
+                            href: href.clone(),
+                            width: w,
+                            height: h,
+                            rows,
+                        }),
+                    });
+                    continue;
+                }
+                None => ("[Illustration]", false),
+            },
+        };
         for (n, wrapped) in wrap_words(px, text, max_w, bold).into_iter().enumerate() {
             lines.push(BookLine {
                 text: wrapped,
                 bold,
                 block: i,
                 line: n,
+                image: None,
             });
         }
     }
     let mut pages: Vec<Vec<BookLine>> = Vec::new();
     let mut current: Vec<BookLine> = Vec::new();
+    let mut used = 0usize;
     for line in lines {
         // A blank separator carries nothing at the top of a page.
-        if current.is_empty() && line.text.is_empty() {
+        if current.is_empty() && line.text.is_empty() && line.image.is_none() {
             continue;
         }
-        current.push(line);
-        if current.len() >= per_page {
+        let rows = line.image.as_ref().map(|i| i.rows).unwrap_or(1);
+        if used + rows > per_page && !current.is_empty() {
             pages.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(line);
+        used += rows;
+        if used >= per_page {
+            pages.push(std::mem::take(&mut current));
+            used = 0;
         }
     }
     if !current.is_empty() || pages.is_empty() {
@@ -954,6 +1011,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// A one-repaint banner over the book page ("Brightness 45%"), wiped
     /// by the next repaint like the manga reader's.
     book_banner: Option<String>,
+    /// The EPUB being opened, for the layout pass that runs before its
+    /// reader screen is on the stack (pictures are measured from the zip).
+    pending_book_path: Option<PathBuf>,
     /// Active profile name (settings.json `active_profile`).
     active_profile: String,
     layout: UiLayout,
@@ -1094,6 +1154,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             book_turns: 0,
             book_slide_base: None,
             book_banner: None,
+            pending_book_path: None,
             library_dir,
             active_profile: "default".to_string(),
             layout,
@@ -1154,7 +1215,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 match books.into_iter().find(|b| b.format == "epub") {
                     Some(book) => match gideon_core::epub::load(&book.path) {
                         Ok(text) if !text.chapters.is_empty() => {
+                            self.pending_book_path = Some(book.path.clone());
                             let pages = self.layout_book_chapter(&text, 0);
+                            self.pending_book_path = None;
                             Screen::BookReader {
                                 book,
                                 text: std::sync::Arc::new(text),
@@ -7855,11 +7918,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         text: &gideon_core::EpubText,
         chapter: usize,
     ) -> Vec<Vec<BookLine>> {
-        let (px, _, max_w, _, _, lines) = self.book_page_metrics();
-        match text.chapters.get(chapter) {
-            Some(c) => paginate_chapter(c, px, max_w, lines),
-            None => vec![Vec::new()],
-        }
+        let (px, _, max_w, _, line_h, lines) = self.book_page_metrics();
+        let Some(c) = text.chapters.get(chapter) else {
+            return vec![Vec::new()];
+        };
+        // Only the headers are read here: a chapter's pictures are measured
+        // once at layout and decoded one page at a time when drawn.
+        let path = match self.stack.last() {
+            Some(Screen::BookReader { book, .. }) => Some(book.path.clone()),
+            _ => self.pending_book_path.clone(),
+        };
+        let dims = move |href: &str| -> Option<(u32, u32)> {
+            let path = path.as_ref()?;
+            let bytes = gideon_core::epub::read_entry(path, href).ok()?;
+            gideon_core::epub::image_dimensions(&bytes)
+        };
+        paginate_chapter_with(c, px, max_w, lines, line_h, &dims)
     }
 
     /// Open an EPUB in gideon's reader at the place it was left.
@@ -7878,7 +7952,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             .get(&book.relative_path)
             .unwrap_or_default();
         let chapter = place.chapter.min(text.chapters.len() - 1);
+        self.pending_book_path = Some(book.path.clone());
         let pages = self.layout_book_chapter(&text, chapter);
+        self.pending_book_path = None;
         let page = resume_page(&pages, (place.block, place.line));
         self.book_turns = 0;
         self.push(Screen::BookReader {
@@ -8048,6 +8124,32 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         let mut y = top;
         for line in pages.get(page).map(|p| p.as_slice()).unwrap_or(&[]) {
+            if let Some(img) = &line.image {
+                // Centred in the text column, scaled at layout time.
+                let x = margin + max_w.saturating_sub(img.width) / 2;
+                match gideon_core::epub::read_entry(&book.path, &img.href)
+                    .ok()
+                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                {
+                    Some(decoded) => {
+                        let gray = decoded
+                            .resize_exact(
+                                img.width.max(1),
+                                img.height.max(1),
+                                image::imageops::FilterType::Triangle,
+                            )
+                            .into_luma8();
+                        for (dx, dy, p) in gray.enumerate_pixels() {
+                            plot(&mut canvas, (x + dx) as i32, (y + dy) as i32, p.0[0]);
+                        }
+                    }
+                    None => {
+                        draw_text(&mut canvas, margin, y, px, "[Illustration]", max_w, false);
+                    }
+                }
+                y += img.rows as u32 * line_h;
+                continue;
+            }
             if !line.text.is_empty() {
                 draw_text(&mut canvas, margin, y, px, &line.text, max_w, line.bold);
             }
