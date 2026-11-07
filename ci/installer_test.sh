@@ -38,6 +38,10 @@ ENTRIES=$(grep -c "^menu_item" "$ROOT/.adds/nm/gideon")
 grep -q "gideon - update" "$ROOT/.adds/nm/gideon" || fail "missing the update menu entry"
 grep -q "gideon-launch.sh" "$ROOT/.adds/nm/gideon" || fail "the menu entry should launch the browse UI"
 [ -x "$ROOT/.adds/gideon/bin/gideon-launch.sh" ] || fail "launch script not installed executable"
+# The launcher hands Nickel back the panel rotation it had: Nickel restarted
+# in place on a rotated framebuffer draws every menu sideways.
+grep -q 'fb0/rotate' "$ROOT/.adds/gideon/bin/gideon-launch.sh" \
+    || fail "the launcher should restore Nickel's framebuffer rotation after gideon exits"
 
 echo "==> install without NickelMenu warns but still succeeds"
 ROOT_NO_NM="$WORKDIR/KoboNoNM"

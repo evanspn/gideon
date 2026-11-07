@@ -261,6 +261,13 @@ pub struct KoboDisplay {
     /// The upright rotation we asked for (`upright_rotate_for_product`,
     /// or the `GIDEON_FB_ROTATE` override).
     upright_rotate: u32,
+    /// The rotation Nickel left the panel at, when we changed it: put back
+    /// on close. Nickel is restarted in place on this same framebuffer,
+    /// and it draws for the rotation it last set — on a Libra Colour left
+    /// at our rotate=1 instead of its rotate=3 every one of its menus comes
+    /// up sideways or torn. KOReader restores the original rotation on
+    /// exit for the same reason ("no matter what", koreader.sh).
+    nickel_rotate: Option<u32>,
     /// Whether the last blit carried real color: a FULL refresh then uses
     /// the Kaleido color waveform (GCC16) on MTK kernels.
     last_blit_color: bool,
@@ -286,6 +293,12 @@ pub struct KoboDisplay {
     /// the Libra Colour); reusing it keeps the hot path allocation-free.
     /// Grown on demand (gray vs RGB sizes), never shrunk.
     scratch: Vec<u8>,
+}
+
+impl Drop for KoboDisplay {
+    fn drop(&mut self) {
+        self.restore_nickel_rotation();
+    }
 }
 
 impl KoboDisplay {
@@ -323,7 +336,9 @@ impl KoboDisplay {
         // kernel that refuses keeps its rotation and we adapt to whatever
         // geometry it reports.
         let wanted_rotate = upright_rotate_from_env();
+        let mut nickel_rotate = None;
         if var.rotate != wanted_rotate {
+            nickel_rotate = Some(var.rotate);
             let mut wanted = var;
             wanted.rotate = wanted_rotate;
             // SAFETY: FBIOPUT_VSCREENINFO with a struct obtained from the
@@ -334,6 +349,10 @@ impl KoboDisplay {
             unsafe {
                 let _ = ioctl(file.as_raw_fd(), FBIOGET_VSCREENINFO, &mut var);
                 let _ = ioctl(file.as_raw_fd(), FBIOGET_FSCREENINFO, &mut fix);
+            }
+            if ret != 0 || var.rotate == nickel_rotate.unwrap_or(var.rotate) {
+                // Refused: nothing changed, so nothing to put back.
+                nickel_rotate = None;
             }
             eprintln!(
                 "gideon fb: rotation normalize to {wanted_rotate} {} (now rotate={})",
@@ -397,12 +416,36 @@ impl KoboDisplay {
             update_api: None,
             rotate: var.rotate,
             upright_rotate: wanted_rotate,
+            nickel_rotate,
             last_blit_color: false,
             cfa_flag: HWTCON_FLAG_CFA_EINK_G2,
             pending_partial_marker: None,
             swap_rb,
             scratch: Vec::new(),
         })
+    }
+
+    /// Put the framebuffer rotation back the way Nickel had it. Idempotent;
+    /// called on drop, and harmless when the rotation was never changed.
+    pub fn restore_nickel_rotation(&mut self) {
+        let Some(original) = self.nickel_rotate.take() else {
+            return;
+        };
+        let mut var = fb_var_screeninfo::default();
+        // SAFETY: standard framebuffer ioctls on our open fb device with a
+        // properly sized zero-initialized out-struct; the PUT only changes
+        // the rotate field of what the matching GET returned.
+        let ret = unsafe {
+            if ioctl(self.file.as_raw_fd(), FBIOGET_VSCREENINFO, &mut var) != 0 {
+                return;
+            }
+            var.rotate = original;
+            ioctl(self.file.as_raw_fd(), FBIOPUT_VSCREENINFO, &mut var)
+        };
+        eprintln!(
+            "gideon fb: rotation restored to {original} for nickel {}",
+            if ret == 0 { "ok" } else { "refused" }
+        );
     }
 
     /// The rotation the framebuffer actually settled on (0..=3). When the
