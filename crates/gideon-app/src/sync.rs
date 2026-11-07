@@ -383,10 +383,17 @@ fn place_upload(
     name: &str,
     bytes: &[u8],
 ) -> std::result::Result<PathBuf, String> {
-    let kind = gideon_core::upload::classify(name, bytes).map_err(|e| e.to_string())?;
-    let dest = gideon_core::upload::destination(kind, books_dir, library_dir, name);
-    gideon_core::upload::place(&dest, bytes)
-        .map_err(|e| format!("couldn't write the file: {e}"))?;
+    use gideon_core::upload::{self, UploadKind};
+    let kind = upload::classify(name, bytes).map_err(|e| e.to_string())?;
+    // Name it from what it says about itself, not from the file name a
+    // download site gave it; the name is only the fallback.
+    let meta = match kind {
+        UploadKind::Epub => upload::epub_meta(bytes),
+        UploadKind::Cbz => upload::cbz_meta(bytes),
+        UploadKind::Pdf => upload::BookMeta::default(),
+    };
+    let dest = upload::destination_named(kind, books_dir, library_dir, name, &meta);
+    upload::place(&dest, bytes).map_err(|e| format!("couldn't write the file: {e}"))?;
     Ok(dest)
 }
 
@@ -613,7 +620,7 @@ mod tests {
 
         // A PDF goes to Books, for Nickel.
         let dest = place_upload(&manga, &books, "paper.pdf", b"%PDF-1.7").unwrap();
-        assert_eq!(dest, books.join("paper.pdf"));
+        assert_eq!(dest, books.join("Unknown author").join("paper.pdf"));
 
         // A lie is refused with the reason the phone will show, and nothing
         // is written anywhere.

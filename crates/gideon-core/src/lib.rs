@@ -26,6 +26,6 @@ pub use settings::{
     FINISHED_CLEANUP_STEPS,
 };
 pub use stats::{ReadingSpan, ReadingStats};
-pub use upload::{sanitize_filename, UploadKind, MAX_UPLOAD_BYTES};
+pub use upload::{sanitize_filename, BookMeta, UploadKind, MAX_UPLOAD_BYTES};
 
 pub type Result<T> = std::result::Result<T, Error>;
