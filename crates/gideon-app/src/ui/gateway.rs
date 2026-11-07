@@ -195,6 +195,14 @@ pub trait SourceGateway {
         Err(anyhow::anyhow!("books are not supported by this gateway"))
     }
 
+    /// The bytes at `url`: a dictionary download. Nothing book-shaped is
+    /// assumed about them.
+    fn fetch(&self, _url: &Url) -> Result<Vec<u8>> {
+        Err(anyhow::anyhow!(
+            "downloads are not supported by this gateway"
+        ))
+    }
+
     /// Check for app updates.
     fn check_updates(&self) -> Result<UpdateCheck>;
 
@@ -333,6 +341,10 @@ impl SourceGateway for AidokuGateway {
         Ok(opds::download_epub(
             fetcher, epub, books_dir, author, title,
         )?)
+    }
+
+    fn fetch(&self, url: &Url) -> Result<Vec<u8>> {
+        Ok(UreqFetcher::new().get(url)?)
     }
 
     fn uninstall_source(&self, source_id: &str) -> Result<()> {

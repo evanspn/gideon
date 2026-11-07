@@ -172,6 +172,21 @@ jobs:
           mkdir -p /tmp/release-assets
           cp "/tmp/gideon-kobo-v${version}/VERSION" /tmp/release-assets/VERSION
 
+      # The book reader's offline dictionary: WordNet 3.1 (Princeton), as
+      # StarDict. Devices fetch releases/latest/download/wordnet-3.1-stardict.zip
+      # when a reader presses a word with no dictionary installed. Built per
+      # release so the asset is always there; a failed download of the source
+      # data must not block the app release.
+      - name: Build the WordNet dictionary asset
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/wordnet-src /tmp/wordnet-out
+          curl -sSfL --retry 3 -o /tmp/wordnet-src/wn3.1.dict.tar.gz https://wordnetcode.princeton.edu/wn3.1.dict.tar.gz
+          tar -xzf /tmp/wordnet-src/wn3.1.dict.tar.gz -C /tmp/wordnet-src
+          python3 -I scripts/wn2stardict.py /tmp/wordnet-src/dict /tmp/wordnet-out/wordnet
+          (cd /tmp/wordnet-out && zip -r /tmp/release-assets/wordnet-3.1-stardict.zip wordnet)
+          ls -la /tmp/release-assets
+
       - name: Smoke-test the bundle installer
         run: |
           version="${{ steps.version.outputs.version }}"
@@ -189,3 +204,4 @@ jobs:
           files: |
             /tmp/gideon-kobo-v${{ steps.version.outputs.version }}.zip
             /tmp/release-assets/VERSION
+            /tmp/release-assets/wordnet-3.1-stardict.zip
