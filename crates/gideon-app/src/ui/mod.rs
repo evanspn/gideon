@@ -437,6 +437,13 @@ enum Screen {
         pages: std::sync::Arc<Vec<Vec<BookLine>>>,
         page: usize,
     },
+    /// The open book's table of contents, pushed over its reader: one row
+    /// per entry, the current chapter bold; a tap jumps the reader there.
+    BookContents {
+        entries: Vec<gideon_core::epub::TocEntry>,
+        current: usize,
+        page: usize,
+    },
     Sources {
         rows: Vec<SourceRow>,
         page: usize,
@@ -2239,6 +2246,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         match self.stack.last() {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
             Some(Screen::BookShelf { books, .. }) => books.len().div_ceil(per_page),
+            Some(Screen::BookContents { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
             Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
             Some(Screen::Popular { mangas, .. }) => mangas.len().div_ceil(per_page),
@@ -2271,6 +2279,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(
                 Screen::Library { page, .. }
                 | Screen::BookShelf { page, .. }
+                | Screen::BookContents { page, .. }
                 | Screen::Sources { page, .. }
                 | Screen::SearchResults { page, .. }
                 | Screen::Popular { page, .. }
@@ -2293,6 +2302,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let (page, count) = match screen {
             Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
             Screen::BookShelf { books, page } => (page, books.len().div_ceil(per_page)),
+            Screen::BookContents { entries, page, .. } => (page, entries.len().div_ceil(per_page)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
             // +1 for the trailing "Search more sources" row.
             Screen::SearchResults { results, page, .. } => {
@@ -2541,6 +2551,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Sheet::BookReading) => (
                 "Reading".to_string(),
                 vec![
+                    ("Contents".into(), "›".into(), false),
                     ("Larger text".into(), String::new(), false),
                     ("Smaller text".into(), String::new(), false),
                     ("Close book".into(), String::new(), false),
@@ -2929,9 +2940,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Sheet::BookReading) => {
                 self.sheet = None;
                 match index {
-                    0 => self.resize_book_text(6)?,
-                    1 => self.resize_book_text(-6)?,
-                    2 => {
+                    0 => self.open_book_contents()?,
+                    1 => self.resize_book_text(6)?,
+                    2 => self.resize_book_text(-6)?,
+                    3 => {
                         self.save_book_place();
                         return self.pop();
                     }
@@ -3339,6 +3351,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // The reader takes its taps in handle_tap, by zone, before the
             // row hit-test; nothing reaches here.
             Screen::BookReader { .. } => Ok(Flow::Continue),
+            Screen::BookContents { entries, page, .. } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(entry) = entries.get(index).cloned() {
+                    self.jump_to_chapter(entry.chapter)?;
+                }
+                Ok(Flow::Continue)
+            }
             Screen::BookShelf { books, page } => {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(book) = books.get(index).cloned() {
@@ -7628,6 +7647,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 pages,
                 page,
             } => self.compose_book_page(book, text, *chapter, pages, *page),
+            Screen::BookContents {
+                entries,
+                current,
+                page,
+            } => {
+                let rows: Vec<(String, bool)> = paged(entries, *page, per_page)
+                    .iter()
+                    .map(|e| (e.title.clone(), e.chapter == *current))
+                    .collect();
+                compose_list(l, "Contents", &rows, *page, l.page_count(entries.len()))
+            }
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -8059,6 +8089,56 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             pages: std::sync::Arc::new(pages),
             page,
         })
+    }
+
+    /// The open book's contents, over the reader. Opens on the page that
+    /// holds the current chapter, so a long list does not start from the
+    /// top every time.
+    fn open_book_contents(&mut self) -> Result<()> {
+        let Some(Screen::BookReader { text, chapter, .. }) = self.stack.last() else {
+            return Ok(());
+        };
+        let entries = text.contents();
+        let current = *chapter;
+        let per_page = self.layout.rows_per_page().max(1);
+        let page = entries
+            .iter()
+            .rposition(|e| e.chapter <= current)
+            .map(|i| i / per_page)
+            .unwrap_or(0);
+        self.push(Screen::BookContents {
+            entries,
+            current,
+            page,
+        })
+    }
+
+    /// Jump the reader beneath the contents list to the start of `chapter`,
+    /// and come back to it. The whole page changes: Full.
+    fn jump_to_chapter(&mut self, chapter: usize) -> Result<()> {
+        if matches!(self.stack.last(), Some(Screen::BookContents { .. })) {
+            self.stack.pop();
+        }
+        let Some(Screen::BookReader { text, .. }) = self.stack.last() else {
+            return self.render_current(RefreshMode::Full);
+        };
+        let text = text.clone();
+        let chapter = chapter.min(text.chapters.len().saturating_sub(1));
+        let pages = std::sync::Arc::new(self.layout_book_chapter(&text, chapter));
+        if let Some(Screen::BookReader {
+            chapter: c,
+            pages: p,
+            page,
+            ..
+        }) = self.stack.last_mut()
+        {
+            *c = chapter;
+            *p = pages;
+            *page = 0;
+        }
+        self.save_book_place();
+        self.book_turns = 0;
+        self.render_current(RefreshMode::Full)
     }
 
     /// Remember where the reader is, by chapter and paragraph.
