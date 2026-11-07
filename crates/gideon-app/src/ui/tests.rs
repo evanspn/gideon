@@ -9134,9 +9134,11 @@ fn the_title_bar_pages_and_does_not_swallow_the_view_toggle() {
     assert_eq!(page_of(&app), 0, "the ‹ chevron pages back");
 
     // The rest of the title bar still toggles the library view — the two
-    // must not fight over the same strip.
+    // must not fight over the same strip. "The rest" starts past the
+    // Manga | Books tab strip at the left end.
     let before = effective_settings(&dir.path().join("data"), &lib).library_view;
-    app.handle_tap(l.pad, title_y).unwrap();
+    let [_, books_tab] = super::library_tab_zones(&l);
+    app.handle_tap(books_tab.1 + l.pad, title_y).unwrap();
     let after = effective_settings(&dir.path().join("data"), &lib).library_view;
     assert_ne!(before, after, "a tap on the title still toggles the view");
     assert_eq!(page_of(&app), 0, "and does not page");
@@ -9713,5 +9715,263 @@ mod books {
         }
         out.sort();
         out
+    }
+}
+
+// --- Library tabs: Manga | Books ---
+
+mod library_tabs {
+    use super::*;
+
+    /// A minimal EPUB whose OPF names it; the file name does not.
+    fn make_epub(path: &Path, title: &str, author: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        zip.start_file("content.opf", opts).unwrap();
+        write!(
+            zip,
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata></package>"#
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// Tap the "Books" tab in the Library's title bar.
+    fn tap_books_tab() -> UiEvent {
+        let l = layout();
+        let [_, books] = library_tab_zones(&l);
+        UiEvent::Tap {
+            x: (books.0 + books.1) / 2,
+            y: l.title_h / 2,
+        }
+    }
+
+    /// Tap the "Manga" tab in the Library's title bar.
+    fn tap_manga_tab() -> UiEvent {
+        let l = layout();
+        let [manga, _] = library_tab_zones(&l);
+        UiEvent::Tap {
+            x: (manga.0 + manga.1) / 2,
+            y: l.title_h / 2,
+        }
+    }
+
+    /// Row `i` of the three-row book sheet: 0 read in Kobo, 1 delete, 2 close.
+    fn tap_book_file_row(i: usize) -> UiEvent {
+        tap_modal_row(3, i)
+    }
+
+    fn shelf(dir: &Path) -> (PathBuf, PathBuf) {
+        let lib = dir.join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let books = lib.join("Books");
+        make_epub(
+            &books.join("Kurt Vonnegut/book-0001.epub"),
+            "Slaughterhouse-Five",
+            "Kurt Vonnegut",
+        );
+        make_epub(
+            &books.join("Natsu Hyuuga/book-0002.epub"),
+            "The Apothecary Diaries, Vol. 1",
+            "Natsu Hyuuga",
+        );
+        (lib, books)
+    }
+
+    #[test]
+    fn the_library_opens_on_manga_and_the_books_tab_lists_books_by_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = shelf(dir.path());
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        );
+        ui.run().unwrap();
+
+        let Screen::BookShelf { books, page } = ui.screen() else {
+            panic!("expected the Books tab, got {:?}", ui.screen());
+        };
+        assert_eq!(*page, 0);
+        let labels: Vec<String> = books.iter().map(|b| b.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Slaughterhouse-Five — Kurt Vonnegut",
+                "The Apothecary Diaries, Vol. 1 — Natsu Hyuuga",
+            ]
+        );
+        // The tab switch repaints the whole content area: Full, never a
+        // partial that would ghost covers under the list.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        // The nav bar still marks Library as where you are.
+        assert!(
+            ui.nav_items()[0].active,
+            "Books is a Library tab, not a new destination"
+        );
+    }
+
+    #[test]
+    fn manga_never_show_on_the_books_tab_and_books_never_on_manga() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = shelf(dir.path());
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        );
+        ui.run().unwrap();
+        let Screen::BookShelf { books, .. } = ui.screen() else {
+            panic!("expected the Books tab");
+        };
+        assert!(
+            books.iter().all(|b| b.format == "epub"),
+            "a .cbz must not appear on the Books tab: {books:?}"
+        );
+
+        let mut ui = app(&lib, FakeGateway::default(), vec![tap_nav(0)]);
+        ui.run().unwrap();
+        let Screen::Library { items, .. } = ui.screen() else {
+            panic!("expected the Manga tab");
+        };
+        assert_eq!(
+            items.len(),
+            1,
+            "one manga series; the EPUBs stay off the shelf"
+        );
+        assert_eq!(items[0].title(), "Series");
+    }
+
+    #[test]
+    fn the_nav_tab_returns_to_the_library_tab_you_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = shelf(dir.path());
+        // Library → Books tab → Today → Library: lands back on Books.
+        let events = vec![tap_nav(0), tap_books_tab(), tap_today(), tap_nav(0)];
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::BookShelf { .. }));
+
+        // And the Manga tab takes you back.
+        let events = vec![tap_nav(0), tap_books_tab(), tap_manga_tab()];
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::Library { .. }));
+    }
+
+    #[test]
+    fn empty_books_tab_explains_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        );
+        ui.run().unwrap();
+        let Screen::BookShelf { books, .. } = ui.screen() else {
+            panic!("expected the Books tab");
+        };
+        assert!(books.is_empty());
+        // Something is drawn in the first content row (the hint), not a blank.
+        let l = layout();
+        let y = l.row_top(0) + l.row_h / 2;
+        assert!(
+            (0..W).any(|x| ui.display().pixel(x, y) < 0x80),
+            "the empty Books tab should say how to get a book"
+        );
+    }
+
+    #[test]
+    fn tapping_a_book_offers_the_kobo_reader_and_reading_closes_gideon() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = shelf(dir.path());
+        let events = vec![tap_nav(0), tap_books_tab(), tap_row(0)];
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Some(Sheet::BookFile { book }) = ui.sheet() else {
+            panic!("expected the book menu");
+        };
+        assert_eq!(book.title, "Slaughterhouse-Five");
+        // The sheet slides over the list: Partial, no flash.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+
+        let events = vec![
+            tap_nav(0),
+            tap_books_tab(),
+            tap_row(0),
+            tap_book_file_row(0),
+        ];
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        let exit = ui.run().unwrap();
+        assert!(
+            matches!(exit, Exit::Close),
+            "reading hands the device to Nickel's reader"
+        );
+    }
+
+    #[test]
+    fn deleting_a_book_asks_first_then_removes_it_from_disk_and_the_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books_dir) = shelf(dir.path());
+        let target = books_dir.join("Kurt Vonnegut/book-0001.epub");
+
+        // Cancel leaves it alone.
+        let events = vec![
+            tap_nav(0),
+            tap_books_tab(),
+            tap_row(0),
+            tap_book_file_row(1),
+            tap_modal_row(2, 1),
+        ];
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(target.exists());
+        assert!(ui.sheet().is_none());
+
+        // Confirm deletes the file, its emptied author folder, and the row.
+        let events = vec![
+            tap_nav(0),
+            tap_books_tab(),
+            tap_row(0),
+            tap_book_file_row(1),
+            tap_modal_row(2, 0),
+        ];
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(!target.exists());
+        assert!(!books_dir.join("Kurt Vonnegut").exists());
+        let Screen::BookShelf { books, .. } = ui.screen() else {
+            panic!("expected to stay on the Books tab");
+        };
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "The Apothecary Diaries, Vol. 1");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn the_title_bar_elsewhere_still_toggles_the_manga_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = shelf(dir.path());
+        let l = layout();
+        let [_, books] = library_tab_zones(&l);
+        // Past both tabs, before the pager: the old shelf/list toggle.
+        let toggle = UiEvent::Tap {
+            x: books.1 + l.pad * 2,
+            y: l.title_h / 2,
+        };
+        let mut ui = app(&lib, FakeGateway::default(), vec![tap_nav(0), toggle]);
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::Library { .. }));
+        // The list is the default, so one toggle lands on the cover shelf.
+        assert_eq!(ui.load_settings().library_view, "shelf");
     }
 }

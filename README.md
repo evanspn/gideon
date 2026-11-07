@@ -39,8 +39,11 @@ The core pipeline works end to end:
 - **Books** — the Discover → Books card browses OPDS catalogues (Project
   Gutenberg out of the box) and downloads EPUBs into `/mnt/onboard/Books`,
   where the Kobo's own reader picks them up the next time Nickel starts —
-  which is what exiting gideon does. gideon does not read EPUBs itself;
-  Nickel already does that well. Add your own catalogue — a Calibre content
+  which is what exiting gideon does. The Library has two tabs, **Manga**
+  and **Books**: the Books tab lists everything in that folder by its own
+  title and author, and tapping a book offers *Read in the Kobo reader*
+  (closes gideon) or *Delete*. gideon does not read EPUBs itself; Nickel
+  already does that well. Add your own catalogue — a Calibre content
   server's address is enough, its OPDS feed is at `/opds` — under *Book
   catalogues* on the web dashboard; it reaches the Kobo on its next sync.
   (`book_catalogs` in `settings.json` still works for a device-only entry.)

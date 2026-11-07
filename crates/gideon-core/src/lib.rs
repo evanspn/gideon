@@ -4,6 +4,7 @@
 //! their pages in natural reading order, decoding page images and tracking
 //! reading progress across a library directory.
 
+pub mod books;
 pub mod cbz;
 pub mod comicinfo;
 pub mod error;
@@ -15,6 +16,7 @@ pub mod settings;
 pub mod stats;
 pub mod upload;
 
+pub use books::Book;
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
 pub use error::Error;
