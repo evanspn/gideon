@@ -301,9 +301,8 @@ fn read_dictzip_header<R: Read + Seek>(r: &mut R) -> Result<(u64, Vec<u16>, u64)
         if &extra[at..at + 2] == b"RA" && body.len() >= 6 {
             let chunk_len = u16::from_le_bytes([body[2], body[3]]) as u64;
             let count = u16::from_le_bytes([body[4], body[5]]) as usize;
-            let sizes: Vec<u16> = body[6..]
-                .chunks_exact(2)
-                .take(count)
+            let sizes: Vec<u16> = (0..count)
+                .map_while(|i| body.get(6 + 2 * i..8 + 2 * i))
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             if sizes.len() != count || chunk_len == 0 {
