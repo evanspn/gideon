@@ -9878,14 +9878,14 @@ mod library_tabs {
     }
 
     /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 mark page,
-    /// 3 text, 4 close book, 5 close.
+    /// 3 text, 4 night mode, 5 rotate, 6 close book, 7 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(6, i)
+        tap_modal_row(8, i)
     }
 
     /// The y of row `i` of the reading menu.
     fn reading_row_y(i: usize) -> u32 {
-        tap_modal_row_y(6, i)
+        tap_modal_row_y(8, i)
     }
 
     /// A plain StarDict dictionary (ifo, idx, dict) at `dir/<stem>`.
@@ -10306,7 +10306,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(4)]);
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(6)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10688,7 +10688,7 @@ mod library_tabs {
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::Back),
-            tap_reading_row(4),
+            tap_reading_row(6),
             tap_today(),
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -11198,5 +11198,139 @@ mod library_tabs {
         assert_eq!(ui.load_settings().library_view, "shelf");
         // Whole content area replaced: a flash.
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn the_footer_estimates_time_left_once_the_pace_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let now = std::rc::Rc::new(std::cell::Cell::new(1_000_000u64));
+        let clock = now.clone();
+        let mut ui =
+            app(&lib, FakeGateway::default(), open_first_book()).with_clock(move || clock.get());
+        ui.run().unwrap();
+        let left = |ui: &UiApp<MemoryDisplay, FakeInput, FakeGateway>| {
+            let Screen::BookReader {
+                text,
+                chapter,
+                pages,
+                page,
+                ..
+            } = ui.screen()
+            else {
+                panic!("expected the reader");
+            };
+            ui.time_left_text(text, *chapter, pages, *page)
+        };
+        assert_eq!(left(&ui), None, "no pace yet");
+        assert_eq!(ui.book_secs_per_page(), None);
+        // Four turns half a minute apart: three gaps, a pace.
+        for _ in 0..4 {
+            now.set(now.get() + 30);
+            ui.turn_book_page(1).unwrap();
+        }
+        assert_eq!(ui.book_secs_per_page(), Some(30.0));
+        let text = left(&ui).expect("a pace");
+        assert!(text.ends_with(" in book"), "{text}");
+        assert!(text.contains(" left in chapter · "), "{text}");
+        // A long paragraph-heavy chapter at 30 s a page reads in minutes.
+        assert!(text.starts_with(|c: char| c.is_ascii_digit()), "{text}");
+        assert!(text.contains("min left in chapter"), "{text}");
+        // A put-down (ten minutes) does not drag the pace out.
+        now.set(now.get() + 600);
+        ui.turn_book_page(1).unwrap();
+        assert_eq!(ui.book_secs_per_page(), Some(30.0));
+        // The page's last line of the footer is the estimate, not the title.
+        assert_eq!(duration_words(20.0), "under a minute");
+        assert_eq!(duration_words(12.0 * 60.0), "12 min");
+        assert_eq!(duration_words(65.0 * 60.0), "1 h 05 min");
+        assert_eq!(duration_words(4.0 * 3600.0), "4 h");
+    }
+
+    #[test]
+    fn night_mode_inverts_the_page_with_a_flash_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let settings_dir = dir.path().join("data");
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book())
+            .with_settings_dir(settings_dir.clone());
+        ui.run().unwrap();
+        let (_, margin, _, top, _, _) = ui.book_page_metrics();
+        // Paper: the margin is white.
+        assert!(ui.display().pixel(margin / 2, top) > 0xf0);
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[4].1, "Off");
+        ui.tap_sheet(W / 2, reading_row_y(4)).unwrap();
+        assert!(ui.sheet.is_none());
+        assert!(
+            ui.display().pixel(margin / 2, top) < 0x10,
+            "night: black margin"
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert!(ui.load_settings().book_night);
+        // A page turn stays partial, as on paper.
+        ui.turn_book_page(1).unwrap();
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(ui.display().pixel(margin / 2, top) < 0x10);
+        // Survives a restart.
+        let mut again =
+            app(&lib, FakeGateway::default(), open_first_book()).with_settings_dir(settings_dir);
+        again.run().unwrap();
+        assert!(again.display().pixel(margin / 2, top) < 0x10);
+        again.sheet = Some(Sheet::BookReading);
+        assert_eq!(again.sheet_rows().1[4].1, "On");
+        again.tap_sheet(W / 2, reading_row_y(4)).unwrap();
+        assert!(again.display().pixel(margin / 2, top) > 0xf0);
+        assert!(!again.load_settings().book_night);
+    }
+
+    #[test]
+    fn rotate_turns_the_book_reader_landscape_and_the_tap_zones_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let settings_dir = dir.path().join("data");
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book())
+            .with_settings_dir(settings_dir.clone());
+        ui.run().unwrap();
+        let portrait_lines = match ui.screen() {
+            Screen::BookReader { pages, .. } => pages[0].len(),
+            other => panic!("expected the reader, got {other:?}"),
+        };
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[5].1, "Portrait");
+        ui.tap_sheet(W / 2, reading_row_y(5)).unwrap();
+        assert!(ui.sheet.is_none());
+        // The reading frame is now the panel on its side: wider, shorter,
+        // so fewer lines fit a page; whole repaint.
+        assert_eq!((ui.layout.width, ui.layout.height), (H, W));
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert!(
+            pages[0].len() < portrait_lines,
+            "{} < {portrait_lines}",
+            pages[0].len()
+        );
+        assert_eq!(*page, 0);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert_eq!(
+            gideon_core::Settings::load(&settings_dir)
+                .unwrap()
+                .reader_rotation,
+            90
+        );
+
+        // A finger on the right third of the READING frame arrives as a
+        // panel point; the run loop's mapping brings it back, and it is
+        // still "next page".
+        let (px, py) = panel_point_for(H * 5 / 6, W / 2, 90);
+        let (x, y) = ui.map_menu_point(px, py);
+        ui.handle_tap(x, y).unwrap();
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert_eq!(*page, 1);
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[5].1, "Landscape");
     }
 }
