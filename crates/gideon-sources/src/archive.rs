@@ -82,6 +82,8 @@ pub fn fetch_feed(fetcher: &dyn Fetcher, url: &Url) -> Result<Feed> {
                 detail: h.creator.clone(),
                 epubs: Vec::new(),
                 feed: Some(client.item_url(&h.identifier).ok()?),
+                year: h.year.clone(),
+                language: h.language.as_deref().map(language_name),
             })
         })
         .collect();
@@ -91,6 +93,7 @@ pub fn fetch_feed(fetcher: &dyn Fetcher, url: &Url) -> Result<Feed> {
         next,
         search: Some(search_link()),
         epubs: Vec::new(),
+        total: Some(page.total),
     })
 }
 
@@ -134,6 +137,7 @@ pub fn open_entry(fetcher: &dyn Fetcher, entry: &Entry) -> Result<Opened> {
             .download_url(&item.identifier, &file.name)
             .map_err(from_archivist)?,
         title: None,
+        size: Some(file.size).filter(|s| *s > 0),
     }))
 }
 
@@ -145,7 +149,28 @@ fn root() -> Feed {
         next: None,
         search: Some(search_link()),
         epubs: Vec::new(),
+        total: None,
     }
+}
+
+/// archive.org's language field is a code ("eng") as often as a name
+/// ("English"); the sheet shows a name.
+fn language_name(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "eng" | "en" | "english" => "English",
+        "fre" | "fra" | "fr" | "french" => "French",
+        "ger" | "deu" | "de" | "german" => "German",
+        "spa" | "es" | "spanish" => "Spanish",
+        "ita" | "it" | "italian" => "Italian",
+        "por" | "pt" | "portuguese" => "Portuguese",
+        "lat" | "la" | "latin" => "Latin",
+        "dut" | "nld" | "nl" | "dutch" => "Dutch",
+        "rus" | "ru" | "russian" => "Russian",
+        "jpn" | "ja" | "japanese" => "Japanese",
+        "chi" | "zho" | "zh" | "chinese" => "Chinese",
+        _ => return raw.trim().to_string(),
+    }
+    .to_string()
 }
 
 /// `https://archive.org/metadata/<identifier>` → the identifier.
@@ -311,6 +336,7 @@ mod tests {
             detail: Some("Shelley, Mary Wollstonecraft".into()),
             epubs: Vec::new(),
             feed: Some(Url::parse("https://archive.org/metadata/frankenstein00shel").unwrap()),
+            ..Default::default()
         };
         match crate::catalog::open_entry(&fetcher, &entry).unwrap() {
             Opened::Book(link) => assert_eq!(

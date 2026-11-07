@@ -34,10 +34,13 @@ pub struct Feed {
     /// EPUB links attached to the feed itself rather than an entry — rare,
     /// but a catalogue that serves a single book this way exists.
     pub epubs: Vec<EpubLink>,
+    /// How many entries the whole result has across every page, when the
+    /// catalogue says (the Internet Archive's search does).
+    pub total: Option<u64>,
 }
 
 /// One entry: a book, a sub-catalogue, or (Gutenberg) a stub for a book.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Entry {
     pub title: String,
     /// The line under the title. For a book that is its author(s); for a
@@ -52,6 +55,11 @@ pub struct Entry {
     pub epubs: Vec<EpubLink>,
     /// Another feed this entry opens — a sub-catalogue or a per-book feed.
     pub feed: Option<Url>,
+    /// Publication year, when the catalogue says (the Internet Archive does;
+    /// OPDS feeds leave it out).
+    pub year: Option<String>,
+    /// Language, when the catalogue says.
+    pub language: Option<String>,
 }
 
 impl Entry {
@@ -65,12 +73,14 @@ impl Entry {
 }
 
 /// An `application/epub+zip` acquisition link.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpubLink {
     pub url: Url,
     /// The link's own title ("EPUB (no images)"), when given — used to
     /// prefer the edition with pictures.
     pub title: Option<String>,
+    /// The file's size in bytes, when known before downloading.
+    pub size: Option<u64>,
 }
 
 /// Where a catalogue's search lives.
@@ -434,7 +444,11 @@ fn handle_link(e: &BytesStart<'_>, base: &Url, feed: &mut Feed, entry: Option<&m
     match entry {
         Some(entry) => {
             if is_epub && is_acquisition {
-                entry.epubs.push(EpubLink { url, title });
+                entry.epubs.push(EpubLink {
+                    url,
+                    title,
+                    size: None,
+                });
             } else if is_atom
                 && entry.feed.is_none()
                 && !matches!(
@@ -465,7 +479,11 @@ fn handle_link(e: &BytesStart<'_>, base: &Url, feed: &mut Feed, entry: Option<&m
                     ));
                 }
             } else if is_epub && is_acquisition {
-                feed.epubs.push(EpubLink { url, title });
+                feed.epubs.push(EpubLink {
+                    url,
+                    title,
+                    size: None,
+                });
             }
         }
     }

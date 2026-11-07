@@ -11,6 +11,7 @@
 //! e-ink refresh, in-screen updates (pagination, status) partial ones.
 //! Errors never panic the UI: they land on a message screen with Back.
 
+mod book_search;
 mod gateway;
 mod layout;
 #[cfg(test)]
@@ -174,6 +175,14 @@ enum Sheet {
     ConfirmDeleteBook { book: gideon_core::Book },
     /// The book reader's menu: text size, and the way out.
     BookReading,
+    /// One Internet Archive result: what it is, then Download, then Read
+    /// now. Drawn and hit-tested by `book_search`, not as rows.
+    BookDownload {
+        // Boxed: an entry is the largest thing any sheet carries.
+        entry: Box<gateway::BookEntry>,
+        epub: Option<gateway::EpubLink>,
+        state: book_search::DownloadState,
+    },
 }
 
 /// What a settings row does when tapped. The grouped list is built once and
@@ -489,10 +498,23 @@ enum Screen {
         feed: gateway::BookFeed,
         page: usize,
     },
-    /// On-screen keyboard for searching one catalogue.
+    /// On-screen keyboard for searching one catalogue. The Internet
+    /// Archive's carries its recent searches as chips (`recent`, newest
+    /// first); an OPDS catalogue's has none.
     BookSearch {
+        title: String,
         search: gateway::SearchLink,
         query: String,
+        recent: Vec<String>,
+    },
+    /// Internet Archive search results as book rows, paged from a footer;
+    /// with no rows (nothing found, or `error`) it is the empty state, whose
+    /// one button goes back to the keyboard. See `book_search`.
+    BookResults {
+        query: String,
+        feed: gateway::BookFeed,
+        page: usize,
+        error: Option<String>,
     },
     MangaList {
         source: SourceEntry,
@@ -1726,6 +1748,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
             };
         }
+        // Internet Archive results: two-row-tall book rows and a footer of
+        // their own, hit-tested by the same functions that draw them.
+        if matches!(self.screen(), Screen::BookResults { .. }) {
+            return self.tap_book_results(x, y);
+        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -2335,6 +2362,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // are two thirds of the panel as a stack and a third of it as
             // tiles, and the sheet covers what you were reading.
             Some(Sheet::QuickSettings) => (String::new(), Vec::new()),
+            // Buttons, not rows: laid out by `download_sheet_layout`.
+            Some(Sheet::BookDownload { .. }) => (String::new(), Vec::new()),
             Some(Sheet::Profiles { ref names }) => {
                 let mut rows: Vec<(String, String, bool)> = names
                     .iter()
@@ -2426,6 +2455,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Where an open sheet sits: anchored to the bottom, as tall as its rows
     /// need. Everything above it stays on screen and unrepainted.
     fn sheet_bounds(&self) -> Option<(u32, u32)> {
+        if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
+            let s = self.download_sheet_layout();
+            return Some((s.top, s.height));
+        }
         if matches!(self.sheet, Some(Sheet::QuickSettings)) {
             let sheet = self.quick_sheet_layout();
             return Some((sheet.top, sheet.height));
@@ -2442,6 +2475,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn overlay_sheet(&self, canvas: &mut RgbPage) {
         if matches!(self.sheet, Some(Sheet::QuickSettings)) {
             return self.overlay_quick_settings(canvas);
+        }
+        if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
+            return self.overlay_book_download(canvas);
         }
         let Some((y, h)) = self.sheet_bounds() else {
             return;
@@ -2660,6 +2696,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// what every modal on every platform does and what a reader will try
     /// first; the sheet's own rows act.
     fn tap_sheet(&mut self, x: u32, y: u32) -> Result<Flow> {
+        // The book sheet has buttons, not rows, and no × to hit.
+        if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
+            return self.tap_book_download(x, y);
+        }
         if self.tap_sheet_close(x, y) {
             self.sheet = None;
             return self
@@ -3271,8 +3311,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             self.keyboard_paints = 0;
                             self.keyboard_shift = false;
                             self.push(Screen::BookSearch {
+                                title: "Search books".to_string(),
                                 search,
                                 query: String::new(),
+                                recent: Vec::new(),
                             })?;
                         }
                     }
@@ -3286,10 +3328,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 Ok(Flow::Continue)
             }
-            Screen::BookSearch { search, query } => {
-                self.tap_book_search(&search, &query, x, y)?;
+            Screen::BookSearch {
+                search,
+                query,
+                recent,
+                ..
+            } => {
+                if !self.tap_recent_chip(&search, &recent, x, y)? {
+                    self.tap_book_search(&search, &query, x, y)?;
+                }
                 Ok(Flow::Continue)
             }
+            // Routed whole in handle_tap; rows here are a different height.
+            Screen::BookResults { .. } => Ok(Flow::Continue),
             Screen::MangaList {
                 source,
                 mangas,
@@ -4235,6 +4286,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 })
             }
         };
+        if gideon_sources::archive::is_archive(&url) {
+            // Search is the whole catalogue: no list to load first.
+            return self.open_archive_search(&catalog.label());
+        }
         self.open_book_feed(&catalog.label(), &url)
     }
 
@@ -4381,6 +4436,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn run_book_search(&mut self, search: &gateway::SearchLink, query: &str) -> Result<()> {
+        if gideon_sources::archive::is_archive_search(search) {
+            return self.run_archive_search(search, query);
+        }
         self.ensure_online()?;
         self.show_status(&[&format!("Searching for \"{query}\"…")])?;
         match self.gateway.book_search(search, query) {
@@ -6352,6 +6410,31 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Home)) {
             return Ok(Some(self.compose_discover()));
         }
+        match self.stack.last() {
+            Some(Screen::BookResults {
+                query,
+                feed,
+                page,
+                error,
+            }) => {
+                return Ok(Some(
+                    self.paint_book_results(query, feed, *page, error.as_deref())
+                        .into_rgb(),
+                ))
+            }
+            Some(Screen::BookSearch {
+                title,
+                search,
+                query,
+                recent,
+            }) if gideon_sources::archive::is_archive_search(search) => {
+                return Ok(Some(
+                    self.paint_book_search(title, search, query, recent)
+                        .into_rgb(),
+                ))
+            }
+            _ => {}
+        }
         if let Some(Screen::BookShelf { books, page }) = self.stack.last() {
             // Like the shelf: a root destination draws its nav bar in RGB.
             let l = &self.layout;
@@ -7526,8 +7609,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 compose_list(l, "Popular manga", &rows, *page, l.page_count(mangas.len()))
             }
             Screen::Books { catalogs } => {
-                let rows: Vec<(String, bool)> =
-                    catalogs.iter().map(|c| (c.label(), true)).collect();
+                let rows: Vec<(String, bool)> = catalogs
+                    .iter()
+                    .map(|c| {
+                        let archive = url::Url::parse(c.url.trim())
+                            .is_ok_and(|u| gideon_sources::archive::is_archive(&u));
+                        if archive {
+                            (format!("{} — search free books", c.label()), true)
+                        } else {
+                            (c.label(), true)
+                        }
+                    })
+                    .collect();
                 compose_list(l, "Books", &rows, 0, 1)
             }
             Screen::BookList { title, feed, page } => {
@@ -7542,8 +7635,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .collect();
                 compose_list(l, title, &rows, *page, l.page_count(all.len()))
             }
-            Screen::BookSearch { query, .. } => {
-                compose_keyboard(l, "Search books", query, "Search", self.keyboard_shift)
+            Screen::BookSearch {
+                title,
+                search,
+                query,
+                recent,
+            } => self.paint_book_search(title, search, query, recent).ink,
+            Screen::BookResults {
+                query,
+                feed,
+                page,
+                error,
+            } => {
+                self.paint_book_results(query, feed, *page, error.as_deref())
+                    .ink
             }
             Screen::MangaList {
                 source,
