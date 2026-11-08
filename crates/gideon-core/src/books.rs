@@ -220,9 +220,22 @@ pub struct BookPlace {
     pub chapters: usize,
     #[serde(default)]
     pub updated_at: u64,
+    /// When the reader reached the book's last page (unix seconds); `None`
+    /// while it is still being read. "Mark as unread" clears the place.
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+    /// The reader chose to keep this finished book when offered to clean
+    /// it up, so it is never offered again.
+    #[serde(default)]
+    pub keep: bool,
 }
 
 impl BookPlace {
+    /// Whether the book has been read to its last page.
+    pub fn is_finished(&self) -> bool {
+        self.finished_at.is_some()
+    }
+
     /// The place as an ordered tuple: further into the book compares greater.
     pub fn place(&self) -> (usize, usize, usize) {
         (self.chapter, self.block, self.line)
@@ -326,6 +339,26 @@ impl BookPlaces {
         list.insert(at, bookmark);
         true
     }
+}
+
+/// The finished books worth offering to delete: finished longer ago than
+/// `hours`, not kept, still on the shelf. `hours == 0` means never, the same
+/// rule as finished manga chapters. Oldest-finished first.
+pub fn stale_finished(books: &[Book], places: &BookPlaces, hours: u32, now: u64) -> Vec<Book> {
+    if hours == 0 {
+        return Vec::new();
+    }
+    let cutoff = now.saturating_sub(u64::from(hours) * 3600);
+    let mut out: Vec<(u64, Book)> = books
+        .iter()
+        .filter_map(|b| {
+            let p = places.get(&b.relative_path)?;
+            let at = p.finished_at?;
+            (!p.keep && at <= cutoff).then(|| (at, b.clone()))
+        })
+        .collect();
+    out.sort_by_key(|(at, _)| *at);
+    out.into_iter().map(|(_, b)| b).collect()
 }
 
 /// Delete a book and, when that leaves its author folder empty, the folder
@@ -460,6 +493,7 @@ mod tests {
                 line: 0,
                 chapters: 20,
                 updated_at: 1,
+                ..Default::default()
             },
         );
         places.save(root).unwrap();
@@ -554,5 +588,54 @@ mod tests {
                 "{title}"
             );
         }
+    }
+
+    #[test]
+    fn stale_finished_offers_only_old_unkept_finished_books_on_the_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (f, t) in [
+            ("A/old.epub", "Old"),
+            ("A/new.epub", "New"),
+            ("A/kept.epub", "Kept"),
+            ("A/reading.epub", "Reading"),
+        ] {
+            epub(&root.join(f), t, "A");
+        }
+        let books = scan(root).unwrap();
+        let mut places = BookPlaces::default();
+        let day = 86_400;
+        let now = 100 * day;
+        let finished = |at: u64, keep: bool| BookPlace {
+            chapter: 9,
+            chapters: 10,
+            finished_at: Some(at),
+            keep,
+            ..Default::default()
+        };
+        places.set("A/old.epub", finished(now - 5 * day, false));
+        places.set("A/new.epub", finished(now - 3600, false));
+        places.set("A/kept.epub", finished(now - 9 * day, true));
+        places.set(
+            "A/reading.epub",
+            BookPlace {
+                chapter: 2,
+                chapters: 10,
+                ..Default::default()
+            },
+        );
+        places.set("A/gone.epub", finished(now - 9 * day, false));
+        let titles = |v: Vec<Book>| v.into_iter().map(|b| b.title).collect::<Vec<_>>();
+        assert_eq!(titles(stale_finished(&books, &places, 48, now)), ["Old"]);
+        assert!(
+            stale_finished(&books, &places, 0, now).is_empty(),
+            "0 is never"
+        );
+        assert_eq!(
+            titles(stale_finished(&books, &places, 1, now)),
+            ["Old", "New"]
+        );
+        assert!(places.get("A/old.epub").unwrap().is_finished());
+        assert!(!places.get("A/reading.epub").unwrap().is_finished());
     }
 }

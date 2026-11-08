@@ -42,6 +42,7 @@ struct BookCard {
 fn book_cards(books: &[gideon_core::Book], places: &gideon_core::BookPlaces) -> Vec<BookCard> {
     let progress_of = |b: &gideon_core::Book| -> (Option<f32>, u64) {
         match places.get(&b.relative_path) {
+            Some(p) if p.is_finished() => (Some(1.0), p.updated_at),
             Some(p) if p.chapters > 0 => (
                 Some((p.chapter as f32 / p.chapters as f32).clamp(0.0, 1.0)),
                 p.updated_at,
@@ -119,7 +120,9 @@ fn book_row_label(book: &gideon_core::Book, places: &gideon_core::BookPlaces) ->
         label.push_str(" · PDF");
     }
     if let Some(p) = places.get(&book.relative_path) {
-        if p.chapters > 0 {
+        if p.is_finished() {
+            label.push_str(" · Finished");
+        } else if p.chapters > 0 {
             let pct = (p.chapter as f32 / p.chapters as f32 * 100.0).round() as u32;
             label.push_str(&format!(" · {pct}%"));
         }
@@ -373,6 +376,9 @@ enum Sheet {
     /// A word was pressed but no dictionary is installed: offer the one
     /// gideon knows how to fetch.
     NoDictionary,
+    /// Finished books past the cleanup delay, offered for deletion when the
+    /// Books tab opens — never deleted without asking.
+    CleanFinishedBooks { books: Vec<gideon_core::Book> },
 }
 
 /// The English dictionary the reader offers to download: WordNet 3.1,
@@ -2870,7 +2876,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ],
                 )
             }
-            Some(Sheet::BookFile { ref book }) => (book.title.clone(), book_file_rows(book)),
+            Some(Sheet::BookFile { ref book }) => (
+                book.title.clone(),
+                book_file_rows(book, self.book_finished(book)),
+            ),
             Some(Sheet::BookReading) => (
                 "Reading".to_string(),
                 vec![
@@ -2951,6 +2960,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         ),
                         ("Margins".into(), title_case(&settings.book_margins), false),
                         ("Close".into(), String::new(), true),
+                    ],
+                )
+            }
+            Some(Sheet::CleanFinishedBooks { ref books }) => {
+                let n = books.len();
+                let noun = if n == 1 { "book" } else { "books" };
+                let first = books.first().map(|b| b.title.clone()).unwrap_or_default();
+                (
+                    if n == 1 {
+                        format!("You finished \"{first}\"")
+                    } else {
+                        format!("You finished {n} books")
+                    },
+                    vec![
+                        (format!("Delete the finished {noun}"), String::new(), false),
+                        ("Keep them".into(), String::new(), false),
+                        ("Not now".into(), String::new(), true),
                     ],
                 )
             }
@@ -3319,7 +3345,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Sheet::BookFile { book }) => {
                 // An EPUB reads here; a PDF only in the Kobo's reader. The
                 // rows differ by one, so index by what they say.
-                let rows = book_file_rows(&book);
+                let rows = book_file_rows(&book, self.book_finished(&book));
                 match rows.get(index).map(|r| r.0.as_str()) {
                     Some("Read") => {
                         self.sheet = None;
@@ -3330,6 +3356,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // the Books folder on start, so the book is on its home
                     // screen when it comes up.
                     Some("Read in the Kobo reader") => Ok(Flow::Quit(Exit::Close)),
+                    Some(label @ ("Mark as finished" | "Mark as unread")) => {
+                        let mut places = gideon_core::BookPlaces::load(&self.books_dir);
+                        if label == "Mark as unread" {
+                            // Back to the first page, as if never opened.
+                            places.places.remove(&book.relative_path);
+                        } else {
+                            let mut p = places.get(&book.relative_path).unwrap_or_default();
+                            p.finished_at = Some((self.clock)());
+                            places.set(&book.relative_path, p);
+                        }
+                        if let Err(e) = places.save(&self.books_dir) {
+                            eprintln!("gideon: couldn't save the reading place: {e}");
+                        }
+                        self.sheet = None;
+                        self.render_current(RefreshMode::Full)?;
+                        Ok(Flow::Continue)
+                    }
                     Some("Delete this book") => {
                         self.sheet = Some(Sheet::ConfirmDeleteBook { book });
                         // One sheet replaces another over the same screen: the
@@ -3343,6 +3386,35 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         Ok(Flow::Continue)
                     }
                 }
+            }
+            Some(Sheet::CleanFinishedBooks { books }) => {
+                self.sheet = None;
+                match index {
+                    0 => {
+                        for book in &books {
+                            if let Err(e) = gideon_core::books::delete(&self.books_dir, book) {
+                                eprintln!("gideon: couldn't delete {}: {e}", book.path.display());
+                            }
+                        }
+                        self.refresh_library_in_place()?;
+                    }
+                    1 => {
+                        let mut places = gideon_core::BookPlaces::load(&self.books_dir);
+                        for book in &books {
+                            if let Some(mut p) = places.get(&book.relative_path) {
+                                p.keep = true;
+                                places.set(&book.relative_path, p);
+                            }
+                        }
+                        if let Err(e) = places.save(&self.books_dir) {
+                            eprintln!("gideon: couldn't save the reading places: {e}");
+                        }
+                    }
+                    _ => {}
+                }
+                // The sheet closing reveals the shelf: Full.
+                self.render_current(RefreshMode::Full)?;
+                Ok(Flow::Continue)
             }
             Some(Sheet::BookReading) => {
                 self.sheet = None;
@@ -4306,7 +4378,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.books_dir.display()
                     )
                 })?;
-                self.goto_root(Screen::BookShelf { books, page: 0 })
+                let hours = self.load_settings().finished_cleanup_hours;
+                let places = gideon_core::BookPlaces::load(&self.books_dir);
+                let stale =
+                    gideon_core::books::stale_finished(&books, &places, hours, (self.clock)());
+                self.goto_root(Screen::BookShelf { books, page: 0 })?;
+                if !stale.is_empty() {
+                    // Offered over the shelf just drawn, which has not moved.
+                    self.sheet = Some(Sheet::CleanFinishedBooks { books: stale });
+                    self.render_current(RefreshMode::Partial)?;
+                }
+                Ok(())
             }
         }
     }
@@ -7559,7 +7641,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let places = gideon_core::BookPlaces::load(&self.books_dir);
         for book in gideon_core::books::scan(&self.books_dir).unwrap_or_default() {
             let place = places.get(&book.relative_path);
-            let finished = place.is_some_and(|p| p.chapters > 0 && p.chapter + 1 >= p.chapters);
+            let finished = place.is_some_and(|p| p.is_finished());
             if book.format == "epub" && !finished {
                 let when = place.map(|p| p.updated_at).unwrap_or(0);
                 rows.push((WaitingRow::Book(book), when));
@@ -9056,6 +9138,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut places = gideon_core::BookPlaces::load(&self.books_dir);
+        let before = places.get(&book.relative_path).unwrap_or_default();
+        // The last page of the last chapter is "finished"; reading on from
+        // an earlier page of a finished book keeps it finished.
+        let at_end = *chapter + 1 >= text.chapters.len() && *page + 1 >= pages.len();
         places.set(
             &book.relative_path,
             gideon_core::BookPlace {
@@ -9064,6 +9150,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 line,
                 chapters: text.chapters.len(),
                 updated_at: now,
+                finished_at: before.finished_at.or(at_end.then_some(now)),
+                keep: before.keep,
             },
         );
         if let Err(e) = places.save(&self.books_dir) {
@@ -9459,6 +9547,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             self.shelf_layout().capacity()
         }
         .max(1)
+    }
+
+    /// Whether `book` has been read to its end (or marked so).
+    fn book_finished(&self, book: &gideon_core::Book) -> bool {
+        gideon_core::BookPlaces::load(&self.books_dir)
+            .get(&book.relative_path)
+            .is_some_and(|p| p.is_finished())
     }
 
     /// The Books tab's cards: volumes of one series under one card, the
@@ -10046,7 +10141,7 @@ fn page_label(page: usize, page_count: usize) -> String {
 /// height wide so they are finger-sized rather than glyph-sized.
 /// What the Books-tab sheet offers for one book. gideon reads an EPUB
 /// itself; a PDF is the Kobo reader's.
-fn book_file_rows(book: &gideon_core::Book) -> Vec<(String, String, bool)> {
+fn book_file_rows(book: &gideon_core::Book, finished: bool) -> Vec<(String, String, bool)> {
     let mut rows = Vec::new();
     if book.format == "epub" {
         rows.push(("Read".to_string(), String::new(), false));
@@ -10054,6 +10149,16 @@ fn book_file_rows(book: &gideon_core::Book) -> Vec<(String, String, bool)> {
     rows.push((
         "Read in the Kobo reader".to_string(),
         "closes gideon".to_string(),
+        false,
+    ));
+    rows.push((
+        if finished {
+            "Mark as unread"
+        } else {
+            "Mark as finished"
+        }
+        .to_string(),
+        String::new(),
         false,
     ));
     rows.push(("Delete this book".to_string(), String::new(), false));
