@@ -2178,18 +2178,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if self.sheet.is_some() {
             return self.tap_sheet(x, y);
         }
-        // The book reader is three zones, like the manga reader: the left
-        // third turns back, the right third forward, the middle opens the
-        // reading menu. No chrome to hit-test.
+        // The book reader is three zones, exactly the manga reader's: the
+        // left third turns back, the right third forward, the middle leaves
+        // the book (its place is saved). The reading menu is the manga
+        // reader's controls gesture: a flick up off the bottom edge.
         if matches!(self.screen(), Screen::BookReader { .. }) {
             return match layout::reader_zone_in_width(self.layout.width, x) {
                 ReaderZone::PrevPage => self.turn_book_page(-1).map(|_| Flow::Continue),
                 ReaderZone::NextPage => self.turn_book_page(1).map(|_| Flow::Continue),
-                ReaderZone::Back => {
-                    self.sheet = Some(Sheet::BookReading);
-                    self.render_current(RefreshMode::Partial)
-                        .map(|_| Flow::Continue)
-                }
+                ReaderZone::Back => self.close_book(),
             };
         }
         // Internet Archive results: two-row-tall book rows and a footer of
@@ -3016,6 +3013,25 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Where an open sheet sits: anchored to the bottom, as tall as its rows
     /// need. Everything above it stays on screen and unrepainted.
+    /// The height of the lamp strip under the reading menu's rows: one
+    /// slider per lamp with gaps, or nothing on a device without a lamp.
+    fn reading_lamp_strip_h(&self) -> u32 {
+        if !matches!(self.sheet, Some(Sheet::BookReading)) {
+            return 0;
+        }
+        let n = self.quick_sliders().len() as u32;
+        if n == 0 {
+            return 0;
+        }
+        SETTINGS_GAP + n * self.layout.row_h + n.saturating_sub(1) * SETTINGS_GAP + SETTINGS_GAP
+    }
+
+    /// Top of the reading menu's lamp strip (its first slider).
+    fn reading_lamp_sliders_top(&self) -> Option<u32> {
+        let strip = self.reading_lamp_strip_h();
+        (strip > 0).then(|| self.layout.height - strip + SETTINGS_GAP)
+    }
+
     fn sheet_bounds(&self) -> Option<(u32, u32)> {
         if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
             let s = self.download_sheet_layout();
@@ -3029,7 +3045,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if rows.is_empty() {
             return None;
         }
-        let h = widgets::sheet_height(rows.len(), self.layout.row_h).min(self.layout.height);
+        let h = (widgets::sheet_height(rows.len(), self.layout.row_h)
+            + self.reading_lamp_strip_h())
+        .min(self.layout.height);
         Some((self.layout.height - h, h))
     }
 
@@ -3054,17 +3072,47 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 dismiss: *d,
             })
             .collect();
+        let strip = self.reading_lamp_strip_h();
         widgets::draw_sheet(
             canvas,
             0,
             y,
             self.layout.width,
-            h,
+            h - strip,
             &title,
             &rows,
             self.layout.text_px,
             &theme,
         );
+        if let Some(top) = self.reading_lamp_sliders_top() {
+            // The lamp, nearest the thumb that just flicked the menu up: the
+            // same sliders the quick-settings sheet draws.
+            let l = &self.layout;
+            widgets::draw_sheet(
+                canvas,
+                0,
+                y + h - strip,
+                l.width,
+                strip,
+                "",
+                &[],
+                l.text_px,
+                &theme,
+            );
+            for (i, (label, percent)) in self.quick_sliders().iter().enumerate() {
+                widgets::draw_slider(
+                    canvas,
+                    l.pad,
+                    top + i as u32 * (l.row_h + SETTINGS_GAP),
+                    l.width.saturating_sub(l.pad * 2),
+                    l.row_h,
+                    label,
+                    *percent,
+                    l.text_px,
+                    &theme,
+                );
+            }
+        }
     }
 
     /// Where each settings row was drawn, and what it does. Built by walking
@@ -3280,9 +3328,18 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 .render_current(RefreshMode::Full)
                 .map(|_| Flow::Continue);
         }
+        if let Some(row) = self.quick_slider_at(y) {
+            // A tap on a lamp slider sets the level where it lands.
+            self.scrub_quick_slider(row, x)?;
+            return Ok(Flow::Continue);
+        }
+        let h = h - self.reading_lamp_strip_h();
         let (_, rows) = self.sheet_rows();
         let row_h = self.layout.row_h;
         let title_h = h.saturating_sub(row_h * rows.len() as u32);
+        if y >= top + h {
+            return Ok(Flow::Continue);
+        }
         if y < top + title_h {
             return Ok(Flow::Continue);
         }
@@ -3534,6 +3591,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// sheet is closed, the device has no lamp, or y is somewhere else on
     /// the sheet.
     fn quick_slider_at(&self, y: u32) -> Option<usize> {
+        if let Some(top) = self.reading_lamp_sliders_top() {
+            let count = self.quick_sliders().len();
+            if y < top {
+                return None;
+            }
+            let row = ((y - top) / (self.layout.row_h + SETTINGS_GAP).max(1)) as usize;
+            return (row < count).then_some(row);
+        }
         if !matches!(self.sheet, Some(Sheet::QuickSettings)) {
             return None;
         }
@@ -3597,13 +3662,27 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // menu.
         if matches!(self.stack.last(), Some(Screen::BookReader { .. })) && self.sheet.is_none() {
             let l = &self.layout;
-            let edge = reader_edge_slide(x0, y0, x1, y1, l.width, l.height, 0).is_some();
-            if !edge && released && is_sheet_swipe(x0, y0, x1, y1, l.height) {
-                // The manga reader's gesture: a flick up off the bottom bezel.
-                // It raises the controls sheet with the lamp sliders on top,
-                // over the page that has not moved (Partial).
+            let (height, edge) = (
+                l.height,
+                reader_edge_slide(x0, y0, x1, y1, l.width, l.height, 0).is_some(),
+            );
+            if !edge && released {
+                // The manga reader's mid-screen gestures, by the same rules.
                 self.book_slide_base = None;
-                self.open_quick_settings()?;
+                let min_travel = (height / 4).max(1);
+                let vertical = y0.abs_diff(y1) > x0.abs_diff(x1);
+                if is_sheet_swipe(x0, y0, x1, y1, height) {
+                    // A flick up off the bottom bezel: the reading menu, with
+                    // the lamp sliders, over the unmoved page (Partial).
+                    self.sheet = Some(Sheet::BookReading);
+                    self.render_current(RefreshMode::Partial)?;
+                } else if vertical && y1 > y0 && y1 - y0 >= min_travel {
+                    // Swipe down: leave the book.
+                    return self.close_book();
+                } else if vertical && y0 > y1 && y0 - y1 >= min_travel {
+                    // Swipe up mid-page: rotate a quarter turn.
+                    self.rotate_book_reader()?;
+                }
                 return Ok(Flow::Continue);
             }
             self.book_edge_slide(x0, y0, x1, y1, released)?;
@@ -9393,6 +9472,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
         }
         canvas
+    }
+
+    /// Leave the book, saving the place: the manga reader's middle tap and
+    /// swipe down, and the reading menu's "Close book".
+    fn close_book(&mut self) -> Result<Flow> {
+        self.sheet = None;
+        self.save_book_place();
+        self.pop()?;
+        Ok(Flow::Continue)
     }
 
     /// Turn the reader (and with it every menu) a quarter turn, like the
