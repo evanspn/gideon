@@ -11338,6 +11338,276 @@ mod library_tabs {
         ui.sheet = Some(Sheet::BookReading);
         assert_eq!(ui.sheet_rows().1[5].1, "Landscape");
     }
+
+    /// Input that flushes like the Kobo's: `discard_taps` really drops what
+    /// is queued (sleep requests aside). FakeInput keeps its script on a
+    /// flush, which is how a mid-slide flush hid from every test.
+    struct FlushingInput {
+        events: std::collections::VecDeque<UiEvent>,
+        flushes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl gideon_device::InputSource for FlushingInput {
+        fn next_event(&mut self) -> gideon_device::Result<UiEvent> {
+            self.events
+                .pop_front()
+                .ok_or_else(|| gideon_device::Error::Display("input exhausted".into()))
+        }
+        fn poll_event(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> gideon_device::Result<Option<UiEvent>> {
+            self.next_event().map(Some)
+        }
+        fn discard_queued(&mut self) {
+            self.flushes.set(self.flushes.get() + 1);
+            self.events.clear();
+        }
+        fn discard_taps(&mut self) {
+            self.flushes.set(self.flushes.get() + 1);
+            self.events.retain(|e| matches!(e, UiEvent::Sleep));
+        }
+    }
+
+    #[test]
+    fn a_slow_repaint_never_flushes_the_rest_of_an_edge_slide() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        // Open the book with a scripted run first, then hand the open reader
+        // a flushing input and a stale window of zero: every event "took
+        // too long", as a book-page repaint does on the Kobo.
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let book = match ui.screen() {
+            Screen::BookReader { book, .. } => book.clone(),
+            other => panic!("expected the reader, got {other:?}"),
+        };
+        let (levels, log, lights) = lights_recording();
+        let flushes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut events = std::collections::VecDeque::new();
+        // Slide up the right edge in five reports, lift, then tap the
+        // middle (opens the reading menu, proving input still flows).
+        for k in 1..=5u32 {
+            events.push_back(UiEvent::Drag {
+                x0: W - 5,
+                y0: H - 100,
+                x1: W - 5,
+                y1: H - 100 - k * H / 10,
+            });
+        }
+        events.push_back(UiEvent::Swipe {
+            x0: W - 5,
+            y0: H - 100,
+            x1: W - 5,
+            y1: H - 100 - H / 2,
+        });
+        let mut slow = UiApp::new(
+            MemoryDisplay::new(W, H),
+            FlushingInput {
+                events,
+                flushes: flushes.clone(),
+            },
+            FakeGateway::default(),
+            lib.clone(),
+        )
+        .with_books_dir(lib.join("Books"))
+        .with_lights(lights)
+        .with_stale_tap_after(std::time::Duration::ZERO);
+        slow.open_book_reader(book).unwrap();
+        let _ = slow.run();
+        // 20 % + half the height = 70 %, every report applied in order.
+        assert_eq!(
+            levels.borrow().0,
+            70,
+            "the whole slide landed: {:?}",
+            log.borrow()
+        );
+        assert_eq!(
+            *log.borrow(),
+            (1..=5u32)
+                .map(|k| Lamp::Brightness(20 + (k * H / 10 * 100 / H) as u8))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(flushes.get(), 0, "motion is never flushed as stale");
+    }
+
+    #[test]
+    fn a_slide_whose_lift_was_lost_does_not_pin_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let (levels, _, lights) = lights_recording();
+        let mut events = open_first_book();
+        events.extend([
+            // A slide from 20 % up a quarter: 45 %. Its lift never arrives.
+            UiEvent::Drag {
+                x0: W - 5,
+                y0: H - 100,
+                x1: W - 5,
+                y1: H - 100 - H / 4,
+            },
+            // A new finger, lower down, up another quarter: from 45, not
+            // from the lost slide's 20.
+            UiEvent::Drag {
+                x0: W - 6,
+                y0: H - 60,
+                x1: W - 6,
+                y1: H - 60 - H / 4,
+            },
+            UiEvent::Swipe {
+                x0: W - 6,
+                y0: H - 60,
+                x1: W - 6,
+                y1: H - 60 - H / 4,
+            },
+            // And all the way down from there: clamps at 0, not stuck.
+            UiEvent::Swipe {
+                x0: W - 5,
+                y0: 100,
+                x1: W - 5,
+                y1: H - 10,
+            },
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        let probe = levels.clone();
+        ui.run().unwrap();
+        assert_eq!(probe.borrow().0, 0, "slid to the bottom");
+        drop(ui);
+
+        // The middle state, checked on its own: two slides, 20 → 45 → 70.
+        let (levels, _, lights) = lights_recording();
+        let mut events = open_first_book();
+        events.extend([
+            UiEvent::Drag {
+                x0: W - 5,
+                y0: H - 100,
+                x1: W - 5,
+                y1: H - 100 - H / 4,
+            },
+            UiEvent::Swipe {
+                x0: W - 6,
+                y0: H - 60,
+                x1: W - 6,
+                y1: H - 60 - H / 4,
+            },
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        ui.run().unwrap();
+        assert_eq!(levels.borrow().0, 70);
+    }
+
+    #[test]
+    fn the_lamp_reaches_both_ends_and_back_in_small_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let (levels, _, lights) = lights_recording();
+        let mut events = open_first_book();
+        // Ten separate short slides up (each its own finger), then ten down.
+        for i in 0..10u32 {
+            let y0 = H - 100 - i;
+            events.push(UiEvent::Swipe {
+                x0: W - 5,
+                y0,
+                x1: W - 5,
+                y1: y0 - H / 10,
+            });
+        }
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        ui.run().unwrap();
+        assert_eq!(levels.borrow().0, 100, "20 + 10 × 10, clamped");
+
+        let (levels, _, lights) = lights_recording();
+        let mut events = open_first_book();
+        for i in 0..10u32 {
+            let y0 = 200 + i;
+            events.push(UiEvent::Swipe {
+                x0: W - 5,
+                y0,
+                x1: W - 5,
+                y1: y0 + H / 10,
+            });
+        }
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        ui.run().unwrap();
+        assert_eq!(levels.borrow().0, 0, "20 − 10 × 10, clamped at off");
+    }
+
+    #[test]
+    fn a_flick_up_off_the_bottom_raises_the_lamp_sheet_like_the_manga_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let (levels, _, lights) = lights_recording();
+        let mut events = open_first_book();
+        events.push(UiEvent::Swipe {
+            x0: W / 2,
+            y0: H - 20,
+            x1: W / 2,
+            y1: H - 20 - H / 6,
+        });
+        let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
+        ui.run().unwrap();
+        assert!(
+            matches!(ui.sheet, Some(Sheet::QuickSettings)),
+            "{:?}",
+            ui.sheet
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(
+            matches!(ui.screen(), Screen::BookReader { .. }),
+            "still reading"
+        );
+        // The sheet's first slider is the lamp; scrubbing it sets the level.
+        let sheet = ui.quick_sheet_layout();
+        let y = sheet.sliders_top + sheet.slider_h / 2;
+        let l = layout();
+        let x = l.pad + (W - 2 * l.pad) * 3 / 10;
+        ui.drag_menu(x, y, x, y, false).unwrap();
+        assert_eq!(levels.borrow().0, 30);
+        // Closing reveals the page: Full.
+        ui.tap_sheet(W / 2, 5).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // Mid-page, the same flick does nothing; nor does a short one off
+        // the bottom (a sloppy page-turn tap).
+        let mut events = open_first_book();
+        events.extend([
+            UiEvent::Swipe {
+                x0: W / 2,
+                y0: H / 2,
+                x1: W / 2,
+                y1: H / 2 - H / 6,
+            },
+            UiEvent::Swipe {
+                x0: W / 2,
+                y0: H - 20,
+                x1: W / 2,
+                y1: H - 20 - 40,
+            },
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(ui.sheet.is_none());
+    }
+
+    #[test]
+    fn the_sheet_gesture_is_one_rule_for_both_readers() {
+        let h = 1448;
+        // From the bottom eighth, an eighth or more of travel, vertical.
+        assert!(is_sheet_swipe(500, h - 10, 500, h - 10 - h / 8, h));
+        assert!(
+            !is_sheet_swipe(500, h - 10, 500, h - 10 - h / 8 + 1, h),
+            "too short"
+        );
+        assert!(
+            !is_sheet_swipe(500, h - h / 4, 500, h / 4, h),
+            "starts too high"
+        );
+        assert!(
+            !is_sheet_swipe(500, h - 10, 900, h - 300, h),
+            "too sideways"
+        );
+        assert!(!is_sheet_swipe(500, h - 300, 500, h - 10, h), "downwards");
+    }
 }
 
 // --- Internet Archive: search-first screens (design `internet-archive-search`) ---
