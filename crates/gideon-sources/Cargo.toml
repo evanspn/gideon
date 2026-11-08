@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 gideon-core = { path = "../gideon-core" }
+archivist = { path = "../archivist" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

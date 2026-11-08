@@ -1294,6 +1294,7 @@ dependencies = [
 name = "gideon-sources"
 version = "1.0.0"
 dependencies = [
+ "archivist",
  "filetime",
  "gideon-core",
  "quick-xml",

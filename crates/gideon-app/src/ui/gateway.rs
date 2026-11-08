@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use gideon_aidoku::source::Source;
-use gideon_sources::opds;
+use gideon_sources::{catalog, opds};
 use gideon_sources::{Fetcher, UreqFetcher};
 use url::Url;
 
@@ -309,25 +309,30 @@ impl SourceGateway for AidokuGateway {
     }
 
     fn book_catalogs(&self) -> Vec<BookCatalog> {
-        gideon_core::Settings::load(&self.data_dir)
+        let mut catalogs = gideon_core::Settings::load(&self.data_dir)
             .unwrap_or_default()
-            .book_catalogs
+            .book_catalogs;
+        // The Internet Archive is built in: settings.json keeps whatever
+        // catalogue list a device first saved, so adding it only to the
+        // defaults would leave it off every device already set up.
+        with_internet_archive(&mut catalogs);
+        catalogs
     }
 
     fn book_feed(&self, url: &Url) -> Result<BookFeed> {
-        Ok(opds::fetch_feed(&UreqFetcher::new(), url)?)
+        Ok(catalog::fetch_feed(&UreqFetcher::new(), url)?)
     }
 
     fn book_next_page(&self, feed: &BookFeed) -> Result<Option<BookFeed>> {
-        Ok(opds::fetch_next(&UreqFetcher::new(), feed)?)
+        Ok(catalog::fetch_next(&UreqFetcher::new(), feed)?)
     }
 
     fn book_search(&self, search: &SearchLink, query: &str) -> Result<Option<BookFeed>> {
-        Ok(opds::search(&UreqFetcher::new(), search, query)?)
+        Ok(catalog::search(&UreqFetcher::new(), search, query)?)
     }
 
     fn book_open(&self, entry: &BookEntry) -> Result<BookOpened> {
-        Ok(opds::open_entry(&UreqFetcher::new(), entry)?)
+        Ok(catalog::open_entry(&UreqFetcher::new(), entry)?)
     }
 
     fn book_download(
@@ -552,4 +557,18 @@ fn latest_release() -> Result<Option<gideon_sources::update::ReleaseInfo>> {
         .or_else(|_| update::check_update_via_assets(&fetcher, &base, &repo, current))
         .or_else(|_| update::check_update(&fetcher, &repo, current))?;
     Ok(release)
+}
+
+/// Append the built-in Internet Archive catalogue unless the list already
+/// has one at that address (a user who typed it in keeps their own name).
+pub fn with_internet_archive(catalogs: &mut Vec<BookCatalog>) {
+    let ia = BookCatalog::internet_archive();
+    let same = |c: &BookCatalog| {
+        Url::parse(c.url.trim())
+            .map(|u| gideon_sources::archive::is_archive(&u) && matches!(u.path(), "" | "/"))
+            .unwrap_or(false)
+    };
+    if !catalogs.iter().any(same) {
+        catalogs.push(ia);
+    }
 }

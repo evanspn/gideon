@@ -187,19 +187,19 @@ impl SourceGateway for FakeGateway {
     }
 
     fn book_feed(&self, url: &url::Url) -> Result<BookFeed> {
-        Ok(gideon_sources::opds::fetch_feed(&self.web, url)?)
+        Ok(gideon_sources::catalog::fetch_feed(&self.web, url)?)
     }
 
     fn book_next_page(&self, feed: &BookFeed) -> Result<Option<BookFeed>> {
-        Ok(gideon_sources::opds::fetch_next(&self.web, feed)?)
+        Ok(gideon_sources::catalog::fetch_next(&self.web, feed)?)
     }
 
     fn book_search(&self, search: &SearchLink, query: &str) -> Result<Option<BookFeed>> {
-        Ok(gideon_sources::opds::search(&self.web, search, query)?)
+        Ok(gideon_sources::catalog::search(&self.web, search, query)?)
     }
 
     fn book_open(&self, entry: &BookEntry) -> Result<BookOpened> {
-        Ok(gideon_sources::opds::open_entry(&self.web, entry)?)
+        Ok(gideon_sources::catalog::open_entry(&self.web, entry)?)
     }
 
     fn book_download(
@@ -451,7 +451,12 @@ fn tap_setting(label: &str) -> Vec<UiEvent> {
 /// Tap card `i` of Discover's grid. Discover is two columns of cards now, so
 /// a tap at the middle of the screen lands in the gutter between them.
 fn tap_card(i: usize) -> UiEvent {
-    let l = layout();
+    tap_card_at(W, H, i)
+}
+
+/// [`tap_card`] on a panel of any size.
+fn tap_card_at(w: u32, h: u32, i: usize) -> UiEvent {
+    let l = UiLayout::new(w, h);
     let gap = l.pad / 2;
     let top = l.content_top() + gap;
     let avail = l.nav_top().saturating_sub(top + gap);
@@ -9720,7 +9725,7 @@ mod books {
         );
     }
 
-    fn walk(dir: &Path) -> Vec<PathBuf> {
+    pub(super) fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -9743,7 +9748,7 @@ mod library_tabs {
     use super::*;
 
     /// A minimal EPUB whose OPF names it; the file name does not.
-    fn make_epub(path: &Path, title: &str, author: &str) {
+    pub(super) fn make_epub(path: &Path, title: &str, author: &str) {
         make_epub_with(path, title, author, &[("One", &["So it goes."])]);
     }
 
@@ -11332,5 +11337,624 @@ mod library_tabs {
         assert_eq!(*page, 1);
         ui.sheet = Some(Sheet::BookReading);
         assert_eq!(ui.sheet_rows().1[5].1, "Landscape");
+    }
+}
+
+// --- Internet Archive: search-first screens (design `internet-archive-search`) ---
+//
+// The whole path a reader takes — Books › Internet Archive › keyboard ›
+// results › book sheet › Download › Read now — against canned archive.org
+// JSON, with every repaint's refresh mode pinned (docs/REFRESH.md).
+
+mod internet_archive {
+    use super::*;
+    use crate::ui::book_search::{self, DownloadState};
+
+    const GUTENBERG: &str = "https://www.gutenberg.org/ebooks.opds/";
+
+    /// A search answer: `found` in all, these docs on this page.
+    fn search_json(found: usize, docs: &[(&str, &str, &str, &str, bool)]) -> String {
+        let docs: Vec<String> = docs
+            .iter()
+            .map(|(id, title, creator, year, epub)| {
+                let format = if *epub { r#"["EPUB","Text PDF"]"# } else { r#"["Text PDF"]"# };
+                format!(
+                    r#"{{"identifier":"{id}","title":"{title}","creator":"{creator}","year":{year},"language":"eng","downloads":10,"format":{format}}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"response":{{"numFound":{found},"start":0,"docs":[{}]}}}}"#,
+            docs.join(",")
+        )
+    }
+
+    fn item_json(id: &str, title: &str, creator: &str, size: u64) -> String {
+        format!(
+            r#"{{"metadata":{{"identifier":"{id}","title":"{title}","creator":"{creator}"}},"files":[{{"name":"{id}.epub","format":"EPUB","size":"{size}"}},{{"name":"{id}.pdf","format":"Text PDF","size":"1"}}]}}"#
+        )
+    }
+
+    fn search_url(q: &str) -> String {
+        gideon_sources::archive::search_url(q).unwrap().to_string()
+    }
+
+    fn page2_url(q: &str) -> String {
+        search_url(q).replace("&page=1&", "&page=2&")
+    }
+
+    /// A real (tiny) EPUB, so "Read now" can open it.
+    fn epub_bytes(title: &str, author: &str) -> Vec<u8> {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("b.epub");
+        super::library_tabs::make_epub(&path, title, author);
+        std::fs::read(path).unwrap()
+    }
+
+    /// Gutenberg plus the built-in Internet Archive, with "frankenstein"
+    /// answering one book with an EPUB and one scan without.
+    fn gateway() -> FakeGateway {
+        let mut catalogs = vec![gideon_core::BookCatalog {
+            name: "Project Gutenberg".into(),
+            url: GUTENBERG.into(),
+        }];
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        FakeGateway {
+            catalogs,
+            web: gideon_sources::FakeFetcher::new()
+                .with(
+                    &search_url("frankenstein"),
+                    search_json(
+                        2,
+                        &[
+                            (
+                                "frankenstein00shel",
+                                "Frankenstein",
+                                "Mary Wollstonecraft Shelley",
+                                "1818",
+                                true,
+                            ),
+                            (
+                                "frankenstein-scan",
+                                "Frankenstein (scan)",
+                                "Shelley",
+                                "1900",
+                                false,
+                            ),
+                        ],
+                    ),
+                )
+                .with(
+                    "https://archive.org/metadata/frankenstein00shel",
+                    item_json(
+                        "frankenstein00shel",
+                        "Frankenstein",
+                        "Mary Wollstonecraft Shelley",
+                        2_097_152,
+                    ),
+                )
+                .with(
+                    "https://archive.org/download/frankenstein00shel/frankenstein00shel.epub",
+                    epub_bytes("Frankenstein", "Mary Wollstonecraft Shelley"),
+                )
+                .with(&search_url("xyzzy"), search_json(0, &[])),
+            ..FakeGateway::default()
+        }
+    }
+
+    /// Discover › Books › Internet Archive (row 1, after Gutenberg).
+    fn open_ia() -> Vec<UiEvent> {
+        vec![nav_discover(), tap_card(3), tap_row(1)]
+    }
+
+    fn type_and_search(q: &str) -> Vec<UiEvent> {
+        let mut e: Vec<UiEvent> = q.chars().map(|c| tap_key(Key::Char(c))).collect();
+        e.push(tap_key(Key::Search));
+        e
+    }
+
+    /// Centre of result row `i` on the current page.
+    fn tap_result(i: usize) -> UiEvent {
+        let l = layout();
+        let rh = book_search::result_row_h(&l);
+        UiEvent::Tap {
+            x: l.width / 2,
+            y: l.content_top() + i as u32 * rh + rh / 2,
+        }
+    }
+
+    /// The book sheet's buttons: 0 the secondary (left), 1 the primary.
+    fn tap_sheet_button(i: usize) -> UiEvent {
+        let probe = app(Path::new("/nonexistent"), FakeGateway::default(), vec![]);
+        let r = probe.download_sheet_layout().buttons[i];
+        UiEvent::Tap {
+            x: r.0 + r.2 / 2,
+            y: r.1 + r.3 / 2,
+        }
+    }
+
+    fn tap_footer(i: usize) -> UiEvent {
+        let r = book_search::results_footer_zones(&layout())[i];
+        UiEvent::Tap {
+            x: r.0 + r.2 / 2,
+            y: r.1 + r.3 / 2,
+        }
+    }
+
+    fn run(
+        dir: &Path,
+        gateway: FakeGateway,
+        events: Vec<UiEvent>,
+    ) -> UiApp<MemoryDisplay, FakeInput, FakeGateway> {
+        let mut ui = app(dir, gateway, events);
+        ui.run().unwrap();
+        ui
+    }
+
+    #[test]
+    fn the_internet_archive_is_built_in_once_beside_the_configured_catalogues() {
+        let mut catalogs = vec![gideon_core::BookCatalog {
+            name: "Project Gutenberg".into(),
+            url: GUTENBERG.into(),
+        }];
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        let labels: Vec<String> = catalogs.iter().map(|c| c.label()).collect();
+        assert_eq!(labels, ["Project Gutenberg", "Internet Archive"]);
+        catalogs[1].name = "IA".into();
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        assert_eq!(
+            catalogs.len(),
+            2,
+            "typed in by hand, under another name: not twice"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_row_says_what_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = run(dir.path(), gateway(), vec![nav_discover(), tap_card(3)]);
+        let Screen::Books { catalogs } = ui.screen() else {
+            panic!("expected the catalogue list, got {:?}", ui.screen());
+        };
+        assert_eq!(catalogs.len(), 2);
+    }
+
+    #[test]
+    fn tapping_the_internet_archive_opens_straight_onto_the_keyboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = run(dir.path(), gateway(), open_ia());
+        let Screen::BookSearch {
+            title,
+            query,
+            recent,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the search screen, got {:?}", ui.screen());
+        };
+        assert_eq!(title, "Internet Archive");
+        assert!(query.is_empty());
+        assert!(recent.is_empty(), "no history yet");
+        // A new screen: Full, in colour (the accent Search key).
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert_eq!(ui.display().blits.last(), Some(&true));
+    }
+
+    #[test]
+    fn typing_repaints_partially() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = open_ia();
+        events.extend("ab".chars().map(|c| tap_key(Key::Char(c))));
+        let ui = run(dir.path(), gateway(), events);
+        let Screen::BookSearch { query, .. } = ui.screen() else {
+            panic!("expected the search screen, got {:?}", ui.screen());
+        };
+        assert_eq!(query, "ab");
+        let f = &ui.display().flushes;
+        assert_eq!(
+            &f[f.len() - 2..],
+            [RefreshMode::Partial, RefreshMode::Partial]
+        );
+    }
+
+    #[test]
+    fn results_are_book_rows_without_the_pdf_only_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = open_ia();
+        events.extend(type_and_search("frankenstein"));
+        let ui = run(dir.path(), gateway(), events);
+        let Screen::BookResults {
+            query,
+            feed,
+            page,
+            error,
+        } = ui.screen()
+        else {
+            panic!("expected results, got {:?}", ui.screen());
+        };
+        assert_eq!(query, "frankenstein");
+        assert_eq!(*page, 0);
+        assert_eq!(*error, None);
+        let rows: Vec<(String, Option<String>, Option<String>)> = feed
+            .entries
+            .iter()
+            .map(|e| (e.title.clone(), e.detail.clone(), e.year.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "Frankenstein".to_string(),
+                Some("Mary Wollstonecraft Shelley".to_string()),
+                Some("1818".to_string())
+            )]
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert_eq!(
+            ui.display().blits.last(),
+            Some(&true),
+            "chips are colour blocks"
+        );
+    }
+
+    #[test]
+    fn a_search_is_remembered_and_its_chip_runs_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        // Search, back out to the keyboard, back out to the list, reopen.
+        let mut events = open_ia();
+        events.extend(type_and_search("frankenstein"));
+        events.push(tap_footer(0)); // Back to the keyboard
+        events.push(tap_nav(0)); // nav strip's Back on the keyboard screen
+        events.push(tap_row(1)); // Internet Archive again
+        let ui = run(dir.path(), gateway(), events);
+        let Screen::BookSearch { recent, .. } = ui.screen() else {
+            panic!("expected the search screen, got {:?}", ui.screen());
+        };
+        assert_eq!(recent, &["frankenstein"]);
+
+        // The chip runs the search without typing.
+        let chip = ui.search_extras(recent).chips[0];
+        let mut events = open_ia();
+        events.push(UiEvent::Tap {
+            x: chip.0 + chip.2 / 2,
+            y: chip.1 + chip.3 / 2,
+        });
+        let ui = run(dir.path(), gateway(), events);
+        assert!(
+            matches!(ui.screen(), Screen::BookResults { query, .. } if query == "frankenstein"),
+            "{:?}",
+            ui.screen()
+        );
+    }
+
+    #[test]
+    fn recent_searches_keep_the_last_three_newest_first_without_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        for q in ["a", "b", "A", "c", "d"] {
+            book_search::remember_search(dir.path(), q);
+        }
+        assert_eq!(
+            book_search::load_recent_searches(dir.path()),
+            ["d", "c", "A"]
+        );
+    }
+
+    #[test]
+    fn a_tap_raises_the_book_sheet_without_flashing_then_downloads_and_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = open_ia();
+        events.extend(type_and_search("frankenstein"));
+        events.push(tap_result(0));
+        let ui = run(dir.path(), gateway(), events.clone());
+        let Some(Sheet::BookDownload { epub, state, .. }) = ui.sheet() else {
+            panic!("expected the book sheet, got {:?}", ui.sheet());
+        };
+        assert_eq!(*state, DownloadState::Ready);
+        assert_eq!(epub.as_ref().and_then(|e| e.size), Some(2_097_152));
+        // "Checking the file…" then the facts: the same strip, twice, no flash.
+        let f = &ui.display().flushes;
+        assert_eq!(
+            &f[f.len() - 2..],
+            [RefreshMode::Partial, RefreshMode::Partial]
+        );
+        assert!(
+            super::books::walk(&dir.path().join("Books")).is_empty(),
+            "nothing downloads until Download is pressed"
+        );
+
+        // Download.
+        events.push(tap_sheet_button(1));
+        let ui = run(dir.path(), gateway(), events.clone());
+        let Some(Sheet::BookDownload {
+            state: DownloadState::Saved(path),
+            ..
+        }) = ui.sheet()
+        else {
+            panic!("expected Saved, got {:?}", ui.sheet());
+        };
+        assert!(
+            path.ends_with("Mary Wollstonecraft Shelley/Frankenstein.epub"),
+            "{path:?}"
+        );
+        assert!(path.exists());
+        let f = &ui.display().flushes;
+        assert_eq!(
+            &f[f.len() - 2..],
+            [RefreshMode::Partial, RefreshMode::Partial]
+        );
+        std::fs::remove_dir_all(dir.path().join("Books")).unwrap();
+
+        // Read now: gideon's own reader, a new screen, Full.
+        events.push(tap_sheet_button(1));
+        let ui = run(dir.path(), gateway(), events);
+        assert!(ui.sheet().is_none());
+        assert!(
+            matches!(ui.screen(), Screen::BookReader { book, .. } if book.title == "Frankenstein"),
+            "{:?}",
+            ui.screen()
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn cancel_closes_the_sheet_with_a_full_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = open_ia();
+        events.extend(type_and_search("frankenstein"));
+        events.push(tap_result(0));
+        events.push(tap_sheet_button(0));
+        let ui = run(dir.path(), gateway(), events);
+        assert!(ui.sheet().is_none());
+        assert!(matches!(ui.screen(), Screen::BookResults { .. }));
+        // The sheet held a strip of the list stale: reveal it Full.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn a_book_already_on_the_kobo_opens_saved_without_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir
+            .path()
+            .join("Books/Mary Wollstonecraft Shelley/Frankenstein.epub");
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        std::fs::write(
+            &on_disk,
+            epub_bytes("Frankenstein", "Mary Wollstonecraft Shelley"),
+        )
+        .unwrap();
+        // No metadata canned: a fetch would fail the sheet.
+        let mut g = gateway();
+        g.web = gideon_sources::FakeFetcher::new().with(
+            &search_url("frankenstein"),
+            search_json(
+                1,
+                &[(
+                    "frankenstein00shel",
+                    "Frankenstein",
+                    "Mary Wollstonecraft Shelley",
+                    "1818",
+                    true,
+                )],
+            ),
+        );
+        let mut events = open_ia();
+        events.extend(type_and_search("frankenstein"));
+        events.push(tap_result(0));
+        let ui = run(dir.path(), g, events);
+        assert!(
+            matches!(ui.sheet(), Some(Sheet::BookDownload { state: DownloadState::Saved(p), .. }) if *p == on_disk),
+            "{:?}",
+            ui.sheet()
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+    }
+
+    #[test]
+    fn nothing_found_says_so_and_edit_search_keeps_the_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = open_ia();
+        events.extend(type_and_search("xyzzy"));
+        let ui = run(dir.path(), gateway(), events.clone());
+        assert!(
+            matches!(ui.screen(), Screen::BookResults { feed, error: None, .. } if feed.entries.is_empty()),
+            "{:?}",
+            ui.screen()
+        );
+        let b = book_search::edit_search_button(&layout());
+        events.push(UiEvent::Tap {
+            x: b.0 + b.2 / 2,
+            y: b.1 + b.3 / 2,
+        });
+        let ui = run(dir.path(), gateway(), events);
+        assert!(
+            matches!(ui.screen(), Screen::BookSearch { query, .. } if query == "xyzzy"),
+            "{:?}",
+            ui.screen()
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn a_failed_search_is_the_empty_state_not_a_dead_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = open_ia();
+        events.extend(type_and_search("nocanned"));
+        let ui = run(dir.path(), gateway(), events);
+        assert!(
+            matches!(ui.screen(), Screen::BookResults { error: Some(_), .. }),
+            "{:?}",
+            ui.screen()
+        );
+    }
+
+    #[test]
+    fn results_page_from_the_footer_fetching_the_next_page_when_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let per = book_search::results_per_page(&layout());
+        // archive.org answers 25 a request: 27 found means a second request
+        // for the last 2, made only when paging reaches them.
+        let total = 27;
+        let docs: Vec<(String, String)> = (0..total)
+            .map(|i| (format!("book{i}"), format!("Book {i}")))
+            .collect();
+        let as_docs = |range: std::ops::Range<usize>| -> String {
+            let d: Vec<(&str, &str, &str, &str, bool)> = docs[range]
+                .iter()
+                .map(|(id, t)| (id.as_str(), t.as_str(), "Anon", "1900", true))
+                .collect();
+            search_json(total, &d)
+        };
+        let mut g = gateway();
+        g.web = g
+            .web
+            .with(&search_url("many"), as_docs(0..25))
+            .with(&page2_url("many"), as_docs(25..total));
+        let last_page = total.div_ceil(per) - 1;
+        assert!(
+            last_page * per < 25 + 2 && (last_page + 1) * per > 25,
+            "the last page needs the second request"
+        );
+        let mut events = open_ia();
+        events.extend(type_and_search("many"));
+        events.extend((0..last_page).map(|_| tap_footer(3))); // Next › to the end
+        let ui = run(dir.path(), g, events);
+        let Screen::BookResults { feed, page, .. } = ui.screen() else {
+            panic!("expected results, got {:?}", ui.screen());
+        };
+        assert_eq!(*page, last_page);
+        assert_eq!(feed.entries.len(), total);
+        assert_eq!(feed.entries[total - 1].title, format!("Book {}", total - 1));
+        assert_eq!(feed.next, None);
+        // A page flip replaces the whole list: Full.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    /// Renders every screen of the flow at the Libra Colour's size, in
+    /// colour, for the design review. `GIDEON_SHOTS=<dir> cargo test -p
+    /// gideon-app -- --ignored internet_archive::shots`.
+    #[test]
+    #[ignore]
+    fn shots() {
+        let Some(out) = std::env::var_os("GIDEON_SHOTS") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let (w, h) = (1264, 1680);
+        let probe = UiApp::new(
+            MemoryDisplay::new(w, h),
+            FakeInput::new(vec![]),
+            FakeGateway::default(),
+            PathBuf::from("/x"),
+        );
+        let l = UiLayout::new(w, h);
+        let tap_at = |x: u32, y: u32| UiEvent::Tap { x, y };
+        let row = |i: usize| tap_at(w / 2, l.row_top(i) + l.row_h / 2);
+        let key = |k: Key| {
+            let (_, x, y, kw, kh) = l
+                .keyboard_keys()
+                .into_iter()
+                .find(|(kk, ..)| *kk == k)
+                .unwrap();
+            tap_at(x + kw / 2, y + kh / 2)
+        };
+        let nav = |i: usize| tap_at(w / 8 + i as u32 * w / 4, h - l.nav_h / 2);
+        let card = tap_card_at(w, h, 3);
+        let rh = book_search::result_row_h(&l);
+        let result = |i: usize| tap_at(w / 2, l.content_top() + i as u32 * rh + rh / 2);
+        let sheet = probe.download_sheet_layout();
+        let button = |i: usize| {
+            let r = sheet.buttons[i];
+            tap_at(r.0 + r.2 / 2, r.1 + r.3 / 2)
+        };
+        let shots_gateway = || {
+            let mut g = gateway();
+            g.web = g
+                .web
+                .with(
+                    &search_url("frankenstein"),
+                    search_json(
+                        48,
+                        &[
+                            (
+                                "frankenstein00shel",
+                                "Frankenstein; or, The Modern Prometheus",
+                                "Mary Wollstonecraft Shelley",
+                                "1818",
+                                true,
+                            ),
+                            (
+                                "frank1831",
+                                "Frankenstein (1831 revised edition)",
+                                "Mary Shelley",
+                                "1831",
+                                true,
+                            ),
+                            ("lastman", "The Last Man", "Mary Shelley", "1826", true),
+                            (
+                                "presumption",
+                                "Presumption; or, The Fate of Frankenstein",
+                                "Richard Brinsley Peake",
+                                "1823",
+                                true,
+                            ),
+                            ("mathilda", "Mathilda", "Mary Shelley", "1959", true),
+                            (
+                                "tales",
+                                "Tales and Stories",
+                                "Mary Wollstonecraft Shelley",
+                                "1891",
+                                true,
+                            ),
+                        ],
+                    ),
+                )
+                .with(
+                    "https://archive.org/metadata/frankenstein00shel",
+                    item_json(
+                        "frankenstein00shel",
+                        "Frankenstein; or, The Modern Prometheus",
+                        "Mary Wollstonecraft Shelley",
+                        2_097_152,
+                    ),
+                )
+                .with(&search_url("frankenstien"), search_json(0, &[]));
+            g
+        };
+        let mut steps: Vec<(&str, Vec<UiEvent>)> = Vec::new();
+        let base = vec![nav(2), card, row(1)];
+        steps.push(("1-catalogues", vec![nav(2), card]));
+        let mut s = base.clone();
+        s.extend("frankenstein".chars().map(|c| key(Key::Char(c))));
+        steps.push(("2-search", s.clone()));
+        s.push(key(Key::Search));
+        steps.push(("3-results", s.clone()));
+        s.push(result(0));
+        steps.push(("4-sheet", s.clone()));
+        s.push(button(1));
+        steps.push(("5-saved", s.clone()));
+        let mut e = base.clone();
+        e.extend("frankenstien".chars().map(|c| key(Key::Char(c))));
+        e.push(key(Key::Search));
+        steps.push(("6-empty", e));
+        for (name, events) in steps {
+            let run_dir = tempfile::tempdir().unwrap();
+            let gd = run_dir.path();
+            book_search::remember_search(gd, "sherlock holmes");
+            book_search::remember_search(gd, "moby dick");
+            book_search::remember_search(gd, "jane austen");
+            let mut ui = UiApp::new(
+                MemoryDisplay::new(w, h),
+                FakeInput::new(events),
+                shots_gateway(),
+                gd.to_path_buf(),
+            )
+            .with_books_dir(gd.join("Books"));
+            ui.run().unwrap();
+            let rgb = ui.compose_final().unwrap();
+            image::RgbImage::from_raw(rgb.width, rgb.height, rgb.pixels)
+                .unwrap()
+                .save(out.join(format!("{name}.png")))
+                .unwrap();
+        }
     }
 }
