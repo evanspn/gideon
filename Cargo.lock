@@ -130,14 +130,14 @@ dependencies = [
 
 [[package]]
 name = "archivist"
-version = "1.0.0"
+version = "0.1.0"
+source = "git+https://github.com/evanspn/Grand-Archives?rev=9554d3e034591784350b3d88e4e77e9ca9d89be3#9554d3e034591784350b3d88e4e77e9ca9d89be3"
 dependencies = [
  "clap",
  "rustls",
  "rustls-native-certs 0.7.3",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "ureq",
  "url",
