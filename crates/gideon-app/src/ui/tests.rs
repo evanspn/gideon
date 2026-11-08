@@ -9882,6 +9882,17 @@ mod library_tabs {
         UiEvent::Tap { x, y: H / 2 }
     }
 
+    /// The manga reader's controls gesture: a flick up off the bottom edge
+    /// of the page opens the reading menu.
+    fn open_reading_menu() -> UiEvent {
+        UiEvent::Swipe {
+            x0: W / 2,
+            y0: H - 20,
+            x1: W / 2,
+            y1: H - 20 - H / 6,
+        }
+    }
+
     /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 mark page,
     /// 3 text, 4 night mode, 5 rotate, 6 close book, 7 close.
     fn tap_reading_row(i: usize) -> UiEvent {
@@ -10311,7 +10322,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(6)]);
+        events.extend([open_reading_menu(), tap_reading_row(6)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10361,7 +10372,10 @@ mod library_tabs {
         let normal_width = ui.book_page_metrics().2;
 
         // The menu's Text row opens the sheet over the unchanged page: no flash.
-        ui.handle_tap(W / 2, H / 2).unwrap();
+        let UiEvent::Swipe { x0, y0, x1, y1 } = open_reading_menu() else {
+            unreachable!()
+        };
+        ui.drag_menu(x0, y0, x1, y1, true).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
         ui.handle_tap(W / 2, reading_row_y(3)).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookText)));
@@ -10489,12 +10503,13 @@ mod library_tabs {
                 x1: 5,
                 y1: H - 100 - H / 4,
             },
-            // A mid-screen drag is nothing: no page turn, no lamp.
+            // A short mid-screen drag (under a quarter of the page, the
+            // manga reader's threshold for leave/rotate) is nothing.
             UiEvent::Swipe {
                 x0: W / 2,
                 y0: H / 2,
                 x1: W / 2,
-                y1: H / 4,
+                y1: H / 2 - H / 8,
             },
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
@@ -10642,7 +10657,7 @@ mod library_tabs {
         let dir = tempfile::tempdir().unwrap();
         let (lib, books) = novel(dir.path());
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(0)]);
+        events.extend([open_reading_menu(), tap_reading_row(0)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         let Screen::BookContents {
@@ -10662,7 +10677,7 @@ mod library_tabs {
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
 
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(0), tap_row(1)]);
+        events.extend([open_reading_menu(), tap_reading_row(0), tap_row(1)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         let Screen::BookReader {
@@ -10697,7 +10712,7 @@ mod library_tabs {
         events.extend([
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
-            tap_reader(ReaderZone::Back),
+            open_reading_menu(),
             tap_reading_row(6),
             tap_today(),
         ]);
@@ -11538,21 +11553,16 @@ mod library_tabs {
     }
 
     #[test]
-    fn a_flick_up_off_the_bottom_raises_the_lamp_sheet_like_the_manga_reader() {
+    fn a_flick_up_off_the_bottom_raises_the_reading_menu_with_the_lamp() {
         let dir = tempfile::tempdir().unwrap();
         let (lib, _) = novel(dir.path());
         let (levels, _, lights) = lights_recording();
         let mut events = open_first_book();
-        events.push(UiEvent::Swipe {
-            x0: W / 2,
-            y0: H - 20,
-            x1: W / 2,
-            y1: H - 20 - H / 6,
-        });
+        events.push(open_reading_menu());
         let mut ui = app(&lib, FakeGateway::default(), events).with_lights(lights);
         ui.run().unwrap();
         assert!(
-            matches!(ui.sheet, Some(Sheet::QuickSettings)),
+            matches!(ui.sheet, Some(Sheet::BookReading)),
             "{:?}",
             ui.sheet
         );
@@ -11561,19 +11571,37 @@ mod library_tabs {
             matches!(ui.screen(), Screen::BookReader { .. }),
             "still reading"
         );
-        // The sheet's first slider is the lamp; scrubbing it sets the level.
-        let sheet = ui.quick_sheet_layout();
-        let y = sheet.sliders_top + sheet.slider_h / 2;
+        // The lamp sliders sit under the menu's rows; a drag on the first
+        // sets brightness where the finger is, a tap on the second warmth.
         let l = layout();
+        let top = ui.reading_lamp_sliders_top().expect("a lamp strip");
         let x = l.pad + (W - 2 * l.pad) * 3 / 10;
+        let y = top + l.row_h / 2;
+        assert_eq!(ui.quick_slider_at(y), Some(0));
         ui.drag_menu(x, y, x, y, false).unwrap();
         assert_eq!(levels.borrow().0, 30);
-        // Closing reveals the page: Full.
-        ui.tap_sheet(W / 2, 5).unwrap();
-        assert!(ui.sheet.is_none());
-        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        let y2 = top + l.row_h + SETTINGS_GAP + l.row_h / 2;
+        let x2 = l.pad + (W - 2 * l.pad) * 6 / 10;
+        ui.tap_sheet(x2, y2).unwrap();
+        assert_eq!(levels.borrow().1, 60);
+        assert!(
+            matches!(ui.sheet, Some(Sheet::BookReading)),
+            "sliders keep the menu up"
+        );
+        // The menu's rows sit above the strip and still act: Contents.
+        let (sheet_top, h) = ui.sheet_bounds().unwrap();
+        let strip = ui.reading_lamp_strip_h();
+        let rows = ui.sheet_rows().1.len() as u32;
+        let rows_top = sheet_top + (h - strip) - rows * l.row_h;
+        ui.tap_sheet(W / 2, rows_top + l.row_h / 2).unwrap();
+        assert!(
+            matches!(ui.screen(), Screen::BookContents { .. }),
+            "{:?}",
+            ui.screen()
+        );
 
-        // Mid-page, the same flick does nothing; nor does a short one off
+        // Mid-page, a short flick does nothing; nor does a short one off
         // the bottom (a sloppy page-turn tap).
         let mut events = open_first_book();
         events.extend([
@@ -11581,7 +11609,7 @@ mod library_tabs {
                 x0: W / 2,
                 y0: H / 2,
                 x1: W / 2,
-                y1: H / 2 - H / 6,
+                y1: H / 2 - H / 8,
             },
             UiEvent::Swipe {
                 x0: W / 2,
@@ -11593,6 +11621,58 @@ mod library_tabs {
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(ui.sheet.is_none());
+        assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+    }
+
+    #[test]
+    fn the_book_reader_leaves_and_rotates_by_the_manga_readers_gestures() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let key = "Kurt Vonnegut/book-0001.epub";
+        // Middle tap: out to the shelf, place saved.
+        let mut events = open_first_book();
+        events.extend([
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::Back),
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(
+            matches!(ui.screen(), Screen::BookShelf { .. }),
+            "{:?}",
+            ui.screen()
+        );
+        assert!(ui.sheet.is_none(), "no menu from a page tap");
+        assert!(gideon_core::BookPlaces::load(&books).get(key).is_some());
+
+        // Swipe down a quarter of the page: out too.
+        let mut events = open_first_book();
+        events.push(UiEvent::Swipe {
+            x0: W / 2,
+            y0: H / 4,
+            x1: W / 2,
+            y1: H / 4 + H / 3,
+        });
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(
+            matches!(ui.screen(), Screen::BookShelf { .. }),
+            "{:?}",
+            ui.screen()
+        );
+
+        // Swipe up mid-page: a quarter turn, still reading.
+        let mut events = open_first_book();
+        events.push(UiEvent::Swipe {
+            x0: W / 2,
+            y0: H * 3 / 4,
+            x1: W / 2,
+            y1: H * 3 / 4 - H / 3,
+        });
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+        assert_eq!((ui.layout.width, ui.layout.height), (H, W));
     }
 
     #[test]
