@@ -126,6 +126,24 @@ fn book_row_label(book: &gideon_core::Book, places: &gideon_core::BookPlaces) ->
     label
 }
 
+/// A span of seconds as a reader reads it: "under a minute", "12 min",
+/// "1 h 05 min", "4 h".
+fn duration_words(secs: f32) -> String {
+    let mins = (secs / 60.0).round() as u32;
+    match mins {
+        0 => "under a minute".to_string(),
+        1..=59 => format!("{mins} min"),
+        _ => {
+            let (h, m) = (mins / 60, mins % 60);
+            if m == 0 || h >= 10 {
+                format!("{h} h")
+            } else {
+                format!("{h} h {m:02} min")
+            }
+        }
+    }
+}
+
 fn bookmark_banner(set: bool) -> &'static str {
     if set {
         "Bookmarked"
@@ -1323,6 +1341,11 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// partially in a loop, so every `full_refresh_interval` turns it
     /// flashes to clear ghosting (docs/REFRESH.md).
     book_turns: u32,
+    /// When each page of the open book was turned (unix seconds), for the
+    /// footer's "time left". Cleared when a book opens.
+    book_turn_times: Vec<u64>,
+    /// The wall clock, in unix seconds; tests hand in a fake.
+    clock: Box<dyn Fn() -> u64>,
     /// The lamp level an edge slide in the book reader started from; the
     /// slide's delta is always applied to this, never accumulated. Cleared
     /// when the finger lifts.
@@ -1474,6 +1497,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             books_dir: books_dir_for(&library_dir),
             library_tab: LibraryTab::Manga,
             book_turns: 0,
+            book_turn_times: Vec::new(),
+            clock: Box::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }),
             book_slide_base: None,
             book_banner: None,
             pending_book_path: None,
@@ -1629,6 +1659,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Persist in-reader setting changes (rotation lock) to this directory.
     /// Also seeds the in-memory orientation-lock state, so the menus know
     /// up front whether the accelerometer should drive auto-rotation.
+    /// Use `clock` for the time of day (unix seconds) instead of the system's.
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
     pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         if let Ok(settings) = gideon_core::Settings::load(&dir) {
             self.rotation_locked = settings.reader_rotation_locked;
@@ -2812,6 +2849,26 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         false,
                     ),
                     ("Text".into(), "›".into(), false),
+                    (
+                        "Night mode".into(),
+                        if self.load_settings().book_night {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                        false,
+                    ),
+                    (
+                        "Rotate 90°".into(),
+                        if self.reader_rotation % 180 == 90 {
+                            "Landscape"
+                        } else {
+                            "Portrait"
+                        }
+                        .into(),
+                        false,
+                    ),
                     ("Close book".into(), String::new(), false),
                     ("Close".into(), String::new(), true),
                 ],
@@ -3259,6 +3316,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.render_current(RefreshMode::Partial)?;
                     }
                     4 => {
+                        // Every pixel flips: a flash, never a partial.
+                        let mut settings = self.load_settings();
+                        settings.book_night = !settings.book_night;
+                        self.save_settings(&settings);
+                        self.render_current(RefreshMode::Full)?;
+                    }
+                    5 => self.rotate_book_reader()?,
+                    6 => {
                         self.save_book_place();
                         return self.pop();
                     }
@@ -4655,6 +4720,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             device.book_text_px = settings.book_text_px;
             device.book_line_spacing = settings.book_line_spacing.clone();
             device.book_margins = settings.book_margins.clone();
+            device.book_night = settings.book_night;
             if let Err(e) = device.save(dir) {
                 eprintln!("gideon: couldn't save settings: {e}");
             }
@@ -8563,6 +8629,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.pending_book_path = None;
         let page = resume_page(&pages, (place.block, place.line));
         self.book_turns = 0;
+        self.book_turn_times.clear();
         self.push(Screen::BookReader {
             book,
             text: std::sync::Arc::new(text),
@@ -8832,6 +8899,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         self.save_book_place();
         self.book_turns = 0;
+        self.book_turn_times.clear();
         self.render_current(RefreshMode::Full)
     }
 
@@ -8926,6 +8994,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         self.save_book_place();
         self.book_turns += 1;
+        self.book_turn_times.push((self.clock)());
+        if self.book_turn_times.len() > 200 {
+            self.book_turn_times.remove(0);
+        }
         let mode = if self
             .book_turns
             .is_multiple_of(self.full_refresh_interval.max(1))
@@ -9073,12 +9145,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             pages.len().max(1)
         );
         let place_w = measure_text(small, &place, false);
+        // Like a Kindle's footer: once the pace is known, the time left
+        // stands where the title did.
+        let left = self
+            .time_left_text(text, chapter, pages, page)
+            .unwrap_or_else(|| book.title.clone());
         draw_text(
             &mut canvas,
             margin,
             fy,
             small,
-            &book.title,
+            &left,
             max_w.saturating_sub(place_w + l.pad * 2),
             false,
         );
@@ -9091,7 +9168,77 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             place_w,
             false,
         );
+        if self.load_settings().book_night {
+            for p in &mut canvas.pixels {
+                *p = 255 - *p;
+            }
+        }
         canvas
+    }
+
+    /// Turn the reader (and with it every menu) a quarter turn, like the
+    /// manga reader's "Rotate 90°": the layout is rebuilt against the
+    /// rotated panel, the chapter re-flowed to the new width at the same
+    /// paragraph, and the orientation kept for next time. Full: every
+    /// pixel moves.
+    fn rotate_book_reader(&mut self) -> Result<()> {
+        self.reader_rotation = (self.reader_rotation + 90) % 360;
+        self.rebuild_layout();
+        let degrees = self.reader_rotation;
+        persist_settings(self.settings_dir.as_deref(), |s| {
+            s.reader_rotation = degrees
+        });
+        self.reflow_book()
+    }
+
+    /// Seconds the reader spends on a page: the median gap between page
+    /// turns this session, ignoring gaps over three minutes (a put-down)
+    /// or under a second (a flick back and forth). Needs three gaps.
+    fn book_secs_per_page(&self) -> Option<f32> {
+        let mut gaps: Vec<u64> = self
+            .book_turn_times
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]))
+            .filter(|&g| (1..=180).contains(&g))
+            .collect();
+        if gaps.len() < 3 {
+            return None;
+        }
+        gaps.sort_unstable();
+        Some(gaps[gaps.len() / 2] as f32)
+    }
+
+    /// "12 min left in chapter · 4 h in book", from the reading pace and
+    /// the pages left; the book's other chapters are sized by paragraph
+    /// count against this one's pages. `None` until the pace is known.
+    fn time_left_text(
+        &self,
+        text: &gideon_core::EpubText,
+        chapter: usize,
+        pages: &[Vec<BookLine>],
+        page: usize,
+    ) -> Option<String> {
+        let spp = self.book_secs_per_page()?;
+        let pages_left = pages.len().saturating_sub(page + 1) as f32;
+        let blocks_here = text
+            .chapters
+            .get(chapter)
+            .map(|c| c.blocks.len())
+            .unwrap_or(1)
+            .max(1) as f32;
+        let pages_per_block = pages.len().max(1) as f32 / blocks_here;
+        let blocks_after: usize = text
+            .chapters
+            .iter()
+            .skip(chapter + 1)
+            .map(|c| c.blocks.len())
+            .sum();
+        let book_pages_left = pages_left + blocks_after as f32 * pages_per_block;
+        Some(format!(
+            "{} left in chapter · {} in book",
+            duration_words(pages_left * spp),
+            duration_words(book_pages_left * spp)
+        ))
     }
 
     /// The Books tab: one row per book, "Title — Author", in title order.

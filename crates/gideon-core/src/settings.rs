@@ -203,6 +203,10 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_book_margins")]
     pub book_margins: String,
 
+    /// Night mode in gideon's book reader: white text on black.
+    #[serde(default)]
+    pub book_night: bool,
+
     /// Page turns between full (flashing) e-ink refreshes. Higher flashes
     /// less often (smoother reading) but lets ghosting build up longer.
     /// Parsed leniently — out-of-range or wrong-typed values fall back to the
@@ -337,6 +341,7 @@ impl Default for Settings {
             book_text_px: default_book_text_px(),
             book_line_spacing: default_book_line_spacing(),
             book_margins: default_book_margins(),
+            book_night: false,
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
@@ -1206,6 +1211,7 @@ mod tests {
             book_text_px: 52,
             book_line_spacing: "loose".into(),
             book_margins: "wide".into(),
+            book_night: true,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
             idle_suspend_minutes: 5,
@@ -1461,6 +1467,7 @@ mod tests {
             book_text_px: 36,
             book_line_spacing: "tight".into(),
             book_margins: "narrow".into(),
+            book_night: false,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
             idle_suspend_minutes: 5,
