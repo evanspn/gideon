@@ -1371,7 +1371,7 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// The lamp level an edge slide in the book reader started from; the
     /// slide's delta is always applied to this, never accumulated. Cleared
     /// when the finger lifts.
-    book_slide_base: Option<u8>,
+    book_slide_base: Option<SlideBase>,
     /// A one-repaint banner over the book page ("Brightness 45%"), wiped
     /// by the next repaint like the manga reader's.
     book_banner: Option<String>,
@@ -1850,6 +1850,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 self.input.next_event()
             };
             let handling_started = std::time::Instant::now();
+            // A finger in motion is never "stale": the input layer already
+            // collapses a slide's reports into the newest, and flushing
+            // mid-slide resets the touch tracker and throws away the lift.
+            // That is how an edge slide used to stop a few percent in: the
+            // first report's repaint outlasted the stale window, and the rest
+            // of the gesture — release included — was drained.
+            let in_motion = matches!(event, Ok(UiEvent::Drag { .. } | UiEvent::Swipe { .. }));
             match event {
                 Err(_) => return Ok(Exit::Close), // input source closed
                 // Every pointer event funnels through map_menu_point first
@@ -1916,7 +1923,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                 }
             }
-            self.drop_stale_taps(handling_started);
+            if !in_motion {
+                self.drop_stale_taps(handling_started);
+            }
         }
     }
 
@@ -3515,6 +3524,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // is where the frontlight gets adjusted, and that is a reader, not a
         // menu.
         if matches!(self.stack.last(), Some(Screen::BookReader { .. })) && self.sheet.is_none() {
+            let l = &self.layout;
+            let edge = reader_edge_slide(x0, y0, x1, y1, l.width, l.height, 0).is_some();
+            if !edge && released && is_sheet_swipe(x0, y0, x1, y1, l.height) {
+                // The manga reader's gesture: a flick up off the bottom bezel.
+                // It raises the controls sheet with the lamp sliders on top,
+                // over the page that has not moved (Partial).
+                self.book_slide_base = None;
+                self.open_quick_settings()?;
+                return Ok(Flow::Continue);
+            }
             self.book_edge_slide(x0, y0, x1, y1, released)?;
         }
         Ok(Flow::Continue)
@@ -3534,7 +3553,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     ) -> Result<()> {
         let l = &self.layout;
         let slid = reader_edge_slide(x0, y0, x1, y1, l.width, l.height, 0);
-        let base_before = if released {
+        let stored = if released {
             self.book_slide_base.take()
         } else {
             self.book_slide_base
@@ -3545,12 +3564,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let Some(lights) = self.lights.as_mut() else {
             return Ok(());
         };
-        let base = base_before.unwrap_or_else(|| match lamp {
-            EdgeLamp::Brightness => lights.brightness(),
-            EdgeLamp::Warmth => lights.warmth(),
-        });
+        // The level this slide started from — but only if the stored one
+        // belongs to THIS finger. A slide whose lift never arrived (input
+        // flushed, finger slid off the panel) must not hand its starting
+        // level to the next slide: that is what pinned the lamp near one
+        // value no matter how far you slid.
+        let base = match stored {
+            Some(b) if b.start == (x0, y0) && b.lamp == lamp => b.level,
+            _ => match lamp {
+                EdgeLamp::Brightness => lights.brightness(),
+                EdgeLamp::Warmth => lights.warmth(),
+            },
+        };
         if !released {
-            self.book_slide_base = Some(base);
+            self.book_slide_base = Some(SlideBase {
+                start: (x0, y0),
+                lamp,
+                level: base,
+            });
         }
         let new = (base as i32 + delta).clamp(0, 100) as u8;
         let banner = match lamp {
@@ -6512,12 +6543,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             // from the mid-screen rotate gesture below, which
                             // starts higher up. An eighth of travel is enough:
                             // it's a flick off the bezel.
-                            let sheet_band = reading_h.saturating_sub((reading_h / 8).max(1));
-                            if ry0 > ry1
-                                && vertical
-                                && ry0 > sheet_band
-                                && ry0 - ry1 >= (reading_h / 8).max(1)
-                            {
+                            if is_sheet_swipe(rx0, ry0, rx1, ry1, reading_h) {
                                 sheet_open = true;
                                 show_controls_sheet(
                                     &mut reader,
@@ -9862,6 +9888,26 @@ fn reader_edge_slide(
 enum EdgeLamp {
     Brightness,
     Warmth,
+}
+
+/// Where an edge slide in progress started, which lamp it works, and the
+/// level that lamp had when the finger went down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlideBase {
+    start: (u32, u32),
+    lamp: EdgeLamp,
+    level: u8,
+}
+
+/// The reader's "raise the controls" gesture, in reading-frame
+/// coordinates: an upward, mostly vertical swipe that STARTS in the bottom
+/// eighth of the frame and travels at least another eighth. Shared by the
+/// manga reader and the book reader so the two cannot drift apart.
+fn is_sheet_swipe(x0: u32, y0: u32, x1: u32, y1: u32, reading_h: u32) -> bool {
+    let eighth = (reading_h / 8).max(1);
+    let band = reading_h.saturating_sub(eighth);
+    let vertical = y0.abs_diff(y1) > x0.abs_diff(x1);
+    y0 > y1 && vertical && y0 > band && y0 - y1 >= eighth
 }
 
 fn show_controls_sheet<D: Display>(
