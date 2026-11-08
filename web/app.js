@@ -140,6 +140,17 @@ async function fetchProgress(session, retry = true, withStartedAt = true) {
   return res.json();
 }
 
+// Where gideon's book reader left off in each EPUB (migration 0007), newest
+// first. [] on any failure, including a project without the table.
+async function fetchBookPlaces() {
+  const res = await authedFetch(
+    "book_places?select=book_key,chapter,block,line,chapters,title,author,updated_at&order=updated_at.desc"
+  );
+  if (!res.ok) return [];
+  const rows = await res.json().catch(() => []);
+  return Array.isArray(rows) ? rows : [];
+}
+
 // Every published chapter-page row at once, for the library's cover art: a
 // series' cover is the first page of its first chapter that the device has
 // published page URLs for. One request; [] on any failure (covers are decor).
@@ -2564,6 +2575,43 @@ function viewLibrary(groups, covers, hiddenSet, showHidden, view) {
   return `${head}<div class="list">${items}</div>${hiddenToggle}${hiddenItems}`;
 }
 
+// --- books (the EPUB reader's places, synced from the Kobo) -----------------
+//
+// One row per book, newest first: title, author, where the reader is, and
+// how long ago. Read-only here — the web has no EPUB reader yet — so a row
+// is a fact, not a button.
+
+function bookTitle(b) {
+  if (b.title && b.title.trim()) return b.title.trim();
+  const file = String(b.book_key || "").split("/").pop() || "Untitled";
+  return file.replace(/\.(epub|pdf)$/i, "").replace(/[-_]+/g, " ");
+}
+
+function bookPlaceText(b) {
+  const chapters = Number(b.chapters) || 0;
+  const chapter = (Number(b.chapter) || 0) + 1;
+  if (!chapters) return `chapter ${chapter}`;
+  const pct = Math.min(100, Math.round(((chapter - 1) / chapters) * 100));
+  return `chapter ${chapter} of ${chapters} · ${pct}%`;
+}
+
+function viewBooks(books) {
+  const rows = books
+    .map(
+      (b) => `
+      <div class="book-row" data-testid="book">
+        <div class="book-spine">📘</div>
+        <div class="book-body">
+          <div class="book-title">${esc(bookTitle(b))}</div>
+          <div class="book-meta">${b.author ? `${esc(b.author)} · ` : ""}${esc(bookPlaceText(b))}</div>
+          <div class="book-when">${esc(timeAgo(b.updated_at))}</div>
+        </div>
+      </div>`
+    )
+    .join("");
+  return `<div class="section-label">Books</div><div class="list books" data-testid="books">${rows}</div>`;
+}
+
 // --- book action sheet (long press on a tile / list card) ------------------
 //
 // An iOS-style bottom sheet: grouped rounded options over a dimmed backdrop,
@@ -2775,11 +2823,15 @@ function signOut() {
 function renderDashboard(email, rows) {
   state.email = email;
   const tab = ["stats", "library", "discover"].includes(state.tab) ? state.tab : "today";
+  const books = state.books || [];
   let body;
   if (tab === "discover") {
     body = viewDiscover();
   } else if (!rows.length) {
-    body = `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`;
+    // No manga yet. Books still deserve their shelf.
+    body = books.length
+      ? viewBooks(books)
+      : `<div class="empty" data-testid="empty"><div class="big">📖</div><p>No reading progress yet.<br/>Read something on your Kobo and it'll show up here.</p></div>`;
   } else if (tab === "today") {
     body = viewToday(
       computeStats(rows),
@@ -2788,13 +2840,14 @@ function renderDashboard(email, rows) {
       rows
     );
   } else if (tab === "library") {
-    body = viewLibrary(
-      groupBySeries(rows),
-      state.covers || new Map(),
-      loadHidden(email),
-      !!state.showHidden,
-      libView()
-    );
+    body =
+      viewLibrary(
+        groupBySeries(rows),
+        state.covers || new Map(),
+        loadHidden(email),
+        !!state.showHidden,
+        libView()
+      ) + (books.length ? viewBooks(books) : "");
   } else {
     body = viewStats(computeStats(rows), groupBySeries(rows), state.sends);
   }
@@ -3359,6 +3412,7 @@ async function showDashboard(session) {
     state.rows = rows;
     state.sends = await fetchSends().catch(() => []);
     state.catalogs = await fetchCatalogs().catch(() => []);
+    state.books = await fetchBookPlaces().catch(() => []);
     // Covers for the library shelf (best-effort decor).
     state.covers = coverBySeries(await fetchAllChapterPages().catch(() => []));
     renderDashboard(email, rows);

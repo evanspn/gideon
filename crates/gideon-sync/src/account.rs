@@ -18,7 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
-use gideon_core::ProgressStore;
+use std::collections::BTreeMap;
+
+use gideon_core::{BookPlaces, ProgressStore};
 
 use crate::supabase::{
     AuthClient, RemoteCatalog, SendItem, Session, SupabaseConfig, SupabaseTransport,
@@ -175,6 +177,39 @@ impl Account {
         }
         let store = ProgressStore::load(&self.progress_path()).unwrap_or_default();
         !crate::pending_pushes(&store, &self.load_state()).is_empty()
+    }
+
+    /// Like [`Account::has_unpushed`], for the book places under `books_dir`.
+    pub fn has_unpushed_places(&self, books_dir: &Path) -> bool {
+        if !self.is_signed_in() {
+            return false;
+        }
+        let places = BookPlaces::load(books_dir);
+        !crate::pending_place_pushes(&places, &BTreeMap::new(), &self.load_state()).is_empty()
+    }
+
+    /// Reconcile the book places in `books_dir` (the device's Books folder)
+    /// the way [`Account::sync`] does manga progress: pull, merge
+    /// furthest-place-wins, push what this device is further into. Titles
+    /// and authors come from the shelf so the dashboard can name the books.
+    pub fn sync_places(&self, now: u64, books_dir: &Path) -> Result<SyncOutcome> {
+        let session = self.ensure_fresh_session(now)?;
+        let mut places = BookPlaces::load(books_dir);
+        let mut state = self.load_state();
+        let names: BTreeMap<String, (String, Option<String>)> = gideon_core::books::scan(books_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| (b.relative_path, (b.title, b.author)))
+            .collect();
+        let transport = SupabaseTransport::new(self.config.clone(), session.access_token.clone());
+        let outcome = Syncer::new(transport).sync_places(&mut places, &names, &mut state, now)?;
+        // The reader may have turned a page while this ran: fold, never
+        // overwrite.
+        places
+            .merge_save(books_dir)
+            .map_err(|e| crate::Error::Transport(e.to_string()))?;
+        self.save_state(&state)?;
+        Ok(outcome)
     }
 
     /// Load the signed-in session, refreshing (and persisting) the access token

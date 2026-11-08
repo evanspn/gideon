@@ -111,6 +111,10 @@ test.beforeEach(async ({ page }) => {
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
   await page.route("**/storage/v1/object/**", (route) => route.fulfill({ status: 404, body: "" }));
+  // Default: no synced book places — same reason.
+  await page.route("**/rest/v1/book_places**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+  );
   // Default: no published chapter pages (library covers) — same reason. Reader
   // tests override this with their own routes (later registrations win).
   await page.route("**/rest/v1/chapter_pages**", (route) =>
@@ -356,6 +360,63 @@ test("the Library tab shows the continue-reading list", async ({ page }) => {
   await expect(items.nth(0)).toContainText("One Piece");
   await expect(items.nth(0)).toContainText("11/20");
   await expect(items.nth(1)).toContainText("Naruto");
+});
+
+const BOOKS = [
+  {
+    book_key: "Kurt Vonnegut/book-0001.epub",
+    chapter: 3,
+    block: 10,
+    line: 0,
+    chapters: 10,
+    title: "Slaughterhouse-Five",
+    author: "Kurt Vonnegut",
+    updated_at: new Date(Date.now() - 2 * 3600e3).toISOString(),
+  },
+  {
+    book_key: "Natsu Hyuuga/apothecary-5.epub",
+    chapter: 0,
+    block: 0,
+    line: 0,
+    chapters: 0,
+    title: null,
+    author: null,
+    updated_at: new Date(Date.now() - 86400e3).toISOString(),
+  },
+];
+
+test("the Library tab lists synced books with the reader's place", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, ROWS);
+  await page.route("**/rest/v1/book_places**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(BOOKS) })
+  );
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await page.getByTestId("tab-library").click();
+
+  const books = page.getByTestId("book");
+  await expect(books).toHaveCount(2);
+  await expect(books.nth(0)).toContainText("Slaughterhouse-Five");
+  await expect(books.nth(0)).toContainText("Kurt Vonnegut · chapter 4 of 10 · 30%");
+  await expect(books.nth(0)).toContainText("2 hours ago");
+  // No metadata: named from the file, place without a total.
+  await expect(books.nth(1)).toContainText("apothecary 5");
+  await expect(books.nth(1)).toContainText("chapter 1");
+  // Manga are still there above.
+  await expect(page.getByTestId("tile")).toHaveCount(2);
+});
+
+test("books alone are not 'no reading progress'", async ({ page }) => {
+  await mockAuthOk(page);
+  await mockProgress(page, []);
+  await page.route("**/rest/v1/book_places**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(BOOKS) })
+  );
+  await page.goto("/");
+  await fillAndSubmit(page);
+  await expect(page.getByTestId("empty")).toHaveCount(0);
+  await expect(page.getByTestId("book")).toHaveCount(2);
 });
 
 test("the Library tab defaults to the cover shelf and a tile opens the reader", async ({ page }) => {

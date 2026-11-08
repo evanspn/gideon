@@ -149,6 +149,49 @@ fn describe(root: &Path, path: &Path, format: &'static str) -> Book {
     }
 }
 
+/// The light-novel series a volume title belongs to, and its number:
+/// "The Apothecary Diaries, Vol. 5" → ("The Apothecary Diaries", 5). Reads
+/// the common spellings — "Vol. 5", "Vol 5", "Volume 5", "v05", "#5",
+/// "Book 5" — at the end of the title or before a ": subtitle". `None`
+/// for a title with no volume number.
+pub fn series_of(title: &str) -> Option<(String, u32)> {
+    let main = title.split(" (").next().unwrap_or(title).trim();
+    let lower = main.to_ascii_lowercase();
+    let markers = ["volume", "vol.", "vol", "book", "#", "v"];
+    for marker in markers {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(marker) {
+            let at = from + rel;
+            from = at + 1;
+            let before = &main[..at];
+            let boundary =
+                before.is_empty() || before.ends_with([' ', ',', '-', '–', ':']) || marker == "#";
+            if !boundary {
+                continue;
+            }
+            let rest = main[at + marker.len()..].trim_start_matches([' ', '.']);
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() || digits.len() > 4 {
+                continue;
+            }
+            let after = &rest[digits.len()..];
+            // The number must end the title or lead into a subtitle.
+            if !(after.is_empty() || after.starts_with([':', ' ', ',', '-', '–'])) {
+                continue;
+            }
+            if marker == "v" && !before.ends_with(' ') {
+                continue;
+            }
+            let series = before.trim_end_matches([' ', ',', '-', '–', ':']).trim();
+            if series.is_empty() {
+                return None;
+            }
+            return digits.parse().ok().map(|n| (series.to_string(), n));
+        }
+    }
+    None
+}
+
 /// The author a wild file name carries: the second " -- " segment of
 /// "Title -- Author -- Publisher, Year -- …". Only a fallback for a loose
 /// file with no metadata and no author folder; `None` when the name has no
@@ -179,12 +222,41 @@ pub struct BookPlace {
     pub updated_at: u64,
 }
 
+impl BookPlace {
+    /// The place as an ordered tuple: further into the book compares greater.
+    pub fn place(&self) -> (usize, usize, usize) {
+        (self.chapter, self.block, self.line)
+    }
+}
+
+/// A page the reader marked: the paragraph and line at its top, and the
+/// first words on it so the list says more than a number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Bookmark {
+    pub chapter: usize,
+    pub block: usize,
+    #[serde(default)]
+    pub line: usize,
+    #[serde(default)]
+    pub snippet: String,
+}
+
+impl Bookmark {
+    /// The place this bookmark stands at, for ordering and matching.
+    pub fn place(&self) -> (usize, usize, usize) {
+        (self.chapter, self.block, self.line)
+    }
+}
+
 /// Every book's place, keyed by its path relative to the Books folder.
 /// Lives in a dotfile beside the books, which Nickel ignores.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BookPlaces {
     #[serde(default)]
     pub places: BTreeMap<String, BookPlace>,
+    /// Each book's bookmarks, in reading order.
+    #[serde(default)]
+    pub bookmarks: BTreeMap<String, Vec<Bookmark>>,
 }
 
 impl BookPlaces {
@@ -209,8 +281,50 @@ impl BookPlaces {
         self.places.get(relative_path).copied()
     }
 
+    /// Fold this copy's places into what is on disk now and save: a place
+    /// moves forward only (chapter, paragraph, line compared in that
+    /// order), and the disk's bookmarks are kept as they are. For a writer
+    /// racing the reader's own saves — the sync sweep — where a blind
+    /// `save` would lose a page the reader just turned.
+    pub fn merge_save(&self, books_dir: &Path) -> std::io::Result<()> {
+        let mut disk = Self::load(books_dir);
+        for (key, mine) in &self.places {
+            let ahead = disk
+                .places
+                .get(key)
+                .is_none_or(|theirs| mine.place() > theirs.place());
+            if ahead {
+                disk.places.insert(key.clone(), *mine);
+            }
+        }
+        disk.save(books_dir)
+    }
+
     pub fn set(&mut self, relative_path: &str, place: BookPlace) {
         self.places.insert(relative_path.to_string(), place);
+    }
+
+    pub fn bookmarks(&self, relative_path: &str) -> &[Bookmark] {
+        self.bookmarks
+            .get(relative_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Add the bookmark, or remove it when one already stands at that
+    /// place. Returns whether it is now set. Kept in reading order.
+    pub fn toggle_bookmark(&mut self, relative_path: &str, bookmark: Bookmark) -> bool {
+        let list = self.bookmarks.entry(relative_path.to_string()).or_default();
+        if let Some(i) = list.iter().position(|b| b.place() == bookmark.place()) {
+            list.remove(i);
+            if list.is_empty() {
+                self.bookmarks.remove(relative_path);
+            }
+            return false;
+        }
+        let at = list.partition_point(|b| b.place() < bookmark.place());
+        list.insert(at, bookmark);
+        true
     }
 }
 
@@ -219,7 +333,9 @@ impl BookPlaces {
 pub fn delete(root: &Path, book: &Book) -> std::io::Result<()> {
     std::fs::remove_file(&book.path)?;
     let mut places = BookPlaces::load(root);
-    if places.places.remove(&book.relative_path).is_some() {
+    let had_place = places.places.remove(&book.relative_path).is_some();
+    let had_marks = places.bookmarks.remove(&book.relative_path).is_some();
+    if had_place || had_marks {
         let _ = places.save(root);
     }
     if let Some(parent) = book.path.parent() {
@@ -356,6 +472,39 @@ mod tests {
     }
 
     #[test]
+    fn bookmarks_toggle_in_reading_order_and_leave_with_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        epub(&root.join("A/one.epub"), "One", "A");
+        let mut places = BookPlaces::load(root);
+        let mark = |c, b| Bookmark {
+            chapter: c,
+            block: b,
+            line: 0,
+            snippet: format!("ch{c} b{b}"),
+        };
+        assert!(places.toggle_bookmark("A/one.epub", mark(2, 5)));
+        assert!(places.toggle_bookmark("A/one.epub", mark(0, 1)));
+        assert!(places.toggle_bookmark("A/one.epub", mark(2, 1)));
+        let order: Vec<_> = places
+            .bookmarks("A/one.epub")
+            .iter()
+            .map(Bookmark::place)
+            .collect();
+        assert_eq!(order, [(0, 1, 0), (2, 1, 0), (2, 5, 0)]);
+        assert!(
+            !places.toggle_bookmark("A/one.epub", mark(2, 1)),
+            "again removes it"
+        );
+        assert_eq!(places.bookmarks("A/one.epub").len(), 2);
+        places.save(root).unwrap();
+        assert_eq!(BookPlaces::load(root).bookmarks("A/one.epub").len(), 2);
+        let one = scan(root).unwrap().remove(0);
+        delete(root, &one).unwrap();
+        assert!(BookPlaces::load(root).bookmarks("A/one.epub").is_empty());
+    }
+
+    #[test]
     fn delete_removes_the_book_and_its_emptied_author_folder() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -370,5 +519,40 @@ mod tests {
         delete(root, three).unwrap();
         assert!(root.join("B/two.epub").exists());
         assert!(root.join("B").exists(), "a folder with books left stays");
+    }
+
+    #[test]
+    fn series_titles_split_into_series_and_volume() {
+        for (title, expected) in [
+            (
+                "The Apothecary Diaries, Vol. 5",
+                Some(("The Apothecary Diaries", 5)),
+            ),
+            (
+                "The Apothecary Diaries Vol 12",
+                Some(("The Apothecary Diaries", 12)),
+            ),
+            (
+                "Spice and Wolf, Volume 3: The Wolf and the Amber Melancholy",
+                Some(("Spice and Wolf", 3)),
+            ),
+            ("Overlord v01", Some(("Overlord", 1))),
+            (
+                "Mushoku Tensei #7 (Light Novel)",
+                Some(("Mushoku Tensei", 7)),
+            ),
+            ("The Wheel of Time, Book 2", Some(("The Wheel of Time", 2))),
+            ("Slaughterhouse-Five", None),
+            ("Volunteer Nation", None),
+            ("Vivaldi", None),
+            ("Catch-22", None),
+        ] {
+            let got = series_of(title);
+            assert_eq!(
+                got.as_ref().map(|(s, n)| (s.as_str(), *n)),
+                expected,
+                "{title}"
+            );
+        }
     }
 }

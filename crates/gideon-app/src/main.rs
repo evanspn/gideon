@@ -404,33 +404,47 @@ fn cmd_books(dir: PathBuf) -> Result<()> {
 }
 
 fn cmd_book(path: PathBuf) -> Result<()> {
+    use std::io::Write as _;
+
     let text = gideon_core::epub::load(&path)
         .with_context(|| format!("couldn't open {}", path.display()))?;
-    println!(
-        "{} — {}",
+    let pictures = text
+        .chapters
+        .iter()
+        .flat_map(|c| c.blocks.iter())
+        .filter(|b| matches!(b, gideon_core::BookBlock::Image(_)))
+        .count();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — {}\n",
         text.title.as_deref().unwrap_or("(untitled)"),
         text.author.as_deref().unwrap_or("(unknown author)")
-    );
-    println!(
-        "{} chapter(s), {} paragraph(s)\n",
+    ));
+    out.push_str(&format!(
+        "{} chapter(s), {} paragraph(s), {} picture(s), {} contents entr{}\n\n",
         text.chapters.len(),
-        text.block_count()
-    );
+        text.block_count() - pictures,
+        pictures,
+        text.toc.len(),
+        if text.toc.len() == 1 { "y" } else { "ies" }
+    ));
     for (i, chapter) in text.chapters.iter().enumerate() {
-        println!(
-            "  {:>3}. {} ({} paragraphs)",
+        out.push_str(&format!(
+            "  {:>3}. {} ({} paragraphs)\n",
             i + 1,
             chapter.title.as_deref().unwrap_or("(no heading)"),
             chapter.blocks.len()
-        );
+        ));
         if let Some(first) = chapter.blocks.iter().find_map(|b| match b {
-            gideon_core::BookBlock::Paragraph(p) => Some(p),
+            gideon_core::BookBlock::Paragraph(p) => Some(p.text()),
             _ => None,
         }) {
             let preview: String = first.chars().take(72).collect();
-            println!("       {preview}");
+            out.push_str(&format!("       {preview}\n"));
         }
     }
+    // A closed pipe (`| head`) is not an error worth a panic.
+    let _ = std::io::stdout().write_all(out.as_bytes());
     Ok(())
 }
 
@@ -651,9 +665,12 @@ fn browse_screenshot(library: PathBuf, out: PathBuf, screen: &str) -> Result<()>
     let input = FakeInput::new(Vec::new());
     let gateway = ui::AidokuGateway::new(data_dir());
     let settings = gideon_core::Settings::load(&data_dir()).unwrap_or_default();
+    // The settings dir too, so a screenshot shows the views the device's
+    // settings pick (the Library's shelf or list, the reader's typography).
     let mut app = ui::UiApp::new(display, input, gateway, library.clone())
         .with_books_dir(ui::books_dir_for(&library))
         .with_profile(&settings.active_profile)
+        .with_settings_dir(data_dir())
         .with_start(start);
     app.render_once()?;
 

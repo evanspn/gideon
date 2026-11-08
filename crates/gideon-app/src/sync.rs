@@ -125,7 +125,7 @@ pub fn has_unpushed(library_dir: &Path) -> bool {
     let Some(account) = account(library_dir) else {
         return false;
     };
-    account.has_unpushed()
+    account.has_unpushed() || account.has_unpushed_places(&crate::ui::books_dir_for(library_dir))
 }
 
 /// Flush reading progress before the device suspends.
@@ -287,6 +287,16 @@ pub fn spawn_sync(library_dir: &Path, gateway: Option<Box<dyn SourceGateway + Se
                         "sync: merged {} pulled row(s), pushed {}",
                         outcome.merged, outcome.pushed
                     );
+                }
+                // Book places ride the same sweep. Best-effort: a project
+                // without migration 0007 answers 404 and the manga sync above
+                // still counts.
+                match account.sync_places(now(), &crate::ui::books_dir_for(&library_dir)) {
+                    Ok(o) if o.merged > 0 || o.pushed > 0 => {
+                        eprintln!("sync: books — merged {}, pushed {}", o.merged, o.pushed)
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("sync: couldn't sync book places ({e})"),
                 }
             }
             None => {
@@ -643,6 +653,28 @@ mod tests {
         let err = place_upload(&manga, &books, "novel.epub", &cbz).unwrap_err();
         assert!(err.contains("named .epub"), "{err}");
         assert!(!books.join("novel.epub").exists());
+    }
+
+    /// The device's whole receive path on a real book from disk: what the
+    /// phone sends, the device must classify, name, place and then open.
+    /// Opt in with `GIDEON_PROBE_EPUB=<path to an .epub>`; silently passes
+    /// otherwise, since nobody's books are checked in.
+    #[test]
+    fn place_upload_accepts_a_real_epub_when_given_one() {
+        let Ok(path) = std::env::var("GIDEON_PROBE_EPUB") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("GIDEON_PROBE_EPUB must point at a readable file");
+        let dir = tempfile::tempdir().unwrap();
+        let manga = dir.path().join("Manga");
+        let books = dir.path().join("Books");
+        let dest = place_upload(&manga, &books, "sent-from-phone.epub", &bytes).unwrap();
+        assert!(dest.starts_with(&books), "{dest:?}");
+        assert_eq!(std::fs::read(&dest).unwrap().len(), bytes.len());
+        // And the reader can open what was placed.
+        let text = gideon_core::epub::load(&dest).unwrap();
+        assert!(!text.chapters.is_empty());
+        assert!(!gideon_core::books::scan(&books).unwrap().is_empty());
     }
 
     #[test]

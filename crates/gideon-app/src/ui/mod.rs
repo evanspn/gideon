@@ -14,12 +14,174 @@
 mod book_search;
 mod gateway;
 mod layout;
+/// The entry after `current` in `choices`, wrapping; the first when
+/// `current` is not a choice (a hand-edited settings file).
+fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
+    let at = choices.iter().position(|c| c == current);
+    choices[at.map_or(0, |i| (i + 1) % choices.len())].clone()
+}
+
+/// One card on the Books tab: a book, or the volumes of a series.
+#[derive(Debug, Clone, PartialEq)]
+struct BookCard {
+    title: String,
+    author: Option<String>,
+    /// The books behind the card, volumes in number order.
+    books: Vec<gideon_core::Book>,
+    /// Chapters read over chapters in the book, for the most recently read
+    /// book of the card; `None` when none of them has been opened.
+    progress: Option<f32>,
+    /// When the card was last read (0: never).
+    last_read: u64,
+}
+
+/// Group a shelf into cards. Volumes whose titles parse to the same series
+/// (`books::series_of`) share a card titled "Series, Vol. a–b"; everything
+/// else is its own card. Most recently read first; unread cards after, in
+/// the shelf's title order.
+fn book_cards(books: &[gideon_core::Book], places: &gideon_core::BookPlaces) -> Vec<BookCard> {
+    let progress_of = |b: &gideon_core::Book| -> (Option<f32>, u64) {
+        match places.get(&b.relative_path) {
+            Some(p) if p.chapters > 0 => (
+                Some((p.chapter as f32 / p.chapters as f32).clamp(0.0, 1.0)),
+                p.updated_at,
+            ),
+            Some(p) => (Some(0.0), p.updated_at),
+            None => (None, 0),
+        }
+    };
+    let mut cards: Vec<BookCard> = Vec::new();
+    // Series name → index into `cards`, plus each volume's number for order.
+    let mut series_at: std::collections::BTreeMap<String, (usize, Vec<u32>)> =
+        std::collections::BTreeMap::new();
+    for book in books {
+        let (progress, read_at) = progress_of(book);
+        match gideon_core::books::series_of(&book.title) {
+            Some((series, n)) => {
+                let key = format!(
+                    "{}\u{0}{}",
+                    series.to_lowercase(),
+                    book.author.as_deref().unwrap_or("").to_lowercase()
+                );
+                match series_at.get_mut(&key) {
+                    Some((i, numbers)) => {
+                        let card = &mut cards[*i];
+                        let at = numbers.partition_point(|&m| m <= n);
+                        numbers.insert(at, n);
+                        card.books.insert(at, book.clone());
+                        if read_at >= card.last_read && read_at > 0 {
+                            card.last_read = read_at;
+                            card.progress = progress;
+                        }
+                    }
+                    None => {
+                        series_at.insert(key, (cards.len(), vec![n]));
+                        cards.push(BookCard {
+                            title: series,
+                            author: book.author.clone(),
+                            books: vec![book.clone()],
+                            progress,
+                            last_read: read_at,
+                        });
+                    }
+                }
+            }
+            None => cards.push(BookCard {
+                title: book.title.clone(),
+                author: book.author.clone(),
+                books: vec![book.clone()],
+                progress,
+                last_read: read_at,
+            }),
+        }
+    }
+    for (series, (i, numbers)) in &series_at {
+        let _ = series;
+        let card = &mut cards[*i];
+        if card.books.len() == 1 {
+            // A lone volume is just a book.
+            card.title = card.books[0].title.clone();
+        } else if let (Some(lo), Some(hi)) = (numbers.first(), numbers.last()) {
+            card.title = format!("{}, Vol. {lo}–{hi}", card.title);
+        }
+    }
+    // Recently read first; then the shelf's own (title) order, which the
+    // stable sort keeps.
+    cards.sort_by_key(|c| std::cmp::Reverse(c.last_read));
+    cards
+}
+
+/// A book's list row: its label, "· PDF" for what the Kobo reader must
+/// open, and how far in the reader is.
+fn book_row_label(book: &gideon_core::Book, places: &gideon_core::BookPlaces) -> String {
+    let mut label = book.label();
+    if book.format == "pdf" {
+        label.push_str(" · PDF");
+    }
+    if let Some(p) = places.get(&book.relative_path) {
+        if p.chapters > 0 {
+            let pct = (p.chapter as f32 / p.chapters as f32 * 100.0).round() as u32;
+            label.push_str(&format!(" · {pct}%"));
+        }
+    }
+    label
+}
+
+fn bookmark_banner(set: bool) -> &'static str {
+    if set {
+        "Bookmarked"
+    } else {
+        "Bookmark removed"
+    }
+}
+
+/// The word of `spans` (one laid-out line) drawn at `x` pixels from the
+/// line's left edge, or `None` on a gap or past the end. Words are the
+/// whitespace-separated tokens, measured as the page draws them.
+fn word_at_x(px: f32, spans: &[BookSpan], x: u32) -> Option<String> {
+    let mut cursor = 0u32;
+    for span in spans {
+        let width = measure_text(px, &span.text, span.bold);
+        if x < cursor + width {
+            let within = x - cursor;
+            let mut start = None;
+            for (i, c) in span.text.char_indices().chain([(span.text.len(), ' ')]) {
+                match (c.is_whitespace(), start) {
+                    (false, None) => start = Some(i),
+                    (true, Some(s)) => {
+                        let left = measure_text(px, &span.text[..s], span.bold);
+                        let right = measure_text(px, &span.text[..i], span.bold);
+                        if within >= left && within < right {
+                            return Some(span.text[s..i].to_string());
+                        }
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        cursor += width;
+    }
+    None
+}
+
+/// "normal" → "Normal", for a setting shown on a row.
+fn title_case(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
 pub use gateway::{AidokuGateway, ChapterEntry, MangaEntry, SourceEntry, SourceGateway};
 pub use layout::{page_button_advances, Key, ReaderZone, TapTarget, UiLayout};
 
+use gideon_core::settings::{BOOK_LINE_SPACINGS, BOOK_MARGINS, BOOK_TEXT_PX_STEPS};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -173,7 +335,7 @@ enum Sheet {
     BookFile { book: gideon_core::Book },
     /// Confirmation before a book is deleted.
     ConfirmDeleteBook { book: gideon_core::Book },
-    /// The book reader's menu: text size, and the way out.
+    /// The book reader's menu: contents, bookmarks, text, and the way out.
     BookReading,
     /// One Internet Archive result: what it is, then Download, then Read
     /// now. Drawn and hit-tested by `book_search`, not as rows.
@@ -183,7 +345,25 @@ enum Sheet {
         epub: Option<gateway::EpubLink>,
         state: book_search::DownloadState,
     },
+    /// The reader's typography: text size, line spacing and margins. Each
+    /// row cycles its setting; the page behind re-flows at once so the
+    /// change is seen with the sheet still open.
+    BookText,
+    /// A word looked up: the headword as the dictionary spells it, and its
+    /// definition wrapped to the sheet's width.
+    Definition { word: String, lines: Vec<String> },
+    /// A word was pressed but no dictionary is installed: offer the one
+    /// gideon knows how to fetch.
+    NoDictionary,
 }
+
+/// The English dictionary the reader offers to download: WordNet 3.1,
+/// converted to StarDict by the release workflow (`scripts/wn2stardict.py`)
+/// and attached to every release.
+pub const DICTIONARY_URL: &str =
+    "https://github.com/evanspn/gideon/releases/latest/download/wordnet-3.1-stardict.zip";
+/// The most definition lines a sheet shows before trailing off.
+const DEFINITION_LINES: usize = 8;
 
 /// What a settings row does when tapped. The grouped list is built once and
 /// used for BOTH drawing and hit-testing: the screen previously drew from
@@ -436,6 +616,13 @@ enum Screen {
         books: Vec<gideon_core::Book>,
         page: usize,
     },
+    /// The volumes of one light-novel series, from a series card on the
+    /// Books tab: a plain list, a row per volume.
+    BookSeries {
+        title: String,
+        books: Vec<gideon_core::Book>,
+        page: usize,
+    },
     /// gideon's own book reader: one chapter of an EPUB, flowed into pages
     /// at the reader text size. `pages` is the current chapter laid out;
     /// the next chapter is laid out when the last page is turned.
@@ -444,6 +631,18 @@ enum Screen {
         text: std::sync::Arc<gideon_core::EpubText>,
         chapter: usize,
         pages: std::sync::Arc<Vec<Vec<BookLine>>>,
+        page: usize,
+    },
+    /// The open book's table of contents, pushed over its reader: one row
+    /// per entry, the current chapter bold; a tap jumps the reader there.
+    BookContents {
+        entries: Vec<gideon_core::epub::TocEntry>,
+        current: usize,
+        page: usize,
+    },
+    /// The open book's bookmarks, pushed over its reader; a tap jumps there.
+    BookBookmarks {
+        entries: Vec<gideon_core::Bookmark>,
         page: usize,
     },
     Sources {
@@ -647,16 +846,76 @@ pub enum LibraryTab {
     Books,
 }
 
+/// What Today's Continue card resumes.
+#[derive(Debug, Clone)]
+enum ContinueTarget {
+    Manga(SeriesCard),
+    Book(gideon_core::Book, gideon_core::BookPlace),
+}
+
+/// One row of Today's "Waiting for you" list.
+#[derive(Debug, Clone)]
+enum WaitingRow {
+    /// A series with this many unread downloaded chapters.
+    Manga(SeriesCard, usize),
+    /// A book not yet finished in gideon's reader.
+    Book(gideon_core::Book),
+}
+
+impl WaitingRow {
+    fn title(&self) -> String {
+        match self {
+            WaitingRow::Manga(card, _) => card.title(),
+            WaitingRow::Book(book) => book.title.clone(),
+        }
+    }
+}
+
 /// One laid-out line of a book page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookLine {
+    /// The line's text, styling dropped (what tests and search read).
     pub text: String,
+    /// The same text as styled runs, concatenating to `text`.
+    pub spans: Vec<BookSpan>,
+    /// A heading line: every run drawn bold.
     pub bold: bool,
     /// Which block of the chapter this line came from, so the reading
     /// place survives a text-size change (pages move; paragraphs do not).
     pub block: usize,
     /// Which wrapped line of that block this is.
     pub line: usize,
+    /// A picture occupying this line and the `rows - 1` after it, scaled
+    /// to `width × height` pixels. `text` is empty on such a line.
+    pub image: Option<BookImage>,
+}
+
+/// A run of one style within a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookSpan {
+    pub text: String,
+    pub italic: bool,
+    pub bold: bool,
+}
+
+impl BookSpan {
+    fn style(&self) -> gideon_render::text::TextStyle {
+        gideon_render::text::TextStyle {
+            bold: self.bold,
+            italic: self.italic,
+        }
+    }
+}
+
+/// An illustration placed on a page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookImage {
+    /// Zip entry inside the EPUB.
+    pub href: String,
+    pub width: u32,
+    pub height: u32,
+    /// Text lines the picture stands in for.
+    pub rows: usize,
 }
 
 impl BookLine {
@@ -678,50 +937,96 @@ fn resume_page(pages: &[Vec<BookLine>], place: (usize, usize)) -> usize {
 
 /// Flow one chapter into pages of `lines_per_page` lines at `px`, wrapping
 /// words to `max_w`. A heading is bold; blocks are separated by a blank
-/// line that is dropped at the top of a page; an illustration becomes a
-/// one-line note, since gideon's reader shows text.
-pub fn paginate_chapter(
+/// line that is dropped at the top of a page. `dims` gives an image's pixel size
+/// by href (`None` = unreadable, shown as a one-line note). A picture is
+/// scaled to the text width, capped at a page, and takes as many rows as
+/// its height covers at `line_h`; one that does not fit in what is left of
+/// a page starts the next one rather than being split.
+pub fn paginate_chapter_with(
     chapter: &gideon_core::epub::Chapter,
     px: f32,
     max_w: u32,
     lines_per_page: usize,
+    line_h: u32,
+    dims: &dyn Fn(&str) -> Option<(u32, u32)>,
 ) -> Vec<Vec<BookLine>> {
     use gideon_core::BookBlock;
     let per_page = lines_per_page.max(1);
+    let line_h = line_h.max(1);
+    let page_h = per_page as u32 * line_h;
     let mut lines: Vec<BookLine> = Vec::new();
     for (i, block) in chapter.blocks.iter().enumerate() {
-        let (text, bold) = match block {
-            BookBlock::Heading(t) => (t.as_str(), true),
-            BookBlock::Paragraph(t) => (t.as_str(), false),
-            BookBlock::Image => ("[Illustration]", false),
-        };
         if !lines.is_empty() {
             lines.push(BookLine {
                 text: String::new(),
+                spans: Vec::new(),
                 bold: false,
                 block: i,
                 line: 0,
+                image: None,
             });
         }
-        for (n, wrapped) in wrap_words(px, text, max_w, bold).into_iter().enumerate() {
+        let (rich, bold) = match block {
+            BookBlock::Heading(t) => (t.clone(), true),
+            BookBlock::Paragraph(t) => (t.clone(), false),
+            BookBlock::Image(href) => match dims(href).filter(|(w, h)| *w > 0 && *h > 0) {
+                Some((iw, ih)) => {
+                    // Fit the width, then the page height, keeping the
+                    // aspect ratio either way.
+                    let mut w = max_w.max(1).min(iw.max(1));
+                    let mut h = (w as u64 * ih as u64 / iw.max(1) as u64).max(1) as u32;
+                    if h > page_h {
+                        h = page_h;
+                        w = (h as u64 * iw as u64 / ih.max(1) as u64).max(1) as u32;
+                    }
+                    let rows = (h.div_ceil(line_h) as usize).clamp(1, per_page);
+                    lines.push(BookLine {
+                        text: String::new(),
+                        spans: Vec::new(),
+                        bold: false,
+                        block: i,
+                        line: 0,
+                        image: Some(BookImage {
+                            href: href.clone(),
+                            width: w,
+                            height: h,
+                            rows,
+                        }),
+                    });
+                    continue;
+                }
+                None => (gideon_core::Rich::from("[Illustration]"), false),
+            },
+        };
+        for (n, spans) in wrap_spans(px, &rich, max_w, bold).into_iter().enumerate() {
             lines.push(BookLine {
-                text: wrapped,
+                text: spans.iter().map(|s| s.text.as_str()).collect(),
+                spans,
                 bold,
                 block: i,
                 line: n,
+                image: None,
             });
         }
     }
     let mut pages: Vec<Vec<BookLine>> = Vec::new();
     let mut current: Vec<BookLine> = Vec::new();
+    let mut used = 0usize;
     for line in lines {
         // A blank separator carries nothing at the top of a page.
-        if current.is_empty() && line.text.is_empty() {
+        if current.is_empty() && line.text.is_empty() && line.image.is_none() {
             continue;
         }
-        current.push(line);
-        if current.len() >= per_page {
+        let rows = line.image.as_ref().map(|i| i.rows).unwrap_or(1);
+        if used + rows > per_page && !current.is_empty() {
             pages.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(line);
+        used += rows;
+        if used >= per_page {
+            pages.push(std::mem::take(&mut current));
+            used = 0;
         }
     }
     if !current.is_empty() || pages.is_empty() {
@@ -730,40 +1035,111 @@ pub fn paginate_chapter(
     pages
 }
 
-/// Word-wrap `text` to `max_w` at `px`. A single word wider than the line
-/// is broken at a character boundary rather than overflowing (e.g. a URL).
-fn wrap_words(px: f32, text: &str, max_w: u32, bold: bool) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        if measure_text(px, &candidate, bold) <= max_w {
-            current = candidate;
-            continue;
-        }
-        if !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
-        }
-        // The word alone: fits, or has to be split.
-        if measure_text(px, word, bold) <= max_w {
-            current = word.to_string();
-        } else {
-            let mut piece = String::new();
-            for ch in word.chars() {
-                let mut next = piece.clone();
-                next.push(ch);
-                if measure_text(px, &next, bold) > max_w && !piece.is_empty() {
-                    lines.push(std::mem::take(&mut piece));
-                    piece.push(ch);
-                } else {
-                    piece = next;
+/// Word-wrap styled text to `max_w` at `px`, keeping each word's runs.
+/// A word is the fragments between spaces, which may change style
+/// mid-word ("<b>goes</b>." is one word of two runs). `heading` draws every
+/// run bold. A word wider than the line is split at a character boundary.
+fn wrap_spans(px: f32, rich: &gideon_core::Rich, max_w: u32, heading: bool) -> Vec<Vec<BookSpan>> {
+    use gideon_render::text::measure_text_styled;
+    // Words as lists of fragments.
+    let mut words: Vec<Vec<BookSpan>> = Vec::new();
+    let mut word: Vec<BookSpan> = Vec::new();
+    for span in &rich.spans {
+        let frag_style = (span.italic, span.bold || heading);
+        let mut piece = String::new();
+        for ch in span.text.chars() {
+            if ch == ' ' || ch == '\u{a0}' {
+                if !piece.is_empty() {
+                    word.push(BookSpan {
+                        text: std::mem::take(&mut piece),
+                        italic: frag_style.0,
+                        bold: frag_style.1,
+                    });
                 }
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                piece.push(ch);
             }
-            current = piece;
+        }
+        if !piece.is_empty() {
+            word.push(BookSpan {
+                text: piece,
+                italic: frag_style.0,
+                bold: frag_style.1,
+            });
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    let width_of = |frags: &[BookSpan]| -> u32 {
+        frags
+            .iter()
+            .map(|f| measure_text_styled(px, &f.text, f.style()))
+            .sum()
+    };
+    let space_w = measure_text(px, " ", heading).max(1);
+
+    let mut lines: Vec<Vec<BookSpan>> = Vec::new();
+    let mut current: Vec<BookSpan> = Vec::new();
+    let mut current_w = 0u32;
+    let push_frags = |current: &mut Vec<BookSpan>, frags: &[BookSpan]| {
+        for f in frags {
+            match current.last_mut() {
+                Some(last) if last.italic == f.italic && last.bold == f.bold => {
+                    last.text.push_str(&f.text)
+                }
+                _ => current.push(f.clone()),
+            }
+        }
+    };
+    let add_space = |current: &mut Vec<BookSpan>| {
+        if let Some(last) = current.last_mut() {
+            last.text.push(' ');
+        }
+    };
+    for frags in words {
+        let w = width_of(&frags);
+        if current.is_empty() {
+            if w <= max_w {
+                push_frags(&mut current, &frags);
+                current_w = w;
+                continue;
+            }
+        } else if current_w + space_w + w <= max_w {
+            add_space(&mut current);
+            push_frags(&mut current, &frags);
+            current_w += space_w + w;
+            continue;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current_w = 0;
+            if w <= max_w {
+                push_frags(&mut current, &frags);
+                current_w = w;
+                continue;
+            }
+        }
+        // A word wider than the line: split it character by character,
+        // fragment styles kept.
+        for f in &frags {
+            for ch in f.text.chars() {
+                let one = BookSpan {
+                    text: ch.to_string(),
+                    italic: f.italic,
+                    bold: f.bold,
+                };
+                let cw = measure_text_styled(px, &one.text, one.style());
+                if current_w + cw > max_w && !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    current_w = 0;
+                }
+                push_frags(&mut current, std::slice::from_ref(&one));
+                current_w += cw;
+            }
         }
     }
     if !current.is_empty() || lines.is_empty() {
@@ -976,6 +1352,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// A one-repaint banner over the book page ("Brightness 45%"), wiped
     /// by the next repaint like the manga reader's.
     book_banner: Option<String>,
+    /// The EPUB being opened, for the layout pass that runs before its
+    /// reader screen is on the stack (pictures are measured from the zip).
+    pending_book_path: Option<PathBuf>,
     /// Active profile name (settings.json `active_profile`).
     active_profile: String,
     layout: UiLayout,
@@ -1030,6 +1409,9 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// Where settings.json lives, for persisting in-reader changes
     /// (rotation lock). `None` skips persistence.
     settings_dir: Option<PathBuf>,
+    /// The installed dictionaries, read from `<settings_dir>/dicts` on the
+    /// first lookup; `None` until then, and again after an install.
+    dictionaries: Option<Vec<gideon_core::Dictionary>>,
     /// Battery charge probe (sysfs on hardware); `None` (tests, headless)
     /// hides the percentage from the Home title and the sleep notice.
     battery: Option<Box<dyn Fn() -> Option<u8>>>,
@@ -1116,6 +1498,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             book_turns: 0,
             book_slide_base: None,
             book_banner: None,
+            pending_book_path: None,
             library_dir,
             active_profile: "default".to_string(),
             layout,
@@ -1136,6 +1519,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             last_wake: None,
             keyboard_paints: 0,
             keyboard_shift: false,
+            dictionaries: None,
             lights: None,
             settings_dir: None,
             battery: None,
@@ -1176,7 +1560,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 match books.into_iter().find(|b| b.format == "epub") {
                     Some(book) => match gideon_core::epub::load(&book.path) {
                         Ok(text) if !text.chapters.is_empty() => {
+                            self.pending_book_path = Some(book.path.clone());
                             let pages = self.layout_book_chapter(&text, 0);
+                            self.pending_book_path = None;
                             Screen::BookReader {
                                 book,
                                 text: std::sync::Arc::new(text),
@@ -1685,13 +2071,19 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// disk scan, keeping the shelf page (clamped). Cheap and only runs when the
     /// Library is actually showing.
     fn refresh_library_in_place(&mut self) -> Result<()> {
-        if let Some(Screen::BookShelf { books, page }) = self.stack.last_mut() {
+        if matches!(self.stack.last(), Some(Screen::BookShelf { .. })) {
             // A sync sweep may have placed a sent book while the shelf sat
             // on screen; rescan so it shows without leaving the tab.
             let fresh = gideon_core::books::scan(&self.books_dir).unwrap_or_default();
-            let per_page = self.layout.rows_per_page().max(1);
-            *page = (*page).min(fresh.len().div_ceil(per_page).saturating_sub(1));
-            *books = fresh;
+            let last = self
+                .book_cards(&fresh)
+                .len()
+                .div_ceil(self.books_page_capacity())
+                .saturating_sub(1);
+            if let Some(Screen::BookShelf { books, page }) = self.stack.last_mut() {
+                *books = fresh;
+                *page = (*page).min(last);
+            }
             return Ok(());
         }
         if !matches!(self.stack.last(), Some(Screen::Library { .. })) {
@@ -1827,8 +2219,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.open_library_tab(LibraryTab::Manga)?;
                     } else if x >= books.0 && x < books.1 {
                         self.open_library_tab(LibraryTab::Books)?;
-                    } else if matches!(self.screen(), Screen::Library { .. }) {
-                        // Elsewhere on the manga tab's title bar toggles between
+                    } else {
+                        // Elsewhere on either tab's title bar toggles between
                         // the cover shelf and the dense metadata list. Two views
                         // of one library: art to browse by, data to decide by.
                         self.toggle_library_view()?;
@@ -1941,6 +2333,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
                 self.handle_tap(x, y)
             }
+            // A long press on a word looks it up; on the margin or a blank
+            // it marks the page (or unmarks it). The reading menu has both.
+            Screen::BookReader { .. } if self.sheet.is_none() => match self.book_word_at(x, y) {
+                Some(word) => self.look_up(&word),
+                None => self.toggle_bookmark(),
+            },
             _ => self.handle_tap(x, y),
         }
     }
@@ -2107,7 +2505,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let shelf_capacity = self.library_page_capacity();
         match self.stack.last() {
             Some(Screen::Library { items, .. }) => items.len().div_ceil(shelf_capacity),
-            Some(Screen::BookShelf { books, .. }) => books.len().div_ceil(per_page),
+            Some(Screen::BookShelf { books, .. }) => self
+                .book_cards(books)
+                .len()
+                .div_ceil(self.books_page_capacity()),
+            Some(Screen::BookSeries { books, .. }) => books.len().div_ceil(per_page),
+            Some(Screen::BookContents { entries, .. }) => entries.len().div_ceil(per_page),
+            Some(Screen::BookBookmarks { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
             Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
             Some(Screen::Popular { mangas, .. }) => mangas.len().div_ceil(per_page),
@@ -2140,6 +2544,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(
                 Screen::Library { page, .. }
                 | Screen::BookShelf { page, .. }
+                | Screen::BookContents { page, .. }
+                | Screen::BookBookmarks { page, .. }
                 | Screen::Sources { page, .. }
                 | Screen::SearchResults { page, .. }
                 | Screen::Popular { page, .. }
@@ -2156,12 +2562,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn move_page(&mut self, mv: PageMove) -> Result<()> {
         let per_page = self.layout.rows_per_page();
         let shelf_capacity = self.library_page_capacity();
+        let book_pages = match self.stack.last() {
+            Some(Screen::BookShelf { books, .. }) => self
+                .book_cards(books)
+                .len()
+                .div_ceil(self.books_page_capacity()),
+            _ => 1,
+        };
         let Some(screen) = self.stack.last_mut() else {
             return Ok(());
         };
         let (page, count) = match screen {
             Screen::Library { items, page } => (page, items.len().div_ceil(shelf_capacity)),
-            Screen::BookShelf { books, page } => (page, books.len().div_ceil(per_page)),
+            Screen::BookShelf { page, .. } => (page, book_pages),
+            Screen::BookSeries { books, page, .. } => (page, books.len().div_ceil(per_page)),
+            Screen::BookContents { entries, page, .. } => (page, entries.len().div_ceil(per_page)),
+            Screen::BookBookmarks { entries, page } => (page, entries.len().div_ceil(per_page)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
             // +1 for the trailing "Search more sources" row.
             Screen::SearchResults { results, page, .. } => {
@@ -2412,12 +2828,66 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Sheet::BookReading) => (
                 "Reading".to_string(),
                 vec![
-                    ("Larger text".into(), String::new(), false),
-                    ("Smaller text".into(), String::new(), false),
+                    ("Contents".into(), "›".into(), false),
+                    ("Bookmarks".into(), "›".into(), false),
+                    (
+                        if self.page_is_bookmarked() {
+                            "Unmark this page"
+                        } else {
+                            "Mark this page"
+                        }
+                        .into(),
+                        String::new(),
+                        false,
+                    ),
+                    ("Text".into(), "›".into(), false),
                     ("Close book".into(), String::new(), false),
                     ("Close".into(), String::new(), true),
                 ],
             ),
+            Some(Sheet::Definition {
+                ref word,
+                ref lines,
+            }) => {
+                let mut rows: Vec<(String, String, bool)> = lines
+                    .iter()
+                    .map(|l| (l.clone(), String::new(), false))
+                    .collect();
+                rows.push(("Close".into(), String::new(), true));
+                (word.clone(), rows)
+            }
+            Some(Sheet::NoDictionary) => (
+                "Dictionary".to_string(),
+                vec![
+                    (
+                        "No dictionary on this Kobo yet.".into(),
+                        String::new(),
+                        false,
+                    ),
+                    ("Download English dictionary".into(), "8 MB".into(), false),
+                    ("Close".into(), String::new(), true),
+                ],
+            ),
+            Some(Sheet::BookText) => {
+                let settings = self.load_settings();
+                (
+                    "Text".to_string(),
+                    vec![
+                        (
+                            "Size".into(),
+                            format!("{} px", settings.book_text_px),
+                            false,
+                        ),
+                        (
+                            "Line spacing".into(),
+                            title_case(&settings.book_line_spacing),
+                            false,
+                        ),
+                        ("Margins".into(), title_case(&settings.book_margins), false),
+                        ("Close".into(), String::new(), true),
+                    ],
+                )
+            }
             Some(Sheet::ConfirmDeleteBook { ref book }) => (
                 format!("Delete \"{}\"?", book.title),
                 vec![
@@ -2811,13 +3281,83 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Sheet::BookReading) => {
                 self.sheet = None;
                 match index {
-                    0 => self.resize_book_text(6)?,
-                    1 => self.resize_book_text(-6)?,
+                    0 => self.open_book_contents()?,
+                    1 => self.open_book_bookmarks()?,
                     2 => {
+                        // The sheet closing reveals the page whole, so
+                        // this one is a flash, unlike the long-press.
+                        let set = self.flip_bookmark();
+                        self.book_banner = Some(bookmark_banner(set).to_string());
+                        let result = self.render_current(RefreshMode::Full);
+                        self.book_banner = None;
+                        result?;
+                    }
+                    3 => {
+                        // One sheet replaces another over a page that has
+                        // not moved: the sheet region alone changes.
+                        self.sheet = Some(Sheet::BookText);
+                        self.render_current(RefreshMode::Partial)?;
+                    }
+                    4 => {
                         self.save_book_place();
                         return self.pop();
                     }
                     _ => self.render_current(RefreshMode::Full)?,
+                }
+                Ok(Flow::Continue)
+            }
+            Some(Sheet::Definition { ref lines, .. }) => {
+                if index < lines.len() {
+                    // The definition's own lines are not buttons.
+                    return Ok(Flow::Continue);
+                }
+                self.sheet = None;
+                self.render_current(RefreshMode::Full)?;
+                Ok(Flow::Continue)
+            }
+            Some(Sheet::NoDictionary) => match index {
+                0 => Ok(Flow::Continue),
+                1 => {
+                    self.sheet = None;
+                    self.install_dictionary()
+                }
+                _ => {
+                    self.sheet = None;
+                    self.render_current(RefreshMode::Full)?;
+                    Ok(Flow::Continue)
+                }
+            },
+            Some(Sheet::BookText) => {
+                match index {
+                    0..=2 => {
+                        let mut settings = self.load_settings();
+                        match index {
+                            0 => {
+                                settings.book_text_px =
+                                    next_in(&BOOK_TEXT_PX_STEPS, &settings.book_text_px);
+                            }
+                            1 => {
+                                let names: Vec<&str> =
+                                    BOOK_LINE_SPACINGS.iter().map(|(n, _)| *n).collect();
+                                settings.book_line_spacing =
+                                    next_in(&names, &settings.book_line_spacing.as_str())
+                                        .to_string();
+                            }
+                            _ => {
+                                let names: Vec<&str> =
+                                    BOOK_MARGINS.iter().map(|(n, _)| *n).collect();
+                                settings.book_margins =
+                                    next_in(&names, &settings.book_margins.as_str()).to_string();
+                            }
+                        }
+                        self.save_settings(&settings);
+                        // The sheet stays up; the page behind re-flows.
+                        self.reflow_book()?;
+                    }
+                    _ => {
+                        self.sheet = None;
+                        self.render_current(RefreshMode::Full)?;
+                    }
                 }
                 Ok(Flow::Continue)
             }
@@ -3208,12 +3748,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // when you press it is the screen lying about what it is.
             Screen::Stats => {
                 if self.continue_card_hit(y) {
-                    if let Some(card) = self.continue_series_card() {
-                        return self.open_series_card(&card);
+                    match self.continue_target() {
+                        Some(ContinueTarget::Manga(card)) => return self.open_series_card(&card),
+                        Some(ContinueTarget::Book(book, _)) => {
+                            self.open_book_reader(book)?;
+                            return Ok(Flow::Continue);
+                        }
+                        None => {}
                     }
                 }
-                if let Some(card) = self.waiting_row_at(y) {
-                    return self.open_series_card(&card);
+                match self.waiting_row_at(y) {
+                    Some(WaitingRow::Manga(card, _)) => return self.open_series_card(&card),
+                    Some(WaitingRow::Book(book)) => {
+                        self.open_book_reader(book)?;
+                        return Ok(Flow::Continue);
+                    }
+                    None => {}
                 }
                 Ok(Flow::Continue)
             }
@@ -3221,12 +3771,36 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             // The reader takes its taps in handle_tap, by zone, before the
             // row hit-test; nothing reaches here.
             Screen::BookReader { .. } => Ok(Flow::Continue),
+            Screen::BookContents { entries, page, .. } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(entry) = entries.get(index).cloned() {
+                    self.jump_to_place(entry.chapter, (0, 0))?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookBookmarks { entries, page } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(mark) = entries.get(index).cloned() {
+                    self.jump_to_place(mark.chapter, (mark.block, mark.line))?;
+                }
+                Ok(Flow::Continue)
+            }
             Screen::BookShelf { books, page } => {
+                let cards = self.book_cards(&books);
+                let card = if self.load_settings().library_view == "list" {
+                    cards.get(page * self.layout.rows_per_page() + row).cloned()
+                } else {
+                    self.book_cell_at(&cards, page, x, y)
+                };
+                if let Some(card) = card {
+                    self.open_book_card(card)?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::BookSeries { books, page, .. } => {
                 let index = page * self.layout.rows_per_page() + row;
                 if let Some(book) = books.get(index).cloned() {
                     self.sheet = Some(Sheet::BookFile { book });
-                    // The row you tapped stays on screen behind the sheet;
-                    // only the strip it covers repaints. See docs/REFRESH.md.
                     self.render_current(RefreshMode::Partial)?;
                 }
                 Ok(Flow::Continue)
@@ -4130,6 +4704,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             device.frontlight_brightness = settings.frontlight_brightness;
             device.frontlight_warmth = settings.frontlight_warmth;
             device.book_text_px = settings.book_text_px;
+            device.book_line_spacing = settings.book_line_spacing.clone();
+            device.book_margins = settings.book_margins.clone();
             if let Err(e) = device.save(dir) {
                 eprintln!("gideon: couldn't save settings: {e}");
             }
@@ -6697,8 +7273,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             );
             wy += head_h + l.pad;
             let mut layer = GrayPage::new_white(l.width, l.height);
-            for (card, unread) in &waiting {
-                let count = format!("{unread} unread");
+            for row in &waiting {
+                let (title, count) = match row {
+                    WaitingRow::Manga(card, unread) => (card.title(), format!("{unread} unread")),
+                    WaitingRow::Book(book) => (book.title.clone(), "book".to_string()),
+                };
                 let cw = measure_text(l.text_px * 0.72, &count, false);
                 let ty = wy + l.row_h.saturating_sub(l.text_px as u32) / 2;
                 draw_text(
@@ -6706,7 +7285,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     l.pad,
                     ty,
                     l.text_px * 0.85,
-                    &card.title(),
+                    &title,
                     inner.saturating_sub(cw + l.pad),
                     true,
                 );
@@ -6867,13 +7446,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// first, and how many each has waiting. Today's bottom third was empty
     /// while this — the answer to "what do I have on the device to read" —
     /// was only derivable by walking the library screen row by row.
-    fn waiting_rows(&self) -> Vec<(SeriesCard, usize)> {
-        let Ok(entries) = Library::new(&self.library_dir).scan() else {
-            return Vec::new();
-        };
+    fn waiting_rows(&self) -> Vec<WaitingRow> {
+        let entries = Library::new(&self.library_dir).scan().unwrap_or_default();
         let cards = group_library(entries);
-        let mut rows = self.with_progress(|_, store| {
-            let mut rows: Vec<(SeriesCard, usize, u64)> = cards
+        let mut rows: Vec<(WaitingRow, u64)> = self.with_progress(|_, store| {
+            cards
                 .into_iter()
                 .filter_map(|card| {
                     let unread = card
@@ -6882,21 +7459,30 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         .filter(|c| !store.get(&c.relative_path).is_some_and(|p| p.is_finished()))
                         .count();
                     let when = card.latest_read_at(store);
-                    (unread > 0).then_some((card, unread, when))
+                    (unread > 0).then_some((WaitingRow::Manga(card, unread), when))
                 })
-                .collect();
-            // Most recently read first; a series never opened sorts last but
-            // still shows — it is exactly what a reader is looking for here.
-            rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.title().cmp(&b.0.title())));
-            rows
+                .collect()
         });
+        // Books are on the same list: one not finished is waiting too.
+        let places = gideon_core::BookPlaces::load(&self.books_dir);
+        for book in gideon_core::books::scan(&self.books_dir).unwrap_or_default() {
+            let place = places.get(&book.relative_path);
+            let finished = place.is_some_and(|p| p.chapters > 0 && p.chapter + 1 >= p.chapters);
+            if book.format == "epub" && !finished {
+                let when = place.map(|p| p.updated_at).unwrap_or(0);
+                rows.push((WaitingRow::Book(book), when));
+            }
+        }
+        // Most recently read first; a series never opened sorts last but
+        // still shows — it is exactly what a reader is looking for here.
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.title().cmp(&b.0.title())));
         rows.truncate(self.waiting_capacity());
-        rows.into_iter().map(|(c, n, _)| (c, n)).collect()
+        rows.into_iter().map(|(r, _)| r).collect()
     }
 
     /// The waiting-list series a tap at `y` lands on, if any. Walks the same
     /// geometry the compositor draws, one row at a time.
-    fn waiting_row_at(&self, y: u32) -> Option<SeriesCard> {
+    fn waiting_row_at(&self, y: u32) -> Option<WaitingRow> {
         let l = &self.layout;
         let head_h = l.row_h * 2 / 3;
         let top = self.waiting_top() + head_h + l.pad;
@@ -6904,7 +7490,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return None;
         }
         let index = ((y - top) / l.row_h.max(1)) as usize;
-        self.waiting_rows().into_iter().nth(index).map(|(c, _)| c)
+        self.waiting_rows().into_iter().nth(index)
     }
 
     /// How many waiting rows fit between the Continue card and the nav bar.
@@ -6929,13 +7515,61 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         })
     }
 
+    /// The book last read in gideon's reader, with its place.
+    fn continue_book(&self) -> Option<(gideon_core::Book, gideon_core::BookPlace)> {
+        let places = gideon_core::BookPlaces::load(&self.books_dir);
+        let (key, place) = places
+            .places
+            .iter()
+            .filter(|(_, p)| p.updated_at > 0)
+            .max_by_key(|(_, p)| p.updated_at)?;
+        let book = gideon_core::books::scan(&self.books_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|b| b.relative_path == *key)?;
+        Some((book, *place))
+    }
+
+    /// What Continue resumes: whichever of the last manga and the last book
+    /// was in your hands more recently. Picking the device up to carry on a
+    /// novel and being offered a manga would be the screen lying.
+    fn continue_target(&self) -> Option<ContinueTarget> {
+        let manga = self.continue_series_card();
+        let manga_at = manga
+            .as_ref()
+            .map(|c| self.with_progress(|_, store| c.latest_read_at(store)))
+            .unwrap_or(0);
+        let book = self.continue_book();
+        let book_at = book.as_ref().map(|(_, p)| p.updated_at).unwrap_or(0);
+        match (manga, book) {
+            (Some(card), Some((book, place))) => Some(if manga_at >= book_at {
+                ContinueTarget::Manga(card)
+            } else {
+                ContinueTarget::Book(book, place)
+            }),
+            (Some(card), None) => Some(ContinueTarget::Manga(card)),
+            (None, Some((book, place))) => Some(ContinueTarget::Book(book, place)),
+            (None, None) => None,
+        }
+    }
+
     fn continue_card(&self) -> Option<(String, String, f32)> {
-        let cards = group_library(Library::new(&self.library_dir).scan().ok()?);
+        match self.continue_target()? {
+            ContinueTarget::Book(book, place) => {
+                let total = place.chapters.max(place.chapter + 1);
+                let pct = place.chapter as f32 / total as f32;
+                let where_at = match &book.author {
+                    Some(a) => format!("{a} — chapter {} of {total}", place.chapter + 1),
+                    None => format!("chapter {} of {total}", place.chapter + 1),
+                };
+                Some((book.title, where_at, pct))
+            }
+            ContinueTarget::Manga(card) => self.continue_card_manga(&card),
+        }
+    }
+
+    fn continue_card_manga(&self, card: &SeriesCard) -> Option<(String, String, f32)> {
         self.with_progress(|_, store| {
-            let card = cards
-                .iter()
-                .filter(|c| c.latest_read_at(store) > 0)
-                .max_by_key(|c| c.latest_read_at(store))?;
             let entry = card.resume_chapter(store);
             let progress = store.get(&entry.relative_path);
             let pct = progress
@@ -7546,6 +8180,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             ),
             Screen::Library { items, page } => self.compose_library(items, *page)?,
             Screen::BookShelf { books, page } => self.compose_book_shelf(books, *page),
+            Screen::BookSeries { title, books, page } => {
+                let places = gideon_core::BookPlaces::load(&self.books_dir);
+                let rows: Vec<(String, bool)> = paged(books, *page, per_page)
+                    .iter()
+                    .map(|b| (book_row_label(b, &places), false))
+                    .collect();
+                compose_list(l, title, &rows, *page, l.page_count(books.len()))
+            }
             Screen::BookReader {
                 book,
                 text,
@@ -7553,6 +8195,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 pages,
                 page,
             } => self.compose_book_page(book, text, *chapter, pages, *page),
+            Screen::BookContents {
+                entries,
+                current,
+                page,
+            } => {
+                let rows: Vec<(String, bool)> = paged(entries, *page, per_page)
+                    .iter()
+                    .map(|e| (e.title.clone(), e.chapter == *current))
+                    .collect();
+                compose_list(l, "Contents", &rows, *page, l.page_count(entries.len()))
+            }
+            Screen::BookBookmarks { entries, page } => {
+                let rows: Vec<(String, bool)> = paged(entries, *page, per_page)
+                    .iter()
+                    .map(|b| (format!("{} · {}", b.chapter + 1, b.snippet), false))
+                    .collect();
+                compose_list(l, "Bookmarks", &rows, *page, l.page_count(entries.len()))
+            }
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -7940,15 +8600,24 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     // --- the book reader ---
 
-    /// The reader's page geometry at the current text size: text px, left
+    /// The reader's page geometry at the current typography: text px, left
     /// margin, text width, first baseline-top, line height, lines per page.
     fn book_page_metrics(&self) -> (f32, u32, u32, u32, u32, usize) {
         let l = &self.layout;
-        let px = self.load_settings().book_text_px as f32;
-        let margin = l.pad * 3;
+        let settings = self.load_settings();
+        let px = settings.book_text_px as f32;
+        let margin_pads = BOOK_MARGINS
+            .iter()
+            .find(|(n, _)| *n == settings.book_margins)
+            .map_or(3, |(_, pads)| *pads);
+        let spacing = BOOK_LINE_SPACINGS
+            .iter()
+            .find(|(n, _)| *n == settings.book_line_spacing)
+            .map_or(1.45, |(_, ratio)| *ratio);
+        let margin = l.pad * margin_pads;
         let max_w = l.width.saturating_sub(margin * 2).max(1);
         let top = l.pad * 2;
-        let line_h = (px * 1.45) as u32;
+        let line_h = (px * spacing) as u32;
         // The footer: one small line of status with air around it.
         let footer_h = (l.text_px * 0.75) as u32 + l.pad * 3;
         let lines = (l.height.saturating_sub(top + footer_h) / line_h.max(1)).max(1) as usize;
@@ -7960,11 +8629,22 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         text: &gideon_core::EpubText,
         chapter: usize,
     ) -> Vec<Vec<BookLine>> {
-        let (px, _, max_w, _, _, lines) = self.book_page_metrics();
-        match text.chapters.get(chapter) {
-            Some(c) => paginate_chapter(c, px, max_w, lines),
-            None => vec![Vec::new()],
-        }
+        let (px, _, max_w, _, line_h, lines) = self.book_page_metrics();
+        let Some(c) = text.chapters.get(chapter) else {
+            return vec![Vec::new()];
+        };
+        // Only the headers are read here: a chapter's pictures are measured
+        // once at layout and decoded one page at a time when drawn.
+        let path = match self.stack.last() {
+            Some(Screen::BookReader { book, .. }) => Some(book.path.clone()),
+            _ => self.pending_book_path.clone(),
+        };
+        let dims = move |href: &str| -> Option<(u32, u32)> {
+            let path = path.as_ref()?;
+            let bytes = gideon_core::epub::read_entry(path, href).ok()?;
+            gideon_core::epub::image_dimensions(&bytes)
+        };
+        paginate_chapter_with(c, px, max_w, lines, line_h, &dims)
     }
 
     /// Open an EPUB in gideon's reader at the place it was left.
@@ -7983,7 +8663,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             .get(&book.relative_path)
             .unwrap_or_default();
         let chapter = place.chapter.min(text.chapters.len() - 1);
+        self.pending_book_path = Some(book.path.clone());
         let pages = self.layout_book_chapter(&text, chapter);
+        self.pending_book_path = None;
         let page = resume_page(&pages, (place.block, place.line));
         self.book_turns = 0;
         self.push(Screen::BookReader {
@@ -7993,6 +8675,269 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             pages: std::sync::Arc::new(pages),
             page,
         })
+    }
+
+    /// The open book's contents, over the reader. Opens on the page that
+    /// holds the current chapter, so a long list does not start from the
+    /// top every time.
+    fn open_book_contents(&mut self) -> Result<()> {
+        let Some(Screen::BookReader { text, chapter, .. }) = self.stack.last() else {
+            return Ok(());
+        };
+        let entries = text.contents();
+        let current = *chapter;
+        let per_page = self.layout.rows_per_page().max(1);
+        let page = entries
+            .iter()
+            .rposition(|e| e.chapter <= current)
+            .map(|i| i / per_page)
+            .unwrap_or(0);
+        self.push(Screen::BookContents {
+            entries,
+            current,
+            page,
+        })
+    }
+
+    /// The open book's bookmarks, over the reader; a book with none says
+    /// how to make one instead of showing an empty list.
+    fn open_book_bookmarks(&mut self) -> Result<()> {
+        let Some(Screen::BookReader { book, .. }) = self.stack.last() else {
+            return Ok(());
+        };
+        let entries = gideon_core::BookPlaces::load(&self.books_dir)
+            .bookmarks(&book.relative_path)
+            .to_vec();
+        if entries.is_empty() {
+            return self.push(Screen::Message {
+                title: "Bookmarks".to_string(),
+                body: "No bookmarks yet.\nPress and hold a page to mark it.".to_string(),
+            });
+        }
+        self.push(Screen::BookBookmarks { entries, page: 0 })
+    }
+
+    /// Mark the page on screen, or unmark it when it already is. The mark
+    /// is the page's top paragraph and line, with its first words for the
+    /// list. One partial repaint shows the corner mark and a banner.
+    fn toggle_bookmark(&mut self) -> Result<Flow> {
+        if !matches!(self.stack.last(), Some(Screen::BookReader { .. })) {
+            return Ok(Flow::Continue);
+        }
+        let set = self.flip_bookmark();
+        self.book_banner = Some(bookmark_banner(set).to_string());
+        let result = self.render_current(RefreshMode::Partial);
+        self.book_banner = None;
+        result.map(|_| Flow::Continue)
+    }
+
+    /// Whether any mark falls on the page the reader shows.
+    fn page_is_bookmarked(&self) -> bool {
+        let Some(Screen::BookReader {
+            book,
+            chapter,
+            pages,
+            page,
+            ..
+        }) = self.stack.last()
+        else {
+            return false;
+        };
+        let Some(lines) = pages.get(*page) else {
+            return false;
+        };
+        let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
+            return false;
+        };
+        let lo = (*chapter, first.block, first.line);
+        let hi = (*chapter, last.block, last.line);
+        gideon_core::BookPlaces::load(&self.books_dir)
+            .bookmarks(&book.relative_path)
+            .iter()
+            .any(|b| (lo..=hi).contains(&b.place()))
+    }
+
+    /// Mark the page the reader shows, or unmark it; `true` when it is now
+    /// marked. Saves; draws nothing.
+    fn flip_bookmark(&mut self) -> bool {
+        let Some(Screen::BookReader {
+            book,
+            chapter,
+            pages,
+            page,
+            ..
+        }) = self.stack.last()
+        else {
+            return false;
+        };
+        let Some(lines) = pages.get(*page) else {
+            return false;
+        };
+        let (block, line) = lines.first().map(BookLine::place).unwrap_or((0, 0));
+        let snippet: String = lines
+            .iter()
+            .find(|l| !l.text.is_empty())
+            .map(|l| l.text.chars().take(48).collect())
+            .unwrap_or_else(|| "[Illustration]".to_string());
+        let mark = gideon_core::Bookmark {
+            chapter: *chapter,
+            block,
+            line,
+            snippet,
+        };
+        let key = book.relative_path.clone();
+        let mut places = gideon_core::BookPlaces::load(&self.books_dir);
+        let set = places.toggle_bookmark(&key, mark);
+        if let Err(e) = places.save(&self.books_dir) {
+            eprintln!("gideon: couldn't save bookmarks: {e}");
+        }
+        set
+    }
+
+    // --- the dictionary ---
+
+    /// Where downloaded dictionaries live: beside settings.json.
+    fn dicts_dir(&self) -> Option<PathBuf> {
+        self.settings_dir.as_ref().map(|d| d.join("dicts"))
+    }
+
+    fn dictionaries(&mut self) -> &mut Vec<gideon_core::Dictionary> {
+        if self.dictionaries.is_none() {
+            let found = self
+                .dicts_dir()
+                .map(|d| gideon_core::Dictionary::installed(&d))
+                .unwrap_or_default();
+            self.dictionaries = Some(found);
+        }
+        self.dictionaries.as_mut().expect("just loaded")
+    }
+
+    /// The word drawn under screen point (x, y) on the reader's page, if
+    /// the point is on one: the line from the page geometry, the word from
+    /// the line's runs and their measured widths.
+    fn book_word_at(&self, x: u32, y: u32) -> Option<String> {
+        let Some(Screen::BookReader { pages, page, .. }) = self.stack.last() else {
+            return None;
+        };
+        let lines = pages.get(*page)?;
+        let (px, margin, _, top, line_h, _) = self.book_page_metrics();
+        let mut ly = top;
+        for line in lines {
+            let rows = line.image.as_ref().map_or(1, |img| img.rows as u32);
+            let h = rows * line_h;
+            if y >= ly && y < ly + h {
+                if line.image.is_some() {
+                    return None;
+                }
+                return word_at_x(px, &line.spans, x.checked_sub(margin)?);
+            }
+            ly += h;
+        }
+        None
+    }
+
+    /// Look `word` up and show the first dictionary's answer as a sheet.
+    /// No dictionary installed offers the download; no entry says so on
+    /// the page's banner. Every repaint here is partial: the page behind
+    /// has not moved.
+    fn look_up(&mut self, word: &str) -> Result<Flow> {
+        if self.dictionaries().is_empty() {
+            self.sheet = Some(Sheet::NoDictionary);
+            return self
+                .render_current(RefreshMode::Partial)
+                .map(|_| Flow::Continue);
+        }
+        let hit = self.dictionaries().iter_mut().find_map(|d| d.lookup(word));
+        match hit {
+            Some(def) => {
+                let max_w = self.layout.width.saturating_sub(self.layout.pad * 2);
+                let mut lines = wrap_text(self.layout.text_px, &def.text, max_w);
+                if lines.len() > DEFINITION_LINES {
+                    lines.truncate(DEFINITION_LINES);
+                    lines.push("…".to_string());
+                }
+                self.sheet = Some(Sheet::Definition {
+                    word: def.word,
+                    lines,
+                });
+                self.render_current(RefreshMode::Partial)?;
+            }
+            None => {
+                let shown = gideon_core::dict::trim_word(word);
+                self.book_banner = Some(format!("No entry for “{shown}”"));
+                let result = self.render_current(RefreshMode::Partial);
+                self.book_banner = None;
+                result?;
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Fetch the English dictionary and unpack it beside settings.json.
+    fn install_dictionary(&mut self) -> Result<Flow> {
+        let Some(dicts) = self.dicts_dir() else {
+            self.push(Screen::Message {
+                title: "Dictionary".to_string(),
+                body: "This gideon has nowhere to keep a dictionary.".to_string(),
+            })?;
+            return Ok(Flow::Continue);
+        };
+        self.ensure_online()?;
+        self.show_status(&["Downloading the dictionary…"])?;
+        let url = url::Url::parse(DICTIONARY_URL).expect("a constant URL");
+        let outcome = self
+            .gateway
+            .fetch(&url)
+            .and_then(|bytes| Ok(gideon_core::dict::install_zip(&dicts, &bytes)?));
+        self.dictionaries = None;
+        match outcome {
+            Ok(_) => self.push(Screen::Message {
+                title: "Dictionary".to_string(),
+                body: "Installed WordNet.\n\nPress and hold a word while reading\nto look it up."
+                    .to_string(),
+            })?,
+            Err(e) => {
+                eprintln!("gideon: dictionary download failed: {e:#}");
+                self.push(Screen::Message {
+                    title: "Dictionary".to_string(),
+                    body: format!("Couldn't download the dictionary:\n{e:#}"),
+                })?;
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Jump the reader beneath a list to `chapter`, at the page holding
+    /// `place` (paragraph, line), and come back to it. The whole page
+    /// changes: Full.
+    fn jump_to_place(&mut self, chapter: usize, place: (usize, usize)) -> Result<()> {
+        if matches!(
+            self.stack.last(),
+            Some(Screen::BookContents { .. } | Screen::BookBookmarks { .. })
+        ) {
+            self.stack.pop();
+        }
+        let Some(Screen::BookReader { text, .. }) = self.stack.last() else {
+            return self.render_current(RefreshMode::Full);
+        };
+        let text = text.clone();
+        let chapter = chapter.min(text.chapters.len().saturating_sub(1));
+        let pages = std::sync::Arc::new(self.layout_book_chapter(&text, chapter));
+        let at = resume_page(&pages, place);
+        if let Some(Screen::BookReader {
+            chapter: c,
+            pages: p,
+            page,
+            ..
+        }) = self.stack.last_mut()
+        {
+            *c = chapter;
+            *p = pages;
+            *page = at;
+        }
+        self.save_book_place();
+        self.book_turns = 0;
+        self.render_current(RefreshMode::Full)
     }
 
     /// Remember where the reader is, by chapter and paragraph.
@@ -8097,19 +9042,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         self.render_current(mode)
     }
 
-    /// Change the reader text size by `delta` px and re-flow the chapter,
-    /// keeping the paragraph that was at the top of the page.
-    fn resize_book_text(&mut self, delta: i32) -> Result<()> {
-        let mut settings = self.load_settings();
-        let next = (settings.book_text_px as i32 + delta).clamp(
-            gideon_core::settings::BOOK_TEXT_PX_MIN as i32,
-            gideon_core::settings::BOOK_TEXT_PX_MAX as i32,
-        ) as u32;
-        if next == settings.book_text_px {
-            return self.render_current(RefreshMode::Full);
-        }
-        settings.book_text_px = next;
-        self.save_settings(&settings);
+    /// Re-flow the open chapter at the current typography, keeping the
+    /// paragraph that was at the top of the page.
+    fn reflow_book(&mut self) -> Result<()> {
         let Some(Screen::BookReader {
             text,
             chapter,
@@ -8151,10 +9086,70 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if let Some(banner) = &self.book_banner {
             crate::reader::draw_banner(&mut canvas, banner);
         }
+        // A bookmarked page carries a dog-ear in the top-right corner: any
+        // mark whose place falls on this page, so the mark survives a text
+        // size change.
+        if let Some(lines) = pages.get(page) {
+            if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
+                let lo = (chapter, first.block, first.line);
+                let hi = (chapter, last.block, last.line);
+                let marked = gideon_core::BookPlaces::load(&self.books_dir)
+                    .bookmarks(&book.relative_path)
+                    .iter()
+                    .any(|b| (lo..=hi).contains(&b.place()));
+                if marked {
+                    draw_dog_ear(&mut canvas, l.pad * 3);
+                }
+            }
+        }
         let mut y = top;
         for line in pages.get(page).map(|p| p.as_slice()).unwrap_or(&[]) {
+            if let Some(img) = &line.image {
+                // Centred in the text column, scaled at layout time.
+                let x = margin + max_w.saturating_sub(img.width) / 2;
+                match gideon_core::epub::read_entry(&book.path, &img.href)
+                    .ok()
+                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                {
+                    Some(decoded) => {
+                        let gray = decoded
+                            .resize_exact(
+                                img.width.max(1),
+                                img.height.max(1),
+                                image::imageops::FilterType::Triangle,
+                            )
+                            .into_luma8();
+                        for (dx, dy, p) in gray.enumerate_pixels() {
+                            plot(&mut canvas, (x + dx) as i32, (y + dy) as i32, p.0[0]);
+                        }
+                    }
+                    None => {
+                        draw_text(&mut canvas, margin, y, px, "[Illustration]", max_w, false);
+                    }
+                }
+                y += img.rows as u32 * line_h;
+                continue;
+            }
             if !line.text.is_empty() {
-                draw_text(&mut canvas, margin, y, px, &line.text, max_w, line.bold);
+                let mut x = margin;
+                let right = margin + max_w;
+                for span in &line.spans {
+                    if x >= right {
+                        break;
+                    }
+                    gideon_render::text::draw_text_styled(
+                        &mut canvas,
+                        x,
+                        y,
+                        px,
+                        &span.text,
+                        right - x,
+                        span.style(),
+                    );
+                    // Advance by the run's own width, not the italic
+                    // overhang, so runs sit flush like one line of type.
+                    x += measure_text(px, &span.text, span.bold);
+                }
             }
             y += line_h;
         }
@@ -8208,8 +9203,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Grayscale like every list; the colour path wraps it for the nav bar.
     fn compose_book_shelf(&self, books: &[gideon_core::Book], page: usize) -> GrayPage {
         let l = &self.layout;
-        let per_page = l.rows_per_page().max(1);
-        let page_count = books.len().div_ceil(per_page).max(1);
+        let cards = self.book_cards(books);
+        let per_page = self.books_page_capacity();
+        let page_count = cards.len().div_ceil(per_page).max(1);
         let nav = self.screen_has_nav();
         let mut canvas = compose_chrome_paged(l, "", page, page_count, !nav, 0, !nav);
         draw_library_tabs(&mut canvas, l, LibraryTab::Books);
@@ -8233,14 +9229,40 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             return canvas;
         }
-        for (i, book) in paged(books, page, per_page).iter().enumerate() {
+        if self.load_settings().library_view != "list" {
+            // The cover shelf, as the manga tab draws it.
+            let shelf = self.shelf_layout();
+            let cell = (
+                shelf.cell_width(),
+                shelf
+                    .cell_height()
+                    .saturating_sub(shelf.title_height + shelf.progress_bar_height),
+            );
+            let entries: Vec<ShelfEntry> = paged(&cards, page, per_page)
+                .iter()
+                .map(|card| ShelfEntry {
+                    cover: self.book_cover(card, cell, per_page),
+                    title: card.title.clone(),
+                    progress: card.progress,
+                })
+                .collect();
+            let grid = compose_shelf(&entries, &shelf);
+            copy_into(&mut canvas, &grid, 0, l.content_top());
+            return canvas;
+        }
+        let places = gideon_core::BookPlaces::load(&self.books_dir);
+        for (i, card) in paged(&cards, page, per_page).iter().enumerate() {
             let top = l.row_top(i);
-            // EPUB is the norm on this shelf; a PDF is worth a word, since
-            // the Kobo reader treats the two quite differently.
-            let row_label = if book.format == "pdf" {
-                format!("{} · PDF", book.label())
-            } else {
-                book.label()
+            let row_label = match card.books.as_slice() {
+                [book] => book_row_label(book, &places),
+                volumes => {
+                    let mut label = card.title.clone();
+                    if let Some(a) = &card.author {
+                        label.push_str(&format!(" — {a}"));
+                    }
+                    label.push_str(&format!(" · {} volumes", volumes.len()));
+                    label
+                }
             };
             draw_text(
                 &mut canvas,
@@ -8254,6 +9276,128 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             hline(&mut canvas, top + l.row_h - 1, 200);
         }
         canvas
+    }
+
+    /// How many cards a Books page holds in the active view.
+    fn books_page_capacity(&self) -> usize {
+        if self.load_settings().library_view == "list" {
+            self.layout.rows_per_page()
+        } else {
+            self.shelf_layout().capacity()
+        }
+        .max(1)
+    }
+
+    /// The Books tab's cards: volumes of one series under one card, the
+    /// rest one card each, the most recently read first and the unread in
+    /// title order after them.
+    fn book_cards(&self, books: &[gideon_core::Book]) -> Vec<BookCard> {
+        book_cards(books, &gideon_core::BookPlaces::load(&self.books_dir))
+    }
+
+    /// The card whose shelf cell contains the tap, if any.
+    fn book_cell_at(&self, cards: &[BookCard], page: usize, x: u32, y: u32) -> Option<BookCard> {
+        let shelf = self.shelf_layout();
+        let capacity = shelf.capacity().max(1);
+        let local_y = y.checked_sub(self.layout.content_top())?;
+        let visible = cards.len().saturating_sub(page * capacity).min(capacity);
+        (0..visible).find_map(|cell| {
+            let (cx, cy) = shelf.cell_origin(cell);
+            (x >= cx
+                && x < cx + shelf.cell_width()
+                && local_y >= cy
+                && local_y < cy + shelf.cell_height())
+            .then(|| cards[page * capacity + cell].clone())
+        })
+    }
+
+    /// A tapped card: one book raises its sheet over the shelf (the shelf
+    /// has not moved: Partial); a series pushes its volume list (Full).
+    fn open_book_card(&mut self, card: BookCard) -> Result<()> {
+        match card.books.as_slice() {
+            [book] => {
+                self.sheet = Some(Sheet::BookFile { book: book.clone() });
+                self.render_current(RefreshMode::Partial)
+            }
+            _ => self.push(Screen::BookSeries {
+                title: card.title.clone(),
+                books: card.books.clone(),
+                page: 0,
+            }),
+        }
+    }
+
+    /// The card's cover at cell size: the EPUB's cover picture, decoded once
+    /// into a `.cover.jpg` beside the book (Nickel ignores dotfiles) and
+    /// thumbnailed through the shelf's cover cache; a plain card when the
+    /// book has none. A series shows its first volume's cover.
+    fn book_cover(
+        &self,
+        card: &BookCard,
+        cell: (u32, u32),
+        capacity: usize,
+    ) -> image::DynamicImage {
+        let Some(book) = card.books.first() else {
+            return placeholder_cover();
+        };
+        let Some(dir) = book.path.parent() else {
+            return placeholder_cover();
+        };
+        let stem = book
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cover_path = dir.join(format!(".{stem}.cover.jpg"));
+        if !cover_path.exists() {
+            if book.format != "epub" {
+                return placeholder_cover();
+            }
+            let Some(decoded) = gideon_core::epub::cover_image(&book.path)
+                .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            else {
+                return placeholder_cover();
+            };
+            // Keep the cache small: the shelf never shows more than a cell.
+            let small = decoded.resize(
+                cell.0 * 2,
+                cell.1 * 2,
+                image::imageops::FilterType::Triangle,
+            );
+            if small.to_rgb8().save(&cover_path).is_err() {
+                return small.resize(cell.0, cell.1, image::imageops::FilterType::Triangle);
+            }
+        }
+        let mtime = std::fs::metadata(&cover_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let mut cache = self.cover_cache.borrow_mut();
+        cache.tick += 1;
+        let tick = cache.tick;
+        let key = (cover_path, mtime, cell);
+        if let Some((stamp, image)) = cache.entries.get_mut(&key) {
+            *stamp = tick;
+            return image.clone();
+        }
+        match image::open(&key.0).ok() {
+            Some(image) => {
+                let thumb = image.resize(cell.0, cell.1, image::imageops::FilterType::Triangle);
+                while cache.entries.len() >= 2 * capacity.max(1) {
+                    let Some(oldest) = cache
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, (stamp, _))| *stamp)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    cache.entries.remove(&oldest);
+                }
+                cache.entries.insert(key, (tick, thumb.clone()));
+                thumb
+            }
+            None => placeholder_cover(),
+        }
     }
 
     /// The series cover art for a library entry (fetched at download time).
@@ -9585,6 +10729,21 @@ fn rect_outline(canvas: &mut GrayPage, x: u32, y: u32, w: u32, h: u32, value: u8
             if xx < canvas.width {
                 canvas.pixels[(yy * canvas.width + xx) as usize] = value;
             }
+        }
+    }
+}
+
+/// A filled triangle in the top-right corner, `size` px on each edge: the
+/// bookmark mark. Solid black so it survives the colour filter and a
+/// partial refresh alike.
+fn draw_dog_ear(canvas: &mut GrayPage, size: u32) {
+    let size = size.min(canvas.width).min(canvas.height);
+    // Row dy runs from the hypotenuse to the right edge: the right angle
+    // sits in the corner.
+    for dy in 0..size {
+        for dx in dy..size {
+            let x = canvas.width - size + dx;
+            plot(canvas, x as i32, dy as i32, 0);
         }
     }
 }

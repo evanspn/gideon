@@ -214,6 +214,10 @@ impl SourceGateway for FakeGateway {
         )?)
     }
 
+    fn fetch(&self, url: &url::Url) -> Result<Vec<u8>> {
+        Ok(gideon_sources::Fetcher::get(&self.web, url)?)
+    }
+
     fn check_updates(&self) -> Result<super::gateway::UpdateCheck> {
         Ok(super::gateway::UpdateCheck {
             message: self.update_message.clone(),
@@ -8561,7 +8565,13 @@ fn todays_waiting_list_shows_unread_series_and_opens_them() {
     probe.goto_root(Screen::Stats).unwrap();
 
     let rows = probe.waiting_rows();
-    let listed: Vec<(String, usize)> = rows.iter().map(|(c, n)| (c.title(), *n)).collect();
+    let listed: Vec<(String, usize)> = rows
+        .iter()
+        .map(|r| match r {
+            WaitingRow::Manga(c, n) => (c.title(), *n),
+            WaitingRow::Book(b) => (b.title.clone(), 0),
+        })
+        .collect();
     assert_eq!(
         listed,
         vec![("Berserk".to_string(), 2), ("Frieren".to_string(), 2)],
@@ -8572,11 +8582,11 @@ fn todays_waiting_list_shows_unread_series_and_opens_them() {
     let l = layout();
     let head_h = l.row_h * 2 / 3;
     let top = probe.waiting_top() + head_h + l.pad;
-    for (i, (card, _)) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let y = top + i as u32 * l.row_h + l.row_h / 2;
         assert_eq!(
             probe.waiting_row_at(y).map(|c| c.title()),
-            Some(card.title()),
+            Some(row.title()),
             "row {i} must hit the series drawn there"
         );
     }
@@ -9742,6 +9752,37 @@ mod library_tabs {
         make_epub_with(path, title, author, &[("One", &["So it goes."])]);
     }
 
+    /// An EPUB whose manifest marks a `cover-image`: a 60×80 PNG of one
+    /// `shade`, so a test can tell it on the shelf by a pixel.
+    fn make_epub_with_cover(path: &Path, title: &str, author: &str, shade: u8) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        write!(
+            zip,
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata><manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/><item id="cov" href="Images/cover.png" media-type="image/png" properties="cover-image"/></manifest><spine><itemref idref="c"/></spine></package>"#
+        )
+        .unwrap();
+        zip.start_file("OEBPS/c.xhtml", opts).unwrap();
+        zip.write_all(b"<html><body><h1>One</h1><p>So it goes.</p></body></html>")
+            .unwrap();
+        zip.start_file("OEBPS/Images/cover.png", opts).unwrap();
+        let img = image::GrayImage::from_pixel(60, 80, image::Luma([shade]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
+        zip.finish().unwrap();
+    }
+
     /// A readable EPUB: each chapter is a heading and its paragraphs, in a
     /// spine in that order.
     fn make_epub_with(path: &Path, title: &str, author: &str, chapters: &[(&str, &[&str])]) {
@@ -9776,6 +9817,32 @@ mod library_tabs {
             }
             write!(zip, "</body></html>").unwrap();
         }
+        zip.finish().unwrap();
+    }
+
+    /// An EPUB whose one chapter is a paragraph, a picture, a paragraph.
+    /// The picture is `w × h`, solid dark grey, so its pixels are unmistakable.
+    fn make_illustrated_epub(path: &Path, w: u32, h: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        zip.write_all(br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Pictures</dc:title><dc:creator>A</dc:creator></metadata><manifest><item id="c" href="Text/c.xhtml" media-type="application/xhtml+xml"/><item id="p" href="Images/p.png" media-type="image/png"/></manifest><spine><itemref idref="c"/></spine></package>"#).unwrap();
+        zip.start_file("OEBPS/Text/c.xhtml", opts).unwrap();
+        zip.write_all(br#"<html><body><p>Before the picture.</p><img src="../Images/p.png"/><p>After the picture.</p></body></html>"#).unwrap();
+        zip.start_file("OEBPS/Images/p.png", opts).unwrap();
+        let img = image::GrayImage::from_pixel(w, h, image::Luma([40u8]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        zip.write_all(&buf.into_inner()).unwrap();
         zip.finish().unwrap();
     }
 
@@ -9815,9 +9882,47 @@ mod library_tabs {
         UiEvent::Tap { x, y: H / 2 }
     }
 
-    /// Row `i` of the reading menu: 0 larger, 1 smaller, 2 close book, 3 close.
+    /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 mark page,
+    /// 3 text, 4 close book, 5 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(4, i)
+        tap_modal_row(6, i)
+    }
+
+    /// The y of row `i` of the reading menu.
+    fn reading_row_y(i: usize) -> u32 {
+        tap_modal_row_y(6, i)
+    }
+
+    /// A plain StarDict dictionary (ifo, idx, dict) at `dir/<stem>`.
+    fn write_stardict(dir: &Path, stem: &str, entries: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut sorted = entries.to_vec();
+        sorted.sort_by_key(|(w, _)| w.to_lowercase());
+        let (mut idx, mut data) = (Vec::new(), Vec::new());
+        for (w, d) in &sorted {
+            idx.extend_from_slice(w.as_bytes());
+            idx.push(0);
+            idx.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            idx.extend_from_slice(&(d.len() as u32).to_be_bytes());
+            data.extend_from_slice(d.as_bytes());
+        }
+        std::fs::write(dir.join(format!("{stem}.idx")), &idx).unwrap();
+        std::fs::write(dir.join(format!("{stem}.dict")), &data).unwrap();
+        std::fs::write(
+            dir.join(format!("{stem}.ifo")),
+            format!(
+                "StarDict's dict ifo file\nversion=2.4.2\nwordcount={}\nidxfilesize={}\nbookname=Test Words\nsametypesequence=m\n",
+                sorted.len(),
+                idx.len()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The y of row `i` of the Text sheet: 0 size, 1 line spacing,
+    /// 2 margins, 3 close.
+    fn text_row_y(i: usize) -> u32 {
+        tap_modal_row_y(4, i)
     }
 
     /// Open the first book on the Books tab in gideon's reader.
@@ -10206,7 +10311,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(2)]);
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(4)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10226,15 +10331,105 @@ mod library_tabs {
             "resumed at the paragraph, not page 1"
         );
 
-        // Larger text: fewer lines per page, same paragraph on the page.
+        // Larger text (Text › Size): same paragraph stays on the page, the
+        // sheet stays up, and the whole page re-flowed, so a Full.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, tap_modal_row_y(4, 0)).unwrap();
+        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookText)));
+        ui.tap_sheet(W / 2, text_row_y(0)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookText)), "sheet stays up");
         let Screen::BookReader { pages, page, .. } = ui.screen() else {
             panic!("expected the reader");
         };
         assert!(pages[*page].iter().any(|l| l.block == top_block));
         assert_eq!(ui.load_settings().book_text_px, 50);
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+    }
+
+    #[test]
+    fn the_text_sheet_cycles_size_spacing_and_margins_and_they_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let settings_dir = dir.path().join("data");
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book())
+            .with_settings_dir(settings_dir.clone());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        let normal_lines = pages[0].len();
+        let normal_width = ui.book_page_metrics().2;
+
+        // The menu's Text row opens the sheet over the unchanged page: no flash.
+        ui.handle_tap(W / 2, H / 2).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
+        ui.handle_tap(W / 2, reading_row_y(3)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::BookText)));
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        let (title, rows) = ui.sheet_rows();
+        assert_eq!(title, "Text");
+        let labels: Vec<(&str, &str)> = rows.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
+        assert_eq!(
+            labels,
+            [
+                ("Size", "44 px"),
+                ("Line spacing", "Normal"),
+                ("Margins", "Normal"),
+                ("Close", "")
+            ]
+        );
+
+        // Line spacing: normal → loose puts fewer lines on the page.
+        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        assert_eq!(ui.load_settings().book_line_spacing, "loose");
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        assert!(
+            pages[0].len() < normal_lines,
+            "{} < {normal_lines}",
+            pages[0].len()
+        );
+        assert_eq!(ui.sheet_rows().1[1].1, "Loose");
+        // … and wraps round: loose → tight → normal.
+        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        assert_eq!(ui.load_settings().book_line_spacing, "tight");
+        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        assert_eq!(ui.load_settings().book_line_spacing, "normal");
+
+        // Margins: normal → wide narrows the text column.
+        ui.handle_tap(W / 2, text_row_y(2)).unwrap();
+        assert_eq!(ui.load_settings().book_margins, "wide");
+        assert!(ui.book_page_metrics().2 < normal_width);
+        assert_eq!(ui.sheet_rows().1[2].1, "Wide");
+
+        // Size steps through the tiles and wraps from the largest.
+        for expected in [50, 56, 64, 72, 32] {
+            ui.handle_tap(W / 2, text_row_y(0)).unwrap();
+            assert_eq!(ui.load_settings().book_text_px, expected);
+        }
+        assert_eq!(ui.sheet_rows().1[0].1, "32 px");
+
+        // Close: the page is revealed whole, so a flash.
+        ui.handle_tap(W / 2, text_row_y(3)).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // Everything survives a restart, on the device's settings.json.
+        let saved = gideon_core::Settings::load(&settings_dir).unwrap();
+        assert_eq!(
+            (
+                saved.book_text_px,
+                saved.book_line_spacing.as_str(),
+                saved.book_margins.as_str()
+            ),
+            (32, "normal", "wide")
+        );
+        let mut again =
+            app(&lib, FakeGateway::default(), open_first_book()).with_settings_dir(settings_dir);
+        again.run().unwrap();
+        assert_eq!(again.book_page_metrics().0, 32.0);
+        assert!(again.book_page_metrics().2 < normal_width);
     }
 
     #[test]
@@ -10311,6 +10506,703 @@ mod library_tabs {
         assert_eq!(*page, 0, "slides and swipes do not turn pages");
         // Each change repainted the page with its banner, without a flash.
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+    }
+
+    #[test]
+    fn an_epub_illustration_is_drawn_in_place_scaled_to_the_text_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        // Wider than the column and squat: scaled down to the column width.
+        make_illustrated_epub(&lib.join("Books/A/pic.epub"), 4000, 1000);
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        let page0 = &pages[0];
+        let img_line = page0
+            .iter()
+            .find(|l| l.image.is_some())
+            .expect("the picture is a line on the first page");
+        let img = img_line.image.as_ref().unwrap();
+        let (_, margin, max_w, top, line_h, _) = ui.book_page_metrics();
+        assert_eq!(img.width, max_w, "fits the text column");
+        assert_eq!(img.height, max_w / 4, "aspect kept");
+        assert_eq!(img.rows, (img.height as usize).div_ceil(line_h as usize));
+        assert!(
+            !page0.iter().any(|l| l.text == "[Illustration]"),
+            "no placeholder when the picture can be drawn"
+        );
+        assert_eq!(page0[0].text, "Before the picture.");
+        assert!(page0.iter().any(|l| l.text == "After the picture."));
+
+        // Its pixels are on the panel where the layout put it: rows above
+        // the image line count one line each (the paragraph, then the blank
+        // separator).
+        let rows_before = page0.iter().take_while(|l| l.image.is_none()).count() as u32;
+        let y = top + rows_before * line_h + img.height / 2;
+        let x = margin + max_w / 2;
+        assert!(
+            ui.display().pixel(x, y) < 0x60,
+            "dark picture pixel at ({x},{y})"
+        );
+        assert!(
+            ui.display().pixel(x, top + 2) > 0xf0,
+            "text row above stays white"
+        );
+    }
+
+    #[test]
+    fn a_tall_illustration_takes_its_own_page_rather_than_being_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        // Taller than a page: capped to the page height, placed after the
+        // paragraph page, alone.
+        make_illustrated_epub(&lib.join("Books/A/tall.epub"), 600, 6000);
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader");
+        };
+        let (_, _, _, _, line_h, lines) = ui.book_page_metrics();
+        assert!(pages.len() >= 2);
+        assert!(
+            pages[0].iter().all(|l| l.image.is_none()),
+            "page 1 is the text before"
+        );
+        let img = pages[1][0]
+            .image
+            .as_ref()
+            .expect("page 2 opens with the picture");
+        assert_eq!(img.height, lines as u32 * line_h, "capped at a page");
+        assert_eq!(img.rows, lines);
+        assert_eq!(pages[1].len(), 1, "nothing shares the page with it");
+    }
+
+    #[test]
+    fn emphasis_is_kept_as_styled_runs_and_drawn_leaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        make_epub_with(
+            &lib.join("Books/A/em.epub"),
+            "Em",
+            "A",
+            &[("One", &["So <i>it</i> <b>goes</b>."])],
+        );
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        let Screen::BookReader { pages, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        let line = pages[0]
+            .iter()
+            .find(|l| l.text == "So it goes.")
+            .expect("the paragraph is one line, styling dropped from `text`");
+        let runs: Vec<(&str, bool, bool)> = line
+            .spans
+            .iter()
+            .map(|s| (s.text.as_str(), s.italic, s.bold))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("So ", false, false),
+                ("it ", true, false),
+                ("goes", false, true),
+                (".", false, false),
+            ]
+        );
+        // A heading's runs are all bold, whatever the markup said.
+        assert!(pages[0][0].bold && pages[0][0].spans.iter().all(|s| s.bold));
+
+        // The drawn page differs from the same text drawn plain: the lean and
+        // the weight are on the panel, not only in the data.
+        let styled = ui.display().buffer.clone();
+        make_epub_with(
+            &lib.join("Books/A/em.epub"),
+            "Em",
+            "A",
+            &[("One", &["So it goes."])],
+        );
+        let mut plain = app(&lib, FakeGateway::default(), open_first_book());
+        plain.run().unwrap();
+        assert_ne!(styled, plain.display().buffer);
+    }
+
+    #[test]
+    fn contents_lists_the_chapters_and_a_tap_jumps_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let mut events = open_first_book();
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(0)]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Screen::BookContents {
+            entries, current, ..
+        } = ui.screen()
+        else {
+            panic!("expected the contents, got {:?}", ui.screen());
+        };
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["One", "Two"],
+            "no nav in the fixture: headings serve"
+        );
+        assert_eq!(*current, 0);
+        // Pushed as a list: Full, with a Back button (it is a child screen).
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        let mut events = open_first_book();
+        events.extend([tap_reader(ReaderZone::Back), tap_reading_row(0), tap_row(1)]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let Screen::BookReader {
+            chapter,
+            page,
+            pages,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the reader back, got {:?}", ui.screen());
+        };
+        assert_eq!((*chapter, *page), (1, 0));
+        assert_eq!(pages[0][0].text, "Two");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        let saved = gideon_core::BookPlaces::load(&books)
+            .get("Kurt Vonnegut/book-0001.epub")
+            .unwrap();
+        assert_eq!(saved.chapter, 1, "the jump is the new place");
+    }
+
+    #[test]
+    fn today_continues_a_book_and_lists_unstarted_books_as_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        make_epub(
+            &books.join("Natsu Hyuuga/book-0002.epub"),
+            "The Apothecary Diaries, Vol. 1",
+            "Natsu Hyuuga",
+        );
+        // Read two pages of the novel, close it, go to Today.
+        let mut events = open_first_book();
+        events.extend([
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::Back),
+            tap_reading_row(4),
+            tap_today(),
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::Stats));
+        let (title, where_at, pct) = ui.continue_card().expect("a book was read");
+        assert_eq!(title, "Slaughterhouse-Five");
+        assert_eq!(where_at, "Kurt Vonnegut — chapter 1 of 2");
+        assert_eq!(pct, 0.0, "still in the first chapter");
+
+        // Waiting: the unread manga and both books (neither finished),
+        // the one being read first.
+        let titles: Vec<String> = ui.waiting_rows().iter().map(|r| r.title()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Slaughterhouse-Five",
+                "Series",
+                "The Apothecary Diaries, Vol. 1"
+            ]
+        );
+
+        // Tapping Continue opens the reader at the saved page.
+        let l = layout();
+        let top = ui.continue_card_top();
+        ui.handle_tap(l.width / 2, top + l.row_h / 2).unwrap();
+        let Screen::BookReader { book, page, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        assert_eq!(book.title, "Slaughterhouse-Five");
+        assert_eq!(*page, 2);
+
+        // A manga read more recently than the book wins the card back.
+        let now = now_unix();
+        write_progress(&lib, &[("Series/vol1.cbz", 1, 2, now + 5)]);
+        ui.invalidate_progress_cache();
+        let (title, _, _) = ui.continue_card().unwrap();
+        assert_eq!(title, "Series");
+    }
+
+    #[test]
+    fn a_long_press_bookmarks_the_page_and_the_list_jumps_back_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let l = layout();
+        // Held on the margin: a word would be looked up instead.
+        let hold = UiEvent::LongPress {
+            x: 2,
+            y: l.height / 2,
+        };
+        // Page 3, hold: bookmarked, with a dog-ear and a banner, partially.
+        let mut events = open_first_book();
+        events.extend([
+            tap_reader(ReaderZone::NextPage),
+            tap_reader(ReaderZone::NextPage),
+            hold,
+        ]);
+        let mut ui = app(&lib, FakeGateway::default(), events);
+        ui.run().unwrap();
+        let marks = gideon_core::BookPlaces::load(&books);
+        let marks = marks.bookmarks("Kurt Vonnegut/book-0001.epub");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].chapter, 0);
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("still reading");
+        };
+        assert_eq!(*page, 2);
+        // The snippet is the page's first words, even mid-paragraph.
+        assert_eq!(
+            marks[0].snippet,
+            pages[2][0].text.chars().take(48).collect::<String>()
+        );
+        assert_eq!(marks[0].block, pages[2][0].block);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(ui.display().pixel(W - 2, 1) < 0x40, "dog-ear in the corner");
+        assert!(ui.display().pixel(1, 1) > 0xf0, "only the corner");
+
+        // Hold again: gone, corner white.
+        ui.handle_long_press(2, l.height / 2).unwrap();
+        assert!(gideon_core::BookPlaces::load(&books)
+            .bookmarks("Kurt Vonnegut/book-0001.epub")
+            .is_empty());
+        assert!(ui.display().pixel(W - 2, 1) > 0xf0);
+
+        // Mark page 3 again, go to page 1, open Bookmarks, tap the mark:
+        // back on page 3.
+        ui.handle_long_press(2, l.height / 2).unwrap();
+        ui.turn_book_page(-1).unwrap();
+        ui.turn_book_page(-1).unwrap();
+        ui.sheet = Some(Sheet::BookReading);
+        ui.tap_sheet(W / 2, reading_row_y(1)).unwrap();
+        let Screen::BookBookmarks { entries, .. } = ui.screen() else {
+            panic!("expected the bookmarks, got {:?}", ui.screen());
+        };
+        assert_eq!(entries.len(), 1);
+        ui.handle_tap(W / 2, l.row_top(0) + l.row_h / 2).unwrap();
+        let Screen::BookReader { page, .. } = ui.screen() else {
+            panic!("expected the reader back");
+        };
+        assert_eq!(*page, 2);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // A book with no marks: the menu says how, instead of an empty list.
+        let other = tempfile::tempdir().unwrap();
+        let (lib2, _) = novel(other.path());
+        let mut fresh = app(&lib2, FakeGateway::default(), open_first_book());
+        fresh.run().unwrap();
+        fresh.sheet = Some(Sheet::BookReading);
+        fresh.tap_sheet(W / 2, reading_row_y(1)).unwrap();
+        assert!(matches!(fresh.screen(), Screen::Message { .. }));
+    }
+
+    #[test]
+    fn word_at_x_finds_the_word_under_a_press() {
+        let spans = vec![
+            BookSpan {
+                text: "So it ".into(),
+                italic: false,
+                bold: false,
+            },
+            BookSpan {
+                text: "goes".into(),
+                italic: true,
+                bold: false,
+            },
+            BookSpan {
+                text: ", Billy.".into(),
+                italic: false,
+                bold: false,
+            },
+        ];
+        let px = 44.0;
+        let so = measure_text(px, "So", false);
+        let so_it = measure_text(px, "So it", false);
+        let plain = measure_text(px, "So it ", false);
+        let goes = measure_text(px, "goes", false);
+        assert_eq!(word_at_x(px, &spans, so / 2).as_deref(), Some("So"));
+        assert_eq!(word_at_x(px, &spans, so_it - 2).as_deref(), Some("it"));
+        assert_eq!(
+            word_at_x(px, &spans, plain + goes / 2).as_deref(),
+            Some("goes")
+        );
+        assert_eq!(
+            word_at_x(px, &spans, plain + goes + 4).as_deref(),
+            Some(",")
+        );
+        let billy_at = plain + goes + measure_text(px, ", ", false) + 4;
+        assert_eq!(word_at_x(px, &spans, billy_at).as_deref(), Some("Billy."));
+        assert_eq!(
+            word_at_x(px, &spans, so + 1),
+            None,
+            "the space between words"
+        );
+        assert_eq!(
+            word_at_x(px, &spans, 5000),
+            None,
+            "past the end of the line"
+        );
+    }
+
+    #[test]
+    fn a_long_press_on_a_word_shows_its_definition_partially() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let data = dir.path().join("data");
+        write_stardict(
+            &data.join("dicts/words"),
+            "words",
+            &[
+                ("pilgrim", "n. someone who journeys to a sacred place\nn. one of the English colonists"),
+                ("time", "n. the continuum of experience in which events pass from the future through the present to the past"),
+            ],
+        );
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book()).with_settings_dir(data);
+        ui.run().unwrap();
+        let (px, margin, _, top, line_h, _) = ui.book_page_metrics();
+        // "Paragraph 0: Billy Pilgrim has come unstuck in time, ..." is the
+        // first paragraph line under the heading; press on "Pilgrim".
+        let (row, first) = match ui.screen() {
+            Screen::BookReader { pages, .. } => pages[0]
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.text.contains("Pilgrim"))
+                .map(|(i, l)| (i as u32, l.text.clone()))
+                .expect("the fixture's first paragraph"),
+            other => panic!("expected the reader, got {other:?}"),
+        };
+        let at = first.find("Pilgrim").unwrap();
+        let x = margin + measure_text(px, &first[..at], false) + measure_text(px, "Pil", false);
+        let y = top + row * line_h + line_h / 2;
+        assert_eq!(ui.book_word_at(x, y).as_deref(), Some("Pilgrim"));
+
+        ui.handle_long_press(x, y).unwrap();
+        let Some(Sheet::Definition { word, lines }) = &ui.sheet else {
+            panic!("expected the definition, got {:?}", ui.sheet);
+        };
+        assert_eq!(word, "pilgrim", "cased as the dictionary spells it");
+        assert!(lines[0].starts_with("n. someone who journeys"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("English colonists")));
+        // The page behind has not moved: the sheet alone repaints.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(
+            gideon_core::BookPlaces::load(&books)
+                .bookmarks("Kurt Vonnegut/book-0001.epub")
+                .is_empty(),
+            "a lookup is not a bookmark"
+        );
+        // The sheet's rows read as the definition, then Close.
+        let (title, rows) = ui.sheet_rows();
+        assert_eq!(title, "pilgrim");
+        assert!(rows.last().unwrap().2, "last row dismisses");
+        // Tapping a definition line does nothing; Close reveals the page: Full.
+        let n = rows.len() as u32;
+        ui.tap_sheet(W / 2, tap_modal_row_y(n, 0)).unwrap();
+        assert!(matches!(ui.sheet, Some(Sheet::Definition { .. })));
+        ui.tap_sheet(W / 2, tap_modal_row_y(n, rows.len() - 1))
+            .unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // A word the dictionary lacks: a banner, no sheet, no bookmark.
+        let at = first.find("Billy").unwrap();
+        let x = margin + measure_text(px, &first[..at], false) + measure_text(px, "Bil", false);
+        ui.handle_long_press(x, y).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert!(gideon_core::BookPlaces::load(&books)
+            .bookmarks("Kurt Vonnegut/book-0001.epub")
+            .is_empty());
+
+        // The margin still bookmarks.
+        ui.handle_long_press(2, y).unwrap();
+        assert_eq!(
+            gideon_core::BookPlaces::load(&books)
+                .bookmarks("Kurt Vonnegut/book-0001.epub")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn without_a_dictionary_a_pressed_word_offers_the_download_which_installs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let data = dir.path().join("data");
+        // The download the fake web serves: a zip of a small dictionary.
+        let src = dir.path().join("src");
+        write_stardict(&src, "wordnet", &[("time", "n. what clocks measure")]);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            for f in ["wordnet.ifo", "wordnet.idx", "wordnet.dict"] {
+                w.start_file(format!("wordnet/{f}"), opts).unwrap();
+                w.write_all(&std::fs::read(src.join(f)).unwrap()).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let gateway = FakeGateway {
+            web: gideon_sources::FakeFetcher::new().with(DICTIONARY_URL, buf.into_inner()),
+            ..Default::default()
+        };
+        let mut ui = app(&lib, gateway, open_first_book()).with_settings_dir(data.clone());
+        ui.run().unwrap();
+        let (px, margin, _, top, line_h, _) = ui.book_page_metrics();
+        let (row, first) = match ui.screen() {
+            Screen::BookReader { pages, .. } => pages[0]
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.text.contains("time"))
+                .map(|(i, l)| (i as u32, l.text.clone()))
+                .expect("the fixture's first paragraph"),
+            other => panic!("expected the reader, got {other:?}"),
+        };
+        let at = first.find("time").unwrap();
+        let x = margin + measure_text(px, &first[..at], false) + measure_text(px, "ti", false);
+        let y = top + row * line_h + line_h / 2;
+
+        ui.handle_long_press(x, y).unwrap();
+        assert!(
+            matches!(ui.sheet, Some(Sheet::NoDictionary)),
+            "{:?}",
+            ui.sheet
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        let (_, rows) = ui.sheet_rows();
+        assert_eq!(rows[1].0, "Download English dictionary");
+
+        ui.tap_sheet(W / 2, tap_modal_row_y(3, 1)).unwrap();
+        let Screen::Message { title, body } = ui.screen() else {
+            panic!("expected the installed message, got {:?}", ui.screen());
+        };
+        assert_eq!(title, "Dictionary");
+        assert!(body.starts_with("Installed WordNet"), "{body}");
+        assert!(data.join("dicts/wordnet/wordnet.ifo").exists());
+
+        // Back to the book: the same press now defines.
+        ui.pop().unwrap();
+        ui.handle_long_press(x, y).unwrap();
+        let Some(Sheet::Definition { word, lines }) = &ui.sheet else {
+            panic!("expected the definition, got {:?}", ui.sheet);
+        };
+        assert_eq!(
+            (word.as_str(), lines[0].as_str()),
+            ("time", "n. what clocks measure")
+        );
+    }
+
+    #[test]
+    fn the_reading_menu_marks_and_unmarks_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = novel(dir.path());
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book());
+        ui.run().unwrap();
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[2].0, "Mark this page");
+        ui.tap_sheet(W / 2, reading_row_y(2)).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(
+            gideon_core::BookPlaces::load(&books)
+                .bookmarks("Kurt Vonnegut/book-0001.epub")
+                .len(),
+            1
+        );
+        // The sheet closing reveals the page: a flash, dog-ear included.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert!(ui.display().pixel(W - 2, 1) < 0x40);
+        ui.sheet = Some(Sheet::BookReading);
+        assert_eq!(ui.sheet_rows().1[2].0, "Unmark this page");
+        ui.tap_sheet(W / 2, reading_row_y(2)).unwrap();
+        assert!(gideon_core::BookPlaces::load(&books)
+            .bookmarks("Kurt Vonnegut/book-0001.epub")
+            .is_empty());
+    }
+
+    /// Deliver a tap event to a running app.
+    fn tap(ui: &mut UiApp<MemoryDisplay, FakeInput, FakeGateway>, ev: UiEvent) {
+        let UiEvent::Tap { x, y } = ev else {
+            panic!("not a tap: {ev:?}");
+        };
+        ui.handle_tap(x, y).unwrap();
+    }
+
+    /// Tap the middle of shelf cell `i` on a Library grid.
+    fn tap_shelf_cell(i: usize) -> UiEvent {
+        let l = layout();
+        let shelf = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS);
+        let (cx, cy) = shelf.cell_origin(i);
+        UiEvent::Tap {
+            x: cx + shelf.cell_width() / 2,
+            y: l.content_top() + cy + shelf.cell_height() / 2,
+        }
+    }
+
+    #[test]
+    fn the_books_shelf_view_shows_covers_recent_first_and_a_cell_opens_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let books = lib.join("Books");
+        make_epub_with_cover(&books.join("A/book-0001.epub"), "Arrival", "A", 20);
+        make_epub(&books.join("B/book-0002.epub"), "Borrowed Time", "B");
+        // Borrowed Time has been read a little: chapter 1 of 4.
+        let mut places = gideon_core::BookPlaces::default();
+        places.set(
+            "B/book-0002.epub",
+            gideon_core::BookPlace {
+                chapter: 1,
+                block: 0,
+                line: 0,
+                chapters: 4,
+                updated_at: 100,
+            },
+        );
+        places.save(&books).unwrap();
+        let settings_dir = dir.path().join("data");
+        let settings = gideon_core::Settings {
+            library_view: "shelf".into(),
+            ..Default::default()
+        };
+        settings.save(&settings_dir).unwrap();
+
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        )
+        .with_settings_dir(settings_dir);
+        ui.run().unwrap();
+        let Screen::BookShelf { books: shown, .. } = ui.screen() else {
+            panic!("expected the Books tab, got {:?}", ui.screen());
+        };
+        // Cards: the read book first, then the unread by title.
+        let cards = ui.book_cards(shown);
+        let titles: Vec<&str> = cards.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["Borrowed Time", "Arrival"]);
+        assert_eq!(cards[0].progress, Some(0.25));
+        assert_eq!(cards[1].progress, None);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // The grid: a plain card where there is no cover, the dark cover
+        // where there is one, decoded once into a dotfile beside the book.
+        let l = layout();
+        let shelf = ShelfLayout::new(l.width, l.content_height(), SHELF_COLUMNS);
+        let probe = |cell: usize| {
+            let (cx, cy) = shelf.cell_origin(cell);
+            ui.display().pixel(
+                cx + shelf.cell_width() / 2,
+                l.content_top() + cy + shelf.cell_width() * 2 / 3,
+            )
+        };
+        assert!(probe(0) > 0xc0, "no cover: a plain card ({:#x})", probe(0));
+        assert!(probe(1) < 0x60, "the cover's shade ({:#x})", probe(1));
+        assert!(books.join("A/.book-0001.cover.jpg").exists());
+
+        // A cell opens the book's sheet over the unmoved shelf.
+        tap(&mut ui, tap_shelf_cell(0));
+        let Some(Sheet::BookFile { book }) = &ui.sheet else {
+            panic!("expected the book sheet, got {:?}", ui.sheet);
+        };
+        assert_eq!(book.title, "Borrowed Time");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+    }
+
+    #[test]
+    fn volumes_of_a_series_share_one_card_that_opens_the_volume_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let books = lib.join("Books");
+        for (n, file) in [(1, "x-1"), (3, "x-3"), (2, "x-2")] {
+            make_epub(
+                &books.join(format!("Natsu Hyuuga/{file}.epub")),
+                &format!("The Apothecary Diaries, Vol. {n}"),
+                "Natsu Hyuuga",
+            );
+        }
+        make_epub(
+            &books.join("Kurt Vonnegut/sh5.epub"),
+            "Slaughterhouse-Five",
+            "Kurt Vonnegut",
+        );
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        );
+        ui.run().unwrap();
+        let Screen::BookShelf { books: shown, .. } = ui.screen() else {
+            panic!("expected the Books tab");
+        };
+        let cards = ui.book_cards(shown);
+        let titles: Vec<&str> = cards.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Slaughterhouse-Five", "The Apothecary Diaries, Vol. 1–3"]
+        );
+        assert_eq!(cards[1].books.len(), 3);
+
+        // The series row opens its volumes, in number order, as a list.
+        tap(&mut ui, tap_row(1));
+        let Screen::BookSeries {
+            title,
+            books: volumes,
+            ..
+        } = ui.screen()
+        else {
+            panic!("expected the volume list, got {:?}", ui.screen());
+        };
+        assert_eq!(title, "The Apothecary Diaries, Vol. 1–3");
+        let vols: Vec<&str> = volumes.iter().map(|b| b.title.as_str()).collect();
+        assert_eq!(
+            vols,
+            [
+                "The Apothecary Diaries, Vol. 1",
+                "The Apothecary Diaries, Vol. 2",
+                "The Apothecary Diaries, Vol. 3",
+            ]
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        // A volume raises the same sheet a lone book does.
+        tap(&mut ui, tap_row(1));
+        let Some(Sheet::BookFile { book }) = &ui.sheet else {
+            panic!("expected the book sheet, got {:?}", ui.sheet);
+        };
+        assert_eq!(book.title, "The Apothecary Diaries, Vol. 2");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+    }
+
+    #[test]
+    fn the_title_bar_toggles_the_books_view_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = shelf(dir.path());
+        let l = layout();
+        let [_, books] = library_tab_zones(&l);
+        let toggle = UiEvent::Tap {
+            x: books.1 + l.pad * 2,
+            y: l.title_h / 2,
+        };
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab(), toggle],
+        );
+        ui.run().unwrap();
+        assert!(matches!(ui.screen(), Screen::BookShelf { .. }));
+        assert_eq!(ui.load_settings().library_view, "shelf");
+        // Whole content area replaced: a flash.
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
     }
 }
 

@@ -15,6 +15,30 @@ static FONT_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 
 const ELLIPSIS: char = '…';
 
+/// How far an italic glyph leans: horizontal shift per pixel above the
+/// baseline. DejaVu Sans has no oblique face vendored (another 1.4 MB in
+/// the binary for two faces); a shear of the upright outline is what most
+/// e-readers do for synthetic italics and reads as italic at 300 dpi.
+const SLANT: f32 = 0.21;
+
+/// Weight and slant for a run of text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextStyle {
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl TextStyle {
+    pub const REGULAR: TextStyle = TextStyle {
+        bold: false,
+        italic: false,
+    };
+    pub const BOLD: TextStyle = TextStyle {
+        bold: true,
+        italic: false,
+    };
+}
+
 fn font(bold: bool) -> FontRef<'static> {
     let bytes = if bold { FONT_BOLD } else { FONT_REGULAR };
     FontRef::try_from_slice(bytes).expect("vendored DejaVu font is valid")
@@ -37,6 +61,22 @@ pub fn measure_text(px: f32, text: &str, bold: bool) -> u32 {
     width.ceil().max(0.0) as u32
 }
 
+/// Width `text` would occupy at `px` in `style`, including the lean of an
+/// italic run's last glyph.
+pub fn measure_text_styled(px: f32, text: &str, style: TextStyle) -> u32 {
+    let base = measure_text(px, text, style.bold);
+    if style.italic && base > 0 {
+        base + italic_overhang(px)
+    } else {
+        base
+    }
+}
+
+/// How far past its advance an italic glyph's top can reach.
+fn italic_overhang(px: f32) -> u32 {
+    (px * 0.75 * SLANT).ceil() as u32
+}
+
 /// Draw `text` at baseline-top position (`x`, `y`) with font size `px`,
 /// clipped to `max_width` and the page bounds. Returns the drawn width in
 /// pixels. Text wider than `max_width` is truncated with an `…` ellipsis.
@@ -49,11 +89,39 @@ pub fn draw_text(
     max_width: u32,
     bold: bool,
 ) -> u32 {
+    draw_text_styled(
+        page,
+        x,
+        y,
+        px,
+        text,
+        max_width,
+        TextStyle {
+            bold,
+            italic: false,
+        },
+    )
+}
+
+/// [`draw_text`] with a [`TextStyle`]: italic is a shear of the upright
+/// outline (see [`SLANT`]), so the same clipping promise holds — nothing
+/// lands past `x + max_width` or the page edge.
+pub fn draw_text_styled(
+    page: &mut GrayPage,
+    x: u32,
+    y: u32,
+    px: f32,
+    text: &str,
+    max_width: u32,
+    style: TextStyle,
+) -> u32 {
     if max_width == 0 || x >= page.width || y >= page.height {
         return 0;
     }
+    let bold = style.bold;
     // Clip budget: never beyond x + max_width, never beyond the page edge.
     let budget = max_width.min(page.width - x) as f32;
+    let slant = if style.italic { SLANT } else { 0.0 };
 
     let font = font(bold);
     let scaled = font.as_scaled(px);
@@ -105,7 +173,14 @@ pub fn draw_text(
         };
         let bounds = outline.px_bounds();
         outline.draw(|gx, gy, coverage| {
-            let px_x = x as i64 + bounds.min.x as i64 + gx as i64;
+            // Lean: a shear about the baseline. `bounds.min.y + gy` is the
+            // row relative to the baseline (negative above it), so rows
+            // above shift right and descenders shift left; the baseline
+            // itself stays put, which keeps runs flush with their
+            // neighbours.
+            let above = -(bounds.min.y + gy as f32);
+            let lean = (above * slant).round() as i64;
+            let px_x = x as i64 + bounds.min.x as i64 + gx as i64 + lean;
             let px_y = y as i64 + (ascent + bounds.min.y) as i64 + gy as i64;
             if px_x < x as i64
                 || px_x >= (x + max_width.min(page.width - x)) as i64
@@ -157,6 +232,50 @@ mod tests {
         draw_text(&mut a, 4, 4, 28.0, "Hi", 190, false);
         draw_text(&mut b, 4, 4, 28.0, "Hi", 190, true);
         assert_ne!(a.pixels, b.pixels);
+    }
+
+    #[test]
+    fn italic_differs_from_regular_and_stays_inside_its_box() {
+        let mut regular = page(200, 60);
+        let mut italic = page(200, 60);
+        draw_text(&mut regular, 10, 5, 24.0, "Billy", 150, false);
+        draw_text_styled(
+            &mut italic,
+            10,
+            5,
+            24.0,
+            "Billy",
+            150,
+            TextStyle {
+                bold: false,
+                italic: true,
+            },
+        );
+        assert_ne!(regular.pixels, italic.pixels, "the lean changes pixels");
+        // Ink leans right: the top rows of the italic reach further right
+        // than the regular's, and nothing lands left of x.
+        let right_edge = |p: &GrayPage, row: u32| {
+            (0..p.width)
+                .rev()
+                .find(|&col| p.pixels[(row * p.width + col) as usize] < 0x80)
+        };
+        let top_row = (5..30).find(|&r| right_edge(&italic, r).is_some()).unwrap();
+        assert!(right_edge(&italic, top_row) >= right_edge(&regular, top_row));
+        for row in 0..italic.height {
+            for col in 0..10 {
+                assert_eq!(italic.pixels[(row * italic.width + col) as usize], 0xff);
+            }
+        }
+        assert!(
+            measure_text_styled(
+                24.0,
+                "Billy",
+                TextStyle {
+                    bold: false,
+                    italic: true
+                }
+            ) > measure_text(24.0, "Billy", false)
+        );
     }
 
     #[test]

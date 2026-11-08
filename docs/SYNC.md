@@ -38,6 +38,20 @@ See `supabase/migrations/0001_reading_progress.sql`:
   incoming)` (furthest-page-wins), `user_id := auth.uid()`. `execute` granted
   only to `authenticated`.
 
+Book places (`supabase/migrations/0007_book_places.sql`), the EPUB reader's
+counterpart:
+
+- `public.book_places (user_id, book_key, chapter, block, line, chapters,
+  title, author, updated_at)`, PK `(user_id, book_key)`, RLS owner-only.
+  `book_key` is the book's path under `Books/`; the place is a chapter, a
+  paragraph and a wrapped line, never a page (pages depend on the text size).
+- `public.upsert_book_place(book_key, chapter, block, line, chapters, title,
+  author)` — furthest-place-wins: `(chapter, block, line)` compared as a tuple,
+  so a device that is behind cannot rewind the reader. Same sweep, same
+  cursor discipline (`SyncState.book_cursor` / `server_places`), same
+  offline-first promises as manga progress; the device folds pulled places
+  into `Books/.gideon-places.json` with `BookPlaces::merge_save`.
+
 ## Sync protocol (client ↔ Supabase)
 
 - **Push** (on chapter close / app background / short idle — debounced, never

@@ -191,6 +191,18 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_book_text_px")]
     pub book_text_px: u32,
 
+    /// Line spacing in gideon's book reader: "tight", "normal" or "loose".
+    /// Parsed leniently — anything else means normal.
+    #[serde(default = "default_book_line_spacing")]
+    #[serde(deserialize_with = "lenient_book_line_spacing")]
+    pub book_line_spacing: String,
+
+    /// Side margins in gideon's book reader: "narrow", "normal" or "wide".
+    /// Parsed leniently — anything else means normal.
+    #[serde(default = "default_book_margins")]
+    #[serde(deserialize_with = "lenient_book_margins")]
+    pub book_margins: String,
+
     /// Page turns between full (flashing) e-ink refreshes. Higher flashes
     /// less often (smoother reading) but lets ghosting build up longer.
     /// Parsed leniently — out-of-range or wrong-typed values fall back to the
@@ -333,6 +345,8 @@ impl Default for Settings {
             library_view: default_library_view(),
             stats_view: default_stats_view(),
             book_text_px: default_book_text_px(),
+            book_line_spacing: default_book_line_spacing(),
+            book_margins: default_book_margins(),
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
             wifi_auto_connect: true,
@@ -499,6 +513,46 @@ pub const BOOK_TEXT_PX_MAX: u32 = 80;
 
 fn default_book_text_px() -> u32 {
     44
+}
+
+/// The text sizes the reader's Text sheet steps through.
+pub const BOOK_TEXT_PX_STEPS: [u32; 7] = [32, 38, 44, 50, 56, 64, 72];
+/// Line spacing choices, and their line height as a multiple of the size.
+pub const BOOK_LINE_SPACINGS: [(&str, f32); 3] =
+    [("tight", 1.25), ("normal", 1.45), ("loose", 1.7)];
+/// Margin choices, and their width as a multiple of the layout pad.
+pub const BOOK_MARGINS: [(&str, u32); 3] = [("narrow", 1), ("normal", 3), ("wide", 5)];
+
+fn default_book_line_spacing() -> String {
+    "normal".to_string()
+}
+
+fn default_book_margins() -> String {
+    "normal".to_string()
+}
+
+fn lenient_book_line_spacing<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if BOOK_LINE_SPACINGS.iter().any(|(n, _)| *n == s) => s,
+            _ => default_book_line_spacing(),
+        },
+    )
+}
+
+fn lenient_book_margins<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if BOOK_MARGINS.iter().any(|(n, _)| *n == s) => s,
+            _ => default_book_margins(),
+        },
+    )
 }
 
 fn lenient_book_text_px<'de, D: serde::Deserializer<'de>>(
@@ -1160,6 +1214,8 @@ mod tests {
             color_post_process: "standard".into(),
             reader_full_refresh_interval: 12,
             book_text_px: 52,
+            book_line_spacing: "loose".into(),
+            book_margins: "wide".into(),
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
             idle_suspend_minutes: 5,
@@ -1413,6 +1469,8 @@ mod tests {
             stats_view: "calendar".into(),
             reader_full_refresh_interval: 20,
             book_text_px: 36,
+            book_line_spacing: "tight".into(),
+            book_margins: "narrow".into(),
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
             idle_suspend_minutes: 5,

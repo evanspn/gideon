@@ -7,6 +7,7 @@
 pub mod books;
 pub mod cbz;
 pub mod comicinfo;
+pub mod dict;
 pub mod epub;
 pub mod error;
 pub mod library;
@@ -16,11 +17,13 @@ pub mod series;
 pub mod settings;
 pub mod stats;
 pub mod upload;
+pub mod zipread;
 
-pub use books::{Book, BookPlace, BookPlaces};
+pub use books::{Book, BookPlace, BookPlaces, Bookmark};
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
-pub use epub::{Block as BookBlock, EpubText};
+pub use dict::{Definition, Dictionary};
+pub use epub::{Block as BookBlock, EpubText, Rich, Span};
 pub use error::Error;
 pub use library::{Library, LibraryEntry, ProgressStore, ReadingProgress};
 pub use profile::DEFAULT_PROFILE;
