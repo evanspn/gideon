@@ -9869,7 +9869,7 @@ mod library_tabs {
     /// Row `i` of an EPUB's four-row book sheet: 0 read here, 1 read in
     /// Kobo, 2 delete, 3 close.
     fn tap_book_file_row(i: usize) -> UiEvent {
-        tap_modal_row(4, i)
+        tap_modal_row(5, i)
     }
 
     /// A tap in the reader: left third back, middle menu, right third next.
@@ -10119,7 +10119,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(2),
+            tap_book_file_row(3),
             tap_modal_row(2, 1),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10132,7 +10132,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(2),
+            tap_book_file_row(3),
             tap_modal_row(2, 0),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10450,7 +10450,12 @@ mod library_tabs {
         let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
             labels,
-            ["Read in the Kobo reader", "Delete this book", "Close"]
+            [
+                "Read in the Kobo reader",
+                "Mark as finished",
+                "Delete this book",
+                "Close"
+            ]
         );
     }
 
@@ -11066,6 +11071,7 @@ mod library_tabs {
                 line: 0,
                 chapters: 4,
                 updated_at: 100,
+                ..Default::default()
             },
         );
         places.save(&books).unwrap();
@@ -11607,6 +11613,163 @@ mod library_tabs {
             "too sideways"
         );
         assert!(!is_sheet_swipe(500, h - 300, 500, h - 10, h), "downwards");
+    }
+    #[test]
+    fn reaching_the_last_page_finishes_the_book_and_unread_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        make_cbz(&lib.join("Series/vol1.cbz"), 2);
+        let books = lib.join("Books");
+        make_epub_with(
+            &books.join("K/short.epub"),
+            "Short",
+            "K",
+            &[("One", &["a"]), ("Two", &["b"])],
+        );
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book()).with_clock(|| 5_000);
+        ui.run().unwrap();
+        let key = "K/short.epub";
+        ui.turn_book_page(1).unwrap();
+        assert_eq!(
+            gideon_core::BookPlaces::load(&books)
+                .get(key)
+                .unwrap()
+                .chapter,
+            1
+        );
+        let place = gideon_core::BookPlaces::load(&books).get(key).unwrap();
+        assert!(place.is_finished(), "the last page of the last chapter");
+
+        // The shelf says so, and the sheet offers the way back.
+        ui.pop().unwrap();
+        let Screen::BookShelf { books: shown, .. } = ui.screen() else {
+            panic!("expected the shelf, got {:?}", ui.screen());
+        };
+        let cards = ui.book_cards(shown);
+        assert_eq!(cards[0].progress, Some(1.0));
+        let book = shown[0].clone();
+        ui.sheet = Some(Sheet::BookFile { book: book.clone() });
+        let labels: Vec<String> = ui.sheet_rows().1.into_iter().map(|r| r.0).collect();
+        assert!(labels.contains(&"Mark as unread".to_string()), "{labels:?}");
+        ui.tap_sheet(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        assert!(
+            gideon_core::BookPlaces::load(&books).get(key).is_none(),
+            "back to page one"
+        );
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // And "Mark as finished" without reading it.
+        ui.sheet = Some(Sheet::BookFile { book });
+        ui.tap_sheet(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        let place = gideon_core::BookPlaces::load(&books).get(key).unwrap();
+        assert_eq!(place.finished_at, Some(5_000));
+    }
+
+    #[test]
+    fn finished_books_past_the_delay_are_offered_for_deletion_never_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, books) = shelf(dir.path());
+        let day = 86_400u64;
+        let now = 100 * day;
+        let mut places = gideon_core::BookPlaces::default();
+        places.set(
+            "Kurt Vonnegut/book-0001.epub",
+            gideon_core::BookPlace {
+                chapter: 0,
+                chapters: 1,
+                finished_at: Some(now - 3 * day),
+                ..Default::default()
+            },
+        );
+        places.save(&books).unwrap();
+        let target = books.join("Kurt Vonnegut/book-0001.epub");
+
+        // Opening the tab offers it (default delay: two days), over the
+        // shelf just drawn: Partial. "Not now" leaves everything as is.
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        )
+        .with_clock(move || now);
+        ui.run().unwrap();
+        let Some(Sheet::CleanFinishedBooks { books: offered }) = &ui.sheet else {
+            panic!("expected the offer, got {:?}", ui.sheet);
+        };
+        assert_eq!(offered.len(), 1);
+        assert_eq!(ui.sheet_rows().0, "You finished \"Slaughterhouse-Five\"");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        ui.tap_sheet(W / 2, tap_modal_row_y(3, 2)).unwrap();
+        assert!(target.exists());
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // "Keep them": never offered again.
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        )
+        .with_clock(move || now);
+        ui.run().unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(3, 1)).unwrap();
+        assert!(target.exists());
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        )
+        .with_clock(move || now);
+        ui.run().unwrap();
+        assert!(ui.sheet.is_none(), "kept books are not offered again");
+
+        // A fresh finished book, deleted on request: file and shelf row go.
+        let mut places = gideon_core::BookPlaces::load(&books);
+        places.set(
+            "Natsu Hyuuga/book-0002.epub",
+            gideon_core::BookPlace {
+                finished_at: Some(now - 5 * day),
+                ..Default::default()
+            },
+        );
+        places.save(&books).unwrap();
+        let other = books.join("Natsu Hyuuga/book-0002.epub");
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        )
+        .with_clock(move || now);
+        ui.run().unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(3, 0)).unwrap();
+        assert!(!other.exists());
+        assert!(target.exists(), "the kept one stays");
+        let Screen::BookShelf { books: shown, .. } = ui.screen() else {
+            panic!("expected the shelf");
+        };
+        assert_eq!(shown.len(), 1);
+
+        // A delay of 0 (never) offers nothing.
+        let settings_dir = dir.path().join("data");
+        gideon_core::Settings {
+            finished_cleanup_hours: 0,
+            ..Default::default()
+        }
+        .save(&settings_dir)
+        .unwrap();
+        let mut places = gideon_core::BookPlaces::load(&books);
+        let mut p = places.get("Kurt Vonnegut/book-0001.epub").unwrap();
+        p.keep = false;
+        places.set("Kurt Vonnegut/book-0001.epub", p);
+        places.save(&books).unwrap();
+        let mut ui = app(
+            &lib,
+            FakeGateway::default(),
+            vec![tap_nav(0), tap_books_tab()],
+        )
+        .with_settings_dir(settings_dir)
+        .with_clock(move || now);
+        ui.run().unwrap();
+        assert!(ui.sheet.is_none());
     }
 }
 

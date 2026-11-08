@@ -213,6 +213,7 @@ pub fn merge_remote_places(
                 Some(mine) if r.chapters == 0 => mine.chapters,
                 _ => r.chapters,
             };
+            let mine = local.get(&r.book_key).unwrap_or_default();
             local.set(
                 &r.book_key,
                 BookPlace {
@@ -221,6 +222,10 @@ pub fn merge_remote_places(
                     line: r.line,
                     chapters,
                     updated_at: now,
+                    // Finishing is this device's record; the server has no
+                    // column for it, so a pulled place keeps it.
+                    finished_at: mine.finished_at,
+                    keep: mine.keep,
                 },
             );
             changed += 1;
@@ -409,6 +414,7 @@ mod tests {
             line: place.2,
             chapters: 20,
             updated_at: 1,
+            ..Default::default()
         }
     }
 
