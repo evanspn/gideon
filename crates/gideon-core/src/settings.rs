@@ -281,7 +281,7 @@ impl BookCatalog {
     /// is the root `gideon_sources::archive` answers for.
     pub fn internet_archive() -> BookCatalog {
         BookCatalog {
-            name: "Internet Archive".to_string(),
+            name: "Search all free books".to_string(),
             url: "https://archive.org/".to_string(),
         }
     }

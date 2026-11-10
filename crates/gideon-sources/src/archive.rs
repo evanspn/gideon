@@ -109,9 +109,63 @@ pub fn search_url(query: &str) -> Result<Url> {
         .map_err(from_archivist)
 }
 
-/// Search titles and authors for `query`.
+/// Search every free catalogue for `query` and hand back one list.
+///
+/// A reader should not have to know which catalogue has a book. archivist
+/// asks Project Gutenberg, Open Library and the Internet Archive, merges
+/// the answers (one row per book, the best copy first) and this turns them
+/// into entries: a Gutenberg book carries its EPUB link outright; an
+/// Archive or Open Library one points at its `/metadata/` page, with the
+/// other candidate scans kept as alternates for [`open_entry`] to try.
+///
+/// One catalogue being down is not an error — the others still answer.
+/// Nobody answering is: the device is offline, and the screen says so.
 pub fn search(fetcher: &dyn Fetcher, query: &str) -> Result<Feed> {
-    fetch_feed(fetcher, &search_url(query)?)
+    let client = client(fetcher);
+    let mut report = client.find(query, ROWS as usize);
+    if report.all_failed() {
+        return Err(from_archivist(report.failed.remove(0).1));
+    }
+    let entries: Vec<Entry> = report
+        .results
+        .into_iter()
+        .filter_map(|f| {
+            let (epubs, feed) = match f.epub {
+                Some(url) => (
+                    vec![EpubLink {
+                        url,
+                        title: None,
+                        size: None,
+                    }],
+                    None,
+                ),
+                None => {
+                    let (first, rest) = f.archive_ids.split_first()?;
+                    let mut url = client.item_url(first).ok()?;
+                    if !rest.is_empty() {
+                        url.query_pairs_mut().append_pair("alt", &rest.join(","));
+                    }
+                    (Vec::new(), Some(url))
+                }
+            };
+            Some(Entry {
+                title: f.title,
+                detail: f.author,
+                epubs,
+                feed,
+                year: f.year,
+                language: f.language.as_deref().map(language_name),
+            })
+        })
+        .collect();
+    Ok(Feed {
+        title: "Results".to_string(),
+        total: Some(entries.len() as u64),
+        entries,
+        next: None,
+        search: Some(search_link()),
+        epubs: Vec::new(),
+    })
 }
 
 /// Open an entry from one of this catalogue's feeds: a book (its
@@ -127,11 +181,35 @@ pub fn open_entry(fetcher: &dyn Fetcher, entry: &Entry) -> Result<Opened> {
         return fetch_feed(fetcher, url).map(Opened::Feed);
     };
     let client = client(fetcher);
-    let item = client.item(&identifier).map_err(from_archivist)?;
-    let file = item.best_epub().ok_or_else(|| Error::Fetch {
-        url: url.to_string(),
-        message: format!("\"{}\" has no EPUB to download", item.title),
-    })?;
+    // The item named, then any alternates a unified search attached (other
+    // scans of the same book): the first with an EPUB wins.
+    let alternates: Vec<String> = url
+        .query_pairs()
+        .find(|(k, _)| k == "alt")
+        .map(|(_, v)| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut found = None;
+    let mut last_err = None;
+    for id in std::iter::once(identifier).chain(alternates) {
+        match client.item(&id) {
+            Ok(item) => match item.best_epub().cloned() {
+                Some(file) => {
+                    found = Some((item, file));
+                    break;
+                }
+                None => {
+                    last_err = Some(Error::Fetch {
+                        url: url.to_string(),
+                        message: format!("\"{}\" has no EPUB to download", item.title),
+                    })
+                }
+            },
+            Err(e) => last_err = Some(from_archivist(e)),
+        }
+    }
+    let Some((item, file)) = found else {
+        return Err(last_err.expect("at least one item was tried"));
+    };
     Ok(Opened::Book(EpubLink {
         url: client
             .download_url(&item.identifier, &file.name)
@@ -144,7 +222,7 @@ pub fn open_entry(fetcher: &dyn Fetcher, entry: &Entry) -> Result<Opened> {
 /// The root feed: search, and nothing to browse.
 fn root() -> Feed {
     Feed {
-        title: "Internet Archive".to_string(),
+        title: "Search all free books".to_string(),
         entries: Vec::new(),
         next: None,
         search: Some(search_link()),
@@ -289,7 +367,7 @@ mod tests {
     #[test]
     fn the_root_is_search_only_and_needs_no_network() {
         let feed = crate::catalog::fetch_feed(&FakeFetcher::new(), &root_url()).unwrap();
-        assert_eq!(feed.title, "Internet Archive");
+        assert_eq!(feed.title, "Search all free books");
         assert!(feed.entries.is_empty(), "nothing to browse, only search");
         assert!(is_archive_search(feed.search.as_ref().unwrap()));
     }
@@ -390,5 +468,80 @@ mod tests {
             "https://www.gutenberg.org/ebooks/search.opds/?query={searchTerms}".into()
         )));
         assert!(is_archive(&Url::parse("https://www.archive.org/").unwrap()));
+    }
+
+    #[test]
+    fn one_search_merges_gutenberg_open_library_and_the_archive() {
+        let probe = archivist::Client::with_fetcher(archivist::FakeFetcher::new());
+        let q = "the time machine";
+        let gutendex = r#"{"results":[{"title":"The Time Machine","authors":[{"name":"Wells, H. G."}],"languages":["en"],"download_count":9,
+            "formats":{"application/epub+zip":"https://www.gutenberg.org/ebooks/35.epub3.images"}}]}"#;
+        let open_library = r#"{"docs":[
+            {"title":"The Time Machine","author_name":["H. G. Wells"],"first_publish_year":1895,"ebook_access":"public","ia":["tm_a","tm_b"]},
+            {"title":"The Time Machine and Other Stories","author_name":["H. G. Wells"],"ebook_access":"public","ia":["tm_other","tm_other2"]}]}"#;
+        let archive = r#"{"response":{"numFound":1,"start":0,"docs":[
+            {"identifier":"tm_scan","title":"The time machine","creator":"Wells, H. G.","downloads":7,"format":["EPUB"]}]}}"#;
+        let item = |id: &str, epub: bool| {
+            let files = if epub {
+                format!(r#"[{{"name":"{id}.epub","format":"EPUB","size":"1000"}}]"#)
+            } else {
+                r#"[{"name":"x.pdf","format":"Text PDF","size":"5"}]"#.to_string()
+            };
+            format!(
+                r#"{{"metadata":{{"identifier":"{id}","title":"The Time Machine and Other Stories"}},"files":{files}}}"#
+            )
+        };
+        let fetcher = FakeFetcher::new()
+            .with(probe.gutendex_url(q).unwrap().as_str(), gutendex)
+            .with(probe.open_library_url(q).unwrap().as_str(), open_library)
+            .with(search_url(q).unwrap().as_str(), archive)
+            .with(
+                probe.item_url("tm_other").unwrap().as_str(),
+                item("tm_other", false),
+            )
+            .with(
+                probe.item_url("tm_other2").unwrap().as_str(),
+                item("tm_other2", true),
+            );
+        let feed = search(&fetcher, q).unwrap();
+        let titles: Vec<&str> = feed.entries.iter().map(|e| e.title.as_str()).collect();
+        // One row for the book itself (three catalogues had it), then the
+        // collection that only Open Library offered.
+        assert_eq!(
+            titles,
+            ["The Time Machine", "The Time Machine and Other Stories"]
+        );
+        assert_eq!(feed.total, Some(2));
+        assert_eq!(feed.next, None);
+        // Gutenberg's copy carries its EPUB outright and opens without a fetch.
+        let top = &feed.entries[0];
+        assert_eq!(top.detail.as_deref(), Some("H. G. Wells"));
+        assert_eq!(top.year.as_deref(), Some("1895"));
+        assert_eq!(top.language.as_deref(), Some("English"));
+        let Opened::Book(link) = crate::catalog::open_entry(&fetcher, top).unwrap() else {
+            panic!("expected a book");
+        };
+        assert_eq!(
+            link.url.as_str(),
+            "https://www.gutenberg.org/ebooks/35.epub3.images"
+        );
+        // The Open Library one resolves through its scans: the first has
+        // only a PDF, the alternate has the EPUB.
+        let Opened::Book(link) = crate::catalog::open_entry(&fetcher, &feed.entries[1]).unwrap()
+        else {
+            panic!("expected a book");
+        };
+        assert!(
+            link.url
+                .as_str()
+                .ends_with("/download/tm_other2/tm_other2.epub"),
+            "{}",
+            link.url
+        );
+
+        // One catalogue alone still answers; none at all is the error.
+        let only_archive = FakeFetcher::new().with(search_url(q).unwrap().as_str(), archive);
+        assert_eq!(search(&only_archive, q).unwrap().entries.len(), 1);
+        assert!(search(&FakeFetcher::new(), q).is_err());
     }
 }

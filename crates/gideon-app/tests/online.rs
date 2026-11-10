@@ -281,3 +281,70 @@ fn wasm_source_end_to_end() {
         eprintln!("skipping: live source returned no downloadable pages");
     });
 }
+
+/// The whole "find me a book" path against the real catalogues: one search
+/// over Project Gutenberg, Open Library and the Internet Archive, the top
+/// result opened and downloaded into a Books folder, the shelf scan finding
+/// it, and the reader's loader opening it.
+#[test]
+#[ignore = "network: searches the live book catalogues and downloads a public-domain EPUB"]
+fn book_search_end_to_end_finds_downloads_and_opens() {
+    use gideon_sources::{archive, catalog, opds};
+
+    let fetcher = UreqFetcher::new();
+    let feed = catalog::search(&fetcher, &archive::search_link(), "the time machine")
+        .expect("at least one catalogue should answer")
+        .expect("the unified search is searchable");
+    let top = feed.entries.first().expect("a result for a famous title");
+    assert!(
+        top.title.to_lowercase().contains("time machine"),
+        "the best match leads: {}",
+        top.title
+    );
+
+    let opds::Opened::Book(epub) =
+        catalog::open_entry(&fetcher, top).expect("opening the top result")
+    else {
+        panic!("the top result should be a book");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let books = dir.path().join("Books");
+    let (path, existed) = opds::download_epub(
+        &fetcher,
+        &epub.url,
+        &books,
+        top.detail.as_deref(),
+        &top.title,
+    )
+    .expect("downloading the EPUB");
+    assert!(!existed);
+    assert!(path.starts_with(&books) && path.extension().is_some_and(|e| e == "epub"));
+
+    // What the Books tab would list, and what the reader would open.
+    let shelf = gideon_core::books::scan(&books).unwrap();
+    assert_eq!(shelf.len(), 1);
+    assert!(
+        shelf[0].title.to_lowercase().contains("time machine"),
+        "{}",
+        shelf[0].title
+    );
+    let text = gideon_core::epub::load(&path).expect("the reader opens it");
+    assert!(
+        text.chapters.len() >= 5,
+        "a real novel: {} chapters",
+        text.chapters.len()
+    );
+    let paragraphs: usize = text.chapters.iter().map(|c| c.blocks.len()).sum();
+    assert!(paragraphs > 200, "{paragraphs} paragraphs");
+
+    // Asking again fetches nothing.
+    let (_, existed) = opds::download_epub(
+        &fetcher,
+        &epub.url,
+        &books,
+        top.detail.as_deref(),
+        &top.title,
+    )
+    .unwrap();
+    assert!(existed);
+}

@@ -10,7 +10,7 @@ repository.workspace = true
 gideon-core = { path = "../gideon-core" }
 # The Internet Archive client lives in its own repo (split out of this
 # workspace in PR #186); pinned to a commit so builds are reproducible.
-archivist = { git = "https://github.com/evanspn/Grand-Archives", rev = "9554d3e034591784350b3d88e4e77e9ca9d89be3" }
+archivist = { git = "https://github.com/evanspn/Grand-Archives", rev = "469db6cdff295a4d8517a1242b4f5c5a11fbbbe9" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
