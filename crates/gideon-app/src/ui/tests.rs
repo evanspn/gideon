@@ -11892,10 +11892,6 @@ mod internet_archive {
         gideon_sources::archive::search_url(q).unwrap().to_string()
     }
 
-    fn page2_url(q: &str) -> String {
-        search_url(q).replace("&page=1&", "&page=2&")
-    }
-
     /// A real (tiny) EPUB, so "Read now" can open it.
     fn epub_bytes(title: &str, author: &str) -> Vec<u8> {
         let tmp = tempfile::tempdir().unwrap();
@@ -11955,9 +11951,9 @@ mod internet_archive {
         }
     }
 
-    /// Discover › Books › Internet Archive (row 1, after Gutenberg).
+    /// Discover › Books › Search all free books (the first row).
     fn open_ia() -> Vec<UiEvent> {
-        vec![nav_discover(), tap_card(3), tap_row(1)]
+        vec![nav_discover(), tap_card(3), tap_row(0)]
     }
 
     fn type_and_search(q: &str) -> Vec<UiEvent> {
@@ -12012,7 +12008,7 @@ mod internet_archive {
         }];
         super::super::gateway::with_internet_archive(&mut catalogs);
         let labels: Vec<String> = catalogs.iter().map(|c| c.label()).collect();
-        assert_eq!(labels, ["Project Gutenberg", "Internet Archive"]);
+        assert_eq!(labels, ["Search all free books", "Project Gutenberg"]);
         catalogs[1].name = "IA".into();
         super::super::gateway::with_internet_archive(&mut catalogs);
         assert_eq!(
@@ -12045,7 +12041,7 @@ mod internet_archive {
         else {
             panic!("expected the search screen, got {:?}", ui.screen());
         };
-        assert_eq!(title, "Internet Archive");
+        assert_eq!(title, "Search all free books");
         assert!(query.is_empty());
         assert!(recent.is_empty(), "no history yet");
         // A new screen: Full, in colour (the accent Search key).
@@ -12117,7 +12113,7 @@ mod internet_archive {
         events.extend(type_and_search("frankenstein"));
         events.push(tap_footer(0)); // Back to the keyboard
         events.push(tap_nav(0)); // nav strip's Back on the keyboard screen
-        events.push(tap_row(1)); // Internet Archive again
+        events.push(tap_row(0)); // the search catalogue again
         let ui = run(dir.path(), gateway(), events);
         let Screen::BookSearch { recent, .. } = ui.screen() else {
             panic!("expected the search screen, got {:?}", ui.screen());
@@ -12300,34 +12296,25 @@ mod internet_archive {
     }
 
     #[test]
-    fn results_page_from_the_footer_fetching_the_next_page_when_needed() {
+    fn results_page_from_the_footer_through_one_merged_list() {
         let dir = tempfile::tempdir().unwrap();
         let per = book_search::results_per_page(&layout());
-        // archive.org answers 25 a request: 27 found means a second request
-        // for the last 2, made only when paging reaches them.
-        let total = 27;
+        // A unified search hands back one merged list (up to 25 books), so
+        // the footer pages through it without another request.
+        let total = 25;
         let docs: Vec<(String, String)> = (0..total)
             .map(|i| (format!("book{i}"), format!("Book {i}")))
             .collect();
-        let as_docs = |range: std::ops::Range<usize>| -> String {
-            let d: Vec<(&str, &str, &str, &str, bool)> = docs[range]
-                .iter()
-                .map(|(id, t)| (id.as_str(), t.as_str(), "Anon", "1900", true))
-                .collect();
-            search_json(total, &d)
-        };
+        let d: Vec<(&str, &str, &str, &str, bool)> = docs
+            .iter()
+            .map(|(id, t)| (id.as_str(), t.as_str(), "Anon", "1900", true))
+            .collect();
         let mut g = gateway();
-        g.web = g
-            .web
-            .with(&search_url("many"), as_docs(0..25))
-            .with(&page2_url("many"), as_docs(25..total));
+        g.web = g.web.with(&search_url("book"), search_json(total, &d));
         let last_page = total.div_ceil(per) - 1;
-        assert!(
-            last_page * per < 25 + 2 && (last_page + 1) * per > 25,
-            "the last page needs the second request"
-        );
+        assert!(last_page >= 1, "more than one page of results");
         let mut events = open_ia();
-        events.extend(type_and_search("many"));
+        events.extend(type_and_search("book"));
         events.extend((0..last_page).map(|_| tap_footer(3))); // Next › to the end
         let ui = run(dir.path(), g, events);
         let Screen::BookResults { feed, page, .. } = ui.screen() else {
@@ -12335,7 +12322,6 @@ mod internet_archive {
         };
         assert_eq!(*page, last_page);
         assert_eq!(feed.entries.len(), total);
-        assert_eq!(feed.entries[total - 1].title, format!("Book {}", total - 1));
         assert_eq!(feed.next, None);
         // A page flip replaces the whole list: Full.
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));

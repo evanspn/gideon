@@ -397,7 +397,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             l.pad,
             extras.hint_y + l.row_h.saturating_sub(small as u32) / 2,
             small,
-            "Titles and authors · free EPUBs only, nothing to borrow",
+            "Gutenberg, Open Library and the Internet Archive at once · free EPUBs",
             l.width - 2 * l.pad,
             false,
         );

@@ -569,6 +569,8 @@ pub fn with_internet_archive(catalogs: &mut Vec<BookCatalog>) {
             .unwrap_or(false)
     };
     if !catalogs.iter().any(same) {
-        catalogs.push(ia);
+        // First: one search over every free catalogue is what most visits
+        // want; the single catalogues below it are for browsing.
+        catalogs.insert(0, ia);
     }
 }

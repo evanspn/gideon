@@ -130,8 +130,8 @@ dependencies = [
 
 [[package]]
 name = "archivist"
-version = "0.1.0"
-source = "git+https://github.com/evanspn/Grand-Archives?rev=9554d3e034591784350b3d88e4e77e9ca9d89be3#9554d3e034591784350b3d88e4e77e9ca9d89be3"
+version = "0.2.0"
+source = "git+https://github.com/evanspn/Grand-Archives?rev=469db6cdff295a4d8517a1242b4f5c5a11fbbbe9#469db6cdff295a4d8517a1242b4f5c5a11fbbbe9"
 dependencies = [
  "clap",
  "rustls",
