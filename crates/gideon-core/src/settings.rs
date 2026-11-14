@@ -203,6 +203,12 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient_book_margins")]
     pub book_margins: String,
 
+    /// The typeface of gideon's book reader, one of [`BOOK_FONTS`]. Parsed
+    /// leniently — anything else means sans.
+    #[serde(default = "default_book_font")]
+    #[serde(deserialize_with = "lenient_book_font")]
+    pub book_font: String,
+
     /// Night mode in gideon's book reader: white text on black.
     #[serde(default)]
     pub book_night: bool,
@@ -351,6 +357,7 @@ impl Default for Settings {
             book_text_px: default_book_text_px(),
             book_line_spacing: default_book_line_spacing(),
             book_margins: default_book_margins(),
+            book_font: default_book_font(),
             book_night: false,
             reader_full_refresh_interval: 8,
             auto_rotate_spreads: false,
@@ -534,6 +541,38 @@ fn default_book_line_spacing() -> String {
 
 fn default_book_margins() -> String {
     "normal".to_string()
+}
+
+/// The reader's typefaces, as stored.
+pub const BOOK_FONTS: [&str; 12] = [
+    "sans",
+    "serif",
+    "literata",
+    "bitter",
+    "baskerville",
+    "garamond",
+    "lora",
+    "merriweather",
+    "open-sans",
+    "jost",
+    "hyperlegible",
+    "opendyslexic",
+];
+
+fn default_book_font() -> String {
+    "sans".to_string()
+}
+
+fn lenient_book_font<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(
+        match value.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if BOOK_FONTS.contains(&s.as_str()) => s,
+            _ => default_book_font(),
+        },
+    )
 }
 
 fn lenient_book_line_spacing<'de, D: serde::Deserializer<'de>>(
@@ -1221,6 +1260,7 @@ mod tests {
             book_text_px: 52,
             book_line_spacing: "loose".into(),
             book_margins: "wide".into(),
+            book_font: "literata".into(),
             book_night: true,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,
@@ -1477,6 +1517,7 @@ mod tests {
             book_text_px: 36,
             book_line_spacing: "tight".into(),
             book_margins: "narrow".into(),
+            book_font: "sans".into(),
             book_night: false,
             auto_rotate_spreads: true,
             wifi_auto_connect: false,

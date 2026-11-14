@@ -10850,25 +10850,34 @@ mod library_tabs {
         let so_it = measure_text(px, "So it", false);
         let plain = measure_text(px, "So it ", false);
         let goes = measure_text(px, "goes", false);
-        assert_eq!(word_at_x(px, &spans, so / 2).as_deref(), Some("So"));
-        assert_eq!(word_at_x(px, &spans, so_it - 2).as_deref(), Some("it"));
         assert_eq!(
-            word_at_x(px, &spans, plain + goes / 2).as_deref(),
+            word_at_x(px, FontFamily::Sans, &spans, so / 2).as_deref(),
+            Some("So")
+        );
+        assert_eq!(
+            word_at_x(px, FontFamily::Sans, &spans, so_it - 2).as_deref(),
+            Some("it")
+        );
+        assert_eq!(
+            word_at_x(px, FontFamily::Sans, &spans, plain + goes / 2).as_deref(),
             Some("goes")
         );
         assert_eq!(
-            word_at_x(px, &spans, plain + goes + 4).as_deref(),
+            word_at_x(px, FontFamily::Sans, &spans, plain + goes + 4).as_deref(),
             Some(",")
         );
         let billy_at = plain + goes + measure_text(px, ", ", false) + 4;
-        assert_eq!(word_at_x(px, &spans, billy_at).as_deref(), Some("Billy."));
         assert_eq!(
-            word_at_x(px, &spans, so + 1),
+            word_at_x(px, FontFamily::Sans, &spans, billy_at).as_deref(),
+            Some("Billy.")
+        );
+        assert_eq!(
+            word_at_x(px, FontFamily::Sans, &spans, so + 1),
             None,
             "the space between words"
         );
         assert_eq!(
-            word_at_x(px, &spans, 5000),
+            word_at_x(px, FontFamily::Sans, &spans, 5000),
             None,
             "past the end of the line"
         );

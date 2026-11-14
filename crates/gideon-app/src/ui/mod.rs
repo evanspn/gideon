@@ -159,10 +159,10 @@ fn bookmark_banner(set: bool) -> &'static str {
 /// The word of `spans` (one laid-out line) drawn at `x` pixels from the
 /// line's left edge, or `None` on a gap or past the end. Words are the
 /// whitespace-separated tokens, measured as the page draws them.
-fn word_at_x(px: f32, spans: &[BookSpan], x: u32) -> Option<String> {
+fn word_at_x(px: f32, family: FontFamily, spans: &[BookSpan], x: u32) -> Option<String> {
     let mut cursor = 0u32;
     for span in spans {
-        let width = measure_text(px, &span.text, span.bold);
+        let width = measure_text_in(px, &span.text, span.bold, family);
         if x < cursor + width {
             let within = x - cursor;
             let mut start = None;
@@ -170,8 +170,8 @@ fn word_at_x(px: f32, spans: &[BookSpan], x: u32) -> Option<String> {
                 match (c.is_whitespace(), start) {
                     (false, None) => start = Some(i),
                     (true, Some(s)) => {
-                        let left = measure_text(px, &span.text[..s], span.bold);
-                        let right = measure_text(px, &span.text[..i], span.bold);
+                        let left = measure_text_in(px, &span.text[..s], span.bold, family);
+                        let right = measure_text_in(px, &span.text[..i], span.bold, family);
                         if within >= left && within < right {
                             return Some(span.text[s..i].to_string());
                         }
@@ -214,7 +214,7 @@ use anyhow::{Context, Result};
 use gideon_core::{CbzDocument, Library, LibraryEntry, ProgressStore};
 use gideon_device::{Display, InputSource, LightControl, RefreshMode, UiEvent};
 use gideon_render::shelf::{compose_shelf, compose_shelf_rgb, ShelfEntry, ShelfLayout};
-use gideon_render::text::{draw_text, measure_text};
+use gideon_render::text::{draw_text, measure_text, measure_text_in, FontFamily};
 use gideon_render::{
     calendar, heatmap, rotate_page, rotate_page_rgb, widgets, FitMode, GrayPage, RgbPage,
 };
@@ -923,10 +923,12 @@ pub struct BookSpan {
 }
 
 impl BookSpan {
-    fn style(&self) -> gideon_render::text::TextStyle {
+    /// How this run draws in the reader's `family`.
+    fn style(&self, family: FontFamily) -> gideon_render::text::TextStyle {
         gideon_render::text::TextStyle {
             bold: self.bold,
             italic: self.italic,
+            family,
         }
     }
 }
@@ -966,8 +968,10 @@ fn resume_page(pages: &[Vec<BookLine>], place: (usize, usize)) -> usize {
 /// scaled to the text width, capped at a page, and takes as many rows as
 /// its height covers at `line_h`; one that does not fit in what is left of
 /// a page starts the next one rather than being split.
+#[allow(clippy::too_many_arguments)]
 pub fn paginate_chapter_with(
     chapter: &gideon_core::epub::Chapter,
+    family: FontFamily,
     px: f32,
     max_w: u32,
     lines_per_page: usize,
@@ -1022,7 +1026,10 @@ pub fn paginate_chapter_with(
                 None => (gideon_core::Rich::from("[Illustration]"), false),
             },
         };
-        for (n, spans) in wrap_spans(px, &rich, max_w, bold).into_iter().enumerate() {
+        for (n, spans) in wrap_spans(px, family, &rich, max_w, bold)
+            .into_iter()
+            .enumerate()
+        {
             lines.push(BookLine {
                 text: spans.iter().map(|s| s.text.as_str()).collect(),
                 spans,
@@ -1063,7 +1070,13 @@ pub fn paginate_chapter_with(
 /// A word is the fragments between spaces, which may change style
 /// mid-word ("<b>goes</b>." is one word of two runs). `heading` draws every
 /// run bold. A word wider than the line is split at a character boundary.
-fn wrap_spans(px: f32, rich: &gideon_core::Rich, max_w: u32, heading: bool) -> Vec<Vec<BookSpan>> {
+fn wrap_spans(
+    px: f32,
+    family: FontFamily,
+    rich: &gideon_core::Rich,
+    max_w: u32,
+    heading: bool,
+) -> Vec<Vec<BookSpan>> {
     use gideon_render::text::measure_text_styled;
     // Words as lists of fragments.
     let mut words: Vec<Vec<BookSpan>> = Vec::new();
@@ -1102,10 +1115,10 @@ fn wrap_spans(px: f32, rich: &gideon_core::Rich, max_w: u32, heading: bool) -> V
     let width_of = |frags: &[BookSpan]| -> u32 {
         frags
             .iter()
-            .map(|f| measure_text_styled(px, &f.text, f.style()))
+            .map(|f| measure_text_styled(px, &f.text, f.style(family)))
             .sum()
     };
-    let space_w = measure_text(px, " ", heading).max(1);
+    let space_w = measure_text_in(px, " ", heading, family).max(1);
 
     let mut lines: Vec<Vec<BookSpan>> = Vec::new();
     let mut current: Vec<BookSpan> = Vec::new();
@@ -1156,7 +1169,7 @@ fn wrap_spans(px: f32, rich: &gideon_core::Rich, max_w: u32, heading: bool) -> V
                     italic: f.italic,
                     bold: f.bold,
                 };
-                let cw = measure_text_styled(px, &one.text, one.style());
+                let cw = measure_text_styled(px, &one.text, one.style(family));
                 if current_w + cw > max_w && !current.is_empty() {
                     lines.push(std::mem::take(&mut current));
                     current_w = 0;
@@ -4963,6 +4976,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             device.book_text_px = settings.book_text_px;
             device.book_line_spacing = settings.book_line_spacing.clone();
             device.book_margins = settings.book_margins.clone();
+            device.book_font = settings.book_font.clone();
             device.book_night = settings.book_night;
             if let Err(e) = device.save(dir) {
                 eprintln!("gideon: couldn't save settings: {e}");
@@ -8855,6 +8869,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// The reader's page geometry at the current typography: text px, left
     /// margin, text width, first baseline-top, line height, lines per page.
+    /// The typeface the reader sets books in (the Text sheet's Font).
+    fn book_family(&self) -> FontFamily {
+        FontFamily::from_name(&self.load_settings().book_font)
+    }
+
     fn book_page_metrics(&self) -> (f32, u32, u32, u32, u32, usize) {
         let l = &self.layout;
         let settings = self.load_settings();
@@ -8897,7 +8916,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             let bytes = gideon_core::epub::read_entry(path, href).ok()?;
             gideon_core::epub::image_dimensions(&bytes)
         };
-        paginate_chapter_with(c, px, max_w, lines, line_h, &dims)
+        paginate_chapter_with(c, self.book_family(), px, max_w, lines, line_h, &dims)
     }
 
     /// Open an EPUB in gideon's reader at the place it was left.
@@ -9083,7 +9102,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if line.image.is_some() {
                     return None;
                 }
-                return word_at_x(px, &line.spans, x.checked_sub(margin)?);
+                return word_at_x(px, self.book_family(), &line.spans, x.checked_sub(margin)?);
             }
             ly += h;
         }
@@ -9347,6 +9366,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     ) -> GrayPage {
         let l = &self.layout;
         let (px, margin, max_w, top, line_h, _) = self.book_page_metrics();
+        let family = self.book_family();
         let mut canvas = GrayPage::new_white(l.width, l.height);
         if let Some(banner) = &self.book_banner {
             crate::reader::draw_banner(&mut canvas, banner);
@@ -9409,11 +9429,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         px,
                         &span.text,
                         right - x,
-                        span.style(),
+                        span.style(family),
                     );
                     // Advance by the run's own width, not the italic
                     // overhang, so runs sit flush like one line of type.
-                    x += measure_text(px, &span.text, span.bold);
+                    x += measure_text_in(px, &span.text, span.bold, family);
                 }
             }
             y += line_h;
