@@ -9901,12 +9901,12 @@ mod library_tabs {
     /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 mark page,
     /// 3 text, 4 night mode, 5 rotate, 6 close book, 7 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(9, i)
+        tap_modal_row(10, i)
     }
 
     /// The y of row `i` of the reading menu.
     fn reading_row_y(i: usize) -> u32 {
-        tap_modal_row_y(9, i)
+        tap_modal_row_y(10, i)
     }
 
     /// A plain StarDict dictionary (ifo, idx, dict) at `dir/<stem>`.
@@ -10321,7 +10321,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([open_reading_menu(), tap_reading_row(7)]);
+        events.extend([open_reading_menu(), tap_reading_row(8)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10344,7 +10344,7 @@ mod library_tabs {
         // Larger text (Text › Size): same paragraph stays on the page, the
         // sheet stays up, and the whole page re-flowed, so a Full.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, reading_row_y(4)).unwrap();
+        ui.tap_sheet(W / 2, reading_row_y(5)).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookText { .. })));
         let next = super::text_sheet::step_of(44) + 1;
         let (x, y) = slider_point(&ui, next);
@@ -10394,7 +10394,7 @@ mod library_tabs {
         };
         ui.drag_menu(x0, y0, x1, y1, true).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
-        ui.handle_tap(W / 2, reading_row_y(4)).unwrap();
+        ui.handle_tap(W / 2, reading_row_y(5)).unwrap();
         assert_eq!(ui.sheet, Some(Sheet::BookText { preview: None }));
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
         let s = ui.text_sheet_layout();
@@ -10783,7 +10783,7 @@ mod library_tabs {
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
             open_reading_menu(),
-            tap_reading_row(7),
+            tap_reading_row(8),
             tap_today(),
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -11000,9 +11000,10 @@ mod library_tabs {
                 .is_empty(),
             "a lookup is not a bookmark"
         );
-        // The sheet's rows read as the definition, then Close.
+        // The sheet's rows read as the definition, then Close; the title
+        // says the word was kept.
         let (title, rows) = ui.sheet_rows();
-        assert_eq!(title, "pilgrim");
+        assert_eq!(title, "pilgrim  ✓ saved to Words");
         assert!(rows.last().unwrap().2, "last row dismisses");
         // Tapping a definition line does nothing; Close reveals the page: Full.
         let n = rows.len() as u32;
@@ -11108,8 +11109,8 @@ mod library_tabs {
         let mut ui = app(&lib, FakeGateway::default(), open_first_book());
         ui.run().unwrap();
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[3].0, "Mark this page");
-        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
+        assert_eq!(ui.sheet_rows().1[4].0, "Mark this page");
+        ui.tap_sheet(W / 2, reading_row_y(4)).unwrap();
         assert!(ui.sheet.is_none());
         assert_eq!(
             gideon_core::BookPlaces::load(&books)
@@ -11121,8 +11122,8 @@ mod library_tabs {
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
         assert!(ui.display().pixel(W - 2, 1) < 0x40);
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[3].0, "Unmark this page");
-        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
+        assert_eq!(ui.sheet_rows().1[4].0, "Unmark this page");
+        ui.tap_sheet(W / 2, reading_row_y(4)).unwrap();
         assert!(gideon_core::BookPlaces::load(&books)
             .bookmarks("Kurt Vonnegut/book-0001.epub")
             .is_empty());
@@ -11364,8 +11365,8 @@ mod library_tabs {
         // Paper: the margin is white.
         assert!(ui.display().pixel(margin / 2, top) > 0xf0);
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[5].1, "Off");
-        ui.tap_sheet(W / 2, reading_row_y(5)).unwrap();
+        assert_eq!(ui.sheet_rows().1[6].1, "Off");
+        ui.tap_sheet(W / 2, reading_row_y(6)).unwrap();
         assert!(ui.sheet.is_none());
         assert!(
             ui.display().pixel(margin / 2, top) < 0x10,
@@ -11383,8 +11384,8 @@ mod library_tabs {
         again.run().unwrap();
         assert!(again.display().pixel(margin / 2, top) < 0x10);
         again.sheet = Some(Sheet::BookReading);
-        assert_eq!(again.sheet_rows().1[5].1, "On");
-        again.tap_sheet(W / 2, reading_row_y(5)).unwrap();
+        assert_eq!(again.sheet_rows().1[6].1, "On");
+        again.tap_sheet(W / 2, reading_row_y(6)).unwrap();
         assert!(again.display().pixel(margin / 2, top) > 0xf0);
         assert!(!again.load_settings().book_night);
     }
@@ -11402,8 +11403,8 @@ mod library_tabs {
             other => panic!("expected the reader, got {other:?}"),
         };
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[6].1, "Portrait");
-        ui.tap_sheet(W / 2, reading_row_y(6)).unwrap();
+        assert_eq!(ui.sheet_rows().1[7].1, "Portrait");
+        ui.tap_sheet(W / 2, reading_row_y(7)).unwrap();
         assert!(ui.sheet.is_none());
         // The reading frame is now the panel on its side: wider, shorter,
         // so fewer lines fit a page; whole repaint.
@@ -11436,7 +11437,7 @@ mod library_tabs {
         };
         assert_eq!(*page, 1);
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[6].1, "Landscape");
+        assert_eq!(ui.sheet_rows().1[7].1, "Landscape");
     }
 
     /// Input that flushes like the Kobo's: `discard_taps` really drops what
@@ -12550,7 +12551,7 @@ mod reader_tools {
     pub(super) const PROSE: [&str; 6] = [
         "The harbour was quiet when Elena reached it, the boats drawn up in a crooked line and the nets left to dry along the wall.",
         "She had promised herself she would not look back at the house, and for a while she kept the promise.",
-        "Further along, a boy was mending a sail with slow, careful stitches. The light had gone gloaming-grey over the water.",
+        "Further along, a boy was mending a sail with slow, careful stitches. The light had gone to gloaming over the water.",
         "“You’re early,” he said, without looking up. She told him the tide would not wait for either of them.",
         "They worked until the lamps came on in the cottages above, and neither of them spoke of the letter in her coat.",
         "Some doors are only ever open from the inside, her mother used to say, and Elena had never understood it until now.",
@@ -12762,9 +12763,12 @@ mod reader_tools {
         assert_eq!(word, "harbour");
         let (_, rows) = ui.sheet_rows();
         let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(&labels[labels.len() - 2..], ["Highlight", "Close"]);
+        assert_eq!(
+            &labels[labels.len() - 3..],
+            ["Highlight", "All my words", "Close"]
+        );
         // Highlight: saved yellow, the one word.
-        let i = rows.len() - 2;
+        let i = rows.len() - 3;
         let row_y = {
             let (top, h) = ui.sheet_bounds().unwrap();
             let row_h = ui.layout.row_h;
@@ -12803,6 +12807,143 @@ mod reader_tools {
         let row = ui.layout.row_top(0) + ui.layout.row_h / 2;
         ui.handle_tap(ui.layout.width / 2, row).unwrap();
         assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+    }
+
+    /// A reader with a small dictionary of the placeholder book's words.
+    fn reader_with_dictionary(dir: &Path) -> Big {
+        super::library_tabs::write_stardict(
+            &dir.join("data/dicts"),
+            "wordnet",
+            &[
+                (
+                    "harbour",
+                    "n. a sheltered place where boats are kept\nmore detail",
+                ),
+                ("gloaming", "n. the dim light after sunset"),
+                ("stitches", "n. loops of thread through cloth"),
+            ],
+        );
+        big_reader(dir)
+    }
+
+    fn words(dir: &Path) -> Vec<gideon_core::SavedWord> {
+        gideon_core::SavedWords::load(&dir.join("Manga/Books")).words
+    }
+
+    /// Hold the first page word that reads `word`, and lift without moving.
+    fn look_up_on_page(ui: &mut Big, word: &str) {
+        let pos = ui
+            .page_words()
+            .into_iter()
+            .find(|w| {
+                let Screen::BookReader { text, chapter, .. } = ui.screen() else {
+                    return false;
+                };
+                super::super::highlights::words_between(text, *chapter, w.pos, w.pos)
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .eq_ignore_ascii_case(word)
+            })
+            .unwrap_or_else(|| panic!("{word} not on the page"));
+        let (x, y) = (pos.rect.0 + pos.rect.2 / 2, pos.rect.1 + pos.rect.3 / 2);
+        ui.handle_hold(x, y).unwrap();
+        ui.handle_long_press(x, y).unwrap();
+        // Close the definition, as a reader would.
+        ui.sheet = None;
+        ui.selection = None;
+    }
+
+    #[test]
+    fn every_lookup_is_kept_with_its_sentence_newest_first_and_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = reader_with_dictionary(dir.path());
+        look_up_on_page(&mut ui, "harbour");
+        look_up_on_page(&mut ui, "gloaming");
+        let w = words(dir.path());
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].word, "gloaming");
+        assert_eq!(w[0].gloss, "n. the dim light after sunset");
+        assert_eq!(
+            w[0].context,
+            "The light had gone to gloaming over the water."
+        );
+        assert_eq!(w[0].title, "The Harbour Wall");
+        assert_eq!(
+            w[1].gloss, "n. a sheltered place where boats are kept",
+            "first line only"
+        );
+        // Looking it up again moves it to the top; it is not listed twice.
+        look_up_on_page(&mut ui, "harbour");
+        let w = words(dir.path());
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].word, "harbour");
+    }
+
+    #[test]
+    fn the_words_list_shows_them_and_a_word_can_be_removed_or_visited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = reader_with_dictionary(dir.path());
+        for w in ["harbour", "gloaming", "stitches"] {
+            look_up_on_page(&mut ui, w);
+        }
+        let (block_of_gloaming, _) = {
+            let w = words(dir.path());
+            (w.iter().find(|w| w.word == "gloaming").unwrap().block, ())
+        };
+        // Reading menu › Words: this book, newest first; a new screen, Full.
+        ui.open_words(true).unwrap();
+        let Screen::Words {
+            entries, this_book, ..
+        } = ui.screen()
+        else {
+            panic!("expected Words, got {:?}", ui.screen());
+        };
+        assert!(*this_book);
+        let order: Vec<&str> = entries.iter().map(|w| w.word.as_str()).collect();
+        assert_eq!(order, ["stitches", "gloaming", "harbour"]);
+        assert_eq!(*ui.display().flushes.last().unwrap(), RefreshMode::Full);
+        // The "All books" tab: the same three here, Full.
+        let tabs = super::super::words::tabs_for_tests(&ui.layout);
+        ui.handle_tap(tabs[0].0 + tabs[0].2 / 2, tabs[0].1 + tabs[0].3 / 2)
+            .unwrap();
+        assert!(matches!(
+            ui.screen(),
+            Screen::Words {
+                this_book: false,
+                ..
+            }
+        ));
+        // A row: the word's sheet over the list, Partial.
+        let rh = super::super::words::row_h_for_tests(&ui.layout);
+        let lay = ui.layout;
+        let row = |i: u32| lay.content_top() + i * rh + rh / 2;
+        let y1 = row(1);
+        ui.handle_tap(ui.layout.width / 2, y1).unwrap();
+        let Some(Sheet::SavedWord { word }) = &ui.sheet else {
+            panic!("expected the word's sheet, got {:?}", ui.sheet);
+        };
+        assert_eq!(word.word, "gloaming");
+        assert_eq!(*ui.display().flushes.last().unwrap(), RefreshMode::Partial);
+        // Go to page: back in the reader, at the word's paragraph.
+        let (top, _, buttons) = ui.word_sheet_layout_for_tests();
+        assert!(top > ui.layout.content_top());
+        ui.handle_tap(buttons[1].0 + 5, buttons[1].1 + 5).unwrap();
+        let Screen::BookReader { pages, page, .. } = ui.screen() else {
+            panic!("expected the reader, got {:?}", ui.screen());
+        };
+        assert!(pages[*page].iter().any(|l| l.block == block_of_gloaming));
+        // Remove: gone from the file and the list.
+        ui.open_words(true).unwrap();
+        ui.handle_tap(ui.layout.width / 2, row(0)).unwrap();
+        let (_, _, buttons) = ui.word_sheet_layout_for_tests();
+        ui.handle_tap(buttons[0].0 + 5, buttons[0].1 + 5).unwrap();
+        assert!(ui.sheet.is_none());
+        assert_eq!(*ui.display().flushes.last().unwrap(), RefreshMode::Full);
+        let left: Vec<String> = words(dir.path()).into_iter().map(|w| w.word).collect();
+        assert_eq!(left, ["gloaming", "harbour"]);
+        let Screen::Words { entries, .. } = ui.screen() else {
+            panic!("still the list");
+        };
+        assert_eq!(entries.len(), 2);
     }
 
     fn save(ui: &UiApp<MemoryDisplay, FakeInput, FakeGateway>, out: &Path, name: &str) {
@@ -12861,6 +13002,37 @@ mod reader_tools {
             save(&ui, &out, "h3-highlighted");
             ui.open_book_highlights().unwrap();
             save(&ui, &out, "h4-list");
+        }
+        // Saved words: a lookup's sheet, the list, and a word's sheet.
+        {
+            let wdir = tempfile::tempdir().unwrap();
+            let mut ui = reader_with_dictionary(wdir.path());
+            for w in ["stitches", "harbour", "gloaming"] {
+                look_up_on_page(&mut ui, w);
+            }
+            let page_word = ui
+                .page_words()
+                .into_iter()
+                .find(|w| {
+                    let Screen::BookReader { text, chapter, .. } = ui.screen() else {
+                        return false;
+                    };
+                    super::super::highlights::words_between(text, *chapter, w.pos, w.pos)
+                        == "gloaming"
+                })
+                .unwrap();
+            let (x, y) = (page_word.rect.0 + 4, page_word.rect.1 + 4);
+            ui.handle_hold(x, y).unwrap();
+            ui.handle_long_press(x, y).unwrap();
+            save(&ui, &out, "w1-definition");
+            ui.sheet = None;
+            ui.selection = None;
+            ui.open_words(false).unwrap();
+            save(&ui, &out, "w2-words");
+            let rh = super::super::words::row_h_for_tests(&ui.layout);
+            let y0 = ui.layout.content_top() + rh / 2;
+            ui.handle_tap(ui.layout.width / 2, y0).unwrap();
+            save(&ui, &out, "w3-word");
         }
         for f in FontFamily::ALL {
             let mut st = ui.load_settings();

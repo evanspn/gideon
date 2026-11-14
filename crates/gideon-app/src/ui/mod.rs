@@ -16,6 +16,7 @@ mod gateway;
 mod highlights;
 mod layout;
 mod text_sheet;
+mod words;
 /// The entry after `current` in `choices`, wrapping; the first when
 /// `current` is not a choice (a hand-edited settings file).
 fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
@@ -380,6 +381,8 @@ enum Sheet {
     /// What to do with a selection (`existing: None`) or a highlight tapped
     /// on the page: colours, Define / note, Remove. See `highlights`.
     Highlight { existing: Option<usize> },
+    /// One saved word: its definition and sentence, Remove, Go to page.
+    SavedWord { word: Box<gideon_core::SavedWord> },
     /// A word looked up: the headword as the dictionary spells it, and its
     /// definition wrapped to the sheet's width.
     Definition { word: String, lines: Vec<String> },
@@ -682,6 +685,15 @@ enum Screen {
     /// The open book's highlights, pushed over its reader; a tap jumps there.
     BookHighlights {
         entries: Vec<gideon_core::Highlight>,
+        page: usize,
+    },
+    /// Every word looked up in the reader, newest first: all books, or the
+    /// open book's (`this_book`). See `words`.
+    Words {
+        entries: Vec<gideon_core::SavedWord>,
+        /// The book open behind the list, if any.
+        book: Option<String>,
+        this_book: bool,
         page: usize,
     },
     /// The keyboard, typing a highlight's note.
@@ -2263,6 +2275,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.screen(), Screen::BookResults { .. }) {
             return self.tap_book_results(x, y);
         }
+        if matches!(self.screen(), Screen::Words { .. }) {
+            return self.tap_words(x, y);
+        }
         let paged = self.current_page_count() > 1;
         match self.layout.tap_target(x, y, paged) {
             TapTarget::Back => self.pop(),
@@ -2967,6 +2982,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("Contents".into(), "›".into(), false),
                     ("Bookmarks".into(), "›".into(), false),
                     ("Highlights".into(), "›".into(), false),
+                    ("Words".into(), "›".into(), false),
                     (
                         if self.page_is_bookmarked() {
                             "Unmark this page"
@@ -3014,8 +3030,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 if self.selection.is_some() {
                     rows.push(("Highlight".into(), String::new(), false));
                 }
+                rows.push(("All my words".into(), "›".into(), false));
                 rows.push(("Close".into(), String::new(), true));
-                (word.clone(), rows)
+                (format!("{word}  ✓ saved to Words"), rows)
             }
             Some(Sheet::NoDictionary) => (
                 "Dictionary".to_string(),
@@ -3030,9 +3047,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ],
             ),
             // Controls, not rows: laid out by `text_sheet`.
-            Some(Sheet::BookText { .. } | Sheet::BookFonts | Sheet::Highlight { .. }) => {
-                (String::new(), Vec::new())
-            }
+            Some(
+                Sheet::BookText { .. }
+                | Sheet::BookFonts
+                | Sheet::Highlight { .. }
+                | Sheet::SavedWord { .. },
+            ) => (String::new(), Vec::new()),
             Some(Sheet::CleanFinishedBooks { ref books }) => {
                 let n = books.len();
                 let noun = if n == 1 { "book" } else { "books" };
@@ -3118,6 +3138,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             let (top, height, ..) = self.highlight_sheet_layout();
             return Some((top, height));
         }
+        if matches!(self.sheet, Some(Sheet::SavedWord { .. })) {
+            return self.word_sheet_bounds();
+        }
         if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
             let s = self.download_sheet_layout();
             return Some((s.top, s.height));
@@ -3152,6 +3175,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if let Some(Sheet::Highlight { existing }) = self.sheet {
             return self.overlay_highlight_sheet(canvas, existing);
+        }
+        if matches!(self.sheet, Some(Sheet::SavedWord { .. })) {
+            return self.overlay_word_sheet(canvas);
         }
         let Some((y, h)) = self.sheet_bounds() else {
             return;
@@ -3414,6 +3440,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if let Some(Sheet::Highlight { existing }) = self.sheet {
             return self.tap_highlight_sheet(x, y, existing);
         }
+        if matches!(self.sheet, Some(Sheet::SavedWord { .. })) {
+            return self.tap_word_sheet(x, y);
+        }
         if self.tap_sheet_close(x, y) {
             self.sheet = None;
             self.selection = None;
@@ -3585,7 +3614,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     0 => self.open_book_contents()?,
                     1 => self.open_book_bookmarks()?,
                     2 => self.open_book_highlights()?,
-                    3 => {
+                    3 => self.open_words(true)?,
+                    4 => {
                         // The sheet closing reveals the page whole, so
                         // this one is a flash, unlike the long-press.
                         let set = self.flip_bookmark();
@@ -3594,21 +3624,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.book_banner = None;
                         result?;
                     }
-                    4 => {
+                    5 => {
                         // One sheet replaces another over a page that has
                         // not moved: the sheet region alone changes.
                         self.sheet = Some(Sheet::BookText { preview: None });
                         self.render_current(RefreshMode::Partial)?;
                     }
-                    5 => {
+                    6 => {
                         // Every pixel flips: a flash, never a partial.
                         let mut settings = self.load_settings();
                         settings.book_night = !settings.book_night;
                         self.save_settings(&settings);
                         self.render_current(RefreshMode::Full)?;
                     }
-                    6 => self.rotate_book_reader()?,
-                    7 => {
+                    7 => self.rotate_book_reader()?,
+                    8 => {
                         self.save_book_place();
                         return self.pop();
                     }
@@ -3621,8 +3651,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // The definition's own lines are not buttons.
                     return Ok(Flow::Continue);
                 }
-                if index == lines.len() && self.selection.is_some() {
+                let highlight_row = self.selection.is_some().then_some(lines.len());
+                let words_row = lines.len() + usize::from(highlight_row.is_some());
+                if Some(index) == highlight_row {
                     self.save_selection(gideon_core::HIGHLIGHT_COLORS[0]);
+                }
+                if index == words_row {
+                    self.open_words(true)?;
+                    return Ok(Flow::Continue);
                 }
                 self.sheet = None;
                 self.selection = None;
@@ -3644,9 +3680,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
             },
             // Routed whole in tap_sheet, before any row arithmetic.
-            Some(Sheet::BookText { .. } | Sheet::BookFonts | Sheet::Highlight { .. }) => {
-                Ok(Flow::Continue)
-            }
+            Some(
+                Sheet::BookText { .. }
+                | Sheet::BookFonts
+                | Sheet::Highlight { .. }
+                | Sheet::SavedWord { .. },
+            ) => Ok(Flow::Continue),
             Some(Sheet::ConfirmDeleteBook { book }) => {
                 self.sheet = None;
                 if index == 0 {
@@ -4136,6 +4175,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::HighlightNote { book, index, note } => {
                 self.tap_highlight_note(&book, index, &note, x, y)
             }
+            // Routed whole in handle_tap: two-row-tall rows and its own tabs.
+            Screen::Words { .. } => Ok(Flow::Continue),
             Screen::BookShelf { books, page } => {
                 let cards = self.book_cards(&books);
                 let card = if self.load_settings().library_view == "list" {
@@ -8593,6 +8634,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::HighlightNote { note, .. } => {
                 compose_keyboard(l, "Note", note, "Save", self.keyboard_shift)
             }
+            Screen::Words {
+                entries,
+                book,
+                this_book,
+                page,
+            } => self.paint_words(entries, book, *this_book, *page),
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -9236,6 +9283,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let hit = self.dictionaries().iter_mut().find_map(|d| d.lookup(word));
         match hit {
             Some(def) => {
+                // Every lookup in a book is kept (see `words`).
+                self.save_looked_up_word(&def.word, &def.text);
                 let max_w = self.layout.width.saturating_sub(self.layout.pad * 2);
                 let mut lines = wrap_text(self.layout.text_px, &def.text, max_w);
                 if lines.len() > DEFINITION_LINES {
