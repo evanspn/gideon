@@ -17,9 +17,10 @@ pub mod series;
 pub mod settings;
 pub mod stats;
 pub mod upload;
+pub mod words;
 pub mod zipread;
 
-pub use books::{Book, BookPlace, BookPlaces, Bookmark};
+pub use books::{Book, BookPlace, BookPlaces, Bookmark, Highlight, HIGHLIGHT_COLORS};
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
 pub use dict::{Definition, Dictionary};
@@ -34,5 +35,6 @@ pub use settings::{
 };
 pub use stats::{ReadingSpan, ReadingStats};
 pub use upload::{sanitize_filename, BookMeta, UploadKind, MAX_UPLOAD_BYTES};
+pub use words::{SavedWord, SavedWords};
 
 pub type Result<T> = std::result::Result<T, Error>;

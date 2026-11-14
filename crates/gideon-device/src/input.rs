@@ -48,6 +48,14 @@ pub enum UiEvent {
     /// A press held in place (≥600 ms without travel) — context actions,
     /// e.g. a library book's chapter list.
     LongPress { x: u32, y: u32 },
+    /// The same press, reported **while the finger is still down**, once it
+    /// has been held in place for the long-press time. What follows is the
+    /// usual stream: `Drag`s if the finger then moves, and on lift either a
+    /// `Swipe` (it moved) or a `LongPress` (it did not). The book reader
+    /// uses it to start a text selection that a drag then extends, the way
+    /// a Kindle does; everything else ignores it and keeps acting on the
+    /// `LongPress` at lift.
+    Hold { x: u32, y: u32 },
     /// The user asked the device to sleep: power button pressed or the
     /// magnetic sleep cover closed (KOReader: KEY_POWER=116 press, sleep
     /// cover codes 59/35 press). Waking is *not* an event: the suspend call
