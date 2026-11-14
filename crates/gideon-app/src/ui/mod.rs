@@ -17,12 +17,6 @@ mod highlights;
 mod layout;
 mod text_sheet;
 mod words;
-/// The entry after `current` in `choices`, wrapping; the first when
-/// `current` is not a choice (a hand-edited settings file).
-fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
-    let at = choices.iter().position(|c| c == current);
-    choices[at.map_or(0, |i| (i + 1) % choices.len())].clone()
-}
 
 /// One card on the Books tab: a book, or the volumes of a series.
 #[derive(Debug, Clone, PartialEq)]

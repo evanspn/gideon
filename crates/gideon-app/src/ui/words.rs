@@ -538,11 +538,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 }
 
 #[cfg(test)]
-pub(super) fn per_page_for_tests(l: &UiLayout) -> usize {
-    words_per_page(l)
-}
-
-#[cfg(test)]
 pub(super) fn row_h_for_tests(l: &UiLayout) -> u32 {
     word_row_h(l)
 }
