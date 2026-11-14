@@ -527,8 +527,10 @@ fn default_book_text_px() -> u32 {
     44
 }
 
-/// The text sizes the reader's Text sheet steps through.
-pub const BOOK_TEXT_PX_STEPS: [u32; 7] = [32, 38, 44, 50, 56, 64, 72];
+/// The text sizes the reader's size slider snaps to: twelve, from the
+/// smallest to the largest the reader allows, closer together at the small
+/// end where a step is a bigger share of the size.
+pub const BOOK_TEXT_PX_STEPS: [u32; 12] = [28, 32, 36, 40, 44, 48, 52, 56, 62, 68, 74, 80];
 /// Line spacing choices, and their line height as a multiple of the size.
 pub const BOOK_LINE_SPACINGS: [(&str, f32); 3] =
     [("tight", 1.25), ("normal", 1.45), ("loose", 1.7)];

@@ -14,6 +14,7 @@
 mod book_search;
 mod gateway;
 mod layout;
+mod text_sheet;
 /// The entry after `current` in `choices`, wrapping; the first when
 /// `current` is not a choice (a hand-edited settings file).
 fn next_in<T: PartialEq + Clone>(choices: &[T], current: &T) -> T {
@@ -369,7 +370,12 @@ enum Sheet {
     /// The reader's typography: text size, line spacing and margins. Each
     /// row cycles its setting; the page behind re-flows at once so the
     /// change is seen with the sheet still open.
-    BookText,
+    BookText {
+        /// The size step under a finger still on the slider, not yet saved.
+        preview: Option<usize>,
+    },
+    /// The Text sheet's font list: twelve faces, each named in itself.
+    BookFonts,
     /// A word looked up: the headword as the dictionary spells it, and its
     /// definition wrapped to the sheet's width.
     Definition { word: String, lines: Vec<String> },
@@ -2968,26 +2974,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     ("Close".into(), String::new(), true),
                 ],
             ),
-            Some(Sheet::BookText) => {
-                let settings = self.load_settings();
-                (
-                    "Text".to_string(),
-                    vec![
-                        (
-                            "Size".into(),
-                            format!("{} px", settings.book_text_px),
-                            false,
-                        ),
-                        (
-                            "Line spacing".into(),
-                            title_case(&settings.book_line_spacing),
-                            false,
-                        ),
-                        ("Margins".into(), title_case(&settings.book_margins), false),
-                        ("Close".into(), String::new(), true),
-                    ],
-                )
-            }
+            // Controls, not rows: laid out by `text_sheet`.
+            Some(Sheet::BookText { .. } | Sheet::BookFonts) => (String::new(), Vec::new()),
             Some(Sheet::CleanFinishedBooks { ref books }) => {
                 let n = books.len();
                 let noun = if n == 1 { "book" } else { "books" };
@@ -3061,6 +3049,14 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     }
 
     fn sheet_bounds(&self) -> Option<(u32, u32)> {
+        if matches!(self.sheet, Some(Sheet::BookText { .. })) {
+            let s = self.text_sheet_layout();
+            return Some((s.top, s.height));
+        }
+        if matches!(self.sheet, Some(Sheet::BookFonts)) {
+            let s = self.font_sheet_layout();
+            return Some((s.top, s.height));
+        }
         if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
             let s = self.download_sheet_layout();
             return Some((s.top, s.height));
@@ -3086,6 +3082,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
             return self.overlay_book_download(canvas);
+        }
+        if let Some(Sheet::BookText { preview }) = self.sheet {
+            return self.overlay_text_sheet(canvas, preview);
+        }
+        if matches!(self.sheet, Some(Sheet::BookFonts)) {
+            return self.overlay_font_sheet(canvas);
         }
         let Some((y, h)) = self.sheet_bounds() else {
             return;
@@ -3338,6 +3340,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
             return self.tap_book_download(x, y);
         }
+        // The Text sheet and font list have controls, not rows.
+        if matches!(self.sheet, Some(Sheet::BookText { .. })) {
+            return self.tap_text_sheet(x, y);
+        }
+        if matches!(self.sheet, Some(Sheet::BookFonts)) {
+            return self.tap_font_sheet(x, y);
+        }
         if self.tap_sheet_close(x, y) {
             self.sheet = None;
             return self
@@ -3518,7 +3527,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     3 => {
                         // One sheet replaces another over a page that has
                         // not moved: the sheet region alone changes.
-                        self.sheet = Some(Sheet::BookText);
+                        self.sheet = Some(Sheet::BookText { preview: None });
                         self.render_current(RefreshMode::Partial)?;
                     }
                     4 => {
@@ -3558,40 +3567,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     Ok(Flow::Continue)
                 }
             },
-            Some(Sheet::BookText) => {
-                match index {
-                    0..=2 => {
-                        let mut settings = self.load_settings();
-                        match index {
-                            0 => {
-                                settings.book_text_px =
-                                    next_in(&BOOK_TEXT_PX_STEPS, &settings.book_text_px);
-                            }
-                            1 => {
-                                let names: Vec<&str> =
-                                    BOOK_LINE_SPACINGS.iter().map(|(n, _)| *n).collect();
-                                settings.book_line_spacing =
-                                    next_in(&names, &settings.book_line_spacing.as_str())
-                                        .to_string();
-                            }
-                            _ => {
-                                let names: Vec<&str> =
-                                    BOOK_MARGINS.iter().map(|(n, _)| *n).collect();
-                                settings.book_margins =
-                                    next_in(&names, &settings.book_margins.as_str()).to_string();
-                            }
-                        }
-                        self.save_settings(&settings);
-                        // The sheet stays up; the page behind re-flows.
-                        self.reflow_book()?;
-                    }
-                    _ => {
-                        self.sheet = None;
-                        self.render_current(RefreshMode::Full)?;
-                    }
-                }
-                Ok(Flow::Continue)
-            }
+            // Routed whole in tap_sheet, before any row arithmetic.
+            Some(Sheet::BookText { .. } | Sheet::BookFonts) => Ok(Flow::Continue),
             Some(Sheet::ConfirmDeleteBook { book }) => {
                 self.sheet = None;
                 if index == 0 {
@@ -3680,6 +3657,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// off the row must not hand the drag to the slider next door, and must
     /// not dismiss the sheet either.
     fn drag_menu(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, released: bool) -> Result<Flow> {
+        if self.drag_text_slider(x0, y0, x1, released)? {
+            return Ok(Flow::Continue);
+        }
         if let Some(row) = self.quick_slider_at(y0) {
             self.scrub_quick_slider(row, x1)?;
             return Ok(Flow::Continue);

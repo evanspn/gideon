@@ -73,9 +73,9 @@ pub(super) enum DownloadState {
 }
 
 /// A rectangle: `(x, y, w, h)`.
-type Rect = (u32, u32, u32, u32);
+pub(super) type Rect = (u32, u32, u32, u32);
 
-fn hit(r: Rect, x: u32, y: u32) -> bool {
+pub(super) fn hit(r: Rect, x: u32, y: u32) -> bool {
     x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
@@ -102,7 +102,7 @@ impl Painted {
 }
 
 /// Fill a rectangle in the ink layer.
-fn fill_gray(canvas: &mut GrayPage, r: Rect, value: u8) {
+pub(super) fn fill_gray(canvas: &mut GrayPage, r: Rect, value: u8) {
     for y in r.1..(r.1 + r.3).min(canvas.height) {
         for x in r.0..(r.0 + r.2).min(canvas.width) {
             plot(canvas, x as i32, y as i32, value);
@@ -111,7 +111,7 @@ fn fill_gray(canvas: &mut GrayPage, r: Rect, value: u8) {
 }
 
 /// A `t`-pixel outline.
-fn outline(canvas: &mut GrayPage, r: Rect, t: u32, value: u8) {
+pub(super) fn outline(canvas: &mut GrayPage, r: Rect, t: u32, value: u8) {
     for i in 0..t {
         if r.2 > 2 * i && r.3 > 2 * i {
             rect_outline(canvas, r.0 + i, r.1 + i, r.2 - 2 * i, r.3 - 2 * i, value);
@@ -180,7 +180,14 @@ fn draw_chip(p: &mut Painted, r: Rect, px: f32, label: &str, fill: [u8; 3]) {
 
 /// A button: the primary one is the accent's wash with a heavy accent
 /// border; the other a plain black outline.
-fn draw_button(p: &mut Painted, r: Rect, px: f32, label: &str, primary: bool, t: &widgets::Theme) {
+pub(super) fn draw_button(
+    p: &mut Painted,
+    r: Rect,
+    px: f32,
+    label: &str,
+    primary: bool,
+    t: &widgets::Theme,
+) {
     if primary {
         p.fills.push((r, t.accent_wash()));
         let b = 3;

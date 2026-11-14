@@ -9785,7 +9785,12 @@ mod library_tabs {
 
     /// A readable EPUB: each chapter is a heading and its paragraphs, in a
     /// spine in that order.
-    fn make_epub_with(path: &Path, title: &str, author: &str, chapters: &[(&str, &[&str])]) {
+    pub(super) fn make_epub_with(
+        path: &Path,
+        title: &str,
+        author: &str,
+        chapters: &[(&str, &[&str])],
+    ) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -9928,12 +9933,6 @@ mod library_tabs {
             ),
         )
         .unwrap();
-    }
-
-    /// The y of row `i` of the Text sheet: 0 size, 1 line spacing,
-    /// 2 margins, 3 close.
-    fn text_row_y(i: usize) -> u32 {
-        tap_modal_row_y(4, i)
     }
 
     /// Open the first book on the Books tab in gideon's reader.
@@ -10346,19 +10345,37 @@ mod library_tabs {
         // sheet stays up, and the whole page re-flowed, so a Full.
         ui.sheet = Some(Sheet::BookReading);
         ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
-        assert!(matches!(ui.sheet, Some(Sheet::BookText)));
-        ui.tap_sheet(W / 2, text_row_y(0)).unwrap();
-        assert!(matches!(ui.sheet, Some(Sheet::BookText)), "sheet stays up");
+        assert!(matches!(ui.sheet, Some(Sheet::BookText { .. })));
+        let next = super::text_sheet::step_of(44) + 1;
+        let (x, y) = slider_point(&ui, next);
+        ui.tap_sheet(x, y).unwrap();
+        assert!(
+            matches!(ui.sheet, Some(Sheet::BookText { .. })),
+            "sheet stays up"
+        );
         let Screen::BookReader { pages, page, .. } = ui.screen() else {
             panic!("expected the reader");
         };
         assert!(pages[*page].iter().any(|l| l.block == top_block));
-        assert_eq!(ui.load_settings().book_text_px, 50);
+        assert_eq!(ui.load_settings().book_text_px, 48);
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
     }
 
+    /// The centre of a sheet control.
+    fn centre(r: (u32, u32, u32, u32)) -> (u32, u32) {
+        (r.0 + r.2 / 2, r.1 + r.3 / 2)
+    }
+
+    /// Where step `i` sits on the Text sheet's size slider.
+    fn slider_point(ui: &UiApp<MemoryDisplay, FakeInput, FakeGateway>, i: usize) -> (u32, u32) {
+        let t = ui.text_sheet_layout().track;
+        let n = gideon_core::settings::BOOK_TEXT_PX_STEPS.len() as u32;
+        (t.0 + t.2 * i as u32 / (n - 1), t.1 + t.3 / 2)
+    }
+
     #[test]
-    fn the_text_sheet_cycles_size_spacing_and_margins_and_they_persist() {
+    fn the_text_sheet_sets_font_size_spacing_and_margins_and_they_persist() {
+        use gideon_core::settings::BOOK_TEXT_PX_STEPS;
         let dir = tempfile::tempdir().unwrap();
         let (lib, _) = novel(dir.path());
         let settings_dir = dir.path().join("data");
@@ -10378,24 +10395,17 @@ mod library_tabs {
         ui.drag_menu(x0, y0, x1, y1, true).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
         ui.handle_tap(W / 2, reading_row_y(3)).unwrap();
-        assert!(matches!(ui.sheet, Some(Sheet::BookText)));
+        assert_eq!(ui.sheet, Some(Sheet::BookText { preview: None }));
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
-        let (title, rows) = ui.sheet_rows();
-        assert_eq!(title, "Text");
-        let labels: Vec<(&str, &str)> = rows.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
-        assert_eq!(
-            labels,
-            [
-                ("Size", "44 px"),
-                ("Line spacing", "Normal"),
-                ("Margins", "Normal"),
-                ("Close", "")
-            ]
-        );
+        let s = ui.text_sheet_layout();
 
-        // Line spacing: normal → loose puts fewer lines on the page.
-        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
+        // Line spacing: Loose puts fewer lines on the page; a re-flow moves
+        // every line, so Full; the sheet stays up.
+        let (x, y) = centre(s.spacing[2]);
+        ui.handle_tap(x, y).unwrap();
         assert_eq!(ui.load_settings().book_line_spacing, "loose");
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        assert!(matches!(ui.sheet, Some(Sheet::BookText { .. })));
         let Screen::BookReader { pages, .. } = ui.screen() else {
             panic!("expected the reader");
         };
@@ -10404,28 +10414,71 @@ mod library_tabs {
             "{} < {normal_lines}",
             pages[0].len()
         );
-        assert_eq!(ui.sheet_rows().1[1].1, "Loose");
-        // … and wraps round: loose → tight → normal.
-        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
-        assert_eq!(ui.load_settings().book_line_spacing, "tight");
-        ui.handle_tap(W / 2, text_row_y(1)).unwrap();
-        assert_eq!(ui.load_settings().book_line_spacing, "normal");
+        for (i, name) in [(0, "tight"), (1, "normal")] {
+            let (x, y) = centre(s.spacing[i]);
+            ui.handle_tap(x, y).unwrap();
+            assert_eq!(ui.load_settings().book_line_spacing, name);
+        }
 
-        // Margins: normal → wide narrows the text column.
-        ui.handle_tap(W / 2, text_row_y(2)).unwrap();
+        // Margins: Wide narrows the text column.
+        let (x, y) = centre(s.margins[2]);
+        ui.handle_tap(x, y).unwrap();
         assert_eq!(ui.load_settings().book_margins, "wide");
         assert!(ui.book_page_metrics().2 < normal_width);
-        assert_eq!(ui.sheet_rows().1[2].1, "Wide");
 
-        // Size steps through the tiles and wraps from the largest.
-        for expected in [50, 56, 64, 72, 32] {
-            ui.handle_tap(W / 2, text_row_y(0)).unwrap();
-            assert_eq!(ui.load_settings().book_text_px, expected);
-        }
-        assert_eq!(ui.sheet_rows().1[0].1, "32 px");
+        // Size: a tap anywhere on the track snaps to the nearest step.
+        let last = BOOK_TEXT_PX_STEPS.len() - 1;
+        let (x, y) = slider_point(&ui, last);
+        ui.handle_tap(x, y).unwrap();
+        assert_eq!(ui.load_settings().book_text_px, 80);
+        let (x, y) = slider_point(&ui, 0);
+        ui.handle_tap(x.saturating_sub(5), y).unwrap();
+        assert_eq!(ui.load_settings().book_text_px, 28);
 
-        // Close: the page is revealed whole, so a flash.
-        ui.handle_tap(W / 2, text_row_y(3)).unwrap();
+        // Sliding the knob: it follows the finger with the sheet alone
+        // repainting (Partial), nothing saved and nothing re-flowed yet…
+        let flushes = ui.display().flushes.len();
+        let (sx, sy) = slider_point(&ui, 0);
+        let (mx, _) = slider_point(&ui, 5);
+        ui.drag_menu(sx, sy, mx, sy, false).unwrap();
+        assert_eq!(ui.sheet, Some(Sheet::BookText { preview: Some(5) }));
+        assert_eq!(ui.display().flushes.len(), flushes + 1);
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        assert_eq!(ui.load_settings().book_text_px, 28);
+        // …the same step again repaints nothing…
+        ui.drag_menu(sx, sy, mx + 1, sy, false).unwrap();
+        assert_eq!(ui.display().flushes.len(), flushes + 1);
+        // …and the lift saves it and re-flows the page, Full.
+        let (ex, _) = slider_point(&ui, 6);
+        ui.drag_menu(sx, sy, ex, sy, true).unwrap();
+        assert_eq!(ui.load_settings().book_text_px, BOOK_TEXT_PX_STEPS[6]);
+        assert_eq!(ui.sheet, Some(Sheet::BookText { preview: None }));
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+        // A slide on the open sheet never reaches the reader's gestures.
+        assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+
+        // Font: the row opens the list in place of the sheet (Partial); a
+        // face sets the page in it and comes back to the Text sheet (Full).
+        let (x, y) = centre(s.font_row);
+        ui.handle_tap(x, y).unwrap();
+        assert_eq!(ui.sheet, Some(Sheet::BookFonts));
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
+        let tiles = ui.font_sheet_layout().tiles;
+        assert_eq!(tiles.len(), 12);
+        let literata = FontFamily::ALL
+            .iter()
+            .position(|f| *f == FontFamily::Literata)
+            .unwrap();
+        let (x, y) = centre(tiles[literata]);
+        ui.handle_tap(x, y).unwrap();
+        assert_eq!(ui.load_settings().book_font, "literata");
+        assert_eq!(ui.book_family(), FontFamily::Literata);
+        assert_eq!(ui.sheet, Some(Sheet::BookText { preview: None }));
+        assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
+
+        // Close (×): the page is revealed whole, so a flash.
+        let (x, y) = centre(s.close);
+        ui.handle_tap(x, y).unwrap();
         assert!(ui.sheet.is_none());
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
 
@@ -10435,15 +10488,32 @@ mod library_tabs {
             (
                 saved.book_text_px,
                 saved.book_line_spacing.as_str(),
-                saved.book_margins.as_str()
+                saved.book_margins.as_str(),
+                saved.book_font.as_str()
             ),
-            (32, "normal", "wide")
+            (BOOK_TEXT_PX_STEPS[6], "normal", "wide", "literata")
         );
         let mut again =
             app(&lib, FakeGateway::default(), open_first_book()).with_settings_dir(settings_dir);
         again.run().unwrap();
-        assert_eq!(again.book_page_metrics().0, 32.0);
-        assert!(again.book_page_metrics().2 < normal_width);
+        assert_eq!(again.book_page_metrics().0, BOOK_TEXT_PX_STEPS[6] as f32);
+        assert_eq!(again.book_family(), FontFamily::Literata);
+    }
+
+    #[test]
+    fn a_page_set_in_another_face_draws_different_ink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, _) = novel(dir.path());
+        let settings_dir = dir.path().join("data");
+        let mut ui = app(&lib, FakeGateway::default(), open_first_book())
+            .with_settings_dir(settings_dir.clone());
+        ui.run().unwrap();
+        let sans = ui.display().buffer.clone();
+        let mut st = ui.load_settings();
+        st.book_font = "garamond".into();
+        ui.save_settings(&st);
+        ui.reflow_book().unwrap();
+        assert_ne!(ui.display().buffer, sans, "the page re-set in Garamond");
     }
 
     #[test]
@@ -12463,6 +12533,85 @@ mod internet_archive {
                 .unwrap()
                 .save(out.join(format!("{name}.png")))
                 .unwrap();
+        }
+    }
+}
+
+// --- Reader tools: renders for the design review ---------------------------
+//
+// Every screen of the reader's new tools at the Libra Colour's real size,
+// set in a book of original placeholder prose (not a real novel's text).
+// `GIDEON_SHOTS=<dir> cargo test -p gideon-app -- --ignored reader_tools::shots`.
+
+mod reader_tools {
+    use super::*;
+
+    pub(super) const PROSE: [&str; 6] = [
+        "The harbour was quiet when Elena reached it, the boats drawn up in a crooked line and the nets left to dry along the wall.",
+        "She had promised herself she would not look back at the house, and for a while she kept the promise.",
+        "Further along, a boy was mending a sail with slow, careful stitches. The light had gone gloaming-grey over the water.",
+        "“You’re early,” he said, without looking up. She told him the tide would not wait for either of them.",
+        "They worked until the lamps came on in the cottages above, and neither of them spoke of the letter in her coat.",
+        "Some doors are only ever open from the inside, her mother used to say, and Elena had never understood it until now.",
+    ];
+
+    /// A reader on a full-size panel, the placeholder book open on page 1.
+    pub(super) fn big_reader(dir: &Path) -> UiApp<MemoryDisplay, FakeInput, FakeGateway> {
+        let lib = dir.join("Manga");
+        let books = lib.join("Books");
+        let paras: Vec<&str> = PROSE.iter().cycle().take(18).copied().collect();
+        super::library_tabs::make_epub_with(
+            &books.join("Placeholder Author/harbour.epub"),
+            "The Harbour Wall",
+            "Placeholder Author",
+            &[("Chapter IV", &paras)],
+        );
+        let mut ui = UiApp::new(
+            MemoryDisplay::new(1264, 1680),
+            FakeInput::new(vec![]),
+            FakeGateway::default(),
+            lib.clone(),
+        )
+        .with_books_dir(books.clone())
+        .with_settings_dir(dir.join("data"));
+        let book = gideon_core::books::scan(&books).unwrap().remove(0);
+        ui.open_book_reader(book).unwrap();
+        ui
+    }
+
+    fn save(ui: &UiApp<MemoryDisplay, FakeInput, FakeGateway>, out: &Path, name: &str) {
+        let rgb = ui.compose_final().unwrap();
+        image::RgbImage::from_raw(rgb.width, rgb.height, rgb.pixels)
+            .unwrap()
+            .save(out.join(format!("{name}.png")))
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn shots() {
+        let Some(out) = std::env::var_os("GIDEON_SHOTS") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let mut st = ui.load_settings();
+        st.book_font = "literata".into();
+        ui.save_settings(&st);
+        ui.reflow_book().unwrap();
+        ui.sheet = Some(Sheet::BookText { preview: None });
+        save(&ui, &out, "t1-text-sheet");
+        ui.sheet = Some(Sheet::BookFonts);
+        save(&ui, &out, "t2-font-list");
+        ui.sheet = None;
+        for f in FontFamily::ALL {
+            let mut st = ui.load_settings();
+            st.book_font = f.name().into();
+            ui.save_settings(&st);
+            ui.reflow_book().unwrap();
+            save(&ui, &out, &format!("t3-page-{}", f.name()));
         }
     }
 }
