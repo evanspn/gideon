@@ -261,6 +261,47 @@ impl Bookmark {
     }
 }
 
+/// The colours a highlight can be, as stored.
+pub const HIGHLIGHT_COLORS: [&str; 3] = ["yellow", "blue", "pink"];
+
+/// A passage the reader highlighted: from its first word to its last
+/// (inclusive), each as (paragraph, word within the paragraph). Words, not
+/// pages or pixels, so a highlight survives any change of font or size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Highlight {
+    pub chapter: usize,
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    /// One of [`HIGHLIGHT_COLORS`].
+    #[serde(default)]
+    pub color: String,
+    /// The reader's note on it, if any.
+    #[serde(default)]
+    pub note: String,
+    /// The words themselves, for the Highlights list.
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+impl Highlight {
+    /// Whether word `word` of paragraph `block` in `chapter` is inside it.
+    pub fn covers(&self, chapter: usize, block: usize, word: usize) -> bool {
+        chapter == self.chapter && self.start <= (block, word) && (block, word) <= self.end
+    }
+
+    /// Whether it shares any word with the range `start..=end` of `chapter`.
+    pub fn overlaps(&self, chapter: usize, start: (usize, usize), end: (usize, usize)) -> bool {
+        chapter == self.chapter && self.start <= end && start <= self.end
+    }
+
+    /// Where it starts, for ordering.
+    pub fn place(&self) -> (usize, usize, usize) {
+        (self.chapter, self.start.0, self.start.1)
+    }
+}
+
 /// Every book's place, keyed by its path relative to the Books folder.
 /// Lives in a dotfile beside the books, which Nickel ignores.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -270,6 +311,9 @@ pub struct BookPlaces {
     /// Each book's bookmarks, in reading order.
     #[serde(default)]
     pub bookmarks: BTreeMap<String, Vec<Bookmark>>,
+    /// Each book's highlights, in reading order.
+    #[serde(default)]
+    pub highlights: BTreeMap<String, Vec<Highlight>>,
 }
 
 impl BookPlaces {
@@ -324,6 +368,55 @@ impl BookPlaces {
             .unwrap_or(&[])
     }
 
+    pub fn highlights(&self, relative_path: &str) -> &[Highlight] {
+        self.highlights
+            .get(relative_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Add a highlight in reading order. Any it overlaps are replaced, the
+    /// way a highlighter pen goes over an earlier stroke. Returns its index.
+    pub fn add_highlight(&mut self, relative_path: &str, highlight: Highlight) -> usize {
+        let list = self
+            .highlights
+            .entry(relative_path.to_string())
+            .or_default();
+        list.retain(|h| !h.overlaps(highlight.chapter, highlight.start, highlight.end));
+        let at = list.partition_point(|h| h.place() < highlight.place());
+        list.insert(at, highlight);
+        at
+    }
+
+    /// Remove highlight `index`; returns it.
+    pub fn remove_highlight(&mut self, relative_path: &str, index: usize) -> Option<Highlight> {
+        let list = self.highlights.get_mut(relative_path)?;
+        if index >= list.len() {
+            return None;
+        }
+        let gone = list.remove(index);
+        if list.is_empty() {
+            self.highlights.remove(relative_path);
+        }
+        Some(gone)
+    }
+
+    /// Change highlight `index` in place.
+    pub fn edit_highlight(
+        &mut self,
+        relative_path: &str,
+        index: usize,
+        edit: impl FnOnce(&mut Highlight),
+    ) {
+        if let Some(h) = self
+            .highlights
+            .get_mut(relative_path)
+            .and_then(|l| l.get_mut(index))
+        {
+            edit(h);
+        }
+    }
+
     /// Add the bookmark, or remove it when one already stands at that
     /// place. Returns whether it is now set. Kept in reading order.
     pub fn toggle_bookmark(&mut self, relative_path: &str, bookmark: Bookmark) -> bool {
@@ -368,7 +461,8 @@ pub fn delete(root: &Path, book: &Book) -> std::io::Result<()> {
     let mut places = BookPlaces::load(root);
     let had_place = places.places.remove(&book.relative_path).is_some();
     let had_marks = places.bookmarks.remove(&book.relative_path).is_some();
-    if had_place || had_marks {
+    let had_highlights = places.highlights.remove(&book.relative_path).is_some();
+    if had_place || had_marks || had_highlights {
         let _ = places.save(root);
     }
     if let Some(parent) = book.path.parent() {
@@ -385,6 +479,60 @@ pub fn delete(root: &Path, book: &Book) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    fn hl(chapter: usize, start: (usize, usize), end: (usize, usize), color: &str) -> Highlight {
+        Highlight {
+            chapter,
+            start,
+            end,
+            color: color.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn highlights_keep_reading_order_and_a_new_stroke_replaces_what_it_covers() {
+        let mut places = BookPlaces::default();
+        let book = "A/b.epub";
+        places.add_highlight(book, hl(1, (4, 0), (4, 3), "yellow"));
+        places.add_highlight(book, hl(0, (9, 2), (10, 1), "blue"));
+        assert_eq!(places.add_highlight(book, hl(1, (2, 0), (2, 0), "pink")), 1);
+        let starts: Vec<_> = places.highlights(book).iter().map(|h| h.place()).collect();
+        assert_eq!(starts, [(0, 9, 2), (1, 2, 0), (1, 4, 0)]);
+        // Over the end of the blue one: the blue one goes.
+        places.add_highlight(book, hl(0, (10, 0), (10, 5), "yellow"));
+        let colors: Vec<_> = places
+            .highlights(book)
+            .iter()
+            .map(|h| h.color.as_str())
+            .collect();
+        assert_eq!(colors, ["yellow", "pink", "yellow"]);
+        assert!(places.highlights(book)[0].covers(0, 10, 5));
+        assert!(!places.highlights(book)[0].covers(0, 10, 6));
+        assert!(
+            !places.highlights(book)[0].covers(1, 10, 0),
+            "another chapter"
+        );
+
+        places.edit_highlight(book, 1, |h| h.note = "ending?".into());
+        assert_eq!(places.highlights(book)[1].note, "ending?");
+        assert_eq!(places.remove_highlight(book, 0).unwrap().color, "yellow");
+        places.remove_highlight(book, 0);
+        places.remove_highlight(book, 0);
+        assert!(places.highlights.is_empty(), "an empty list leaves no key");
+    }
+
+    #[test]
+    fn highlights_survive_the_file_and_older_files_without_them_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut places = BookPlaces::default();
+        places.add_highlight("A/b.epub", hl(0, (1, 2), (1, 4), "blue"));
+        places.save(dir.path()).unwrap();
+        assert_eq!(BookPlaces::load(dir.path()).highlights("A/b.epub").len(), 1);
+        std::fs::write(dir.path().join(BookPlaces::FILE), r#"{"places":{}}"#).unwrap();
+        assert!(BookPlaces::load(dir.path()).highlights.is_empty());
+    }
+
     use super::*;
     use std::io::Write;
 

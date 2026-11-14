@@ -9901,16 +9901,16 @@ mod library_tabs {
     /// Row `i` of the reading menu: 0 contents, 1 bookmarks, 2 mark page,
     /// 3 text, 4 night mode, 5 rotate, 6 close book, 7 close.
     fn tap_reading_row(i: usize) -> UiEvent {
-        tap_modal_row(8, i)
+        tap_modal_row(9, i)
     }
 
     /// The y of row `i` of the reading menu.
     fn reading_row_y(i: usize) -> u32 {
-        tap_modal_row_y(8, i)
+        tap_modal_row_y(9, i)
     }
 
     /// A plain StarDict dictionary (ifo, idx, dict) at `dir/<stem>`.
-    fn write_stardict(dir: &Path, stem: &str, entries: &[(&str, &str)]) {
+    pub(super) fn write_stardict(dir: &Path, stem: &str, entries: &[(&str, &str)]) {
         std::fs::create_dir_all(dir).unwrap();
         let mut sorted = entries.to_vec();
         sorted.sort_by_key(|(w, _)| w.to_lowercase());
@@ -10321,7 +10321,7 @@ mod library_tabs {
 
         // Close via the menu, reopen: same paragraph at the top.
         let mut events = open_first_book();
-        events.extend([open_reading_menu(), tap_reading_row(6)]);
+        events.extend([open_reading_menu(), tap_reading_row(7)]);
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
         assert!(
@@ -10344,7 +10344,7 @@ mod library_tabs {
         // Larger text (Text › Size): same paragraph stays on the page, the
         // sheet stays up, and the whole page re-flowed, so a Full.
         ui.sheet = Some(Sheet::BookReading);
-        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
+        ui.tap_sheet(W / 2, reading_row_y(4)).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookText { .. })));
         let next = super::text_sheet::step_of(44) + 1;
         let (x, y) = slider_point(&ui, next);
@@ -10394,7 +10394,7 @@ mod library_tabs {
         };
         ui.drag_menu(x0, y0, x1, y1, true).unwrap();
         assert!(matches!(ui.sheet, Some(Sheet::BookReading)));
-        ui.handle_tap(W / 2, reading_row_y(3)).unwrap();
+        ui.handle_tap(W / 2, reading_row_y(4)).unwrap();
         assert_eq!(ui.sheet, Some(Sheet::BookText { preview: None }));
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
         let s = ui.text_sheet_layout();
@@ -10783,7 +10783,7 @@ mod library_tabs {
             tap_reader(ReaderZone::NextPage),
             tap_reader(ReaderZone::NextPage),
             open_reading_menu(),
-            tap_reading_row(6),
+            tap_reading_row(7),
             tap_today(),
         ]);
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -11108,8 +11108,8 @@ mod library_tabs {
         let mut ui = app(&lib, FakeGateway::default(), open_first_book());
         ui.run().unwrap();
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[2].0, "Mark this page");
-        ui.tap_sheet(W / 2, reading_row_y(2)).unwrap();
+        assert_eq!(ui.sheet_rows().1[3].0, "Mark this page");
+        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
         assert!(ui.sheet.is_none());
         assert_eq!(
             gideon_core::BookPlaces::load(&books)
@@ -11121,8 +11121,8 @@ mod library_tabs {
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Full));
         assert!(ui.display().pixel(W - 2, 1) < 0x40);
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[2].0, "Unmark this page");
-        ui.tap_sheet(W / 2, reading_row_y(2)).unwrap();
+        assert_eq!(ui.sheet_rows().1[3].0, "Unmark this page");
+        ui.tap_sheet(W / 2, reading_row_y(3)).unwrap();
         assert!(gideon_core::BookPlaces::load(&books)
             .bookmarks("Kurt Vonnegut/book-0001.epub")
             .is_empty());
@@ -11364,8 +11364,8 @@ mod library_tabs {
         // Paper: the margin is white.
         assert!(ui.display().pixel(margin / 2, top) > 0xf0);
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[4].1, "Off");
-        ui.tap_sheet(W / 2, reading_row_y(4)).unwrap();
+        assert_eq!(ui.sheet_rows().1[5].1, "Off");
+        ui.tap_sheet(W / 2, reading_row_y(5)).unwrap();
         assert!(ui.sheet.is_none());
         assert!(
             ui.display().pixel(margin / 2, top) < 0x10,
@@ -11383,8 +11383,8 @@ mod library_tabs {
         again.run().unwrap();
         assert!(again.display().pixel(margin / 2, top) < 0x10);
         again.sheet = Some(Sheet::BookReading);
-        assert_eq!(again.sheet_rows().1[4].1, "On");
-        again.tap_sheet(W / 2, reading_row_y(4)).unwrap();
+        assert_eq!(again.sheet_rows().1[5].1, "On");
+        again.tap_sheet(W / 2, reading_row_y(5)).unwrap();
         assert!(again.display().pixel(margin / 2, top) > 0xf0);
         assert!(!again.load_settings().book_night);
     }
@@ -11402,8 +11402,8 @@ mod library_tabs {
             other => panic!("expected the reader, got {other:?}"),
         };
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[5].1, "Portrait");
-        ui.tap_sheet(W / 2, reading_row_y(5)).unwrap();
+        assert_eq!(ui.sheet_rows().1[6].1, "Portrait");
+        ui.tap_sheet(W / 2, reading_row_y(6)).unwrap();
         assert!(ui.sheet.is_none());
         // The reading frame is now the panel on its side: wider, shorter,
         // so fewer lines fit a page; whole repaint.
@@ -11436,7 +11436,7 @@ mod library_tabs {
         };
         assert_eq!(*page, 1);
         ui.sheet = Some(Sheet::BookReading);
-        assert_eq!(ui.sheet_rows().1[5].1, "Landscape");
+        assert_eq!(ui.sheet_rows().1[6].1, "Landscape");
     }
 
     /// Input that flushes like the Kobo's: `discard_taps` really drops what
@@ -12544,6 +12544,7 @@ mod internet_archive {
 // `GIDEON_SHOTS=<dir> cargo test -p gideon-app -- --ignored reader_tools::shots`.
 
 mod reader_tools {
+    use super::super::highlights::SELECTION_FULL_EVERY;
     use super::*;
 
     pub(super) const PROSE: [&str; 6] = [
@@ -12579,6 +12580,231 @@ mod reader_tools {
         ui
     }
 
+    type Big = UiApp<MemoryDisplay, FakeInput, FakeGateway>;
+
+    /// The centre of the page word at `pos`.
+    fn word_at(ui: &Big, pos: (usize, usize)) -> (u32, u32) {
+        let w = ui
+            .page_words()
+            .into_iter()
+            .find(|w| w.pos == pos)
+            .unwrap_or_else(|| panic!("no word {pos:?} on the page"));
+        (w.rect.0 + w.rect.2 / 2, w.rect.1 + w.rect.3 / 2)
+    }
+
+    /// The first two text paragraphs on the page, by block.
+    fn two_blocks(ui: &Big) -> (usize, usize) {
+        let mut blocks: Vec<usize> = ui.page_words().iter().map(|w| w.pos.0).collect();
+        blocks.dedup();
+        // Past the chapter heading.
+        (blocks[1], blocks[2])
+    }
+
+    fn last_flush(ui: &Big) -> RefreshMode {
+        *ui.display().flushes.last().unwrap()
+    }
+
+    fn highlights(dir: &Path) -> Vec<gideon_core::Highlight> {
+        gideon_core::BookPlaces::load(&dir.join("Manga/Books"))
+            .highlights("Placeholder Author/harbour.epub")
+            .to_vec()
+    }
+
+    #[test]
+    fn hold_a_word_then_drag_selects_across_lines_without_closing_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, b2) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 0));
+        // The hold, finger still down: the word is selected, Partial.
+        ui.handle_hold(hx, hy).unwrap();
+        assert_eq!(ui.selection, Some(((b1, 0), (b1, 0))));
+        assert_eq!(last_flush(&ui), RefreshMode::Partial);
+        // Drag down onto the next paragraph's third word: the selection
+        // follows, still Partial, and a drag down did NOT close the book.
+        let (tx, ty) = word_at(&ui, (b2, 2));
+        ui.drag_menu(hx, hy, tx, ty, false).unwrap();
+        assert_eq!(ui.selection, Some(((b1, 0), (b2, 2))));
+        assert_eq!(last_flush(&ui), RefreshMode::Partial);
+        assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+        // The selected words are drawn inverted: white ink on black.
+        let marks = ui.page_marks();
+        assert!(marks
+            .iter()
+            .any(|(_, m)| *m == super::super::highlights::Mark::Selected));
+        // Lift: the highlight sheet, over the unmoved page (Partial).
+        ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+        assert_eq!(ui.sheet, Some(Sheet::Highlight { existing: None }));
+        assert_eq!(last_flush(&ui), RefreshMode::Partial);
+        assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+    }
+
+    #[test]
+    fn a_long_drag_gives_ghosting_a_full_refresh_now_and_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let words: Vec<(u32, u32)> = ui
+            .page_words()
+            .iter()
+            .filter(|w| w.pos.0 == b1)
+            .map(|w| (w.rect.0 + w.rect.2 / 2, w.rect.1 + w.rect.3 / 2))
+            .collect();
+        let (hx, hy) = words[0];
+        ui.handle_hold(hx, hy).unwrap();
+        let before = ui.display().flushes.len();
+        for &(x, y) in &words[1..] {
+            ui.drag_menu(hx, hy, x, y, false).unwrap();
+        }
+        let during = &ui.display().flushes[before..];
+        assert!(
+            during.len() >= SELECTION_FULL_EVERY as usize,
+            "{} repaints",
+            during.len()
+        );
+        assert!(during.contains(&RefreshMode::Full), "a periodic Full");
+        assert!(
+            during
+                .iter()
+                .filter(|m| **m == RefreshMode::Partial)
+                .count()
+                > during.len() / 2,
+            "mostly Partial"
+        );
+    }
+
+    #[test]
+    fn a_colour_saves_the_highlight_draws_it_in_colour_and_it_survives_a_new_font() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 1));
+        let (tx, ty) = word_at(&ui, (b1, 3));
+        ui.handle_hold(hx, hy).unwrap();
+        ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+        let (_, _, colors, _) = ui.highlight_sheet_layout();
+        let blue = colors[1];
+        ui.handle_tap(blue.0 + blue.2 / 2, blue.1 + blue.3 / 2)
+            .unwrap();
+        // Saved, as words; the sheet and the selection gone; Full, because
+        // the sheet held part of the page stale.
+        let saved = highlights(dir.path());
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].start, saved[0].end), ((b1, 1), (b1, 3)));
+        assert_eq!(saved[0].color, "blue");
+        assert_eq!(saved[0].text, "harbour was quiet");
+        assert!(ui.sheet.is_none() && ui.selection.is_none());
+        assert_eq!(last_flush(&ui), RefreshMode::Full);
+        // In colour on a colour panel: the band is the blue, the text black.
+        let rgb = ui.compose_color_current().unwrap().expect("a colour page");
+        let blue_rgb = super::super::highlights::highlight_rgb("blue");
+        assert!(rgb.pixels.chunks(3).any(|p| p == blue_rgb));
+        assert_eq!(ui.display().blits.last(), Some(&true));
+        // A new font re-flows the page; the highlight is the same words.
+        let mut st = ui.load_settings();
+        st.book_font = "garamond".into();
+        ui.save_settings(&st);
+        ui.reflow_book().unwrap();
+        let marks = ui.page_marks();
+        let banded: usize = marks
+            .iter()
+            .filter(
+                |(_, m)| matches!(m, super::super::highlights::Mark::Highlight(c) if c == "blue"),
+            )
+            .count();
+        assert!(banded >= 1, "still drawn after the re-flow");
+    }
+
+    #[test]
+    fn a_tap_on_a_highlight_opens_it_and_remove_takes_it_off_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 4));
+        let (tx, ty) = word_at(&ui, (b1, 6));
+        ui.handle_hold(hx, hy).unwrap();
+        ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+        let (_, _, colors, actions) = ui.highlight_sheet_layout();
+        ui.handle_tap(colors[0].0 + 5, colors[0].1 + 5).unwrap();
+        assert_eq!(highlights(dir.path())[0].color, "yellow");
+        // A tap on it: its sheet (Partial), not a page turn.
+        let (mx, my) = word_at(&ui, (b1, 5));
+        ui.handle_tap(mx, my).unwrap();
+        assert_eq!(ui.sheet, Some(Sheet::Highlight { existing: Some(0) }));
+        assert_eq!(last_flush(&ui), RefreshMode::Partial);
+        // Pink: the colour changes in place.
+        ui.handle_tap(colors[2].0 + 5, colors[2].1 + 5).unwrap();
+        assert_eq!(highlights(dir.path())[0].color, "pink");
+        // Open again, Remove (the right-hand action).
+        ui.handle_tap(mx, my).unwrap();
+        ui.handle_tap(actions[1].0 + 5, actions[1].1 + 5).unwrap();
+        assert!(highlights(dir.path()).is_empty());
+        assert!(ui.page_marks().is_empty());
+        assert_eq!(last_flush(&ui), RefreshMode::Full);
+    }
+
+    #[test]
+    fn hold_and_lift_on_one_word_is_its_definition_with_highlight_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        super::library_tabs::write_stardict(
+            &dir.path().join("data/dicts"),
+            "wordnet",
+            &[("harbour", "n. a sheltered place for ships")],
+        );
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (x, y) = word_at(&ui, (b1, 1));
+        ui.handle_hold(x, y).unwrap();
+        ui.handle_long_press(x, y).unwrap();
+        let Some(Sheet::Definition { word, .. }) = ui.sheet.clone() else {
+            panic!("expected a definition, got {:?}", ui.sheet);
+        };
+        assert_eq!(word, "harbour");
+        let (_, rows) = ui.sheet_rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(&labels[labels.len() - 2..], ["Highlight", "Close"]);
+        // Highlight: saved yellow, the one word.
+        let i = rows.len() - 2;
+        let row_y = {
+            let (top, h) = ui.sheet_bounds().unwrap();
+            let row_h = ui.layout.row_h;
+            let title_h = h - row_h * rows.len() as u32;
+            top + title_h + row_h * i as u32 + row_h / 2
+        };
+        ui.handle_tap(ui.layout.width / 2, row_y).unwrap();
+        let saved = highlights(dir.path());
+        assert_eq!(
+            (saved[0].start, saved[0].end, saved[0].color.as_str()),
+            ((b1, 1), (b1, 1), "yellow")
+        );
+        assert!(ui.selection.is_none());
+    }
+
+    #[test]
+    fn the_reading_menu_lists_highlights_and_one_tap_goes_back_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 0));
+        let (tx, ty) = word_at(&ui, (b1, 2));
+        ui.handle_hold(hx, hy).unwrap();
+        ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+        let (_, _, colors, _) = ui.highlight_sheet_layout();
+        ui.handle_tap(colors[0].0 + 5, colors[0].1 + 5).unwrap();
+        ui.sheet = Some(Sheet::BookReading);
+        let (_, rows) = ui.sheet_rows();
+        assert_eq!(rows[2].0, "Highlights");
+        ui.open_book_highlights().unwrap();
+        let Screen::BookHighlights { entries, .. } = ui.screen() else {
+            panic!("expected the list, got {:?}", ui.screen());
+        };
+        assert_eq!(entries[0].text, "The harbour was");
+        ui.sheet = None;
+        let row = ui.layout.row_top(0) + ui.layout.row_h / 2;
+        ui.handle_tap(ui.layout.width / 2, row).unwrap();
+        assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+    }
+
     fn save(ui: &UiApp<MemoryDisplay, FakeInput, FakeGateway>, out: &Path, name: &str) {
         let rgb = ui.compose_final().unwrap();
         image::RgbImage::from_raw(rgb.width, rgb.height, rgb.pixels)
@@ -12606,6 +12832,36 @@ mod reader_tools {
         ui.sheet = Some(Sheet::BookFonts);
         save(&ui, &out, "t2-font-list");
         ui.sheet = None;
+        // Highlights: a selection being dragged, its sheet, then three
+        // saved highlights in their colours, on a fresh reader.
+        {
+            let hdir = tempfile::tempdir().unwrap();
+            let mut ui = big_reader(hdir.path());
+            let mut st = ui.load_settings();
+            st.book_font = "literata".into();
+            ui.save_settings(&st);
+            ui.reflow_book().unwrap();
+            let (b1, b2) = two_blocks(&ui);
+            let (hx, hy) = word_at(&ui, (b2, 0));
+            let (tx, ty) = word_at(&ui, (b2, 9));
+            ui.handle_hold(hx, hy).unwrap();
+            ui.drag_menu(hx, hy, tx, ty, false).unwrap();
+            save(&ui, &out, "h1-selecting");
+            ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+            save(&ui, &out, "h2-sheet");
+            let (_, _, colors, _) = ui.highlight_sheet_layout();
+            ui.handle_tap(colors[0].0 + 5, colors[0].1 + 5).unwrap();
+            for (blk, from, to, c) in [(b1, 4, 9, 1usize), (b2 + 1, 0, 6, 2)] {
+                let (hx, hy) = word_at(&ui, (blk, from));
+                let (tx, ty) = word_at(&ui, (blk, to));
+                ui.handle_hold(hx, hy).unwrap();
+                ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+                ui.handle_tap(colors[c].0 + 5, colors[c].1 + 5).unwrap();
+            }
+            save(&ui, &out, "h3-highlighted");
+            ui.open_book_highlights().unwrap();
+            save(&ui, &out, "h4-list");
+        }
         for f in FontFamily::ALL {
             let mut st = ui.load_settings();
             st.book_font = f.name().into();

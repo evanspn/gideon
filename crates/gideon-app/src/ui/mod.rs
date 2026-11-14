@@ -13,6 +13,7 @@
 
 mod book_search;
 mod gateway;
+mod highlights;
 mod layout;
 mod text_sheet;
 /// The entry after `current` in `choices`, wrapping; the first when
@@ -376,6 +377,9 @@ enum Sheet {
     },
     /// The Text sheet's font list: twelve faces, each named in itself.
     BookFonts,
+    /// What to do with a selection (`existing: None`) or a highlight tapped
+    /// on the page: colours, Define / note, Remove. See `highlights`.
+    Highlight { existing: Option<usize> },
     /// A word looked up: the headword as the dictionary spells it, and its
     /// definition wrapped to the sheet's width.
     Definition { word: String, lines: Vec<String> },
@@ -675,6 +679,17 @@ enum Screen {
         entries: Vec<gideon_core::Bookmark>,
         page: usize,
     },
+    /// The open book's highlights, pushed over its reader; a tap jumps there.
+    BookHighlights {
+        entries: Vec<gideon_core::Highlight>,
+        page: usize,
+    },
+    /// The keyboard, typing a highlight's note.
+    HighlightNote {
+        book: String,
+        index: usize,
+        note: String,
+    },
     Sources {
         rows: Vec<SourceRow>,
         page: usize,
@@ -915,6 +930,10 @@ pub struct BookLine {
     pub block: usize,
     /// Which wrapped line of that block this is.
     pub line: usize,
+    /// The paragraph's word this line starts at (words are its
+    /// space-separated tokens), so a word on the page has a place that
+    /// survives re-flow: (block, word0 + its index on the line).
+    pub word0: usize,
     /// A picture occupying this line and the `rows - 1` after it, scaled
     /// to `width × height` pixels. `text` is empty on such a line.
     pub image: Option<BookImage>,
@@ -997,6 +1016,7 @@ pub fn paginate_chapter_with(
                 bold: false,
                 block: i,
                 line: 0,
+                word0: 0,
                 image: None,
             });
         }
@@ -1020,6 +1040,7 @@ pub fn paginate_chapter_with(
                         bold: false,
                         block: i,
                         line: 0,
+                        word0: 0,
                         image: Some(BookImage {
                             href: href.clone(),
                             width: w,
@@ -1032,7 +1053,7 @@ pub fn paginate_chapter_with(
                 None => (gideon_core::Rich::from("[Illustration]"), false),
             },
         };
-        for (n, spans) in wrap_spans(px, family, &rich, max_w, bold)
+        for (n, (spans, word0)) in wrap_spans(px, family, &rich, max_w, bold)
             .into_iter()
             .enumerate()
         {
@@ -1042,6 +1063,7 @@ pub fn paginate_chapter_with(
                 bold,
                 block: i,
                 line: n,
+                word0,
                 image: None,
             });
         }
@@ -1082,7 +1104,7 @@ fn wrap_spans(
     rich: &gideon_core::Rich,
     max_w: u32,
     heading: bool,
-) -> Vec<Vec<BookSpan>> {
+) -> Vec<(Vec<BookSpan>, usize)> {
     use gideon_render::text::measure_text_styled;
     // Words as lists of fragments.
     let mut words: Vec<Vec<BookSpan>> = Vec::new();
@@ -1126,9 +1148,11 @@ fn wrap_spans(
     };
     let space_w = measure_text_in(px, " ", heading, family).max(1);
 
-    let mut lines: Vec<Vec<BookSpan>> = Vec::new();
+    let mut lines: Vec<(Vec<BookSpan>, usize)> = Vec::new();
     let mut current: Vec<BookSpan> = Vec::new();
     let mut current_w = 0u32;
+    // The word the line being built starts at.
+    let mut current_start = 0usize;
     let push_frags = |current: &mut Vec<BookSpan>, frags: &[BookSpan]| {
         for f in frags {
             match current.last_mut() {
@@ -1144,9 +1168,10 @@ fn wrap_spans(
             last.text.push(' ');
         }
     };
-    for frags in words {
+    for (wi, frags) in words.into_iter().enumerate() {
         let w = width_of(&frags);
         if current.is_empty() {
+            current_start = wi;
             if w <= max_w {
                 push_frags(&mut current, &frags);
                 current_w = w;
@@ -1158,8 +1183,9 @@ fn wrap_spans(
             current_w += space_w + w;
             continue;
         } else {
-            lines.push(std::mem::take(&mut current));
+            lines.push((std::mem::take(&mut current), current_start));
             current_w = 0;
+            current_start = wi;
             if w <= max_w {
                 push_frags(&mut current, &frags);
                 current_w = w;
@@ -1177,8 +1203,10 @@ fn wrap_spans(
                 };
                 let cw = measure_text_styled(px, &one.text, one.style(family));
                 if current_w + cw > max_w && !current.is_empty() {
-                    lines.push(std::mem::take(&mut current));
+                    lines.push((std::mem::take(&mut current), current_start));
                     current_w = 0;
+                    // The rest of a split word is still word `wi`.
+                    current_start = wi;
                 }
                 push_frags(&mut current, std::slice::from_ref(&one));
                 current_w += cw;
@@ -1186,7 +1214,7 @@ fn wrap_spans(
         }
     }
     if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
+        lines.push((current, current_start));
     }
     lines
 }
@@ -1484,6 +1512,11 @@ pub struct UiApp<D: Display, I: InputSource, G: SourceGateway> {
     /// The open modal sheet, if any. A sheet layers over whatever screen is
     /// underneath instead of replacing it, so dismissing one never navigates.
     sheet: Option<Sheet>,
+    /// A text selection being made in the book reader: (anchor, focus) as
+    /// (paragraph, word) in the open chapter. See `highlights`.
+    selection: Option<((usize, usize), (usize, usize))>,
+    /// Partial repaints since the selection started, for its periodic Full.
+    selection_paints: u32,
     /// Which page of the grouped Settings screen is showing. Settings is
     /// taller than any panel gideon runs on, so it pages like every other
     /// list; reset whenever Settings is entered afresh.
@@ -1583,6 +1616,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             charger: None,
             cover_cache: std::cell::RefCell::new(CoverCache::default()),
             sheet: None,
+            selection: None,
+            selection_paints: 0,
             settings_page: 0,
             progress_cache: std::cell::RefCell::new(None),
             index_guard: Arc::new(Mutex::new(())),
@@ -2213,6 +2248,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // the book (its place is saved). The reading menu is the manga
         // reader's controls gesture: a flick up off the bottom edge.
         if matches!(self.screen(), Screen::BookReader { .. }) {
+            // A tap on a highlight opens it, wherever on the page it is.
+            if self.tap_on_highlight(x, y)? {
+                return Ok(Flow::Continue);
+            }
             return match layout::reader_zone_in_width(self.layout.width, x) {
                 ReaderZone::PrevPage => self.turn_book_page(-1).map(|_| Flow::Continue),
                 ReaderZone::NextPage => self.turn_book_page(1).map(|_| Flow::Continue),
@@ -2337,8 +2376,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Long press: a library card opens its book menu; a chapter row
     /// downloads that chapter without opening the reader. Everywhere else
     /// a long press is just a slow tap.
-    fn handle_hold(&mut self, _x: u32, _y: u32) -> Result<Flow> {
-        Ok(Flow::Continue)
+    /// A press still held down: in the book reader it starts a selection on
+    /// the word under it (see `highlights`); elsewhere it waits for the
+    /// LongPress at lift.
+    fn handle_hold(&mut self, x: u32, y: u32) -> Result<Flow> {
+        self.hold_in_reader(x, y)
     }
 
     fn handle_long_press(&mut self, x: u32, y: u32) -> Result<Flow> {
@@ -2418,6 +2460,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             }
             // A long press on a word looks it up; on the margin or a blank
             // it marks the page (or unmarks it). The reading menu has both.
+            // A hold that started a selection ends here when the finger did
+            // not move: one word, so its definition (with Highlight on it).
+            Screen::BookReader { .. } if self.sheet.is_none() && self.selection.is_some() => {
+                self.finish_selection()
+            }
             Screen::BookReader { .. } if self.sheet.is_none() => match self.book_word_at(x, y) {
                 Some(word) => self.look_up(&word),
                 None => self.toggle_bookmark(),
@@ -2595,6 +2642,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Some(Screen::BookSeries { books, .. }) => books.len().div_ceil(per_page),
             Some(Screen::BookContents { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::BookBookmarks { entries, .. }) => entries.len().div_ceil(per_page),
+            Some(Screen::BookHighlights { entries, .. }) => entries.len().div_ceil(per_page),
             Some(Screen::Sources { rows, .. }) => rows.len().div_ceil(per_page),
             Some(Screen::SearchResults { results, .. }) => (results.len() + 1).div_ceil(per_page),
             Some(Screen::Popular { mangas, .. }) => mangas.len().div_ceil(per_page),
@@ -2629,6 +2677,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 | Screen::BookShelf { page, .. }
                 | Screen::BookContents { page, .. }
                 | Screen::BookBookmarks { page, .. }
+                | Screen::BookHighlights { page, .. }
                 | Screen::Sources { page, .. }
                 | Screen::SearchResults { page, .. }
                 | Screen::Popular { page, .. }
@@ -2661,6 +2710,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             Screen::BookSeries { books, page, .. } => (page, books.len().div_ceil(per_page)),
             Screen::BookContents { entries, page, .. } => (page, entries.len().div_ceil(per_page)),
             Screen::BookBookmarks { entries, page } => (page, entries.len().div_ceil(per_page)),
+            Screen::BookHighlights { entries, page } => (page, entries.len().div_ceil(per_page)),
             Screen::Sources { rows, page } => (page, rows.len().div_ceil(per_page)),
             // +1 for the trailing "Search more sources" row.
             Screen::SearchResults { results, page, .. } => {
@@ -2916,6 +2966,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 vec![
                     ("Contents".into(), "›".into(), false),
                     ("Bookmarks".into(), "›".into(), false),
+                    ("Highlights".into(), "›".into(), false),
                     (
                         if self.page_is_bookmarked() {
                             "Unmark this page"
@@ -2959,6 +3010,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .iter()
                     .map(|l| (l.clone(), String::new(), false))
                     .collect();
+                // Looked up from a held word: it can be highlighted from here.
+                if self.selection.is_some() {
+                    rows.push(("Highlight".into(), String::new(), false));
+                }
                 rows.push(("Close".into(), String::new(), true));
                 (word.clone(), rows)
             }
@@ -2975,7 +3030,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 ],
             ),
             // Controls, not rows: laid out by `text_sheet`.
-            Some(Sheet::BookText { .. } | Sheet::BookFonts) => (String::new(), Vec::new()),
+            Some(Sheet::BookText { .. } | Sheet::BookFonts | Sheet::Highlight { .. }) => {
+                (String::new(), Vec::new())
+            }
             Some(Sheet::CleanFinishedBooks { ref books }) => {
                 let n = books.len();
                 let noun = if n == 1 { "book" } else { "books" };
@@ -3057,6 +3114,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             let s = self.font_sheet_layout();
             return Some((s.top, s.height));
         }
+        if matches!(self.sheet, Some(Sheet::Highlight { .. })) {
+            let (top, height, ..) = self.highlight_sheet_layout();
+            return Some((top, height));
+        }
         if matches!(self.sheet, Some(Sheet::BookDownload { .. })) {
             let s = self.download_sheet_layout();
             return Some((s.top, s.height));
@@ -3088,6 +3149,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if matches!(self.sheet, Some(Sheet::BookFonts)) {
             return self.overlay_font_sheet(canvas);
+        }
+        if let Some(Sheet::Highlight { existing }) = self.sheet {
+            return self.overlay_highlight_sheet(canvas, existing);
         }
         let Some((y, h)) = self.sheet_bounds() else {
             return;
@@ -3347,8 +3411,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.sheet, Some(Sheet::BookFonts)) {
             return self.tap_font_sheet(x, y);
         }
+        if let Some(Sheet::Highlight { existing }) = self.sheet {
+            return self.tap_highlight_sheet(x, y, existing);
+        }
         if self.tap_sheet_close(x, y) {
             self.sheet = None;
+            self.selection = None;
             return self
                 .render_current(RefreshMode::Full)
                 .map(|_| Flow::Continue);
@@ -3361,6 +3429,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         };
         if y < top {
             self.sheet = None;
+            self.selection = None;
             return self
                 .render_current(RefreshMode::Full)
                 .map(|_| Flow::Continue);
@@ -3515,7 +3584,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 match index {
                     0 => self.open_book_contents()?,
                     1 => self.open_book_bookmarks()?,
-                    2 => {
+                    2 => self.open_book_highlights()?,
+                    3 => {
                         // The sheet closing reveals the page whole, so
                         // this one is a flash, unlike the long-press.
                         let set = self.flip_bookmark();
@@ -3524,21 +3594,21 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.book_banner = None;
                         result?;
                     }
-                    3 => {
+                    4 => {
                         // One sheet replaces another over a page that has
                         // not moved: the sheet region alone changes.
                         self.sheet = Some(Sheet::BookText { preview: None });
                         self.render_current(RefreshMode::Partial)?;
                     }
-                    4 => {
+                    5 => {
                         // Every pixel flips: a flash, never a partial.
                         let mut settings = self.load_settings();
                         settings.book_night = !settings.book_night;
                         self.save_settings(&settings);
                         self.render_current(RefreshMode::Full)?;
                     }
-                    5 => self.rotate_book_reader()?,
-                    6 => {
+                    6 => self.rotate_book_reader()?,
+                    7 => {
                         self.save_book_place();
                         return self.pop();
                     }
@@ -3551,7 +3621,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // The definition's own lines are not buttons.
                     return Ok(Flow::Continue);
                 }
+                if index == lines.len() && self.selection.is_some() {
+                    self.save_selection(gideon_core::HIGHLIGHT_COLORS[0]);
+                }
                 self.sheet = None;
+                self.selection = None;
                 self.render_current(RefreshMode::Full)?;
                 Ok(Flow::Continue)
             }
@@ -3559,16 +3633,20 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 0 => Ok(Flow::Continue),
                 1 => {
                     self.sheet = None;
+                    self.selection = None;
                     self.install_dictionary()
                 }
                 _ => {
                     self.sheet = None;
+                    self.selection = None;
                     self.render_current(RefreshMode::Full)?;
                     Ok(Flow::Continue)
                 }
             },
             // Routed whole in tap_sheet, before any row arithmetic.
-            Some(Sheet::BookText { .. } | Sheet::BookFonts) => Ok(Flow::Continue),
+            Some(Sheet::BookText { .. } | Sheet::BookFonts | Sheet::Highlight { .. }) => {
+                Ok(Flow::Continue)
+            }
             Some(Sheet::ConfirmDeleteBook { book }) => {
                 self.sheet = None;
                 if index == 0 {
@@ -3662,6 +3740,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         }
         if let Some(row) = self.quick_slider_at(y0) {
             self.scrub_quick_slider(row, x1)?;
+            return Ok(Flow::Continue);
+        }
+        // A selection being dragged in the book reader takes the drag, so a
+        // drag down the page selects lines rather than closing the book.
+        if matches!(self.stack.last(), Some(Screen::BookReader { .. }))
+            && self.drag_selection(x1, y1, released)?
+        {
             return Ok(Flow::Continue);
         }
         // The book reader has the manga reader's lamp controls: a slide up
@@ -3774,6 +3859,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let (top, grid, actions_top) = (sheet.top, sheet.grid, sheet.actions_top);
         if y < top {
             self.sheet = None;
+            self.selection = None;
             return self
                 .render_current(RefreshMode::Full)
                 .map(|_| Flow::Continue);
@@ -4039,6 +4125,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     self.jump_to_place(mark.chapter, (mark.block, mark.line))?;
                 }
                 Ok(Flow::Continue)
+            }
+            Screen::BookHighlights { entries, page } => {
+                let index = page * self.layout.rows_per_page() + row;
+                if let Some(h) = entries.get(index).cloned() {
+                    self.jump_to_place(h.chapter, (h.start.0, 0))?;
+                }
+                Ok(Flow::Continue)
+            }
+            Screen::HighlightNote { book, index, note } => {
+                self.tap_highlight_note(&book, index, &note, x, y)
             }
             Screen::BookShelf { books, page } => {
                 let cards = self.book_cards(&books);
@@ -7250,6 +7346,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if matches!(self.stack.last(), Some(Screen::Home)) {
             return Ok(Some(self.compose_discover()));
         }
+        if matches!(self.stack.last(), Some(Screen::BookReader { .. })) {
+            return self.compose_highlighted_page();
+        }
         match self.stack.last() {
             Some(Screen::BookResults {
                 query,
@@ -8477,6 +8576,23 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     .collect();
                 compose_list(l, "Bookmarks", &rows, *page, l.page_count(entries.len()))
             }
+            Screen::BookHighlights { entries, page } => {
+                let rows: Vec<(String, bool)> = paged(entries, *page, per_page)
+                    .iter()
+                    .map(|h| {
+                        let note = if h.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", h.note)
+                        };
+                        (format!("{} · “{}”{note}", h.chapter + 1, h.text), false)
+                    })
+                    .collect();
+                compose_list(l, "Highlights", &rows, *page, l.page_count(entries.len()))
+            }
+            Screen::HighlightNote { note, .. } => {
+                compose_keyboard(l, "Note", note, "Save", self.keyboard_shift)
+            }
             Screen::Sources { rows, page } => {
                 let labels: Vec<(String, bool)> = paged(rows, *page, per_page)
                     .iter()
@@ -9135,6 +9251,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             None => {
                 let shown = gideon_core::dict::trim_word(word);
                 self.book_banner = Some(format!("No entry for “{shown}”"));
+                self.selection = None;
                 let result = self.render_current(RefreshMode::Partial);
                 self.book_banner = None;
                 result?;
@@ -9183,7 +9300,11 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn jump_to_place(&mut self, chapter: usize, place: (usize, usize)) -> Result<()> {
         if matches!(
             self.stack.last(),
-            Some(Screen::BookContents { .. } | Screen::BookBookmarks { .. })
+            Some(
+                Screen::BookContents { .. }
+                    | Screen::BookBookmarks { .. }
+                    | Screen::BookHighlights { .. }
+            )
         ) {
             self.stack.pop();
         }
@@ -9384,6 +9505,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 }
             }
         }
+        // Highlight bands go down first, so the text is drawn over them.
+        let marks = self.page_marks();
+        self.paint_highlight_bands(&mut canvas, &marks);
         let mut y = top;
         for line in pages.get(page).map(|p| p.as_slice()).unwrap_or(&[]) {
             if let Some(img) = &line.image {
@@ -9483,6 +9607,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             place_w,
             false,
         );
+        // The selection last, inverted over its words.
+        Self::paint_selection(&mut canvas, &marks);
         if self.load_settings().book_night {
             for p in &mut canvas.pixels {
                 *p = 255 - *p;
