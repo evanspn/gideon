@@ -1915,6 +1915,17 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         Err(e) => self.show_error(&e)?,
                     }
                 }
+                // A press still held down at the long-press time. Only the
+                // book reader acts on it (a text selection a drag extends);
+                // everything else waits for the LongPress at lift.
+                Ok(UiEvent::Hold { x, y }) => {
+                    let (x, y) = self.map_menu_point(x, y);
+                    match self.handle_hold(x, y) {
+                        Ok(Flow::Quit(exit)) => return Ok(exit),
+                        Ok(Flow::Continue) => {}
+                        Err(e) => self.show_error(&e)?,
+                    }
+                }
                 // Physical page-turn buttons and the Bluetooth remote both page
                 // through whatever list is on screen (library shelf, sources,
                 // results…). Paging a list is orientation-independent, so the
@@ -2320,6 +2331,10 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Long press: a library card opens its book menu; a chapter row
     /// downloads that chapter without opening the reader. Everywhere else
     /// a long press is just a slow tap.
+    fn handle_hold(&mut self, _x: u32, _y: u32) -> Result<Flow> {
+        Ok(Flow::Continue)
+    }
+
     fn handle_long_press(&mut self, x: u32, y: u32) -> Result<Flow> {
         let screen = self.stack.last().cloned().expect("stack never empty");
         match screen {
@@ -6777,6 +6792,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     // Press-and-hold zooms into the comic frame under the finger
                     // (KOReader's panel zoom); holding again leaves zoom. While
                     // zoomed, taps step frames and a centre tap also exits.
+                    // The manga reader acts on the LongPress at lift, as before.
+                    Ok(UiEvent::Hold { .. }) => {}
                     Ok(UiEvent::LongPress { x, y }) => {
                         if reader.panel_zoom_active() {
                             reader.exit_panel_zoom()?;

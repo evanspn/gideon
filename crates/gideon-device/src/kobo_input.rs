@@ -179,6 +179,9 @@ pub struct TouchTracker {
     /// The position of the last in-flight report we emitted, so a finger
     /// holding still does not generate motion at the panel's report rate.
     reported: Option<(i32, i32)>,
+    /// This contact has already been offered as a hold (see
+    /// [`RawTouch::Held`]); a contact is offered once.
+    hold_offered: bool,
 }
 
 /// A completed raw gesture: start position, end position, hold time (ms).
@@ -189,6 +192,10 @@ pub type RawGesture = ((u32, u32), (u32, u32), u64);
 pub enum RawTouch {
     /// The finger is still down and has moved since the last report.
     Moved { start: (u32, u32), at: (u32, u32) },
+    /// The finger has been down for the long-press time and is still down.
+    /// Offered once per contact; whether it counts as a hold (it has not
+    /// travelled) is the caller's call, in screen pixels.
+    Held { start: (u32, u32), at: (u32, u32) },
     /// The finger lifted.
     Done(RawGesture),
 }
@@ -255,6 +262,9 @@ impl TouchTracker {
             // can follow. Only on actual movement — a finger resting on the
             // panel reports continuously.
             (EV_SYN, SYN_REPORT) if self.touching => {
+                if let Some(held) = self.held(ev_millis(ev)) {
+                    return Some(held);
+                }
                 return self.moved();
             }
             _ => {}
@@ -286,6 +296,27 @@ impl TouchTracker {
         })
     }
 
+    /// Offer the contact as a hold the first time a report arrives after
+    /// the long-press time with the finger still down.
+    fn held(&mut self, now_ms: u64) -> Option<RawTouch> {
+        if self.hold_offered {
+            return None;
+        }
+        let down = self.down_ms?;
+        if now_ms.saturating_sub(down) < LONG_PRESS_MS {
+            return None;
+        }
+        self.hold_offered = true;
+        let (x, y) = (self.last_x?, self.last_y?);
+        Some(RawTouch::Held {
+            start: (
+                self.first_x.unwrap_or(x).max(0) as u32,
+                self.first_y.unwrap_or(y).max(0) as u32,
+            ),
+            at: (x.max(0) as u32, y.max(0) as u32),
+        })
+    }
+
     /// Mark the contact as active, stamping its start time on the
     /// transition (idle -> touching) only.
     fn begin_contact(&mut self, ev: &libc::input_event) {
@@ -298,6 +329,7 @@ impl TouchTracker {
     fn finish_tap(&mut self, now_ms: u64) -> Option<RawTouch> {
         self.release_seen = false;
         self.reported = None;
+        self.hold_offered = false;
         let (first_x, first_y) = (self.first_x.take(), self.first_y.take());
         let down_ms = self.down_ms.take();
         if !self.touching {
@@ -358,6 +390,16 @@ fn classify_motion(start: (u32, u32), at: (u32, u32)) -> Option<UiEvent> {
         x1: at.0,
         y1: at.1,
     })
+}
+
+/// A contact held for the long-press time is a hold only if it has not left
+/// the tap slop; one already on the move is a drag, and stays one.
+fn classify_hold(start: (u32, u32), at: (u32, u32)) -> Option<UiEvent> {
+    if start.0.abs_diff(at.0) <= TAP_SLOP_PX && start.1.abs_diff(at.1) <= TAP_SLOP_PX {
+        Some(UiEvent::Hold { x: at.0, y: at.1 })
+    } else {
+        None
+    }
 }
 
 /// Queue an event, collapsing a run of in-flight drags into the newest one.
@@ -971,6 +1013,11 @@ impl KoboTouch {
                         }
                         Some(RawTouch::Moved { start, at }) => {
                             if let Some(event) = classify_motion(screen(start), screen(at)) {
+                                queue(pending, event);
+                            }
+                        }
+                        Some(RawTouch::Held { start, at }) => {
+                            if let Some(event) = classify_hold(screen(start), screen(at)) {
                                 queue(pending, event);
                             }
                         }
@@ -1864,6 +1911,60 @@ mod tests {
                 x1: 100,
                 y1: 900
             }
+        );
+    }
+
+    #[test]
+    fn a_finger_held_still_is_offered_once_as_a_hold_while_still_down() {
+        let at = |ms: u64, type_: u16, code: u16, value: i32| {
+            let mut e = ev(type_, code, value);
+            e.time.tv_sec = (ms / 1000) as _;
+            e.time.tv_usec = ((ms % 1000) * 1000) as _;
+            e
+        };
+        let mut t = TouchTracker::new();
+        assert_eq!(t.push(&at(1000, EV_ABS, ABS_MT_POSITION_X, 50)), None);
+        assert_eq!(t.push(&at(1000, EV_ABS, ABS_MT_POSITION_Y, 60)), None);
+        assert_eq!(t.push(&at(1000, EV_SYN, SYN_REPORT, 0)), None);
+        // Before the long-press time: nothing (the finger has not moved).
+        assert_eq!(t.push(&at(1300, EV_SYN, SYN_REPORT, 0)), None);
+        // At it: offered once, with the finger still down…
+        assert_eq!(
+            t.push(&at(1000 + LONG_PRESS_MS, EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Held {
+                start: (50, 60),
+                at: (50, 60)
+            })
+        );
+        // …and never again for this contact.
+        assert_eq!(t.push(&at(1800, EV_SYN, SYN_REPORT, 0)), None);
+        // The lift still reports the whole gesture, so the LongPress at
+        // release is unchanged.
+        assert_eq!(t.push(&at(1900, EV_ABS, ABS_MT_TRACKING_ID, -1)), None);
+        assert_eq!(
+            t.push(&at(1900, EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Done(((50, 60), (50, 60), 900)))
+        );
+        // A new contact can be held again.
+        t.push(&at(3000, EV_ABS, ABS_MT_POSITION_X, 10));
+        t.push(&at(3000, EV_ABS, ABS_MT_POSITION_Y, 10));
+        t.push(&at(3000, EV_SYN, SYN_REPORT, 0));
+        assert!(matches!(
+            t.push(&at(3000 + LONG_PRESS_MS, EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Held { .. })
+        ));
+    }
+
+    #[test]
+    fn a_hold_counts_only_inside_the_tap_slop() {
+        assert_eq!(
+            classify_hold((100, 100), (110, 95)),
+            Some(UiEvent::Hold { x: 110, y: 95 })
+        );
+        // Already on the move when the time came: a drag, not a hold.
+        assert_eq!(
+            classify_hold((100, 100), (100 + TAP_SLOP_PX + 1, 100)),
+            None
         );
     }
 
