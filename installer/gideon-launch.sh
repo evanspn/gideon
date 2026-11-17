@@ -60,6 +60,13 @@ nm_failsafe_heal() {
     if [ -e "$NM_LIB.failsafe" ] && [ ! -e "$NM_LIB" ]; then
         mv "$NM_LIB.failsafe" "$NM_LIB" 2>/dev/null
         sync
+    elif [ -e "$NM_LIB.failsafe" ]; then
+        # Both present: NickelHook renames one into the other, so the two
+        # never coexist inside a live window. This is a leftover (say, a
+        # rescue boot reinstalled the library beside it), and left alone it
+        # would hold up the launch guard below for its whole timeout.
+        rm -f "$NM_LIB.failsafe"
+        sync
     fi
 }
 
@@ -80,10 +87,14 @@ nm_stage_rescue() {
     fi
     work=$(mktemp -d 2>/dev/null) || return 0
     lib_dir=$(dirname "$NM_LIB")
+    # Packed the way NickelHook packs its own KoboRoot.tgz: one file entry,
+    # no directory entries (unpacking those over / would reset the system
+    # folders' modes), mode 0644. We run as root, so the copy is root's.
     mkdir -p "$work/${lib_dir#/}" &&
         cp "$NM_LIB" "$work/${lib_dir#/}/" &&
+        chmod 0644 "$work/${NM_LIB#/}" &&
         mkdir -p "$(dirname "$NM_RESCUE")" "$(dirname "$NM_RESCUE_MARK")" &&
-        (cd "$work" && tar czf "$NM_RESCUE.part" "${lib_dir#/}") &&
+        (cd "$work" && tar czf "$NM_RESCUE.part" "${NM_LIB#/}") &&
         mv "$NM_RESCUE.part" "$NM_RESCUE" &&
         md5sum <"$NM_RESCUE" | cut -d' ' -f1 >"$NM_RESCUE_MARK"
     rm -rf "$work" "$NM_RESCUE.part" 2>/dev/null
@@ -100,6 +111,26 @@ nm_clear_rescue() {
 }
 
 # Sourced by the test suite for the functions above only.
+# Whether nickel's failsafe can still be armed: the library is parked, or
+# nickel is young enough that it may not have been loaded (and parked) yet.
+nm_failsafe_armed() {
+    # The parked library is the authoritative marker when present…
+    [ -e "$NM_LIB.failsafe" ] && return 0
+    # …and nickel's process age covers NickelMenu versions whose failsafe
+    # works differently: field 22 of /proc/<pid>/stat is the start time in
+    # clock ticks (100 Hz on these kernels).
+    pid=$(pidof -s nickel) || return 1
+    age=$(awk -v up="$(cut -d' ' -f1 /proc/uptime)" \
+        '{print int(up - $22 / 100)}' "/proc/$pid/stat" 2>/dev/null)
+    [ -n "$age" ] && [ "$age" -lt 25 ]
+}
+
+# The failsafe window after a nickel (re)start is still open, or nickel is
+# gone: either way the rescue copy is still needed.
+nm_window_open() {
+    nm_failsafe_armed || ! pidof nickel >/dev/null 2>&1
+}
+
 if [ "${GIDEON_LAUNCH_FUNCTIONS_ONLY:-}" = 1 ]; then
     # shellcheck disable=SC2317 # return when sourced, exit when run
     return 0 2>/dev/null || exit 0
@@ -191,17 +222,6 @@ restart_nickel() {
 # Never kill nickel while its failsafe has the library parked (see the
 # NickelMenu protection notes at the top), and never walk away from a nickel
 # we started while it is still parked.
-nm_failsafe_armed() {
-    # The parked library is the authoritative marker when present…
-    [ -e "$NM_LIB.failsafe" ] && return 0
-    # …and nickel's process age covers NickelMenu versions whose failsafe
-    # works differently: field 22 of /proc/<pid>/stat is the start time in
-    # clock ticks (100 Hz on these kernels).
-    pid=$(pidof -s nickel) || return 1
-    age=$(awk -v up="$(cut -d' ' -f1 /proc/uptime)" \
-        '{print int(up - $22 / 100)}' "/proc/$pid/stat" 2>/dev/null)
-    [ -n "$age" ] && [ "$age" -lt 25 ]
-}
 
 i=0
 while nm_failsafe_armed; do
@@ -294,8 +314,15 @@ done
 # the next boot, with nobody left to notice. So don't exit yet: babysit
 # the window until the failsafe disarms, and restore the library ourselves
 # if nickel dies first (or the disarm never comes within ~30 s).
+#
+# "Not parked" alone does not mean the window is over: nickel loads its
+# plugins a moment after its process appears, so right after pidof
+# succeeds the library may not have been parked YET. Clearing the rescue
+# then would drop it just before the window it exists for. So keep watching
+# until nickel is past the age at which the failsafe can still be armed
+# (nm_failsafe_armed: parked, or nickel younger than 25 s).
 i=0
-while [ -e "$NM_LIB.failsafe" ]; do
+while nm_window_open; do
     i=$((i + 1))
     if [ "$i" -ge 120 ]; then
         # Init hung with the failsafe still armed: keep NickelMenu alive

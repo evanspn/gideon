@@ -76,6 +76,39 @@ nm_failsafe_heal
 nm_failsafe_heal   # twice is harmless
 [ -e "$GIDEON_NM_LIB" ] || fail "second heal broke it"
 
+echo "==> the rescue holds one file, like NickelHook's own KoboRoot.tgz"
+reset
+chmod 0600 "$GIDEON_NM_LIB"
+nm_stage_rescue
+entries=$(tar tzvf "$GIDEON_NM_RESCUE")
+[ "$(echo "$entries" | wc -l)" -eq 1 ] || fail "extra entries: $entries"
+echo "$entries" | grep -q '^-rw-r--r-- .*libnm.so$' || fail "not a 0644 file: $entries"
+
+echo "==> a leftover .failsafe beside a reinstalled library is cleared"
+reset
+echo stale > "$GIDEON_NM_LIB.failsafe"
+nm_failsafe_heal
+[ ! -e "$GIDEON_NM_LIB.failsafe" ] || fail "stale .failsafe kept"
+grep -q "nickelmenu v0.6" "$GIDEON_NM_LIB" || fail "heal touched the live library"
+
+echo "==> a freshly started nickel that hasn't parked the library yet keeps the window open"
+reset
+# A "nickel" started a moment ago. (pidof is called from the sourced
+# launcher functions, which shellcheck cannot see.)
+sleep 30 &
+young=$!
+# shellcheck disable=SC2329
+pidof() { [ "$1" = -s ] && shift; [ "$1" = nickel ] && echo "$young"; }
+nm_window_open || fail "window closed before nickel loaded NickelMenu (rescue would be cleared too early)"
+mv "$GIDEON_NM_LIB" "$GIDEON_NM_LIB.failsafe"
+nm_window_open || fail "parked library not seen as an open window"
+mv "$GIDEON_NM_LIB.failsafe" "$GIDEON_NM_LIB"
+# shellcheck disable=SC2329
+pidof() { return 1; }
+nm_window_open || fail "nickel gone must still count as needing the rescue"
+unset -f pidof
+kill "$young" 2>/dev/null || true
+
 echo "==> each step is logged"
 reset
 nm_log exit
