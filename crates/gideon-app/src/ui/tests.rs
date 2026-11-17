@@ -1071,7 +1071,7 @@ fn orientation_lock_toggle_persists_and_auto_keeps_rotation_session_only() {
 
     let mid_swipe_up = UiEvent::Swipe {
         x0: W / 2,
-        y0: H - 150,
+        y0: H * 3 / 5,
         x1: W / 2,
         y1: 100,
     };
@@ -4694,7 +4694,7 @@ fn swipe_up_rotates_and_locks_the_reader() {
 
     let swipe_up = UiEvent::Swipe {
         x0: W / 2,
-        y0: H - 100,
+        y0: H * 3 / 5,
         x1: W / 2,
         y1: 100,
     };
@@ -4824,17 +4824,19 @@ fn rotation_gestures_follow_the_reading_orientation() {
 
     let panel_up = UiEvent::Swipe {
         x0: W / 2,
-        y0: H - 100,
+        y0: H * 3 / 5,
         x1: W / 2,
         y1: 100,
     };
     // Reading-frame "up" at rotation 90: panel x increases, y steady.
     // (map_reader_tap: reading_y = panel_w - 1 - x, so larger x = smaller
     // reading y = upward.) Mid-screen vertically to dodge the edge bands.
+    // It starts above the bottom third of the rotated frame, where a swipe
+    // up is the menu rather than a turn.
     let rotated_up = UiEvent::Swipe {
-        x0: 150,
+        x0: W * 2 / 5,
         y0: H / 2,
-        x1: W - 150,
+        x1: W - 20,
         y1: H / 2,
     };
     let events = vec![tap_nav(0), tap_shelf_cell0(), panel_up, rotated_up];
@@ -11745,9 +11747,9 @@ mod library_tabs {
         let mut events = open_first_book();
         events.push(UiEvent::Swipe {
             x0: W / 2,
-            y0: H * 3 / 4,
+            y0: H / 2 + H / 20,
             x1: W / 2,
-            y1: H * 3 / 4 - H / 3,
+            y1: H / 2 + H / 20 - H / 3,
         });
         let mut ui = app(&lib, FakeGateway::default(), events);
         ui.run().unwrap();
@@ -11756,24 +11758,43 @@ mod library_tabs {
     }
 
     #[test]
-    fn the_sheet_gesture_is_one_rule_for_both_readers() {
-        let h = 1448;
-        // From the bottom eighth, an eighth or more of travel, vertical.
-        assert!(is_sheet_swipe(500, h - 10, 500, h - 10 - h / 8, h));
-        assert!(
-            !is_sheet_swipe(500, h - 10, 500, h - 10 - h / 8 + 1, h),
+    fn the_reader_swipes_are_one_forgiving_rule_for_both_readers() {
+        use super::super::{classify_reader_swipe as swipe, ReaderSwipe::*};
+        let h = 1680;
+        // Menu: up from anywhere in the bottom third, a tenth of travel.
+        assert_eq!(swipe(500, h - 10, 500, h - 10 - h / 10, h), Some(Menu));
+        // The swipe that used to rotate the page: starting a little above the
+        // old bottom-eighth band. It opens the menu now.
+        assert_eq!(swipe(500, h * 3 / 4, 500, h * 3 / 4 - h / 3, h), Some(Menu));
+        assert_eq!(
+            swipe(500, h - h / 3, 500, h - h / 3 - h / 9, h),
+            Some(Menu),
+            "band edge"
+        );
+        assert_eq!(
+            swipe(500, h - 10, 500, h - 10 - h / 12, h),
+            None,
             "too short"
         );
-        assert!(
-            !is_sheet_swipe(500, h - h / 4, 500, h / 4, h),
-            "starts too high"
+        // Close: down a fifth, from anywhere.
+        assert_eq!(swipe(500, h / 3, 500, h / 3 + h / 5, h), Some(Close));
+        assert_eq!(
+            swipe(500, h / 2, 520, h / 2 + h / 8, h),
+            None,
+            "a short drag down"
         );
-        assert!(
-            !is_sheet_swipe(500, h - 10, 900, h - 300, h),
-            "too sideways"
+        // Rotate: only a long, deliberate swipe up from above the menu third.
+        assert_eq!(swipe(500, h / 2, 500, h / 2 - h / 3, h), Some(Rotate));
+        assert_eq!(
+            swipe(500, h / 2, 500, h / 2 - h / 4, h),
+            None,
+            "not deliberate enough"
         );
-        assert!(!is_sheet_swipe(500, h - 300, 500, h - 10, h), "downwards");
+        // Sideways is never a reader swipe (page turns drift).
+        assert_eq!(swipe(100, h - 10, 900, h - 400, h), None);
+        assert_eq!(swipe(100, h / 2, 900, h / 2 + 300, h), None);
     }
+
     #[test]
     fn reaching_the_last_page_finishes_the_book_and_unread_resets_it() {
         let dir = tempfile::tempdir().unwrap();

@@ -3801,19 +3801,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             if !edge && released {
                 // The manga reader's mid-screen gestures, by the same rules.
                 self.book_slide_base = None;
-                let min_travel = (height / 4).max(1);
-                let vertical = y0.abs_diff(y1) > x0.abs_diff(x1);
-                if is_sheet_swipe(x0, y0, x1, y1, height) {
-                    // A flick up off the bottom bezel: the reading menu, with
-                    // the lamp sliders, over the unmoved page (Partial).
-                    self.sheet = Some(Sheet::BookReading);
-                    self.render_current(RefreshMode::Partial)?;
-                } else if vertical && y1 > y0 && y1 - y0 >= min_travel {
-                    // Swipe down: leave the book.
-                    return self.close_book();
-                } else if vertical && y0 > y1 && y0 - y1 >= min_travel {
-                    // Swipe up mid-page: rotate a quarter turn.
-                    self.rotate_book_reader()?;
+                match classify_reader_swipe(x0, y0, x1, y1, height) {
+                    // Up from the lower page: the reading menu, with the lamp
+                    // sliders, over the unmoved page (Partial).
+                    Some(ReaderSwipe::Menu) => {
+                        self.sheet = Some(Sheet::BookReading);
+                        self.render_current(RefreshMode::Partial)?;
+                    }
+                    Some(ReaderSwipe::Close) => return self.close_book(),
+                    Some(ReaderSwipe::Rotate) => self.rotate_book_reader()?,
+                    None => {}
                 }
                 return Ok(Flow::Continue);
             }
@@ -6837,41 +6834,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             panel.height
                         };
                         if slid.is_none() {
-                            // Mid-screen gestures: swipe down to leave the manga,
-                            // swipe up to rotate 90° clockwise — for reading on
-                            // your side in bed. Both demand deliberate travel (a
-                            // quarter of the reading height): a sloppy page-turn
-                            // tap drifting past the 30px slop must never exit,
-                            // and certainly never rotate the whole reader.
-                            let min_travel = (reading_h / 4).max(1);
-                            let vertical = ry0.abs_diff(ry1) > rx0.abs_diff(rx1);
-                            // An up-swipe STARTING in the bottom eighth of the
-                            // reading frame opens the controls sheet — distinct
-                            // from the mid-screen rotate gesture below, which
-                            // starts higher up. An eighth of travel is enough:
-                            // it's a flick off the bezel.
-                            if is_sheet_swipe(rx0, ry0, rx1, ry1, reading_h) {
-                                sheet_open = true;
-                                show_controls_sheet(
-                                    &mut reader,
-                                    &panel,
-                                    rotation,
-                                    rotation_locked,
-                                    self.auto_rotate_spreads,
-                                )?;
-                                continue;
-                            }
-                            if ry1 > ry0 && vertical && ry1 - ry0 >= min_travel {
-                                break;
-                            }
-                            if ry0 > ry1 && vertical && ry0 - ry1 >= min_travel {
-                                rotate_reader_90(
-                                    &mut reader,
-                                    &mut rotation,
-                                    self.settings_dir.as_deref(),
-                                    rotation_locked,
-                                )?;
-                                self.reader_rotation = rotation;
+                            // Mid-screen gestures, by the rules both readers
+                            // share (classify_reader_swipe): up from the lower
+                            // page opens the controls, down leaves the manga,
+                            // a long swipe up from higher on the page turns
+                            // the reader 90° — for reading on your side in bed.
+                            match classify_reader_swipe(rx0, ry0, rx1, ry1, reading_h) {
+                                Some(ReaderSwipe::Menu) => {
+                                    sheet_open = true;
+                                    show_controls_sheet(
+                                        &mut reader,
+                                        &panel,
+                                        rotation,
+                                        rotation_locked,
+                                        self.auto_rotate_spreads,
+                                    )?;
+                                }
+                                Some(ReaderSwipe::Close) => break,
+                                Some(ReaderSwipe::Rotate) => {
+                                    rotate_reader_90(
+                                        &mut reader,
+                                        &mut rotation,
+                                        self.settings_dir.as_deref(),
+                                        rotation_locked,
+                                    )?;
+                                    self.reader_rotation = rotation;
+                                }
+                                None => {}
                             }
                             continue;
                         }
@@ -10280,15 +10269,52 @@ struct SlideBase {
     level: u8,
 }
 
-/// The reader's "raise the controls" gesture, in reading-frame
-/// coordinates: an upward, mostly vertical swipe that STARTS in the bottom
-/// eighth of the frame and travels at least another eighth. Shared by the
-/// manga reader and the book reader so the two cannot drift apart.
-fn is_sheet_swipe(x0: u32, y0: u32, x1: u32, y1: u32, reading_h: u32) -> bool {
-    let eighth = (reading_h / 8).max(1);
-    let band = reading_h.saturating_sub(eighth);
-    let vertical = y0.abs_diff(y1) > x0.abs_diff(x1);
-    y0 > y1 && vertical && y0 > band && y0 - y1 >= eighth
+/// What a mid-page swipe in a reader means. One set of rules for the manga
+/// reader and the book reader, so the two can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderSwipe {
+    /// Up from the lower part of the page: the reading menu.
+    Menu,
+    /// Down: leave the book or the manga.
+    Close,
+    /// A long, deliberate swipe up from higher on the page: turn a quarter.
+    Rotate,
+}
+
+/// Classify a released mid-page swipe, in reading-frame coordinates (edge
+/// slides are the lamp, decided before this). The rules are forgiving where
+/// a miss is merely annoying and strict where a mistake is disruptive:
+///
+/// * **Menu** — up, starting anywhere in the bottom third, travelling a
+///   tenth of the height. It used to need a start in the bottom eighth;
+///   a flick that began a little higher was read as Rotate and turned the
+///   page sideways, which is what made the gesture feel unreliable.
+/// * **Close** — down, a fifth of the height.
+/// * **Rotate** — up, starting above the menu's third, a full third of the
+///   height: only ever on purpose.
+///
+/// "Up" and "down" mean mostly vertical (more vertical travel than
+/// sideways), so a sloppy page-turn never counts.
+fn classify_reader_swipe(
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    reading_h: u32,
+) -> Option<ReaderSwipe> {
+    let h = reading_h.max(1);
+    let dy = y0.abs_diff(y1);
+    if dy <= x0.abs_diff(x1) {
+        return None;
+    }
+    if y1 > y0 {
+        return (dy >= h / 5).then_some(ReaderSwipe::Close);
+    }
+    let menu_band = h - h / 3;
+    if y0 >= menu_band {
+        return (dy >= h / 10).then_some(ReaderSwipe::Menu);
+    }
+    (dy >= h / 3).then_some(ReaderSwipe::Rotate)
 }
 
 fn show_controls_sheet<D: Display>(
