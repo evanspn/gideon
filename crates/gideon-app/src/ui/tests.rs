@@ -13269,3 +13269,611 @@ mod reader_tools {
         }
     }
 }
+
+// --- Every screen, for the design review --------------------------------
+//
+// Renders every screen and sheet of the app at the Libra Colour's real size,
+// with placeholder content (invented titles, original prose), and records
+// which refresh each everyday action asks the panel for — the e-ink review.
+// `GIDEON_SHOTS=<dir> cargo test -p gideon-app -- --ignored all_screens::shots`
+// writes <dir>/<name>.png and <dir>/refresh.tsv.
+
+mod all_screens {
+    use super::reader_tools::big_reader;
+    use super::*;
+
+    type Big = UiApp<MemoryDisplay, FakeInput, FakeGateway>;
+
+    fn save(ui: &Big, out: &Path, name: &str) {
+        let rgb = ui.compose_final().unwrap();
+        image::RgbImage::from_raw(rgb.width, rgb.height, rgb.pixels)
+            .unwrap()
+            .save(out.join(format!("{name}.png")))
+            .unwrap();
+    }
+
+    fn src(id: &str, name: &str) -> SourceEntry {
+        SourceEntry {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn manga(id: &str, title: &str) -> MangaEntry {
+        MangaEntry {
+            id: id.into(),
+            title: title.into(),
+            cover_url: None,
+        }
+    }
+
+    fn chapter(n: f32) -> ChapterEntry {
+        ChapterEntry {
+            id: format!("c{n}"),
+            num: Some(n),
+            title: Some(format!("The tide comes in, part {n}")),
+            lang: Some("en".into()),
+        }
+    }
+
+    /// Put `screen` on top of Discover and `sheet` over it, and save it.
+    fn shot(ui: &mut Big, out: &Path, name: &str, screen: Screen, sheet: Option<Sheet>) {
+        ui.stack = vec![Screen::Home, screen];
+        ui.sheet = sheet;
+        save(ui, out, name);
+    }
+
+    fn nav(ui: &Big, zone: u32) -> (u32, u32) {
+        let l = ui.layout;
+        (l.width * (2 * zone + 1) / 8, l.nav_top() + l.nav_h / 2)
+    }
+
+    #[test]
+    #[ignore]
+    fn shots() {
+        let Some(out) = std::env::var_os("GIDEON_SHOTS") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Manga");
+        for (series, n) in [
+            ("Harbour Lights", 4),
+            ("Tidewater", 3),
+            ("The Lamp Keeper", 2),
+            ("Salt and Rope", 2),
+        ] {
+            for v in 1..=n {
+                make_cbz(&lib.join(format!("{series}/{series} v{v:02}.cbz")), 3);
+            }
+        }
+        let mut ui = big_reader(dir.path());
+        let mut refresh: Vec<(String, String)> = Vec::new();
+        let mut act = |ui: &mut Big, label: &str, f: &mut dyn FnMut(&mut Big)| {
+            let before = ui.display().flushes.len();
+            f(ui);
+            let modes: Vec<String> = ui.display().flushes[before..]
+                .iter()
+                .map(|m| format!("{m:?}"))
+                .collect();
+            refresh.push((label.to_string(), modes.join(", ")));
+        };
+
+        // --- the four destinations and the screens a tap away ---------------
+        ui.stack = vec![Screen::Home];
+        ui.sheet = None;
+        ui.render_current(RefreshMode::Full).unwrap();
+        save(&ui, &out, "01-discover");
+        let (x, y) = nav(&ui, 1);
+        act(&mut ui, "Nav: Discover → Today", &mut |ui| {
+            ui.handle_tap(x, y).unwrap();
+        });
+        save(&ui, &out, "02-today");
+        let (x, y) = nav(&ui, 0);
+        act(&mut ui, "Nav: Today → Library", &mut |ui| {
+            ui.handle_tap(x, y).unwrap();
+        });
+        save(&ui, &out, "03-library-shelf");
+        act(&mut ui, "Library: shelf ⇄ list (title tap)", &mut |ui| {
+            ui.toggle_library_view().unwrap();
+        });
+        save(&ui, &out, "04-library-list");
+        act(&mut ui, "Library: list ⇄ shelf", &mut |ui| {
+            ui.toggle_library_view().unwrap();
+        });
+        act(&mut ui, "Library: Manga → Books tab", &mut |ui| {
+            ui.open_library_tab(LibraryTab::Books).unwrap();
+        });
+        save(&ui, &out, "05-books-tab");
+        act(&mut ui, "Books tab: tap a book (sheet)", &mut |ui| {
+            let book = match ui.screen() {
+                Screen::BookShelf { books, .. } => books[0].clone(),
+                _ => unreachable!(),
+            };
+            ui.sheet = Some(Sheet::BookFile { book });
+            ui.render_current(RefreshMode::Partial).unwrap();
+        });
+        save(&ui, &out, "06-book-sheet");
+        ui.sheet = None;
+        let (x, y) = nav(&ui, 3);
+        act(
+            &mut ui,
+            "Nav: Library → Settings (quick sheet)",
+            &mut |ui| {
+                ui.handle_tap(x, y).unwrap();
+            },
+        );
+        save(&ui, &out, "07-quick-settings");
+        ui.sheet = None;
+        act(&mut ui, "Quick settings → All settings", &mut |ui| {
+            ui.push(Screen::Settings).unwrap();
+        });
+        save(&ui, &out, "08-settings");
+        act(&mut ui, "Settings → Storage", &mut |ui| {
+            ui.push(Screen::Storage).unwrap();
+        });
+        save(&ui, &out, "09-storage");
+        act(&mut ui, "Back (pop)", &mut |ui| {
+            ui.pop().unwrap();
+        });
+        act(&mut ui, "Profiles sheet", &mut |ui| {
+            ui.open_profile_menu().unwrap();
+        });
+        save(&ui, &out, "10-profiles");
+        ui.sheet = None;
+
+        // --- manga: sources, search, chapters --------------------------------
+        let hl = src("harbour", "Harbour Scans");
+        shot(
+            &mut ui,
+            &out,
+            "11-sources",
+            Screen::Sources {
+                rows: vec![
+                    SourceRow::Installed(hl.clone()),
+                    SourceRow::Installed(src("tide", "Tidewater Comics")),
+                    SourceRow::Separator("Available".into()),
+                    SourceRow::Available(src("lamp", "Lamplight Library")),
+                    SourceRow::Available(src("salt", "Salt Road Reader")),
+                ],
+                page: 0,
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "12-listings",
+            Screen::Listings { source: hl.clone() },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "13-search",
+            Screen::Search {
+                source: None,
+                query: "harbour".into(),
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "14-recent-searches",
+            Screen::RecentSearches {
+                recents: vec![("harbour".into(), 6), ("lamp keeper".into(), 2)],
+            },
+            None,
+        );
+        let results: Vec<(SourceEntry, MangaEntry)> = (0..9)
+            .map(|i| {
+                (
+                    hl.clone(),
+                    manga(&format!("m{i}"), &format!("Harbour Lights {}", i + 1)),
+                )
+            })
+            .collect();
+        shot(
+            &mut ui,
+            &out,
+            "15-search-results",
+            Screen::SearchResults {
+                query: "harbour".into(),
+                results,
+                tried: vec!["harbour".into()],
+                page: 0,
+            },
+            None,
+        );
+        let list: Vec<MangaEntry> = [
+            "Harbour Lights",
+            "Tidewater",
+            "The Lamp Keeper",
+            "Salt and Rope",
+            "North Pier",
+            "Gull Cove",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| manga(&format!("p{i}"), t))
+        .collect();
+        shot(
+            &mut ui,
+            &out,
+            "16-popular",
+            Screen::Popular {
+                mangas: list.clone(),
+                page: 0,
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "17-manga-list",
+            Screen::MangaList {
+                source: hl.clone(),
+                listing: "Latest".into(),
+                mangas: list.clone(),
+                page: 0,
+            },
+            None,
+        );
+        let chapters: Vec<ChapterEntry> = (1..=24).map(|n| chapter(n as f32)).collect();
+        let hm = manga("hl", "Harbour Lights");
+        shot(
+            &mut ui,
+            &out,
+            "18-chapter-list",
+            Screen::ChapterList {
+                source: hl.clone(),
+                manga: hm.clone(),
+                chapters: chapters.clone(),
+                page: 0,
+                sort: ChapterSort::Ascending,
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "19-chapter-menu",
+            Screen::ChapterMenu {
+                title: "Chapter 3".into(),
+                key: None,
+                finished: false,
+                download: Some(DownloadContext {
+                    source: hl.clone(),
+                    manga: hm.clone(),
+                    chapters: chapters.clone(),
+                    index: 2,
+                }),
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "20-download-ahead",
+            Screen::DownloadAheadMenu {
+                source: hl.clone(),
+                manga: hm.clone(),
+                chapters: chapters.clone(),
+                index: 2,
+            },
+            None,
+        );
+        let entries = gideon_core::Library::new(&lib).scan().unwrap();
+        let first = entries[0].clone();
+        shot(
+            &mut ui,
+            &out,
+            "21-downloaded-chapters",
+            Screen::DownloadedChapters {
+                title: "Harbour Lights".into(),
+                entries: entries
+                    .iter()
+                    .filter(|e| e.relative_path.starts_with("Harbour"))
+                    .cloned()
+                    .collect(),
+                page: 0,
+                sort: ChapterSort::Ascending,
+            },
+            None,
+        );
+        ui.stack = vec![Screen::Home];
+        ui.open_library_tab(LibraryTab::Manga).unwrap();
+        ui.sheet = Some(Sheet::Book {
+            entry: first.clone(),
+            series_dir: "Harbour Lights".into(),
+            read_key: None,
+        });
+        save(&ui, &out, "22-series-sheet");
+        ui.sheet = Some(Sheet::ConfirmDelete {
+            entry: first.clone(),
+            series_dir: "Harbour Lights".into(),
+            scope: DeleteScope::Series,
+        });
+        save(&ui, &out, "23-confirm-delete");
+        ui.sheet = None;
+
+        // --- books: catalogues, search, results -------------------------------
+        let mut catalogs = vec![gideon_core::BookCatalog {
+            name: "Project Gutenberg".into(),
+            url: "https://www.gutenberg.org/ebooks.opds/".into(),
+        }];
+        super::super::gateway::with_internet_archive(&mut catalogs);
+        shot(
+            &mut ui,
+            &out,
+            "24-book-catalogues",
+            Screen::Books { catalogs },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "25-book-search",
+            Screen::BookSearch {
+                title: "Internet Archive".into(),
+                search: gideon_sources::archive::search_link(),
+                query: "harbour".into(),
+                recent: vec!["lighthouses".into(), "sea stories".into()],
+            },
+            None,
+        );
+        let mut feed = gateway::BookFeed {
+            title: "Results".into(),
+            total: Some(14),
+            ..Default::default()
+        };
+        for (t, a, y) in [
+            ("The Harbour Wall", "Placeholder Author", "1911"),
+            ("Notes on Tides", "A. N. Example", "1899"),
+            ("Lamps of the North Pier", "Placeholder Author", "1920"),
+            ("Salt and Rope", "R. Imaginary", "1905"),
+        ] {
+            feed.entries.push(gateway::BookEntry {
+                title: t.into(),
+                detail: Some(a.into()),
+                year: Some(y.into()),
+                feed: Some(url::Url::parse("https://archive.org/metadata/x").unwrap()),
+                ..Default::default()
+            });
+        }
+        shot(
+            &mut ui,
+            &out,
+            "26-book-results",
+            Screen::BookResults {
+                query: "harbour".into(),
+                feed: feed.clone(),
+                page: 0,
+                error: None,
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "27-book-download-sheet",
+            Screen::BookResults {
+                query: "harbour".into(),
+                feed: feed.clone(),
+                page: 0,
+                error: None,
+            },
+            Some(Sheet::BookDownload {
+                entry: Box::new(feed.entries[0].clone()),
+                epub: None,
+                state: super::super::book_search::DownloadState::Ready,
+            }),
+        );
+
+        // --- the book reader and its sheets ----------------------------------
+        let book = gideon_core::books::scan(&lib.join("Books"))
+            .unwrap()
+            .remove(0);
+        ui.stack = vec![Screen::Home];
+        ui.sheet = None;
+        ui.open_book_reader(book).unwrap();
+        save(&ui, &out, "28-book-reader");
+        act(&mut ui, "Book reader: page turn", &mut |ui| {
+            ui.turn_book_page(1).unwrap();
+        });
+        act(&mut ui, "Book reader: page back", &mut |ui| {
+            ui.turn_book_page(-1).unwrap();
+        });
+        act(&mut ui, "Book reader: swipe up (reading menu)", &mut |ui| {
+            let h = ui.layout.height;
+            let w = ui.layout.width;
+            ui.drag_menu(w / 2, h - 60, w / 2, h - 60 - h / 6, true)
+                .unwrap();
+        });
+        save(&ui, &out, "29-reading-menu");
+        act(&mut ui, "Reading menu → Text sheet", &mut |ui| {
+            ui.sheet = Some(Sheet::BookText { preview: None });
+            ui.render_current(RefreshMode::Partial).unwrap();
+        });
+        save(&ui, &out, "30-text-sheet");
+        ui.sheet = Some(Sheet::BookFonts);
+        save(&ui, &out, "31-font-list");
+        act(&mut ui, "Close a sheet over the page", &mut |ui| {
+            ui.sheet = None;
+            ui.render_current(RefreshMode::Full).unwrap();
+        });
+        ui.sheet = Some(Sheet::Definition {
+            word: "harbour".into(),
+            lines: vec!["n. a sheltered place where boats are kept".into()],
+        });
+        save(&ui, &out, "32-definition");
+        ui.sheet = None;
+        let toc: Vec<gideon_core::epub::TocEntry> =
+            ["Chapter I", "Chapter II", "Chapter III", "Chapter IV"]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| gideon_core::epub::TocEntry {
+                    title: (*t).into(),
+                    chapter: i,
+                })
+                .collect();
+        let reader = ui.stack.last().unwrap().clone();
+        ui.stack = vec![
+            Screen::Home,
+            reader.clone(),
+            Screen::BookContents {
+                entries: toc,
+                current: 0,
+                page: 0,
+            },
+        ];
+        save(&ui, &out, "33-contents");
+        ui.stack = vec![
+            Screen::Home,
+            reader.clone(),
+            Screen::Words {
+                entries: vec![
+                    gideon_core::SavedWord {
+                        word: "gloaming".into(),
+                        gloss: "n. the dim light after sunset".into(),
+                        title: "The Harbour Wall".into(),
+                        ..Default::default()
+                    },
+                    gideon_core::SavedWord {
+                        word: "harbour".into(),
+                        gloss: "n. a sheltered place where boats are kept".into(),
+                        title: "The Harbour Wall".into(),
+                        ..Default::default()
+                    },
+                ],
+                book: None,
+                this_book: false,
+                page: 0,
+            },
+        ];
+        save(&ui, &out, "34-words");
+
+        // --- device: Wi-Fi, account, power, profiles, messages ---------------
+        let nets = vec![
+            gideon_device::network::WifiNetwork {
+                ssid: "Harbour House".into(),
+                signal: -42,
+                secured: true,
+                saved: true,
+                connected: true,
+            },
+            gideon_device::network::WifiNetwork {
+                ssid: "Pier Cafe".into(),
+                signal: -61,
+                secured: false,
+                saved: false,
+                connected: false,
+            },
+            gideon_device::network::WifiNetwork {
+                ssid: "Lamp Room".into(),
+                signal: -75,
+                secured: true,
+                saved: false,
+                connected: false,
+            },
+        ];
+        shot(
+            &mut ui,
+            &out,
+            "35-wifi",
+            Screen::WifiList { networks: nets },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "36-wifi-password",
+            Screen::WifiPassword {
+                ssid: "Lamp Room".into(),
+                password: "tide".into(),
+            },
+            None,
+        );
+        shot(&mut ui, &out, "37-account", Screen::AccountMenu, None);
+        shot(&mut ui, &out, "38-power", Screen::PowerMenu, None);
+        shot(
+            &mut ui,
+            &out,
+            "39-new-profile",
+            Screen::NewProfile {
+                name: "elena".into(),
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "40-sent",
+            Screen::SentList {
+                items: vec![gideon_sync::supabase::SendItem {
+                    id: "1".into(),
+                    title: "Harbour Lights".into(),
+                    kind: Default::default(),
+                    file_path: None,
+                    file_size: None,
+                }],
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "41-update",
+            Screen::UpdatePrompt {
+                body: "gideon 1.1.0 is ready.\nInstall it now?".into(),
+            },
+            None,
+        );
+        shot(
+            &mut ui,
+            &out,
+            "42-message",
+            Screen::Message {
+                title: "Books".into(),
+                body: "Saved The Harbour Wall.".into(),
+            },
+            None,
+        );
+
+        // --- a list page flip and a keyboard press, for the refresh table -----
+        ui.stack = vec![
+            Screen::Home,
+            Screen::ChapterList {
+                source: hl.clone(),
+                manga: hm.clone(),
+                chapters,
+                page: 0,
+                sort: ChapterSort::Ascending,
+            },
+        ];
+        ui.render_current(RefreshMode::Full).unwrap();
+        act(&mut ui, "List: next page (chapter list)", &mut |ui| {
+            ui.flip_page(1).unwrap();
+        });
+        ui.stack = vec![
+            Screen::Home,
+            Screen::Search {
+                source: None,
+                query: String::new(),
+            },
+        ];
+        ui.keyboard_paints = 0;
+        ui.render_current(RefreshMode::Full).unwrap();
+        act(&mut ui, "Keyboard: one key", &mut |ui| {
+            ui.keyboard_repaint().unwrap();
+        });
+
+        let mut tsv = String::from("action\trefresh\n");
+        for (a, m) in &refresh {
+            tsv.push_str(&format!("{a}\t{m}\n"));
+        }
+        std::fs::write(out.join("refresh.tsv"), tsv).unwrap();
+    }
+}
