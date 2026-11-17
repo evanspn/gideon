@@ -3539,8 +3539,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Some(Sheet::BookFile { book }) => {
-                // An EPUB reads here; a PDF only in the Kobo's reader. The
-                // rows differ by one, so index by what they say.
+                // An EPUB reads here; a PDF does not. The rows differ by one,
+                // so index by what they say.
                 let rows = book_file_rows(&book, self.book_finished(&book));
                 match rows.get(index).map(|r| r.0.as_str()) {
                     Some("Read") => {
@@ -3548,10 +3548,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.open_book_reader(book)?;
                         Ok(Flow::Continue)
                     }
-                    // Closing hands the device back to Nickel, which indexes
-                    // the Books folder on start, so the book is on its home
-                    // screen when it comes up.
-                    Some("Read in the Kobo reader") => Ok(Flow::Quit(Exit::Close)),
                     Some(label @ ("Mark as finished" | "Mark as unread")) => {
                         let mut places = gideon_core::BookPlaces::load(&self.books_dir);
                         if label == "Mark as unread" {
@@ -9092,7 +9088,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return self.push(Screen::Message {
                 title: book.title.clone(),
                 body: "This book has no readable text — it may be images only.\n\
-                       Use \"Read in the Kobo reader\" instead."
+                       It is in your Kobo library too, after you close gideon."
                     .to_string(),
             });
         }
@@ -10430,17 +10426,14 @@ fn page_label(page: usize, page_count: usize) -> String {
 /// see but not hit is worse than no chevron. The zones are a full title-bar
 /// height wide so they are finger-sized rather than glyph-sized.
 /// What the Books-tab sheet offers for one book. gideon reads an EPUB
-/// itself; a PDF is the Kobo reader's.
+/// itself. There is deliberately no "Read in the Kobo reader": it was a
+/// way out of gideon dressed as a reading option, and every way out
+/// restarts Nickel (closing from the power menu does the same, knowingly).
 fn book_file_rows(book: &gideon_core::Book, finished: bool) -> Vec<(String, String, bool)> {
     let mut rows = Vec::new();
     if book.format == "epub" {
         rows.push(("Read".to_string(), String::new(), false));
     }
-    rows.push((
-        "Read in the Kobo reader".to_string(),
-        "closes gideon".to_string(),
-        false,
-    ));
     rows.push((
         if finished {
             "Mark as unread"

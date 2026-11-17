@@ -9871,10 +9871,10 @@ mod library_tabs {
         }
     }
 
-    /// Row `i` of an EPUB's four-row book sheet: 0 read here, 1 read in
-    /// Kobo, 2 delete, 3 close.
+    /// Row `i` of an EPUB's four-row book sheet: 0 read here, 1 mark as
+    /// finished, 2 delete, 3 close.
     fn tap_book_file_row(i: usize) -> UiEvent {
-        tap_modal_row(5, i)
+        tap_modal_row(4, i)
     }
 
     /// A tap in the reader: left third back, middle menu, right third next.
@@ -10104,6 +10104,11 @@ mod library_tabs {
         // The sheet slides over the list: Partial, no flash.
         assert_eq!(ui.display().flushes.last(), Some(&RefreshMode::Partial));
 
+        // No way out of gideon dressed up as a reading option: every exit
+        // restarts Nickel, so leaving is only ever the power menu's Close.
+        let (_, rows) = ui.sheet_rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(labels, ["Read", "Mark as finished", "Delete this book", "Close"]);
         let events = vec![
             tap_nav(0),
             tap_books_tab(),
@@ -10111,10 +10116,10 @@ mod library_tabs {
             tap_book_file_row(1),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
-        let exit = ui.run().unwrap();
+        ui.run().unwrap();
         assert!(
-            matches!(exit, Exit::Close),
-            "reading hands the device to Nickel's reader"
+            matches!(ui.screen(), Screen::BookShelf { .. }),
+            "row 1 marks the book finished and stays in gideon"
         );
     }
 
@@ -10129,7 +10134,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(3),
+            tap_book_file_row(2),
             tap_modal_row(2, 1),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10142,7 +10147,7 @@ mod library_tabs {
             tap_nav(0),
             tap_books_tab(),
             tap_row(0),
-            tap_book_file_row(3),
+            tap_book_file_row(2),
             tap_modal_row(2, 0),
         ];
         let mut ui = app(&lib, FakeGateway::default(), events);
@@ -10517,7 +10522,7 @@ mod library_tabs {
     }
 
     #[test]
-    fn a_pdf_offers_only_the_kobo_reader() {
+    fn a_pdf_offers_no_way_out_of_gideon_dressed_as_reading() {
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("Manga");
         make_cbz(&lib.join("Series/vol1.cbz"), 2);
@@ -10534,12 +10539,7 @@ mod library_tabs {
         let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
             labels,
-            [
-                "Read in the Kobo reader",
-                "Mark as finished",
-                "Delete this book",
-                "Close"
-            ]
+            ["Mark as finished", "Delete this book", "Close"]
         );
     }
 
@@ -11811,7 +11811,7 @@ mod library_tabs {
         ui.sheet = Some(Sheet::BookFile { book: book.clone() });
         let labels: Vec<String> = ui.sheet_rows().1.into_iter().map(|r| r.0).collect();
         assert!(labels.contains(&"Mark as unread".to_string()), "{labels:?}");
-        ui.tap_sheet(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(4, 1)).unwrap();
         assert!(
             gideon_core::BookPlaces::load(&books).get(key).is_none(),
             "back to page one"
@@ -11820,7 +11820,7 @@ mod library_tabs {
 
         // And "Mark as finished" without reading it.
         ui.sheet = Some(Sheet::BookFile { book });
-        ui.tap_sheet(W / 2, tap_modal_row_y(5, 2)).unwrap();
+        ui.tap_sheet(W / 2, tap_modal_row_y(4, 1)).unwrap();
         let place = gideon_core::BookPlaces::load(&books).get(key).unwrap();
         assert_eq!(place.finished_at, Some(5_000));
     }
