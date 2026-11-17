@@ -2153,11 +2153,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     // --- navigation ---
 
     fn push(&mut self, screen: Screen) -> Result<()> {
+        // A text selection belongs to the page it was made on: any change of
+        // screen ends it, so it can never be picked up again later.
+        self.selection = None;
         self.stack.push(screen);
         self.render_current(RefreshMode::Full)
     }
 
     fn pop(&mut self) -> Result<Flow> {
+        self.selection = None;
         if self.stack.len() <= 1 {
             // Home has no Back: quitting goes through the power menu.
             return Ok(Flow::Continue);
@@ -2254,6 +2258,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         // the book (its place is saved). The reading menu is the manga
         // reader's controls gesture: a flick up off the bottom edge.
         if matches!(self.screen(), Screen::BookReader { .. }) {
+            // A selection left on the page (its lift never arrived): a tap
+            // puts it away and does nothing else.
+            if self.selection.take().is_some() {
+                self.render_current(RefreshMode::Full)?;
+                return Ok(Flow::Continue);
+            }
             // A tap on a highlight opens it, wherever on the page it is.
             if self.tap_on_highlight(x, y)? {
                 return Ok(Flow::Continue);
@@ -9075,6 +9085,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
 
     /// Open an EPUB in gideon's reader at the place it was left.
     fn open_book_reader(&mut self, book: gideon_core::Book) -> Result<()> {
+        self.selection = None;
         let text = gideon_core::epub::load(&book.path)
             .map_err(|e| anyhow::anyhow!("couldn't open \"{}\": {e}", book.title))?;
         if text.chapters.is_empty() {
@@ -9341,6 +9352,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// `place` (paragraph, line), and come back to it. The whole page
     /// changes: Full.
     fn jump_to_place(&mut self, chapter: usize, place: (usize, usize)) -> Result<()> {
+        self.selection = None;
         if matches!(
             self.stack.last(),
             Some(
@@ -9422,6 +9434,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// the ends; nothing happens past the last page of the book. Partial
     /// refresh, with a Full every `full_refresh_interval` turns.
     fn turn_book_page(&mut self, delta: i64) -> Result<()> {
+        self.selection = None;
         let Some(Screen::BookReader {
             text,
             chapter,
@@ -9490,6 +9503,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Re-flow the open chapter at the current typography, keeping the
     /// paragraph that was at the top of the page.
     fn reflow_book(&mut self) -> Result<()> {
+        self.selection = None;
         let Some(Screen::BookReader {
             text,
             chapter,
@@ -9664,6 +9678,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// swipe down, and the reading menu's "Close book".
     fn close_book(&mut self) -> Result<Flow> {
         self.sheet = None;
+        self.selection = None;
         self.save_book_place();
         self.pop()?;
         Ok(Flow::Continue)
@@ -9675,6 +9690,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// paragraph, and the orientation kept for next time. Full: every
     /// pixel moves.
     fn rotate_book_reader(&mut self) -> Result<()> {
+        self.selection = None;
         self.reader_rotation = (self.reader_rotation + 90) % 360;
         self.rebuild_layout();
         let degrees = self.reader_rotation;

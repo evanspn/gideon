@@ -182,6 +182,11 @@ pub struct TouchTracker {
     /// This contact has already been offered as a hold (see
     /// [`RawTouch::Held`]); a contact is offered once.
     hold_offered: bool,
+    /// When this contact began, by this process's clock — what the hold
+    /// timer counts from. A finger held still makes most Kobo panels go
+    /// quiet, so the hold cannot wait for a report: the input loop wakes
+    /// itself at `down_at + LONG_PRESS_MS` (see [`TouchTracker::hold_due`]).
+    down_at: Option<std::time::Instant>,
 }
 
 /// A completed raw gesture: start position, end position, hold time (ms).
@@ -296,6 +301,36 @@ impl TouchTracker {
         })
     }
 
+    /// How long until the finger now down has been held for the long-press
+    /// time, if one is down and has not been offered yet: the input loop
+    /// caps its wait at this, so the hold arrives on time even when the
+    /// panel reports nothing for a finger that is not moving.
+    pub fn time_until_hold(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !self.touching || self.hold_offered || self.release_seen {
+            return None;
+        }
+        let due = self.down_at? + std::time::Duration::from_millis(LONG_PRESS_MS);
+        Some(due.saturating_duration_since(now))
+    }
+
+    /// The hold, by the clock: once the finger has been down for the
+    /// long-press time (and was not offered already), offer it where it is
+    /// now. The caller decides, in screen pixels, whether it stayed still.
+    pub fn hold_due(&mut self, now: std::time::Instant) -> Option<RawTouch> {
+        if self.time_until_hold(now)? > std::time::Duration::ZERO {
+            return None;
+        }
+        self.hold_offered = true;
+        let (x, y) = (self.last_x?, self.last_y?);
+        Some(RawTouch::Held {
+            start: (
+                self.first_x.unwrap_or(x).max(0) as u32,
+                self.first_y.unwrap_or(y).max(0) as u32,
+            ),
+            at: (x.max(0) as u32, y.max(0) as u32),
+        })
+    }
+
     /// Offer the contact as a hold the first time a report arrives after
     /// the long-press time with the finger still down.
     fn held(&mut self, now_ms: u64) -> Option<RawTouch> {
@@ -322,6 +357,7 @@ impl TouchTracker {
     fn begin_contact(&mut self, ev: &libc::input_event) {
         if !self.touching {
             self.down_ms = Some(ev_millis(ev));
+            self.down_at = Some(std::time::Instant::now());
         }
         self.touching = true;
     }
@@ -330,6 +366,7 @@ impl TouchTracker {
         self.release_seen = false;
         self.reported = None;
         self.hold_offered = false;
+        self.down_at = None;
         let (first_x, first_y) = (self.first_x.take(), self.first_y.take());
         let down_ms = self.down_ms.take();
         if !self.touching {
@@ -961,8 +998,12 @@ impl KoboTouch {
         // Wait indefinitely, unless the gyro has an orientation settling or the
         // caller capped the wait: then poll only that long, so a rotation fires
         // on its timeout and a caller-supplied timeout is honored.
-        let settle = self.gyro.time_until_settle(std::time::Instant::now());
-        let timeout = match settle.into_iter().chain(max_wait).min() {
+        let wait_from = std::time::Instant::now();
+        let settle = self.gyro.time_until_settle(wait_from);
+        // A finger down and not yet held: wake at the long-press time even if
+        // the panel stays quiet, so a hold is never missed (see hold_due).
+        let hold = self.tracker.time_until_hold(wait_from);
+        let timeout = match settle.into_iter().chain(hold).chain(max_wait).min() {
             Some(d) => (d.as_millis().min(i32::MAX as u128) as libc::c_int).max(0),
             None => -1,
         };
@@ -1040,6 +1081,21 @@ impl KoboTouch {
         // re-report from the driver.
         if let Some(event) = self.gyro.settled(std::time::Instant::now()) {
             self.pending.push_back(event);
+        }
+
+        // The hold timer: the finger has been down for the long-press time.
+        // Also reached on a bare poll timeout, which is the point — a still
+        // finger often sends nothing. A lift drained above has already ended
+        // the contact, so a tap or a swipe never turns into a hold.
+        if let Some(RawTouch::Held { start, at }) = self.tracker.hold_due(std::time::Instant::now())
+        {
+            let (transform, max_x, max_y) = (self.transform, self.max_x, self.max_y);
+            let (screen_w, screen_h) = (self.screen_w, self.screen_h);
+            let screen =
+                |p: (u32, u32)| transform.apply(p.0, p.1, max_x, max_y, screen_w, screen_h);
+            if let Some(event) = classify_hold(screen(start), screen(at)) {
+                queue(&mut self.pending, event);
+            }
         }
 
         let mut lost_touch = false;
@@ -1953,6 +2009,66 @@ mod tests {
             t.push(&at(3000 + LONG_PRESS_MS, EV_SYN, SYN_REPORT, 0)),
             Some(RawTouch::Held { .. })
         ));
+    }
+
+    #[test]
+    fn a_still_finger_is_held_by_the_clock_even_when_the_panel_goes_quiet() {
+        use std::time::{Duration, Instant};
+        let mut t = TouchTracker::new();
+        // Nothing down: no timer.
+        assert_eq!(t.time_until_hold(Instant::now()), None);
+        t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, 3));
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 200));
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 300));
+        t.push(&ev(EV_SYN, SYN_REPORT, 0));
+        let start = t.down_at.unwrap();
+        // The loop is told when to wake…
+        let wait = t.time_until_hold(start).unwrap();
+        assert_eq!(wait, Duration::from_millis(LONG_PRESS_MS));
+        // …not due before then, with no report at all in between…
+        assert_eq!(
+            t.hold_due(start + Duration::from_millis(LONG_PRESS_MS - 1)),
+            None
+        );
+        // …and due at it: offered once, where the finger is.
+        assert_eq!(
+            t.hold_due(start + Duration::from_millis(LONG_PRESS_MS)),
+            Some(RawTouch::Held {
+                start: (200, 300),
+                at: (200, 300)
+            })
+        );
+        assert_eq!(t.hold_due(start + Duration::from_secs(5)), None);
+        assert_eq!(
+            t.time_until_hold(start),
+            None,
+            "no more waking for this contact"
+        );
+        // A report after it does not offer it twice.
+        let _ = Instant::now();
+        t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
+        assert!(matches!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Done(_))
+        ));
+        assert_eq!(t.time_until_hold(Instant::now()), None, "lifted");
+    }
+
+    #[test]
+    fn a_tap_lifted_before_the_long_press_time_is_never_held() {
+        use std::time::{Duration, Instant};
+        let mut t = TouchTracker::new();
+        t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, 3));
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_X, 10));
+        t.push(&ev(EV_ABS, ABS_MT_POSITION_Y, 10));
+        t.push(&ev(EV_ABS, ABS_MT_TRACKING_ID, -1));
+        // Release seen but not yet reported: the timer must not fire.
+        assert_eq!(t.time_until_hold(Instant::now()), None);
+        assert!(matches!(
+            t.push(&ev(EV_SYN, SYN_REPORT, 0)),
+            Some(RawTouch::Done(_))
+        ));
+        assert_eq!(t.hold_due(Instant::now() + Duration::from_secs(2)), None);
     }
 
     #[test]

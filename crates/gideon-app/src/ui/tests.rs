@@ -12617,10 +12617,17 @@ mod reader_tools {
         let mut ui = big_reader(dir.path());
         let (b1, b2) = two_blocks(&ui);
         let (hx, hy) = word_at(&ui, (b1, 0));
-        // The hold, finger still down: the word is selected, Partial.
+        // The hold, finger still down: the word is the anchor, but nothing
+        // is drawn yet — a hold alone is a dictionary lookup.
+        let flushes = ui.display().flushes.len();
         ui.handle_hold(hx, hy).unwrap();
         assert_eq!(ui.selection, Some(((b1, 0), (b1, 0))));
-        assert_eq!(last_flush(&ui), RefreshMode::Partial);
+        assert_eq!(
+            ui.display().flushes.len(),
+            flushes,
+            "no repaint on the hold"
+        );
+        assert!(ui.page_marks().is_empty(), "nothing highlighted on a hold");
         // Drag down onto the next paragraph's third word: the selection
         // follows, still Partial, and a drag down did NOT close the book.
         let (tx, ty) = word_at(&ui, (b2, 2));
@@ -12638,6 +12645,101 @@ mod reader_tools {
         assert_eq!(ui.sheet, Some(Sheet::Highlight { existing: None }));
         assert_eq!(last_flush(&ui), RefreshMode::Partial);
         assert!(matches!(ui.screen(), Screen::BookReader { .. }));
+    }
+
+    // --- The device report: "selecting closes the chapter; going back
+    // selects more words, deletes it and crashes the book". ---
+
+    #[test]
+    fn a_hold_then_drag_down_the_page_highlights_and_never_closes_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, b2) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 2));
+        let (tx, ty) = word_at(&ui, (b2, 3));
+        ui.handle_hold(hx, hy).unwrap();
+        // The finger moves down the page (as Swipe at lift): a selection,
+        // not the swipe-down that leaves the book.
+        ui.drag_menu(hx, hy, tx, ty, false).unwrap();
+        assert!(
+            !ui.page_marks().is_empty(),
+            "the highlight shows once the drag reaches a second word"
+        );
+        ui.drag_menu(hx, hy, tx, ty, true).unwrap();
+        assert!(
+            matches!(ui.screen(), Screen::BookReader { .. }),
+            "still in the book"
+        );
+        assert_eq!(ui.sheet, Some(Sheet::Highlight { existing: None }));
+    }
+
+    #[test]
+    fn a_long_press_without_moving_looks_the_word_up_and_highlights_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        super::library_tabs::write_stardict(
+            &dir.path().join("data/dicts"),
+            "wordnet",
+            &[("quiet", "adj. making little noise")],
+        );
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (x, y) = word_at(&ui, (b1, 3));
+        ui.handle_hold(x, y).unwrap();
+        ui.handle_long_press(x, y).unwrap();
+        assert!(matches!(&ui.sheet, Some(Sheet::Definition { word, .. }) if word == "quiet"));
+        assert!(
+            ui.page_marks().is_empty(),
+            "no highlight drawn for a lookup"
+        );
+        assert!(highlights(dir.path()).is_empty(), "nothing saved");
+    }
+
+    #[test]
+    fn leaving_the_book_mid_selection_leaves_nothing_behind_for_the_next_visit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 0));
+        let (tx, ty) = word_at(&ui, (b1, 4));
+        // Selecting, then the book goes away before the lift arrives.
+        ui.handle_hold(hx, hy).unwrap();
+        ui.drag_menu(hx, hy, tx, ty, false).unwrap();
+        ui.close_book().unwrap();
+        assert!(ui.selection.is_none());
+        // Back in: a drag is a drag again, not more of the old selection.
+        let book = gideon_core::books::scan(&dir.path().join("Manga/Books"))
+            .unwrap()
+            .remove(0);
+        ui.open_book_reader(book).unwrap();
+        assert!(ui.selection.is_none());
+        let (ax, ay) = word_at(&ui, (b1, 1));
+        let (bx, by) = word_at(&ui, (b1, 3));
+        ui.drag_menu(ax, ay, bx, by, false).unwrap();
+        assert!(ui.selection.is_none(), "no stale selection to extend");
+        assert!(ui.page_marks().is_empty());
+        assert!(highlights(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn turning_the_page_or_a_tap_puts_a_dangling_selection_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        let (b1, _) = two_blocks(&ui);
+        let (hx, hy) = word_at(&ui, (b1, 0));
+        ui.handle_hold(hx, hy).unwrap();
+        ui.turn_book_page(1).unwrap();
+        assert!(ui.selection.is_none());
+        ui.turn_book_page(-1).unwrap();
+        ui.handle_hold(hx, hy).unwrap();
+        // A tap with a selection still up only puts it away: no page turn.
+        let page_before = match ui.screen() {
+            Screen::BookReader { page, .. } => *page,
+            _ => unreachable!(),
+        };
+        ui.handle_tap(ui.layout.width - 5, ui.layout.height / 2)
+            .unwrap();
+        assert!(ui.selection.is_none());
+        assert!(matches!(ui.screen(), Screen::BookReader { page, .. } if *page == page_before));
     }
 
     #[test]
@@ -12944,6 +13046,109 @@ mod reader_tools {
             panic!("still the list");
         };
         assert_eq!(entries.len(), 2);
+    }
+
+    /// A tiny deterministic generator, so a failing sequence can be replayed.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// Hundreds of random gestures over the reader — holds, drags, lifts,
+    /// long presses, taps on whatever sheet is up, page turns, leaving and
+    /// reopening the book — must never panic, never leave a selection behind
+    /// a closed book, and never leave the app without a screen.
+    #[test]
+    fn random_gestures_never_crash_the_reader_or_leave_a_stale_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        super::library_tabs::write_stardict(
+            &dir.path().join("data/dicts"),
+            "wordnet",
+            &[
+                ("harbour", "n. a place for boats"),
+                ("quiet", "adj. making little noise"),
+            ],
+        );
+        let mut ui = big_reader(dir.path());
+        let (w, h) = (ui.layout.width, ui.layout.height);
+        let mut rng = Lcg(0x5eed_1234);
+        for step in 0..250u32 {
+            let in_reader = matches!(ui.screen(), Screen::BookReader { .. });
+            let words = if in_reader {
+                ui.page_words()
+            } else {
+                Vec::new()
+            };
+            let word_pt = |rng: &mut Lcg| -> (u32, u32) {
+                if words.is_empty() {
+                    (rng.below(w), rng.below(h))
+                } else {
+                    let wd = &words[rng.below(words.len() as u32) as usize];
+                    (wd.rect.0 + wd.rect.2 / 2, wd.rect.1 + wd.rect.3 / 2)
+                }
+            };
+            let r = rng.below(100);
+            let result = if !in_reader {
+                // Back into the book from wherever we ended up.
+                while ui.stack.len() > 1 && !matches!(ui.screen(), Screen::BookReader { .. }) {
+                    ui.stack.pop();
+                }
+                ui.sheet = None;
+                if !matches!(ui.screen(), Screen::BookReader { .. }) {
+                    let book = gideon_core::books::scan(&dir.path().join("Manga/Books"))
+                        .unwrap()
+                        .remove(0);
+                    assert!(
+                        ui.selection.is_none(),
+                        "step {step}: a selection outlived the book"
+                    );
+                    ui.open_book_reader(book).map(|_| Flow::Continue)
+                } else {
+                    Ok(Flow::Continue)
+                }
+            } else if r < 20 {
+                let (x, y) = word_pt(&mut rng);
+                ui.handle_hold(x, y)
+            } else if r < 40 {
+                let (x0, y0) = word_pt(&mut rng);
+                let (x1, y1) = word_pt(&mut rng);
+                ui.drag_menu(x0, y0, x1, y1, rng.below(3) == 0)
+            } else if r < 50 {
+                let (x, y) = word_pt(&mut rng);
+                ui.handle_long_press(x, y)
+            } else if r < 85 {
+                ui.handle_tap(rng.below(w), rng.below(h))
+            } else if r < 92 {
+                let (x0, y0) = (rng.below(w), rng.below(h));
+                ui.drag_menu(x0, y0, rng.below(w), rng.below(h), true)
+            } else if r < 96 {
+                ui.close_book()
+            } else {
+                ui.turn_book_page(if rng.below(2) == 0 { 1 } else { -1 })
+                    .map(|_| Flow::Continue)
+            };
+            if let Err(e) = result {
+                // Errors are allowed (the UI shows them); panics are not.
+                let _ = e;
+            }
+            assert!(!ui.stack.is_empty(), "step {step}: no screen");
+            if ui.selection.is_some() {
+                assert!(
+                    matches!(ui.screen(), Screen::BookReader { .. }),
+                    "step {step}: a selection on {:?}",
+                    ui.screen()
+                );
+            }
+        }
     }
 
     fn save(ui: &UiApp<MemoryDisplay, FakeInput, FakeGateway>, out: &Path, name: &str) {

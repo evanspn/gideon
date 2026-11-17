@@ -2,10 +2,12 @@
 //! design `reader-highlights-fonts-words`), done the Kindle way:
 //!
 //! * **Hold a word, then drag.** The hold ([`UiEvent::Hold`], while the
-//!   finger is still down) selects the word under it; the drag that follows
-//!   extends the selection word by word; the lift opens the highlight
-//!   sheet. A hold and lift without moving is the dictionary, as before,
-//!   with a Highlight button on the definition.
+//!   finger is still down, timed by the input loop) anchors a selection on
+//!   the word under it without drawing anything; the drag that follows
+//!   starts showing the highlight when it reaches a second word and extends
+//!   it word by word; the lift opens the highlight sheet. A hold and lift
+//!   without moving is the dictionary, as on a Kindle, with a Highlight
+//!   button on the definition.
 //! * **Three colours**, drawn as blocks behind the words (black text stays
 //!   black; on a grey panel the band is a light grey).
 //! * **Tap a highlight** to change its colour, add a note, or remove it.
@@ -212,9 +214,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         let highlights = gideon_core::BookPlaces::load(&self.books_dir)
             .highlights(&key)
             .to_vec();
-        let selection = self
-            .selection
-            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+        // A selection is drawn only once it spans more than the held word: a
+        // hold on one word is a dictionary lookup, and shows nothing until
+        // the finger drags on to a second word.
+        let selection =
+            self.selection
+                .filter(|(a, b)| a != b)
+                .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         if highlights.is_empty() && selection.is_none() {
             return Vec::new();
         }
@@ -318,11 +324,12 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
         if !matches!(self.stack.last(), Some(Screen::BookReader { .. })) || self.sheet.is_some() {
             return Ok(Flow::Continue);
         }
+        // The held word becomes the selection's anchor, but nothing is drawn
+        // yet: lifting here is the dictionary, and only a drag on to another
+        // word starts showing a highlight (the Kindle and KOReader way).
         if let Some(pos) = self.word_pos_at(x, y, false) {
             self.selection = Some((pos, pos));
             self.selection_paints = 0;
-            // One word changes: Partial.
-            self.render_current(RefreshMode::Partial)?;
         }
         Ok(Flow::Continue)
     }
