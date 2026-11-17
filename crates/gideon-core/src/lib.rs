@@ -20,7 +20,9 @@ pub mod upload;
 pub mod words;
 pub mod zipread;
 
-pub use books::{Book, BookPlace, BookPlaces, Bookmark, Highlight, HIGHLIGHT_COLORS};
+pub use books::{
+    Book, BookActivity, BookDay, BookPlace, BookPlaces, Bookmark, Highlight, HIGHLIGHT_COLORS,
+};
 pub use cbz::CbzDocument;
 pub use comicinfo::ComicInfo;
 pub use dict::{Definition, Dictionary};

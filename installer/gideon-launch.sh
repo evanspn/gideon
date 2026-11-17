@@ -9,6 +9,133 @@
 # refuses to come up.
 set -u
 
+# --- NickelMenu protection ------------------------------------------------
+# Verified against the source (NickelHook nh.c + NickelMenu nickelmenu.cc):
+#   * nh_init is a shared-library constructor, so it runs when nickel's Qt
+#     plugin loader dlopens /usr/local/Kobo/imageformats/libnm.so during
+#     startup (install path: NickelHook.mk, KOBOROOT rule).
+#   * nh_failsafe_create renames libnm.so -> libnm.so.failsafe ("parks" it).
+#   * At the END of nh_init — on the success AND the error path — a detached
+#     thread is scheduled that sleeps failsafe_delay (NickelMenu: 3 s) and
+#     renames the library back.
+#   * If nickel dies before that thread fires, the library stays parked and
+#     NickelMenu is simply absent on the next boot ("uninstalled itself").
+#     Nothing but that thread — or us — ever restores it.
+#   * The one case nothing in this script can heal: the DEVICE goes down
+#     inside that window (the reboot on exit with a Bluetooth device
+#     connected, koreader/koreader#12739, lands exactly there, while nickel
+#     brings its stack up). For that, the library is staged as a KoboRoot.tgz
+#     before nickel restarts — the firmware unpacks it early in the next
+#     boot, before nickel, which is precisely how NickelMenu is installed in
+#     the first place — and the staged copy is removed once the window has
+#     passed safely. A KoboRoot.tgz that is not ours (a firmware or
+#     NickelMenu update waiting to install) is never touched.
+# Paths are overridable only so ci/launch_nm_test.sh can run these on a
+# fake root; on the device they are always the defaults.
+NM_LIB=${GIDEON_NM_LIB:-/usr/local/Kobo/imageformats/libnm.so}
+NM_RESCUE=${GIDEON_NM_RESCUE:-/mnt/onboard/.kobo/KoboRoot.tgz}
+NM_RESCUE_MARK=${GIDEON_NM_RESCUE_MARK:-/mnt/onboard/.adds/gideon/nm-rescue.md5}
+LAUNCH_LOG=${GIDEON_LAUNCH_LOG:-/mnt/onboard/.adds/gideon/launch.log}
+
+# One line of evidence per step, so a NickelMenu that vanished leaves a
+# trail: what the library looked like at each point. Kept small.
+nm_log() {
+    if [ -f "$LAUNCH_LOG" ] && [ "$(wc -c <"$LAUNCH_LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
+        tail -n 200 "$LAUNCH_LOG" >"$LAUNCH_LOG.tmp" 2>/dev/null && mv "$LAUNCH_LOG.tmp" "$LAUNCH_LOG"
+    fi
+    lib=absent
+    [ -e "$NM_LIB" ] && lib=present
+    parked=no
+    [ -e "$NM_LIB.failsafe" ] && parked=yes
+    rescue=none
+    [ -e "$NM_RESCUE" ] && rescue=staged
+    echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) $1: libnm=$lib parked=$parked rescue=$rescue" \
+        >>"$LAUNCH_LOG" 2>/dev/null
+}
+
+# Restore a library the failsafe left parked (nickel died inside the
+# window, so NickelMenu never got to rename it back). Without this,
+# NickelMenu has silently uninstalled itself come the next boot.
+nm_failsafe_heal() {
+    if [ -e "$NM_LIB.failsafe" ] && [ ! -e "$NM_LIB" ]; then
+        mv "$NM_LIB.failsafe" "$NM_LIB" 2>/dev/null
+        sync
+    elif [ -e "$NM_LIB.failsafe" ]; then
+        # Both present: NickelHook renames one into the other, so the two
+        # never coexist inside a live window. This is a leftover (say, a
+        # rescue boot reinstalled the library beside it), and left alone it
+        # would hold up the launch guard below for its whole timeout.
+        rm -f "$NM_LIB.failsafe"
+        sync
+    fi
+}
+
+# Whether the staged KoboRoot.tgz is the one we wrote.
+nm_rescue_is_ours() {
+    [ -e "$NM_RESCUE" ] && [ -e "$NM_RESCUE_MARK" ] &&
+        [ "$(md5sum <"$NM_RESCUE" | cut -d' ' -f1)" = "$(cat "$NM_RESCUE_MARK")" ]
+}
+
+# Stage NickelMenu's library to be reinstalled by the next boot, in case
+# the device goes down while nickel's failsafe has it parked. Does nothing
+# when NickelMenu is not installed, or when someone else's KoboRoot.tgz is
+# already waiting.
+nm_stage_rescue() {
+    [ -e "$NM_LIB" ] || return 0
+    if [ -e "$NM_RESCUE" ] && ! nm_rescue_is_ours; then
+        return 0
+    fi
+    work=$(mktemp -d 2>/dev/null) || return 0
+    lib_dir=$(dirname "$NM_LIB")
+    # Packed the way NickelHook packs its own KoboRoot.tgz: one file entry,
+    # no directory entries (unpacking those over / would reset the system
+    # folders' modes), mode 0644. We run as root, so the copy is root's.
+    mkdir -p "$work/${lib_dir#/}" &&
+        cp "$NM_LIB" "$work/${lib_dir#/}/" &&
+        chmod 0644 "$work/${NM_LIB#/}" &&
+        mkdir -p "$(dirname "$NM_RESCUE")" "$(dirname "$NM_RESCUE_MARK")" &&
+        (cd "$work" && tar czf "$NM_RESCUE.part" "${NM_LIB#/}") &&
+        mv "$NM_RESCUE.part" "$NM_RESCUE" &&
+        md5sum <"$NM_RESCUE" | cut -d' ' -f1 >"$NM_RESCUE_MARK"
+    rm -rf "$work" "$NM_RESCUE.part" 2>/dev/null
+    sync
+}
+
+# The window passed: take back our staged copy (never anyone else's).
+nm_clear_rescue() {
+    if nm_rescue_is_ours; then
+        rm -f "$NM_RESCUE"
+    fi
+    rm -f "$NM_RESCUE_MARK"
+    sync
+}
+
+# Sourced by the test suite for the functions above only.
+# Whether nickel's failsafe can still be armed: the library is parked, or
+# nickel is young enough that it may not have been loaded (and parked) yet.
+nm_failsafe_armed() {
+    # The parked library is the authoritative marker when present…
+    [ -e "$NM_LIB.failsafe" ] && return 0
+    # …and nickel's process age covers NickelMenu versions whose failsafe
+    # works differently: field 22 of /proc/<pid>/stat is the start time in
+    # clock ticks (100 Hz on these kernels).
+    pid=$(pidof -s nickel) || return 1
+    age=$(awk -v up="$(cut -d' ' -f1 /proc/uptime)" \
+        '{print int(up - $22 / 100)}' "/proc/$pid/stat" 2>/dev/null)
+    [ -n "$age" ] && [ "$age" -lt 25 ]
+}
+
+# The failsafe window after a nickel (re)start is still open, or nickel is
+# gone: either way the rescue copy is still needed.
+nm_window_open() {
+    nm_failsafe_armed || ! pidof nickel >/dev/null 2>&1
+}
+
+if [ "${GIDEON_LAUNCH_FUNCTIONS_ONLY:-}" = 1 ]; then
+    # shellcheck disable=SC2317 # return when sourced, exit when run
+    return 0 2>/dev/null || exit 0
+fi
+
 GIDEON_DATA_DIR=/mnt/onboard/.adds/gideon/data
 export GIDEON_DATA_DIR
 
@@ -92,42 +219,9 @@ restart_nickel() {
 }
 
 # --- NickelMenu failsafe guard -------------------------------------------
-# Verified against the source (NickelHook nh.c + NickelMenu nickelmenu.cc):
-#   * nh_init is a shared-library constructor, so it runs when nickel's Qt
-#     plugin loader dlopens /usr/local/Kobo/imageformats/libnm.so during
-#     startup (install path: NickelHook.mk, KOBOROOT rule).
-#   * nh_failsafe_create renames libnm.so -> libnm.so.failsafe ("parks" it).
-#   * At the END of nh_init — on the success AND the error path — a detached
-#     thread is scheduled that sleeps failsafe_delay (NickelMenu: 3 s) and
-#     renames the library back.
-#   * If nickel dies before that thread fires, the library stays parked and
-#     NickelMenu is simply absent on the next boot ("uninstalled itself").
-#     Nothing but that thread — or us — ever restores it.
-# So: never kill nickel while the library is parked, and never walk away
-# from a nickel we started while it is still parked.
-NM_LIB=/usr/local/Kobo/imageformats/libnm.so
-
-nm_failsafe_armed() {
-    # The parked library is the authoritative marker when present…
-    [ -e "$NM_LIB.failsafe" ] && return 0
-    # …and nickel's process age covers NickelMenu versions whose failsafe
-    # works differently: field 22 of /proc/<pid>/stat is the start time in
-    # clock ticks (100 Hz on these kernels).
-    pid=$(pidof -s nickel) || return 1
-    age=$(awk -v up="$(cut -d' ' -f1 /proc/uptime)" \
-        '{print int(up - $22 / 100)}' "/proc/$pid/stat" 2>/dev/null)
-    [ -n "$age" ] && [ "$age" -lt 25 ]
-}
-
-# Restore a library the failsafe left parked (nickel died inside the
-# window, so NickelMenu never got to rename it back). Without this,
-# NickelMenu has silently uninstalled itself come the next boot.
-nm_failsafe_heal() {
-    if [ -e "$NM_LIB.failsafe" ] && [ ! -e "$NM_LIB" ]; then
-        mv "$NM_LIB.failsafe" "$NM_LIB" 2>/dev/null
-        sync
-    fi
-}
+# Never kill nickel while its failsafe has the library parked (see the
+# NickelMenu protection notes at the top), and never walk away from a nickel
+# we started while it is still parked.
 
 i=0
 while nm_failsafe_armed; do
@@ -135,6 +229,13 @@ while nm_failsafe_armed; do
     [ "$i" -ge 100 ] && break # ~25 s upper bound; never hang the launch
     usleep 250000 2>/dev/null || sleep 1
 done
+# Still parked once the window is long past: nickel's disarm never came.
+# NickelMenu is still loaded in this nickel (its code stays mapped), so put
+# the file back now, while there is a chance — and drop any rescue copy a
+# previous exit left behind (the window it guarded is over).
+nm_failsafe_heal
+nm_clear_rescue
+nm_log launch
 
 # Stop nickel and its watchdog/helper daemons so the screen is ours, and
 # wait for nickel to actually exit (up to ~4s) instead of guessing — both
@@ -182,6 +283,10 @@ fi
 # window), put NickelMenu's library back before nickel comes up.
 sync
 nm_failsafe_heal
+# From here until nickel's failsafe disarms, a reboot would strand
+# NickelMenu: stage its library for the next boot to reinstall.
+nm_stage_rescue
+nm_log exit
 restart_nickel
 
 # Fallback: if nickel didn't appear within ~10s, reboot — that reliably
@@ -209,13 +314,21 @@ done
 # the next boot, with nobody left to notice. So don't exit yet: babysit
 # the window until the failsafe disarms, and restore the library ourselves
 # if nickel dies first (or the disarm never comes within ~30 s).
+#
+# "Not parked" alone does not mean the window is over: nickel loads its
+# plugins a moment after its process appears, so right after pidof
+# succeeds the library may not have been parked YET. Clearing the rescue
+# then would drop it just before the window it exists for. So keep watching
+# until nickel is past the age at which the failsafe can still be armed
+# (nm_failsafe_armed: parked, or nickel younger than 25 s).
 i=0
-while [ -e "$NM_LIB.failsafe" ]; do
+while nm_window_open; do
     i=$((i + 1))
     if [ "$i" -ge 120 ]; then
         # Init hung with the failsafe still armed: keep NickelMenu alive
         # (a double restore is harmless — NM's own rename just no-ops).
         nm_failsafe_heal
+        nm_log heal-after-hang
         break
     fi
     if ! pidof nickel >/dev/null 2>&1; then
@@ -223,6 +336,7 @@ while [ -e "$NM_LIB.failsafe" ]; do
         # a clean boot reliably brings the stock UI back with NickelMenu
         # intact.
         nm_failsafe_heal
+        nm_log nickel-died-in-window
         sync
         sleep 1
         reboot
@@ -231,4 +345,8 @@ while [ -e "$NM_LIB.failsafe" ]; do
     usleep 250000 2>/dev/null || sleep 1
 done
 
+# The window has passed with NickelMenu back in place: the rescue copy is
+# no longer needed, and must not reinstall anything on a later boot.
+nm_clear_rescue
+nm_log disarmed
 exit 0

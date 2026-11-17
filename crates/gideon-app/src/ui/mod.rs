@@ -3539,8 +3539,8 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 Ok(Flow::Continue)
             }
             Some(Sheet::BookFile { book }) => {
-                // An EPUB reads here; a PDF only in the Kobo's reader. The
-                // rows differ by one, so index by what they say.
+                // An EPUB reads here; a PDF does not. The rows differ by one,
+                // so index by what they say.
                 let rows = book_file_rows(&book, self.book_finished(&book));
                 match rows.get(index).map(|r| r.0.as_str()) {
                     Some("Read") => {
@@ -3548,10 +3548,6 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                         self.open_book_reader(book)?;
                         Ok(Flow::Continue)
                     }
-                    // Closing hands the device back to Nickel, which indexes
-                    // the Books folder on start, so the book is on its home
-                    // screen when it comes up.
-                    Some("Read in the Kobo reader") => Ok(Flow::Quit(Exit::Close)),
                     Some(label @ ("Mark as finished" | "Mark as unread")) => {
                         let mut places = gideon_core::BookPlaces::load(&self.books_dir);
                         if label == "Mark as unread" {
@@ -3643,7 +3639,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                     7 => self.rotate_book_reader()?,
                     8 => {
-                        self.save_book_place();
+                        self.save_book_place(0);
                         return self.pop();
                     }
                     _ => self.render_current(RefreshMode::Full)?,
@@ -3805,19 +3801,16 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             if !edge && released {
                 // The manga reader's mid-screen gestures, by the same rules.
                 self.book_slide_base = None;
-                let min_travel = (height / 4).max(1);
-                let vertical = y0.abs_diff(y1) > x0.abs_diff(x1);
-                if is_sheet_swipe(x0, y0, x1, y1, height) {
-                    // A flick up off the bottom bezel: the reading menu, with
-                    // the lamp sliders, over the unmoved page (Partial).
-                    self.sheet = Some(Sheet::BookReading);
-                    self.render_current(RefreshMode::Partial)?;
-                } else if vertical && y1 > y0 && y1 - y0 >= min_travel {
-                    // Swipe down: leave the book.
-                    return self.close_book();
-                } else if vertical && y0 > y1 && y0 - y1 >= min_travel {
-                    // Swipe up mid-page: rotate a quarter turn.
-                    self.rotate_book_reader()?;
+                match classify_reader_swipe(x0, y0, x1, y1, height) {
+                    // Up from the lower page: the reading menu, with the lamp
+                    // sliders, over the unmoved page (Partial).
+                    Some(ReaderSwipe::Menu) => {
+                        self.sheet = Some(Sheet::BookReading);
+                        self.render_current(RefreshMode::Partial)?;
+                    }
+                    Some(ReaderSwipe::Close) => return self.close_book(),
+                    Some(ReaderSwipe::Rotate) => self.rotate_book_reader()?,
+                    None => {}
                 }
                 return Ok(Flow::Continue);
             }
@@ -6841,41 +6834,33 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                             panel.height
                         };
                         if slid.is_none() {
-                            // Mid-screen gestures: swipe down to leave the manga,
-                            // swipe up to rotate 90° clockwise — for reading on
-                            // your side in bed. Both demand deliberate travel (a
-                            // quarter of the reading height): a sloppy page-turn
-                            // tap drifting past the 30px slop must never exit,
-                            // and certainly never rotate the whole reader.
-                            let min_travel = (reading_h / 4).max(1);
-                            let vertical = ry0.abs_diff(ry1) > rx0.abs_diff(rx1);
-                            // An up-swipe STARTING in the bottom eighth of the
-                            // reading frame opens the controls sheet — distinct
-                            // from the mid-screen rotate gesture below, which
-                            // starts higher up. An eighth of travel is enough:
-                            // it's a flick off the bezel.
-                            if is_sheet_swipe(rx0, ry0, rx1, ry1, reading_h) {
-                                sheet_open = true;
-                                show_controls_sheet(
-                                    &mut reader,
-                                    &panel,
-                                    rotation,
-                                    rotation_locked,
-                                    self.auto_rotate_spreads,
-                                )?;
-                                continue;
-                            }
-                            if ry1 > ry0 && vertical && ry1 - ry0 >= min_travel {
-                                break;
-                            }
-                            if ry0 > ry1 && vertical && ry0 - ry1 >= min_travel {
-                                rotate_reader_90(
-                                    &mut reader,
-                                    &mut rotation,
-                                    self.settings_dir.as_deref(),
-                                    rotation_locked,
-                                )?;
-                                self.reader_rotation = rotation;
+                            // Mid-screen gestures, by the rules both readers
+                            // share (classify_reader_swipe): up from the lower
+                            // page opens the controls, down leaves the manga,
+                            // a long swipe up from higher on the page turns
+                            // the reader 90° — for reading on your side in bed.
+                            match classify_reader_swipe(rx0, ry0, rx1, ry1, reading_h) {
+                                Some(ReaderSwipe::Menu) => {
+                                    sheet_open = true;
+                                    show_controls_sheet(
+                                        &mut reader,
+                                        &panel,
+                                        rotation,
+                                        rotation_locked,
+                                        self.auto_rotate_spreads,
+                                    )?;
+                                }
+                                Some(ReaderSwipe::Close) => break,
+                                Some(ReaderSwipe::Rotate) => {
+                                    rotate_reader_90(
+                                        &mut reader,
+                                        &mut rotation,
+                                        self.settings_dir.as_deref(),
+                                        rotation_locked,
+                                    )?;
+                                    self.reader_rotation = rotation;
+                                }
+                                None => {}
                             }
                             continue;
                         }
@@ -7500,7 +7485,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn compose_stats(&self) -> RgbPage {
         let l = &self.layout;
         let settings = self.load_settings();
-        let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
+        let stats = self.reading_stats();
         let theme = widgets::Theme::from_setting(&settings.color_profile);
         let palette = heatmap::Palette::from_setting(&settings.color_profile);
         let inner = l.width.saturating_sub(l.pad * 2);
@@ -9092,7 +9077,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             return self.push(Screen::Message {
                 title: book.title.clone(),
                 body: "This book has no readable text — it may be images only.\n\
-                       Use \"Read in the Kobo reader\" instead."
+                       It is in your Kobo library too, after you close gideon."
                     .to_string(),
             });
         }
@@ -9381,14 +9366,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             *p = pages;
             *page = at;
         }
-        self.save_book_place();
+        self.save_book_place(0);
         self.book_turns = 0;
         self.book_turn_times.clear();
         self.render_current(RefreshMode::Full)
     }
 
-    /// Remember where the reader is, by chapter and paragraph.
-    fn save_book_place(&self) {
+    /// Remember where the reader is, by chapter and paragraph, and log
+    /// `read_pages` pages read today for Today's calendar and heatmap.
+    fn save_book_place(&self, read_pages: u32) {
         let Some(Screen::BookReader {
             book,
             text,
@@ -9425,6 +9411,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 keep: before.keep,
             },
         );
+        places.record_reading(&book.relative_path, &book.title, now, read_pages, |t| {
+            local_zone().day_index(t as i64)
+        });
         if let Err(e) = places.save(&self.books_dir) {
             eprintln!("gideon: couldn't save the reading place: {e}");
         }
@@ -9483,7 +9472,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             *p = pages;
             *pg = page;
         }
-        self.save_book_place();
+        self.save_book_place(u32::from(delta > 0));
         self.book_turns += 1;
         self.book_turn_times.push((self.clock)());
         if self.book_turn_times.len() > 200 {
@@ -9679,7 +9668,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn close_book(&mut self) -> Result<Flow> {
         self.sheet = None;
         self.selection = None;
-        self.save_book_place();
+        self.save_book_place(0);
         self.pop()?;
         Ok(Flow::Continue)
     }
@@ -10003,10 +9992,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Run `f` with the (cached) ProgressStore: the disk read + JSON parse
     /// happen at most once between [`Self::invalidate_progress_cache`]
     /// calls, not once per repaint.
-    /// This profile's reading statistics, from its own progress store.
-    #[cfg(test)]
+    /// This profile's reading statistics: its manga progress store and the
+    /// books' reading days.
     fn reading_stats(&self) -> gideon_core::ReadingStats {
-        self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store))
+        let books = gideon_core::BookPlaces::load(&self.books_dir);
+        self.with_progress(|_, store| {
+            gideon_core::ReadingStats::from_store_and_books(store, &books)
+        })
     }
 
     fn with_progress<R>(&self, f: impl FnOnce(&Self, &ProgressStore) -> R) -> R {
@@ -10284,15 +10276,52 @@ struct SlideBase {
     level: u8,
 }
 
-/// The reader's "raise the controls" gesture, in reading-frame
-/// coordinates: an upward, mostly vertical swipe that STARTS in the bottom
-/// eighth of the frame and travels at least another eighth. Shared by the
-/// manga reader and the book reader so the two cannot drift apart.
-fn is_sheet_swipe(x0: u32, y0: u32, x1: u32, y1: u32, reading_h: u32) -> bool {
-    let eighth = (reading_h / 8).max(1);
-    let band = reading_h.saturating_sub(eighth);
-    let vertical = y0.abs_diff(y1) > x0.abs_diff(x1);
-    y0 > y1 && vertical && y0 > band && y0 - y1 >= eighth
+/// What a mid-page swipe in a reader means. One set of rules for the manga
+/// reader and the book reader, so the two can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderSwipe {
+    /// Up from the lower part of the page: the reading menu.
+    Menu,
+    /// Down: leave the book or the manga.
+    Close,
+    /// A long, deliberate swipe up from higher on the page: turn a quarter.
+    Rotate,
+}
+
+/// Classify a released mid-page swipe, in reading-frame coordinates (edge
+/// slides are the lamp, decided before this). The rules are forgiving where
+/// a miss is merely annoying and strict where a mistake is disruptive:
+///
+/// * **Menu** — up, starting anywhere in the bottom third, travelling a
+///   tenth of the height. It used to need a start in the bottom eighth;
+///   a flick that began a little higher was read as Rotate and turned the
+///   page sideways, which is what made the gesture feel unreliable.
+/// * **Close** — down, a fifth of the height.
+/// * **Rotate** — up, starting above the menu's third, a full third of the
+///   height: only ever on purpose.
+///
+/// "Up" and "down" mean mostly vertical (more vertical travel than
+/// sideways), so a sloppy page-turn never counts.
+fn classify_reader_swipe(
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    reading_h: u32,
+) -> Option<ReaderSwipe> {
+    let h = reading_h.max(1);
+    let dy = y0.abs_diff(y1);
+    if dy <= x0.abs_diff(x1) {
+        return None;
+    }
+    if y1 > y0 {
+        return (dy >= h / 5).then_some(ReaderSwipe::Close);
+    }
+    let menu_band = h - h / 3;
+    if y0 >= menu_band {
+        return (dy >= h / 10).then_some(ReaderSwipe::Menu);
+    }
+    (dy >= h / 3).then_some(ReaderSwipe::Rotate)
 }
 
 fn show_controls_sheet<D: Display>(
@@ -10430,17 +10459,14 @@ fn page_label(page: usize, page_count: usize) -> String {
 /// see but not hit is worse than no chevron. The zones are a full title-bar
 /// height wide so they are finger-sized rather than glyph-sized.
 /// What the Books-tab sheet offers for one book. gideon reads an EPUB
-/// itself; a PDF is the Kobo reader's.
+/// itself. There is deliberately no "Read in the Kobo reader": it was a
+/// way out of gideon dressed as a reading option, and every way out
+/// restarts Nickel (closing from the power menu does the same, knowingly).
 fn book_file_rows(book: &gideon_core::Book, finished: bool) -> Vec<(String, String, bool)> {
     let mut rows = Vec::new();
     if book.format == "epub" {
         rows.push(("Read".to_string(), String::new(), false));
     }
-    rows.push((
-        "Read in the Kobo reader".to_string(),
-        "closes gideon".to_string(),
-        false,
-    ));
     rows.push((
         if finished {
             "Mark as unread"
@@ -12452,4 +12478,12 @@ fn progress_key(library_dir: &Path, path: &Path) -> String {
     path.strip_prefix(library_dir)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.display().to_string())
+}
+
+/// The device's time zone, read once: the book reader asks on every page
+/// turn, and the zoneinfo file does not change while gideon runs.
+fn local_zone() -> &'static gideon_core::stats::LocalTimeZone {
+    static ZONE: std::sync::OnceLock<gideon_core::stats::LocalTimeZone> =
+        std::sync::OnceLock::new();
+    ZONE.get_or_init(gideon_core::stats::LocalTimeZone::system)
 }
