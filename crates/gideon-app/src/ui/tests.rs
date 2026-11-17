@@ -10108,7 +10108,10 @@ mod library_tabs {
         // restarts Nickel, so leaving is only ever the power menu's Close.
         let (_, rows) = ui.sheet_rows();
         let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(labels, ["Read", "Mark as finished", "Delete this book", "Close"]);
+        assert_eq!(
+            labels,
+            ["Read", "Mark as finished", "Delete this book", "Close"]
+        );
         let events = vec![
             tap_nav(0),
             tap_books_tab(),
@@ -10537,10 +10540,7 @@ mod library_tabs {
         ui.run().unwrap();
         let (_, rows) = ui.sheet_rows();
         let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["Mark as finished", "Delete this book", "Close"]
-        );
+        assert_eq!(labels, ["Mark as finished", "Delete this book", "Close"]);
     }
 
     #[test]

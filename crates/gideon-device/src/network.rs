@@ -284,9 +284,7 @@ pub fn scan_networks() -> Vec<WifiNetwork> {
         return Vec::new();
     }
     let iface = interface();
-    let _ = wpa_cli(&iface, &["scan"]);
-    std::thread::sleep(Duration::from_secs(3));
-    let results = wpa_cli(&iface, &["scan_results"]).unwrap_or_default();
+    let results = scan_with(&mut |args| wpa_cli(&iface, args), &std::thread::sleep);
     let saved = saved_ssids(&iface);
     let connected = current_ssid(&iface);
 
@@ -310,6 +308,55 @@ pub fn scan_networks() -> Vec<WifiNetwork> {
         .collect();
     nets.sort_by(|a, b| b.connected.cmp(&a.connected).then(b.signal.cmp(&a.signal)));
     nets
+}
+
+/// How long to wait for wpa_supplicant to answer, a scan to be accepted,
+/// and its results to arrive — each in steps of [`SCAN_STEP`].
+const SUPPLICANT_WAIT_STEPS: u32 = 20;
+const SCAN_REQUEST_STEPS: u32 = 10;
+const SCAN_RESULT_STEPS: u32 = 16;
+const SCAN_STEP: Duration = Duration::from_millis(500);
+
+/// The scan itself, with the `wpa_cli` runner and the sleep passed in so the
+/// timing can be tested. Returns the raw `scan_results` text.
+///
+/// The first scan after Wi-Fi was off used to find nothing: the Wi-Fi
+/// screen brings the radio up in the background and scanned straight away,
+/// so `scan` went to a supplicant that was not running yet, failed, and a
+/// fixed 3 s later `scan_results` was empty. Now it waits for the
+/// supplicant to answer, retries a scan the radio refuses as busy, and
+/// polls for results instead of guessing how long they take — taking one
+/// more poll after the first networks appear, since they arrive in batches.
+fn scan_with(run: &mut dyn FnMut(&[&str]) -> Option<String>, sleep: &dyn Fn(Duration)) -> String {
+    for _ in 0..SUPPLICANT_WAIT_STEPS {
+        if run(&["ping"]).is_some_and(|o| o.contains("PONG")) {
+            break;
+        }
+        sleep(SCAN_STEP);
+    }
+    for _ in 0..SCAN_REQUEST_STEPS {
+        match run(&["scan"]) {
+            Some(o) if o.trim() == "OK" => break,
+            _ => sleep(SCAN_STEP),
+        }
+    }
+    let mut best = String::new();
+    let mut seen_any = false;
+    for _ in 0..SCAN_RESULT_STEPS {
+        sleep(SCAN_STEP);
+        let results = run(&["scan_results"]).unwrap_or_default();
+        let count = parse_scan_results(&results).len();
+        if count > parse_scan_results(&best).len() {
+            best = results;
+        }
+        if count > 0 {
+            if seen_any {
+                break;
+            }
+            seen_any = true;
+        }
+    }
+    best
 }
 
 /// Connect to `ssid` (`password = None` for an open or already-saved network):
@@ -592,6 +639,82 @@ mod tests {
         assert!(s.contains("moal"));
         assert!(s.contains("ifconfig wlan0 up"));
         std::env::remove_var("GIDEON_WIFI_MODULE");
+    }
+
+    #[test]
+    fn the_first_scan_after_wifi_was_off_waits_for_the_supplicant_and_its_results() {
+        use std::cell::{Cell, RefCell};
+        // The radio is coming up: the supplicant answers on the 4th ping,
+        // refuses the first scan as busy, and its results arrive in two
+        // batches. The old code asked once and read once after 3 s: empty.
+        let pings = Cell::new(0);
+        let scans = Cell::new(0);
+        let polls = Cell::new(0);
+        let log = RefCell::new(Vec::new());
+        let row = |b: &str, ssid: &str| format!("{b}\t2437\t-50\t[WPA2-PSK-CCMP][ESS]\t{ssid}\n");
+        let mut run = |args: &[&str]| -> Option<String> {
+            log.borrow_mut().push(args[0].to_string());
+            match args[0] {
+                "ping" => {
+                    pings.set(pings.get() + 1);
+                    (pings.get() >= 4).then(|| "PONG\n".to_string())
+                }
+                "scan" => {
+                    scans.set(scans.get() + 1);
+                    Some(
+                        if scans.get() == 1 {
+                            "FAIL-BUSY\n"
+                        } else {
+                            "OK\n"
+                        }
+                        .to_string(),
+                    )
+                }
+                "scan_results" => {
+                    polls.set(polls.get() + 1);
+                    let header = "bssid / frequency / signal level / flags / ssid\n".to_string();
+                    Some(match polls.get() {
+                        1 | 2 => header,
+                        3 => header + &row("aa:aa:aa:aa:aa:aa", "Home"),
+                        _ => {
+                            header
+                                + &row("aa:aa:aa:aa:aa:aa", "Home")
+                                + &row("bb:bb:bb:bb:bb:bb", "Cafe")
+                        }
+                    })
+                }
+                _ => None,
+            }
+        };
+        let slept = Cell::new(Duration::ZERO);
+        let sleep = |d: Duration| slept.set(slept.get() + d);
+        let results = scan_with(&mut run, &sleep);
+        let names: Vec<String> = parse_scan_results(&results)
+            .into_iter()
+            .map(|n| n.0)
+            .collect();
+        assert_eq!(names.len(), 2, "both batches: {names:?}");
+        assert!(names.contains(&"Home".to_string()) && names.contains(&"Cafe".to_string()));
+        assert_eq!(pings.get(), 4, "waited for the supplicant");
+        assert_eq!(scans.get(), 2, "retried the busy scan");
+        assert!(
+            slept.get() < Duration::from_secs(10),
+            "no longer than it needs: {:?}",
+            slept.get()
+        );
+    }
+
+    #[test]
+    fn a_dead_supplicant_gives_up_in_bounded_time_with_no_networks() {
+        use std::cell::Cell;
+        let slept = Cell::new(Duration::ZERO);
+        let results = scan_with(&mut |_| None, &|d| slept.set(slept.get() + d));
+        assert!(parse_scan_results(&results).is_empty());
+        assert!(
+            slept.get() <= Duration::from_secs(25),
+            "bounded: {:?}",
+            slept.get()
+        );
     }
 
     #[test]
