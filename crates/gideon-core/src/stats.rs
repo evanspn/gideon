@@ -47,6 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::books::BookPlaces;
 use crate::library::{ProgressStore, ReadingProgress};
 
 /// Seconds in a day. Local days are exactly this long *in local time*; DST
@@ -379,6 +380,14 @@ fn parse_block(cur: &mut Cursor<'_>, head: &TzifHeader, time_width: usize) -> Op
 /// (`"Series/vol3.cbz"` → `"Series"`), or the whole key for a loose file in the
 /// library root. Mirrors `series_key_of` in the app UI so the series count here
 /// matches the number of cards on the Home screen.
+/// A readable title from a book's path, for a place saved before titles
+/// were recorded: the file name without its extension or " -- author" tail.
+fn title_of_path(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+    stem.split(" -- ").next().unwrap_or(stem).trim().to_string()
+}
+
 fn series_key_of(chapter_key: &str) -> &str {
     chapter_key.split('/').next().unwrap_or(chapter_key)
 }
@@ -444,6 +453,10 @@ pub struct ReadingStats {
     /// Series name → the local days it was read on. What the calendar view
     /// draws: a title, and which squares it belongs in.
     pub series_days: BTreeMap<String, BTreeSet<i64>>,
+    /// Books with at least one reading day. Their pages and days are in
+    /// [`Self::pages_read`], [`Self::by_day`] and [`Self::series_days`]
+    /// alongside the manga's, so the heatmap and calendar show both.
+    pub books_read: usize,
     /// The local day the statistics were computed on. Anchors both the current
     /// streak and the right-hand edge of [`Self::heatmap`], and keeps the whole
     /// struct a pure function of its inputs (which is what makes it testable).
@@ -512,8 +525,71 @@ impl ReadingStats {
             longest_streak,
             by_day,
             series_days,
+            books_read: 0,
             today,
         }
+    }
+
+    /// [`Self::from_store`] plus the books' reading days, in the device's
+    /// local zone.
+    pub fn from_store_and_books(store: &ProgressStore, books: &BookPlaces) -> Self {
+        let tz = LocalTimeZone::system();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Self::compute(store.entries(), &tz, now).with_books(books, &tz)
+    }
+
+    /// Fold the books' reading days in: each day's pages join the heatmap,
+    /// each book is a bar on the calendar under its title, and streaks count
+    /// a day with only book reading. A book read before the daily log
+    /// existed still has its place, whose timestamp is one day it was read.
+    pub fn with_books(mut self, books: &BookPlaces, tz: &LocalTimeZone) -> Self {
+        let mut read = BTreeSet::new();
+        for (path, activity) in &books.activity {
+            let title = if activity.title.is_empty() {
+                title_of_path(path)
+            } else {
+                activity.title.clone()
+            };
+            for day in &activity.days {
+                self.add_book_day(&title, tz.day_index(day.at as i64), day.pages as usize);
+                read.insert(path.as_str());
+            }
+        }
+        for (path, place) in &books.places {
+            if place.updated_at == 0 || books.activity.contains_key(path) {
+                continue;
+            }
+            self.add_book_day(
+                &title_of_path(path),
+                tz.day_index(place.updated_at as i64),
+                0,
+            );
+            read.insert(path.as_str());
+        }
+        self.books_read = read.len();
+        let (current, longest) = streaks(&self.by_day, self.today);
+        self.current_streak = current;
+        self.longest_streak = longest;
+        self.active_days = self.by_day.len();
+        self.first_day = self.by_day.keys().next().map(|&d| d.max(0) as u64);
+        self
+    }
+
+    fn add_book_day(&mut self, title: &str, day: i64, pages: usize) {
+        if day > self.today {
+            return; // a clock that jumped back: don't paint the future
+        }
+        // At least one page, so a day the book was only opened still shades
+        // a heatmap square; the calendar counts it either way.
+        *self.by_day.entry(day).or_insert(0) += pages.max(1);
+        self.pages_read += pages;
+        self.series_days
+            .entry(title.to_owned())
+            .or_default()
+            .insert(day);
     }
 
     /// The busiest day's page count, the denominator the heatmap shades
@@ -1148,5 +1224,60 @@ mod tests {
         assert_eq!(after - before, 1);
         assert_eq!(civil_from_days(before), (2026, 3, 8));
         assert_eq!(civil_from_days(after), (2026, 3, 9));
+    }
+
+    #[test]
+    fn books_join_the_heatmap_calendar_and_streaks() {
+        use crate::books::{BookPlace, BookPlaces};
+        let tz = LocalTimeZone::utc();
+        let today = 20_000i64;
+        let now = (today * SECS_PER_DAY + 3_600) as u64;
+        let day = |d: i64| (d * SECS_PER_DAY + 72_000) as u64; // 20:00
+        let mut books = BookPlaces::default();
+        let day_of = |t: u64| tz.day_index(t as i64);
+        // Three evenings in a row, the second in two sittings.
+        for (d, pages) in [(today - 2, 10), (today - 1, 4), (today - 1, 6), (today, 3)] {
+            books.record_reading("A/ship.epub", "The Ship", day(d), pages, day_of);
+        }
+        assert_eq!(
+            books.activity["A/ship.epub"].days.len(),
+            3,
+            "a day's sittings merge"
+        );
+        // A book read before the log existed: its place's timestamp is a day.
+        books.set(
+            "old -- Someone.epub",
+            BookPlace {
+                updated_at: day(today - 10),
+                ..Default::default()
+            },
+        );
+        // One manga chapter, four days ago.
+        let manga = [(
+            "Berserk/ch1.cbz",
+            ReadingProgress {
+                current_page: 4,
+                total_pages: 5,
+                last_read_at: day(today - 4),
+            },
+        )];
+        let stats = ReadingStats::compute(manga.iter().map(|(k, p)| (*k, *p)), &tz, now as i64)
+            .with_books(&books, &tz);
+        assert_eq!(stats.books_read, 2);
+        assert_eq!(stats.pages_read, 5 + 23);
+        assert_eq!(stats.pages_on(today - 1), 10);
+        assert_eq!(
+            stats.pages_on(today - 10),
+            1,
+            "an opened-only day still shades"
+        );
+        assert_eq!(stats.current_streak, 3, "book days count toward the streak");
+        assert_eq!(stats.active_days, 5);
+        let spans = stats.spans(today - 30, today);
+        let ship: Vec<_> = spans.iter().filter(|s| s.series == "The Ship").collect();
+        assert_eq!(ship.len(), 1);
+        assert_eq!(ship[0].days(), 3);
+        assert!(spans.iter().any(|s| s.series == "old"), "{spans:?}");
+        assert!(spans.iter().any(|s| s.series == "Berserk"));
     }
 }

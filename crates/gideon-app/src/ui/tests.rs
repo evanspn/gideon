@@ -12602,6 +12602,41 @@ mod reader_tools {
         ui
     }
 
+    #[test]
+    fn reading_a_book_lands_in_todays_heatmap_and_calendar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = big_reader(dir.path());
+        assert_eq!(
+            ui.reading_stats().books_read,
+            0,
+            "opening alone logs nothing"
+        );
+        ui.turn_book_page(1).unwrap();
+        ui.turn_book_page(1).unwrap();
+        ui.turn_book_page(-1).unwrap();
+        let stats = ui.reading_stats();
+        assert_eq!(stats.books_read, 1);
+        assert_eq!(
+            stats.pages_read, 2,
+            "two pages forward; going back reads nothing new"
+        );
+        assert!(
+            stats.pages_on(stats.today) >= 2,
+            "today's heatmap square is shaded"
+        );
+        assert_eq!(stats.current_streak, 1);
+        let spans = stats.spans(stats.today - 7, stats.today);
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.series == "The Harbour Wall" && s.end_day == stats.today),
+            "the book is a bar on the calendar under its title: {spans:?}"
+        );
+        let places = gideon_core::BookPlaces::load(&ui.books_dir);
+        let days = &places.activity["Placeholder Author/harbour.epub"].days;
+        assert_eq!(days.len(), 1, "a day's turns share one row");
+    }
+
     type Big = UiApp<MemoryDisplay, FakeInput, FakeGateway>;
 
     /// The centre of the page word at `pos`.

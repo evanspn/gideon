@@ -3639,7 +3639,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                     }
                     7 => self.rotate_book_reader()?,
                     8 => {
-                        self.save_book_place();
+                        self.save_book_place(0);
                         return self.pop();
                     }
                     _ => self.render_current(RefreshMode::Full)?,
@@ -7485,7 +7485,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn compose_stats(&self) -> RgbPage {
         let l = &self.layout;
         let settings = self.load_settings();
-        let stats = self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store));
+        let stats = self.reading_stats();
         let theme = widgets::Theme::from_setting(&settings.color_profile);
         let palette = heatmap::Palette::from_setting(&settings.color_profile);
         let inner = l.width.saturating_sub(l.pad * 2);
@@ -9366,14 +9366,15 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             *p = pages;
             *page = at;
         }
-        self.save_book_place();
+        self.save_book_place(0);
         self.book_turns = 0;
         self.book_turn_times.clear();
         self.render_current(RefreshMode::Full)
     }
 
-    /// Remember where the reader is, by chapter and paragraph.
-    fn save_book_place(&self) {
+    /// Remember where the reader is, by chapter and paragraph, and log
+    /// `read_pages` pages read today for Today's calendar and heatmap.
+    fn save_book_place(&self, read_pages: u32) {
         let Some(Screen::BookReader {
             book,
             text,
@@ -9410,6 +9411,9 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
                 keep: before.keep,
             },
         );
+        places.record_reading(&book.relative_path, &book.title, now, read_pages, |t| {
+            local_zone().day_index(t as i64)
+        });
         if let Err(e) = places.save(&self.books_dir) {
             eprintln!("gideon: couldn't save the reading place: {e}");
         }
@@ -9468,7 +9472,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
             *p = pages;
             *pg = page;
         }
-        self.save_book_place();
+        self.save_book_place(u32::from(delta > 0));
         self.book_turns += 1;
         self.book_turn_times.push((self.clock)());
         if self.book_turn_times.len() > 200 {
@@ -9664,7 +9668,7 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     fn close_book(&mut self) -> Result<Flow> {
         self.sheet = None;
         self.selection = None;
-        self.save_book_place();
+        self.save_book_place(0);
         self.pop()?;
         Ok(Flow::Continue)
     }
@@ -9988,10 +9992,13 @@ impl<D: Display, I: InputSource, G: SourceGateway> UiApp<D, I, G> {
     /// Run `f` with the (cached) ProgressStore: the disk read + JSON parse
     /// happen at most once between [`Self::invalidate_progress_cache`]
     /// calls, not once per repaint.
-    /// This profile's reading statistics, from its own progress store.
-    #[cfg(test)]
+    /// This profile's reading statistics: its manga progress store and the
+    /// books' reading days.
     fn reading_stats(&self) -> gideon_core::ReadingStats {
-        self.with_progress(|_, store| gideon_core::ReadingStats::from_store(store))
+        let books = gideon_core::BookPlaces::load(&self.books_dir);
+        self.with_progress(|_, store| {
+            gideon_core::ReadingStats::from_store_and_books(store, &books)
+        })
     }
 
     fn with_progress<R>(&self, f: impl FnOnce(&Self, &ProgressStore) -> R) -> R {
@@ -12471,4 +12478,12 @@ fn progress_key(library_dir: &Path, path: &Path) -> String {
     path.strip_prefix(library_dir)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.display().to_string())
+}
+
+/// The device's time zone, read once: the book reader asks on every page
+/// turn, and the zoneinfo file does not change while gideon runs.
+fn local_zone() -> &'static gideon_core::stats::LocalTimeZone {
+    static ZONE: std::sync::OnceLock<gideon_core::stats::LocalTimeZone> =
+        std::sync::OnceLock::new();
+    ZONE.get_or_init(gideon_core::stats::LocalTimeZone::system)
 }

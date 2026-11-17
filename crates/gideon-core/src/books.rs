@@ -314,7 +314,34 @@ pub struct BookPlaces {
     /// Each book's highlights, in reading order.
     #[serde(default)]
     pub highlights: BTreeMap<String, Vec<Highlight>>,
+    /// Which days each book was read on, for Today's calendar and heatmap.
+    /// A place holds one timestamp, so on its own a book read every evening
+    /// for a week would show as a single day.
+    #[serde(default)]
+    pub activity: BTreeMap<String, BookActivity>,
 }
+
+/// The days one book was read on: its title (so Today can label the
+/// calendar without scanning the shelf) and a row per reading day.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookActivity {
+    pub title: String,
+    #[serde(default)]
+    pub days: Vec<BookDay>,
+}
+
+/// One day's reading of a book: when it was last read that day (unix
+/// seconds, so the stats can bucket it in local time) and the pages turned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookDay {
+    pub at: u64,
+    #[serde(default)]
+    pub pages: u32,
+}
+
+/// Reading days kept per book: a year and a bit, which is more than the
+/// calendar or heatmap ever looks back.
+pub const BOOK_DAYS_KEPT: usize = 400;
 
 impl BookPlaces {
     pub const FILE: &'static str = ".gideon-places.json";
@@ -359,6 +386,32 @@ impl BookPlaces {
 
     pub fn set(&mut self, relative_path: &str, place: BookPlace) {
         self.places.insert(relative_path.to_string(), place);
+    }
+
+    /// Note that `pages` pages of the book were read at `now`. `day_of`
+    /// turns a timestamp into a local day; a second reading on the same day
+    /// adds to that day's row instead of starting a new one.
+    pub fn record_reading(
+        &mut self,
+        relative_path: &str,
+        title: &str,
+        now: u64,
+        pages: u32,
+        day_of: impl Fn(u64) -> i64,
+    ) {
+        let entry = self.activity.entry(relative_path.to_string()).or_default();
+        entry.title = title.to_string();
+        match entry.days.last_mut() {
+            Some(last) if day_of(last.at) == day_of(now) => {
+                last.at = last.at.max(now);
+                last.pages = last.pages.saturating_add(pages);
+            }
+            _ => entry.days.push(BookDay { at: now, pages }),
+        }
+        if entry.days.len() > BOOK_DAYS_KEPT {
+            let extra = entry.days.len() - BOOK_DAYS_KEPT;
+            entry.days.drain(..extra);
+        }
     }
 
     pub fn bookmarks(&self, relative_path: &str) -> &[Bookmark] {
